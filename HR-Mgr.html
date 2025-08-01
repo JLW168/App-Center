@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HR Management System</title>
+    <title>Future Plan Management</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -1590,7 +1590,20 @@
                     return;
                 }
                 setIsSaving(true);
-                
+
+                const { runTransaction, doc, collection, query, where, getDocs } = window.firebaseSDK;
+
+                // Find the active loan for the employee first, outside the transaction.
+                let activeLoanRef = null;
+                let activeLoanId = null;
+                const loansRef = collection(db, "staffLoans");
+                const loanQuery = query(loansRef, where("employeeId", "==", selectedEmployee.id), where("status", "==", "Active"));
+                const loanQuerySnapshot = await getDocs(loanQuery);
+                if (!loanQuerySnapshot.empty) {
+                    activeLoanRef = loanQuerySnapshot.docs[0].ref;
+                    activeLoanId = loanQuerySnapshot.docs[0].id;
+                }
+
                 const payrollData = {
                     employeeId: selectedEmployee.id,
                     shopId: selectedEmployee.shop,
@@ -1606,70 +1619,106 @@
                     finalSalary: calculatedData.finalSalary,
                     loanRemains: calculatedData.loanRemains,
                     note: payrollInput.note,
-                    createdAt: new Date().toISOString()
+                    createdAt: new Date().toISOString(),
+                    loanId: activeLoanId // Store the loanId with the payroll for easier reference
                 };
-
-                const { runTransaction, doc, collection, query, where, getDocs } = window.firebaseSDK;
 
                 try {
                     if (editingPayrollId) {
                         // --- UPDATE LOGIC ---
+                        const paymentsRef = collection(db, "loanPayments");
+                        const paymentQuery = query(paymentsRef, where("payrollId", "==", editingPayrollId));
+                        const paymentQuerySnapshot = await getDocs(paymentQuery);
+                        let existingPaymentRef = null;
+                        if (!paymentQuerySnapshot.empty) {
+                            existingPaymentRef = paymentQuerySnapshot.docs[0].ref;
+                        }
+
                         await runTransaction(db, async (transaction) => {
+                            // --- ALL READS FIRST ---
                             const payrollRef = doc(db, "payrolls", editingPayrollId);
                             const originalPayrollDoc = await transaction.get(payrollRef);
+                            
+                            let loanDoc = null;
+                            if (activeLoanRef) {
+                                loanDoc = await transaction.get(activeLoanRef);
+                            }
+
+                            // --- LOGIC & CALCULATIONS ---
                             if (!originalPayrollDoc.exists()) {
                                 throw "Original payroll document not found!";
                             }
+                            
                             const oldLoanDed = originalPayrollDoc.data().loanDed || 0;
                             const newLoanDed = payrollData.loanDed;
                             const loanDedDifference = newLoanDed - oldLoanDed;
 
-                            if (loanDedDifference !== 0) {
-                                const loansRef = collection(db, "staffLoans");
-                                const q = query(loansRef, where("employeeId", "==", selectedEmployee.id), where("status", "==", "Active"));
-                                const loanQuerySnapshot = await getDocs(q);
-                                if (!loanQuerySnapshot.empty) {
-                                    const loanDoc = loanQuerySnapshot.docs[0];
-                                    const loanData = loanDoc.data();
-                                    const newTotalPaid = (loanData.totalPaid || 0) + loanDedDifference;
-                                    transaction.update(loanDoc.ref, { 
-                                        totalPaid: newTotalPaid,
-                                        status: newTotalPaid >= loanData.loanAmount ? "Paid Off" : "Active"
-                                    });
-                                }
+                            // --- ALL WRITES LAST ---
+                            if (loanDedDifference !== 0 && activeLoanRef && loanDoc && loanDoc.exists()) {
+                                const loanData = loanDoc.data();
+                                const newTotalPaid = (loanData.totalPaid || 0) + loanDedDifference;
+                                transaction.update(activeLoanRef, { 
+                                    totalPaid: newTotalPaid,
+                                    status: newTotalPaid >= loanData.loanAmount ? "Paid Off" : "Active"
+                                });
                             }
-                            transaction.update(payrollRef, payrollData);
-                        });
-                        alert("Payroll updated successfully!");
-                    } else {
-                        // --- ADD NEW LOGIC ---
-                        await runTransaction(db, async (transaction) => {
-                            const payrollRef = doc(collection(db, "payrolls"));
-                            transaction.set(payrollRef, payrollData);
-                            
-                            if (payrollData.loanDed > 0) {
-                                const loansRef = collection(db, "staffLoans");
-                                const q = query(loansRef, where("employeeId", "==", selectedEmployee.id), where("status", "==", "Active"));
-                                const loanQuerySnapshot = await getDocs(q);
-                                
-                                if (!loanQuerySnapshot.empty) {
-                                    const loanDoc = loanQuerySnapshot.docs[0];
-                                    const loanData = loanDoc.data();
-                                    const newTotalPaid = (loanData.totalPaid || 0) + payrollData.loanDed;
-                                    transaction.update(loanDoc.ref, {
-                                        totalPaid: newTotalPaid,
-                                        status: newTotalPaid >= loanData.loanAmount ? "Paid Off" : "Active"
-                                    });
-                                    // Create payment history for payroll deduction
-                                    const paymentRef = doc(collection(db, "loanPayments"));
-                                    transaction.set(paymentRef, {
-                                        loanId: loanDoc.id,
+
+                            if (newLoanDed > 0) {
+                                if (existingPaymentRef) {
+                                    transaction.update(existingPaymentRef, { paymentAmount: newLoanDed, paymentDate: payrollData.createdAt.slice(0, 10) });
+                                } else if (activeLoanRef) {
+                                    const newPaymentRef = doc(collection(db, "loanPayments"));
+                                    transaction.set(newPaymentRef, {
+                                        loanId: activeLoanId,
+                                        payrollId: editingPayrollId,
                                         employeeId: selectedEmployee.id,
-                                        paymentAmount: payrollData.loanDed,
-                                        paymentDate: new Date().toISOString().slice(0,10),
+                                        paymentAmount: newLoanDed,
+                                        paymentDate: payrollData.createdAt.slice(0, 10),
                                         note: `Payroll Deduction for ${payrollData.payrollMonth}`
                                     });
                                 }
+                            } else if (oldLoanDed > 0 && newLoanDed <= 0 && existingPaymentRef) {
+                                transaction.delete(existingPaymentRef);
+                            }
+                            
+                            transaction.update(payrollRef, payrollData);
+                        });
+                        alert("Payroll updated successfully!");
+
+                    } else {
+                        // --- ADD NEW LOGIC ---
+                        await runTransaction(db, async (transaction) => {
+                            // --- READ FIRST ---
+                            let loanDoc = null;
+                            if (activeLoanRef) {
+                                loanDoc = await transaction.get(activeLoanRef);
+                            }
+                            
+                            // --- LOGIC & WRITES ---
+                            const payrollRef = doc(collection(db, "payrolls"));
+                            transaction.set(payrollRef, { ...payrollData, id: payrollRef.id });
+                            
+                            if (payrollData.loanDed > 0 && activeLoanRef) {
+                                if (!loanDoc || !loanDoc.exists()) {
+                                     throw "Active loan not found in transaction. Please try again.";
+                                }
+                                
+                                const loanData = loanDoc.data();
+                                const newTotalPaid = (loanData.totalPaid || 0) + payrollData.loanDed;
+                                transaction.update(activeLoanRef, {
+                                    totalPaid: newTotalPaid,
+                                    status: newTotalPaid >= loanData.loanAmount ? "Paid Off" : "Active"
+                                });
+
+                                const paymentRef = doc(collection(db, "loanPayments"));
+                                transaction.set(paymentRef, {
+                                    loanId: activeLoanId,
+                                    payrollId: payrollRef.id,
+                                    employeeId: selectedEmployee.id,
+                                    paymentAmount: payrollData.loanDed,
+                                    paymentDate: payrollData.createdAt.slice(0, 10),
+                                    note: `Payroll Deduction for ${payrollData.payrollMonth}`
+                                });
                             }
                         });
                         alert("Payroll saved successfully!");
@@ -1683,7 +1732,6 @@
                             link.click();
                         });
                     }
-
                     resetForm();
                 } catch (error) {
                     console.error("Error saving payroll:", error);
@@ -1692,6 +1740,7 @@
                     setIsSaving(false);
                 }
             };
+
 
             return (
                 <div>
@@ -1828,26 +1877,40 @@
             const handleDelete = async (payroll) => {
                 if (await showConfirmation("Are you sure you want to delete this payroll record? This will also reverse any loan deduction made.")) {
                     const { runTransaction, doc, collection, query, where, getDocs } = window.firebaseSDK;
+
+                    const paymentsRef = collection(db, "loanPayments");
+                    const paymentQuery = query(paymentsRef, where("payrollId", "==", payroll.id));
+                    const paymentQuerySnapshot = await getDocs(paymentQuery);
+                    let paymentToDeleteRef = null;
+                    if (!paymentQuerySnapshot.empty) {
+                        paymentToDeleteRef = paymentQuerySnapshot.docs[0].ref;
+                    }
+
                     try {
                         await runTransaction(db, async (transaction) => {
+                            // --- READS FIRST ---
+                            let loanDoc = null;
+                            const loanRef = payroll.loanId ? doc(db, "staffLoans", payroll.loanId) : null;
+                            if (loanRef) {
+                                loanDoc = await transaction.get(loanRef);
+                            }
+
+                            // --- LOGIC & WRITES ---
                             const payrollRef = doc(db, "payrolls", payroll.id);
                             
-                            if (payroll.loanDed > 0) {
-                                const loansRef = collection(db, "staffLoans");
-                                const q = query(loansRef, where("employeeId", "==", payroll.employeeId));
-                                const loanQuerySnapshot = await getDocs(q);
-                                
-                                if (!loanQuerySnapshot.empty) {
-                                    const loanDoc = loanQuerySnapshot.docs[0];
-                                    const loanData = loanDoc.data();
-                                    const newTotalPaid = (loanData.totalPaid || 0) - payroll.loanDed;
-                                    transaction.update(loanDoc.ref, { 
-                                        totalPaid: newTotalPaid < 0 ? 0 : newTotalPaid,
-                                        status: "Active"
-                                    });
-                                }
+                            if (payroll.loanDed > 0 && loanRef && loanDoc && loanDoc.exists()) {
+                                const loanData = loanDoc.data();
+                                const newTotalPaid = (loanData.totalPaid || 0) - payroll.loanDed;
+                                transaction.update(loanRef, { 
+                                    totalPaid: newTotalPaid < 0 ? 0 : newTotalPaid,
+                                    status: "Active"
+                                });
                             }
-                            
+
+                            if (paymentToDeleteRef) {
+                                transaction.delete(paymentToDeleteRef);
+                            }
+
                             transaction.delete(payrollRef);
                         });
                         alert("Payroll record deleted successfully.");
