@@ -1169,15 +1169,18 @@ const POAuditPage = ({ poDataToAudit, setPage, userProfile, shops }) => {
 
     const handleAuditSubmit = async () => {
         if (!exchangeRate) {
-             setModalInfo({ show: true, title: 'Validation Error', message: 'Please enter the exchange rate.', isError: true });
-             return;
+            setModalInfo({ show: true, title: 'Validation Error', message: 'Please enter the exchange rate.', isError: true });
+            return;
         }
         if (!auditedByName) {
-             setModalInfo({ show: true, title: 'Validation Error', message: "Please enter the auditor's name.", isError: true });
-             return;
+            setModalInfo({ show: true, title: 'Validation Error', message: "Please enter the auditor's name.", isError: true });
+            return;
         }
-
+    
         try {
+            const batch = db.batch();
+            const poRef = db.collection("purchaseOrders").doc(poDataToAudit.id);
+            
             const auditData = {
                 status: 'audited',
                 items: auditedItems,
@@ -1187,25 +1190,58 @@ const POAuditPage = ({ poDataToAudit, setPage, userProfile, shops }) => {
                 auditedAt: firebase.firestore.FieldValue.serverTimestamp(),
                 updatedAt: firebase.firestore.FieldValue.serverTimestamp()
             };
-
-            await db.collection("purchaseOrders").doc(poDataToAudit.id).update(auditData);
-
+            batch.update(poRef, auditData);
+    
             const shop = shops.find(s => s.id === poDataToAudit.shopId);
-            if (shop && shop.manageStock) {
-                const batch = db.batch();
-                auditedItems.forEach(item => {
-                    if (item.productId) {
-                        const productRef = db.collection("products").doc(item.productId);
-                        const auditedQty = parseFloat(item.auditedQty) || 0;
-                        const updateData = {};
-                        updateData[`stockByShop.${poDataToAudit.shopId}`] = firebase.firestore.FieldValue.increment(auditedQty);
-                        batch.update(productRef, updateData);
+            
+            auditedItems.forEach(item => {
+                if (item.productId) {
+                    const productRef = db.collection("products").doc(item.productId);
+                    const auditedQty = parseFloat(item.auditedQty) || 0;
+    
+                    // Update stock if the shop manages it
+                    if (shop && shop.manageStock && auditedQty > 0) {
+                        const stockUpdate = {};
+                        stockUpdate[`stockByShop.${poDataToAudit.shopId}`] = firebase.firestore.FieldValue.increment(auditedQty);
+                        batch.update(productRef, stockUpdate);
                     }
-                });
-                await batch.commit();
-            }
-
-            setModalInfo({ show: true, title: 'Success', message: 'PO has been successfully audited and stock has been updated.' });
+    
+                    // Calculate new cost and update history if changed
+                    if (auditedQty > 0) {
+                        let newCostPerUnit = 0;
+                        const auditedTotalKHR = parseFloat(item.auditedTotalKHR) || 0;
+                        const auditedTotalUSD = parseFloat(item.auditedTotalUSD) || 0;
+                        const rate = parseFloat(exchangeRate) || 0;
+    
+                        if (auditedTotalKHR > 0) {
+                            newCostPerUnit = auditedTotalKHR / auditedQty;
+                        } else if (auditedTotalUSD > 0 && rate > 0) {
+                            newCostPerUnit = (auditedTotalUSD * rate) / auditedQty;
+                        }
+    
+                        // Using a small epsilon for float comparison
+                        if (newCostPerUnit > 0 && Math.abs(newCostPerUnit - item.originalCost) > 0.01) {
+                            // Update the product's main cost field
+                            batch.update(productRef, { cost: newCostPerUnit });
+    
+                            // Add a record to cost history
+                            const historyRef = db.collection("costHistory").doc();
+                            batch.set(historyRef, {
+                                productId: item.productId,
+                                poNumber: poDataToAudit.poNumber,
+                                oldCost: item.originalCost,
+                                newCost: newCostPerUnit,
+                                auditedBy: auditedByName,
+                                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                            });
+                        }
+                    }
+                }
+            });
+    
+            await batch.commit();
+    
+            setModalInfo({ show: true, title: 'Success', message: 'PO has been successfully audited. Stock and cost history have been updated.' });
             setPage('po-center');
         } catch (error) {
             console.error("Error submitting audit:", error);
@@ -1877,7 +1913,7 @@ const TransferAuditModal = ({ transferData, shops, onClose }) => {
 
     const handleCompleteTransfer = async () => {
         const fromShop = shops.find(s => s.id === transferData.fromShopId);
-        const toShop = shops.find(s => s.id === transferData.toShopId);
+        const toShop = shops.find(s => s.id === toShopId);
 
         try {
             const batch = db.batch();
@@ -2014,12 +2050,10 @@ const ProductDataPage = ({ userProfile, shops, vendors, products }) => {
 };
 
 const ProductList = ({ userProfile, products, vendors, shops }) => {
-    const initialFormState = { code: '', barcode: '', name: '', vendorId: '', cost: 0, price: 0, note: '', stockByShop: {} };
-    const [formData, setFormData] = useState(initialFormState);
-    const [editId, setEditId] = useState(null);
     const [modal, setModal] = useState({ type: null, data: null });
     const [historyModal, setHistoryModal] = useState({ show: false, product: null });
     const [labelModal, setLabelModal] = useState({ show: false, product: null });
+    const [productModal, setProductModal] = useState({ show: false, product: null });
     const [searchTerm, setSearchTerm] = useState('');
     const [shopFilter, setShopFilter] = useState('');
     const [vendorFilter, setVendorFilter] = useState('');
@@ -2064,31 +2098,6 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
 
     const paginate = (pageNumber) => setCurrentPage(pageNumber);
 
-    const handleInputChange = (e) => {
-        const { name, value } = e.target;
-        setFormData(prev => ({ ...prev, [name]: value }));
-    };
-
-    const resetForm = () => {
-        setFormData(initialFormState);
-        setEditId(null);
-    };
-
-    const handleEdit = (product) => {
-        setEditId(product.id);
-        setFormData({
-            code: product.code || '',
-            barcode: product.barcode || '',
-            name: product.name || '',
-            vendorId: product.vendorId || '',
-            cost: product.cost || 0,
-            price: product.price || 0,
-            note: product.note || '',
-            stockByShop: product.stockByShop || {}
-        });
-        window.scrollTo(0, 0);
-    };
-
     const handleDelete = async (id) => {
         try {
             await db.collection("products").doc(id).delete();
@@ -2097,9 +2106,8 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
             setModal({ type: 'message', data: { title: 'Error', message: 'Failed to delete product.', isError: true } });
         }
     };
-
-    const handleSubmit = async (e) => {
-        e.preventDefault();
+    
+    const handleSaveProduct = async (formData, editId) => {
         const selectedVendor = vendors.find(v => v.id === formData.vendorId);
         const dataToSave = {
             ...formData,
@@ -2116,12 +2124,12 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                 await db.collection("products").add(dataToSave);
                 setModal({ type: 'message', data: { title: 'Success', message: 'Product added successfully.' } });
             }
-            resetForm();
+            setProductModal({ show: false, product: null });
         } catch (error) {
             setModal({ type: 'message', data: { title: 'Error', message: 'Failed to save product.', isError: true } });
         }
     };
-    
+
     const openDeleteAllModal = () => {
         setModal({
             type: 'confirmDeleteAll',
@@ -2263,6 +2271,7 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
     const handleExportToExcel = () => {
         const dataToExport = filteredProducts.map(p => ({
             'Product Code': p.code,
+            'Barcode': p.barcode,
             'Name': p.name,
             'Vendor': p.vendorName,
             'Current Cost': p.cost,
@@ -2317,49 +2326,7 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
             />
             {historyModal.show && <CostHistoryModal product={historyModal.product} onClose={() => setHistoryModal({ show: false, product: null })} />}
             {labelModal.show && <ProductLabelModal product={labelModal.product} onClose={() => setLabelModal({ show: false, product: null })} />}
-
-
-            <FormCard title={editId ? "Edit Product" : "Add New Product"} onSubmit={handleSubmit}>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Product Code</label>
-                        <input type="text" name="code" placeholder="Product Code" value={formData.code} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Barcode</label>
-                        <input type="text" name="barcode" placeholder="Barcode" value={formData.barcode} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" />
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Product Name</label>
-                        <input type="text" name="name" placeholder="Product Name" value={formData.name} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Vendor</label>
-                        <select name="vendorId" value={formData.vendorId} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required>
-                            <option value="">Select Vendor</option>
-                            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                        </select>
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Cost</label>
-                        <input type="number" name="cost" placeholder="Cost" value={formData.cost} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Sale Price</label>
-                        <input type="number" name="price" placeholder="Sale Price" value={formData.price} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
-                    </div>
-                    <div className="md:col-span-2 lg:col-span-3">
-                        <label className="block text-sm font-medium text-slate-300 mb-1">Note</label>
-                        <textarea name="note" placeholder="Note..." value={formData.note} onChange={handleInputChange} rows="1" className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md"></textarea>
-                    </div>
-                </div>
-                <div className="mt-6 text-right space-x-3">
-                    {editId && <button type="button" onClick={resetForm} className="bg-slate-600 text-slate-100 font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Cancel</button>}
-                    <button type="submit" className={`${editId ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'} text-white font-bold py-2 px-6 rounded-lg transition`}>
-                        {editId ? 'Update Product' : 'Add Product'}
-                    </button>
-                </div>
-            </FormCard>
+            {productModal.show && <ProductModal show={productModal.show} productToEdit={productModal.product} vendors={vendors} onSave={handleSaveProduct} onClose={() => setProductModal({ show: false, product: null })} />}
 
             <TableCard title={`Existing Products (${filteredProducts.length})`}>
                  <div className="mb-4 px-1 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -2384,26 +2351,31 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                         </button>
                     </div>
                 </div>
-                 <div className="mb-4 px-1 flex flex-wrap gap-2 items-center justify-end">
-                    <button onClick={handleDownloadTemplate} className="bg-cyan-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-cyan-700 transition flex items-center gap-2">
-                        <i className="fas fa-download"></i> Template
+                 <div className="mb-4 px-1 flex flex-wrap gap-2 items-center justify-between">
+                    <button onClick={() => setProductModal({ show: true, product: null })} className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
+                        <i className="fas fa-plus"></i> Add Product
                     </button>
-                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} style={{ display: 'none' }} accept=".xlsx, .xls, .csv" />
-                    <button onClick={() => fileInputRef.current.click()} disabled={isImporting} className="bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-indigo-700 transition flex items-center gap-2 disabled:bg-indigo-800">
-                        {isImporting ? <div className="loader"></div> : <i className="fas fa-upload"></i>}
-                        {isImporting ? 'Importing...' : 'Import'}
-                    </button>
-                    <button onClick={handleExportToExcel} className="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 transition flex items-center gap-2">
-                        <i className="fas fa-file-excel"></i> Export
-                    </button>
-                    {userProfile && userProfile.role === 'Admin' && (
-                        <button 
-                            onClick={openDeleteAllModal} 
-                            className="bg-red-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-800 transition flex items-center gap-2"
-                        >
-                            <i className="fas fa-exclamation-triangle"></i> Delete All
+                    <div className="flex flex-wrap gap-2 items-center justify-end">
+                        <button onClick={handleDownloadTemplate} className="bg-cyan-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-cyan-700 transition flex items-center gap-2">
+                            <i className="fas fa-download"></i> Template
                         </button>
-                    )}
+                        <input type="file" ref={fileInputRef} onChange={handleFileUpload} style={{ display: 'none' }} accept=".xlsx, .xls, .csv" />
+                        <button onClick={() => fileInputRef.current.click()} disabled={isImporting} className="bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-indigo-700 transition flex items-center gap-2 disabled:bg-indigo-800">
+                            {isImporting ? <div className="loader"></div> : <i className="fas fa-upload"></i>}
+                            {isImporting ? 'Importing...' : 'Import'}
+                        </button>
+                        <button onClick={handleExportToExcel} className="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 transition flex items-center gap-2">
+                            <i className="fas fa-file-excel"></i> Export
+                        </button>
+                        {userProfile && userProfile.role === 'Admin' && (
+                            <button 
+                                onClick={openDeleteAllModal} 
+                                className="bg-red-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-800 transition flex items-center gap-2"
+                            >
+                                <i className="fas fa-exclamation-triangle"></i> Delete All
+                            </button>
+                        )}
+                    </div>
                 </div>
                 {products.length === 0 ? <p className="text-center p-4 text-slate-400">No products found.</p> : (
                     <React.Fragment>
@@ -2411,6 +2383,7 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                             <thead className="bg-slate-900/50">
                                 <tr>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Code</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Barcode</th>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Vendor</th>
                                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Cost</th>
@@ -2425,6 +2398,7 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                                 {currentItems.map(p => (
                                     <tr key={p.id} className="hover:bg-slate-700/50">
                                         <td className="px-4 py-3 text-sm text-slate-200">{p.code}</td>
+                                        <td className="px-4 py-3 text-sm text-slate-300">{p.barcode}</td>
                                         <td className="px-4 py-3 text-sm text-slate-300">{p.name}</td>
                                         <td className="px-4 py-3 text-sm text-slate-400">{p.vendorName}</td>
                                         <td className="px-4 py-3 text-sm text-slate-300 text-right">{khrFormatter.format(p.cost)}</td>
@@ -2446,7 +2420,7 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                                         <td className="px-4 py-3 text-center space-x-4">
                                             <button onClick={() => setLabelModal({ show: true, product: p })} className="text-teal-400 hover:text-teal-300" title="Print Label"><i className="fas fa-barcode"></i></button>
                                             <button onClick={() => handleViewHistory(p)} className="text-green-400 hover:text-green-300" title="Cost History"><i className="fas fa-history"></i></button>
-                                            <button onClick={() => handleEdit(p)} className="text-blue-400 hover:text-blue-300" title="Edit"><i className="fas fa-edit"></i></button>
+                                            <button onClick={() => setProductModal({ show: true, product: p })} className="text-blue-400 hover:text-blue-300" title="Edit"><i className="fas fa-edit"></i></button>
                                             <button onClick={() => setModal({ type: 'confirmDelete', data: p.id })} className="text-red-500 hover:text-red-400" title="Delete"><i className="fas fa-trash"></i></button>
                                         </td>
                                     </tr>
@@ -2477,6 +2451,87 @@ const ProductList = ({ userProfile, products, vendors, shops }) => {
                 )}
             </TableCard>
         </div>
+    );
+};
+
+const ProductModal = ({ show, onClose, productToEdit, vendors, onSave }) => {
+    const initialFormState = { code: '', barcode: '', name: '', vendorId: '', cost: 0, price: 0, note: '', stockByShop: {} };
+    const [formData, setFormData] = useState(initialFormState);
+
+    useEffect(() => {
+        if (productToEdit) {
+            setFormData({
+                code: productToEdit.code || '',
+                barcode: productToEdit.barcode || '',
+                name: productToEdit.name || '',
+                vendorId: productToEdit.vendorId || '',
+                cost: productToEdit.cost || 0,
+                price: productToEdit.price || 0,
+                note: productToEdit.note || '',
+                stockByShop: productToEdit.stockByShop || {}
+            });
+        } else {
+            setFormData(initialFormState);
+        }
+    }, [productToEdit, show]);
+
+    const handleInputChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        onSave(formData, productToEdit ? productToEdit.id : null);
+    };
+
+    return (
+        <Modal show={show} onClose={onClose} maxWidth="max-w-4xl">
+            <form onSubmit={handleSubmit}>
+                <ModalHeader title={productToEdit ? "Edit Product" : "Add New Product"} onClose={onClose} />
+                <ModalBody>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Product Code</label>
+                            <input type="text" name="code" placeholder="Product Code" value={formData.code} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Barcode</label>
+                            <input type="text" name="barcode" placeholder="Barcode" value={formData.barcode} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Product Name</label>
+                            <input type="text" name="name" placeholder="Product Name" value={formData.name} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Vendor</label>
+                            <select name="vendorId" value={formData.vendorId} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required>
+                                <option value="">Select Vendor</option>
+                                {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Cost</label>
+                            <input type="number" name="cost" placeholder="Cost" value={formData.cost} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Sale Price</label>
+                            <input type="number" name="price" placeholder="Sale Price" value={formData.price} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" required />
+                        </div>
+                        <div className="md:col-span-2 lg:col-span-3">
+                            <label className="block text-sm font-medium text-slate-300 mb-1">Note</label>
+                            <textarea name="note" placeholder="Note..." value={formData.note} onChange={handleInputChange} rows="2" className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md"></textarea>
+                        </div>
+                    </div>
+                </ModalBody>
+                <ModalFooter>
+                    <button type="button" onClick={onClose} className="bg-slate-600 text-slate-100 font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Cancel</button>
+                    <button type="submit" className={`${productToEdit ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'} text-white font-bold py-2 px-6 rounded-lg transition`}>
+                        {productToEdit ? 'Update Product' : 'Add Product'}
+                    </button>
+                </ModalFooter>
+            </form>
+        </Modal>
     );
 };
 
