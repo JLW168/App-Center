@@ -114,12 +114,12 @@ const { useState, useEffect, useCallback, useMemo, useRef, createContext, useCon
 // Application Data Context
 const DataContext = createContext(null);
 const DataProvider = ({ children }) => {
-    // Products are now loaded on-demand in ProductList. We still load them here for Fuse search on other pages.
+    // Products are loaded on-demand in ProductList, but we still load them here for Fuse search on other pages.
     const { data: products, loading: productsLoading } = useCollection('products');
     const { data: vendors, loading: vendorsLoading } = useCollection('vendors');
     const { data: shops, loading: shopsLoading } = useCollection('shops');
 
-    const isLoading = vendorsLoading || shopsLoading; // Products loading is handled separately
+    const isLoading = vendorsLoading || shopsLoading;
 
     const value = { products, vendors, shops, isLoading, productsLoading };
 
@@ -195,6 +195,95 @@ const useDebounce = (value, delay) => {
     return debouncedValue;
 };
 
+// ** REFACTORED HOOK ** for handling paginated and filtered Firestore queries
+const usePaginatedFirestore = (collectionName, { itemsPerPage = 20, initialFilters = {} }) => {
+    const [state, setState] = useState({
+        loading: true,
+        error: null,
+        documents: [],
+        total: 0,
+        page: 1,
+    });
+    const [filters, setFilters] = useState(initialFilters);
+    const pageSnapshots = useRef({ first: [null], last: null }); // Stores first doc of each page and last doc of current page
+
+    // Memoized fetch function to avoid re-creation on every render
+    const fetchData = useCallback(async (newPage, startAfterDoc = null) => {
+        setState(s => ({ ...s, loading: true, error: null }));
+        try {
+            // Build the base query with filters
+            let query = db.collection(collectionName);
+            if (filters.vendorId) {
+                query = query.where('vendorId', '==', filters.vendorId);
+            }
+            if (filters.name) {
+                // Firestore range filter for "starts with" search
+                query = query.where('name', '>=', filters.name).where('name', '<=', filters.name + '\uf8ff');
+            }
+
+            // Get total count for pagination info
+            const totalSnapshot = await query.get();
+            const total = totalSnapshot.size;
+
+            // Apply ordering and pagination
+            let paginatedQuery = query.orderBy("name");
+            if (startAfterDoc) {
+                paginatedQuery = paginatedQuery.startAfter(startAfterDoc);
+            }
+            paginatedQuery = paginatedQuery.limit(itemsPerPage);
+
+            const snapshot = await paginatedQuery.get();
+            const newDocs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            
+            // Update snapshot refs for next/prev page logic
+            pageSnapshots.current.last = snapshot.docs[snapshot.docs.length - 1] || null;
+            if (newPage > pageSnapshots.current.first.length - 1) {
+                 pageSnapshots.current.first.push(snapshot.docs[0] || null);
+            }
+
+            setState({
+                loading: false,
+                error: null,
+                documents: newDocs,
+                total,
+                page: newPage,
+            });
+        } catch (err) {
+            console.error("Error fetching paginated data:", err);
+            setState(s => ({ ...s, loading: false, error: err.message, documents: [], total: 0 }));
+        }
+    }, [collectionName, itemsPerPage, JSON.stringify(filters)]);
+
+    // Effect to refetch data when filters change, resetting to page 1
+    useEffect(() => {
+        pageSnapshots.current = { first: [null], last: null }; // Reset pagination on filter change
+        fetchData(1, null);
+    }, [fetchData]);
+
+    const nextPage = () => {
+        if (state.page * itemsPerPage < state.total) {
+            fetchData(state.page + 1, pageSnapshots.current.last);
+        }
+    };
+
+    const prevPage = () => {
+        if (state.page > 1) {
+            // The document to start *after* for the previous page is the one before the first doc of the current page
+            const prevPageStartAfter = pageSnapshots.current.first[state.page - 2] || null;
+            fetchData(state.page - 1, prevPageStartAfter);
+        }
+    };
+    
+    // Function to trigger a full refresh to the first page
+    const refresh = useCallback(() => {
+        pageSnapshots.current = { first: [null], last: null };
+        fetchData(1, null);
+    }, [fetchData]);
+
+    return { ...state, setFilters, nextPage, prevPage, refresh };
+};
+
+
 // --- 4. UTILITY FUNCTIONS ---
 
 // Safely converts Firestore Timestamps or date strings to Date objects
@@ -230,7 +319,6 @@ const TableCard = memo(({ title, children }) => (
         <div className="flex flex-col md:flex-row justify-between md:items-center mb-4">
             <h4 className="text-lg md:text-xl font-semibold text-slate-200 mb-4 md:mb-0">{title}</h4>
         </div>
-        {/* This div enables horizontal scrolling for wide tables on small screens */}
         <div className="overflow-x-auto">
             {children}
         </div>
@@ -961,6 +1049,114 @@ const POPreviewModal = ({ po, onClose }) => {
         }, 100);
     };
 
+    const handleExportToExcel = () => {
+        // --- Define Styles ---
+        const fontStyle = { name: "Ang DaunKeo", sz: 11 };
+        const centeredWhiteOnDarkStyle = {
+            font: { ...fontStyle, color: { rgb: "FFFFFF" } },
+            alignment: { horizontal: "center", vertical: "center" },
+            fill: { fgColor: { rgb: "2A3347" } } // Dark slate color
+        };
+        const defaultStyle = { font: fontStyle };
+        const headerStyle = { font: { ...fontStyle, bold: true } };
+
+        // --- Prepare Data ---
+        const poDate = safeToDate(po.requestDate);
+        const formattedDate = poDate ? `${String(poDate.getDate()).padStart(2, '0')}-${String(poDate.getMonth() + 1).padStart(2, '0')}-${poDate.getFullYear()}` : 'N/A';
+        
+        const wb = XLSX.utils.book_new();
+        const ws_data = [];
+
+        // --- Build Header ---
+        ws_data.push([{v: 'Purchase Order', s: { font: { ...fontStyle, sz: 16, bold: true } } }]);
+        if (po.status === 'audited') {
+            ws_data.push([{v: 'Audited', s: { font: { ...fontStyle, color: { rgb: "22C55E" }}}}]);
+        }
+        ws_data.push([]);
+
+        ws_data.push([
+            {v: 'Vendor:', s: headerStyle}, {v: vendorDetails.name || po.vendorName, s: defaultStyle}, null,
+            {v: 'PO No.:', s: headerStyle}, {v: po.poNumber, s: defaultStyle}
+        ]);
+        ws_data.push([
+            {v: 'Contact:', s: headerStyle}, {v: vendorDetails.contact || 'N/A', s: defaultStyle}, null,
+            {v: 'Date:', s: headerStyle}, {v: formattedDate, s: defaultStyle}
+        ]);
+        if (po.status === 'audited') {
+             const auditedDate = safeToDate(po.auditedAt);
+             const formattedAuditedDate = auditedDate ? auditedDate.toLocaleString() : 'N/A';
+             ws_data.push([
+                {v: 'Audited By:', s: headerStyle}, {v: po.auditedBy || 'N/A', s: defaultStyle}, null,
+                {v: 'Exchange Rate:', s: headerStyle}, {v: po.exchangeRate || 'N/A', s: defaultStyle}
+             ]);
+             ws_data.push([{v: 'Audited At:', s: headerStyle}, {v: formattedAuditedDate, s: defaultStyle}]);
+        }
+        ws_data.push([]);
+
+        // --- Build Table ---
+        const tableHeader = ['No', 'Product Code', 'Barcode', 'Name', 'QTY', 'Cost(៛)', 'Cost($)', 'Sub-Total', po.status === 'audited' ? 'CheckUp' : 'Note'];
+        ws_data.push(tableHeader.map(h => ({ v: h, s: headerStyle })));
+
+        po.items.forEach((item, index) => {
+            const qty = po.status === 'audited' && typeof item.auditedQty !== 'undefined' ? item.auditedQty : item.quantity;
+            let cost = item.cost;
+             if (po.status === 'audited') {
+                const auditedQtyNum = parseFloat(qty) || 0;
+                if (auditedQtyNum > 0) {
+                    const auditedTotalKHR = parseFloat(item.auditedTotalKHR) || 0;
+                    const auditedTotalUSD = parseFloat(item.auditedTotalUSD) || 0;
+                    const rate = parseFloat(po.exchangeRate) || 0;
+                    if (auditedTotalKHR > 0) cost = auditedTotalKHR / auditedQtyNum;
+                    else if (auditedTotalUSD > 0 && rate > 0) cost = (auditedTotalUSD * rate) / auditedQtyNum;
+                }
+            }
+            const subTotal = cost * qty;
+            const costUSD = po.exchangeRate ? (cost / po.exchangeRate) : null;
+
+            ws_data.push([
+                { v: index + 1, s: defaultStyle },
+                { v: item.code, s: defaultStyle },
+                { v: item.barcode, s: defaultStyle },
+                { v: item.name, s: defaultStyle },
+                { v: qty, t: 'n', s: defaultStyle },
+                { v: cost, t: 'n', s: centeredWhiteOnDarkStyle, z: '#,##0' },
+                { v: costUSD, t: 'n', s: centeredWhiteOnDarkStyle, z: '"$"#,##0.00' },
+                { v: subTotal, t: 'n', s: centeredWhiteOnDarkStyle, z: '#,##0' },
+                { v: item.checkUp || item.note || '', s: defaultStyle }
+            ]);
+        });
+        
+        ws_data.push([]);
+
+        // --- Build Footer ---
+        const totalAuditedAmountKHR = po.status === 'audited' ? po.items.reduce((sum, item) => {
+            const khr = parseFloat(item.auditedTotalKHR) || 0;
+            const usdInKhr = (parseFloat(item.auditedTotalUSD) || 0) * (parseFloat(po.exchangeRate) || 0);
+            return sum + khr + usdInKhr;
+        }, 0) : 0;
+        const totalLabel = po.status === 'audited' ? 'Audited Total (KHR):' : 'Total (KHR):';
+        const totalValue = po.status === 'audited' ? totalAuditedAmountKHR : po.totalAmount;
+        ws_data.push([null, null, null, null, null, null, {v: totalLabel, s: headerStyle}, {v: totalValue, t: 'n', s: centeredWhiteOnDarkStyle, z: '"៛"#,##0'}]);
+        if (po.status === 'audited' && po.exchangeRate) {
+            ws_data.push([null, null, null, null, null, null, {v: 'Audited Total (USD):', s: headerStyle}, {v: totalAuditedAmountKHR / po.exchangeRate, t: 'n', s: centeredWhiteOnDarkStyle, z: '"$"#,##0.00'}]);
+        }
+
+        // --- Create Worksheet and Download ---
+        const ws = XLSX.utils.aoa_to_sheet(ws_data);
+        ws['!cols'] = [ {wch:5}, {wch:15}, {wch:15}, {wch:40}, {wch:8}, {wch:12}, {wch:12}, {wch:15}, {wch:20} ];
+        
+        // Set page layout
+        ws['!pageSetup'] = {
+            orientation: 'landscape',
+            paper: 9, // A4
+            margins: { left: 0.6, right: 0.6, top: 0.8, bottom: 0.8, header: 0.8, footer: 0.8 }
+        };
+
+        XLSX.utils.book_append_sheet(wb, ws, 'Purchase Order');
+        XLSX.writeFile(wb, `PO-${po.poNumber}.xlsx`);
+    };
+
+
     const poDate = safeToDate(po.requestDate);
     const auditedDate = safeToDate(po.auditedAt);
     const formattedDate = poDate ? `${String(poDate.getDate()).padStart(2, '0')}-${String(poDate.getMonth() + 1).padStart(2, '0')}-${poDate.getFullYear()}` : 'N/A';
@@ -1082,10 +1278,15 @@ const POPreviewModal = ({ po, onClose }) => {
             </ModalBody>
             <ModalFooter>
                 <button onClick={onClose} type="button" className="bg-slate-600 text-slate-100 font-bold py-2 px-6 rounded-lg hover:bg-slate-500 transition">Close</button>
-                <button onClick={handleDownloadImage} disabled={loading} type="button" className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 transition flex items-center gap-2 disabled:bg-green-800">
-                    {loading ? <div className="loader"></div> : <i className="fas fa-camera"></i>}
-                    {loading ? 'Capturing...' : 'Download Image'}
+                <button onClick={handleExportToExcel} type="button" className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 transition flex items-center gap-2">
+                    <i className="fas fa-file-excel"></i> Export to Excel
                 </button>
+                {po.status !== 'submitted' && (
+                    <button onClick={handleDownloadImage} disabled={loading} type="button" className="bg-blue-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-blue-700 transition flex items-center gap-2 disabled:bg-blue-800">
+                        {loading ? <div className="loader"></div> : <i className="fas fa-camera"></i>}
+                        {loading ? 'Capturing...' : 'Download Image'}
+                    </button>
+                )}
             </ModalFooter>
         </Modal>
     );
@@ -1912,145 +2113,283 @@ const ProductDataPage = ({ userProfile }) => {
     );
 };
 
-const ProductList = ({ userProfile }) => {
-    const { vendors, shops } = useData();
-    const [products, setProducts] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [lastDoc, setLastDoc] = useState(null);
-    const [pageDocs, setPageDocs] = useState({});
-    const [totalProducts, setTotalProducts] = useState(0);
+// ** REFACTORED ProductList and its sub-components **
 
-    const initialFormState = { code: '', barcode: '', name: '', vendorId: '', cost: 0, price: 0, note: '', stockByShop: {} };
-    const [modal, setModal] = useState({ type: null, data: null });
-    const [historyModal, setHistoryModal] = useState({ show: false, product: null });
-    const [labelModal, setLabelModal] = useState({ show: false, product: null });
-    const [productModal, setProductModal] = useState({ show: false, product: null });
+// Component for handling product filters
+const ProductFilters = memo(({ onFilterChange, onClear }) => {
+    const { vendors } = useData();
     const [searchTerm, setSearchTerm] = useState('');
-    const [shopFilter, setShopFilter] = useState('');
     const [vendorFilter, setVendorFilter] = useState('');
-    const [isImporting, setIsImporting] = useState(false);
-    const fileInputRef = useRef(null);
-    const [currentPage, setCurrentPage] = useState(1);
-    const [itemsPerPage, setItemsPerPage] = useState(20);
-
     const debouncedSearchTerm = useDebounce(searchTerm, 500);
 
+    useEffect(() => {
+        onFilterChange({ name: debouncedSearchTerm, vendorId: vendorFilter });
+    }, [debouncedSearchTerm, vendorFilter, onFilterChange]);
+
+    const handleClear = () => {
+        setSearchTerm('');
+        setVendorFilter('');
+        onClear();
+    };
+
+    return (
+        <div className="mb-4 px-1 grid grid-cols-1 md:grid-cols-3 gap-4">
+            <input 
+                type="text" 
+                placeholder="Search by name..." 
+                value={searchTerm} 
+                onChange={(e) => setSearchTerm(e.target.value)} 
+                className="md:col-span-1 bg-slate-700 text-slate-100 px-4 py-2 border border-slate-600 rounded-md"
+            />
+            <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <select value={vendorFilter} onChange={e => setVendorFilter(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md">
+                    <option value="">All Vendors</option>
+                    {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                </select>
+                <button onClick={handleClear} className="bg-slate-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-400 flex items-center justify-center gap-2">
+                    <i className="fas fa-times-circle"></i> Clear
+                </button>
+            </div>
+        </div>
+    );
+});
+
+// Component for handling the main action buttons
+const ProductActions = memo(({ onAddNew, onImport, onExport, onTemplate, onDeleteAll, userProfile }) => {
+    const [isImporting, setIsImporting] = useState(false);
+    const fileInputRef = useRef(null);
+
+    const handleFileChange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        setIsImporting(true);
+        onImport(file).finally(() => {
+            setIsImporting(false);
+            if(fileInputRef.current) fileInputRef.current.value = "";
+        });
+    };
+
+    return (
+        <div className="mb-4 px-1 flex flex-wrap gap-2 items-center justify-between">
+            <button onClick={onAddNew} className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 flex items-center gap-2">
+                <i className="fas fa-plus"></i> Add Product
+            </button>
+            <div className="flex flex-wrap gap-2 items-center justify-end">
+                <button onClick={onTemplate} className="bg-cyan-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-cyan-700 flex items-center gap-2"><i className="fas fa-download"></i> Template</button>
+                <input type="file" ref={fileInputRef} onChange={handleFileChange} style={{ display: 'none' }} accept=".xlsx, .xls, .csv" />
+                <button onClick={() => fileInputRef.current.click()} disabled={isImporting} className="bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-indigo-700 flex items-center gap-2 disabled:bg-indigo-800">
+                    {isImporting ? <div className="loader"></div> : <i className="fas fa-upload"></i>} {isImporting ? 'Importing...' : 'Import'}
+                </button>
+                <button onClick={onExport} className="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 flex items-center gap-2"><i className="fas fa-file-excel"></i> Export</button>
+                {userProfile?.role === 'Admin' && <button onClick={onDeleteAll} className="bg-red-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-800 flex items-center gap-2"><i className="fas fa-exclamation-triangle"></i> Delete All</button>}
+            </div>
+        </div>
+    );
+});
+
+// Component for rendering the product table
+const ProductTable = memo(({ products, onAction, userProfile }) => {
+    const { shops } = useData();
     const managedShops = useMemo(() => shops.filter(s => s.manageStock), [shops]);
-    
-    useEffect(() => {
-        const fetchProducts = async () => {
-            setLoading(true);
-            let query = db.collection("products").orderBy("name");
 
-            if (debouncedSearchTerm) {
-                query = query.where('name', '>=', debouncedSearchTerm).where('name', '<=', debouncedSearchTerm + '\uf8ff');
-            }
-            if (vendorFilter) {
-                query = query.where('vendorId', '==', vendorFilter);
-            }
-            
-            const countQuery = query;
-            try {
-                const totalSnapshot = await countQuery.get();
-                setTotalProducts(totalSnapshot.size);
-
-                if (currentPage > 1 && pageDocs[currentPage - 1]) {
-                    query = query.startAfter(pageDocs[currentPage - 1]);
-                }
-                
-                query = query.limit(itemsPerPage);
-
-                const snapshot = await query.get();
-                const newProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                
-                if (!snapshot.empty) {
-                    setPageDocs(prev => ({...prev, [currentPage]: snapshot.docs[snapshot.docs.length - 1]}));
-                }
-
-                setProducts(newProducts);
-            } catch (error) {
-                console.error("Error fetching products:", error);
-                // Handle error, maybe show a message to the user
-            }
-            setLoading(false);
-        };
-
-        fetchProducts();
-    }, [debouncedSearchTerm, vendorFilter, itemsPerPage, currentPage]);
-
-    useEffect(() => {
-        setCurrentPage(1);
-        setPageDocs({});
-    }, [debouncedSearchTerm, vendorFilter, itemsPerPage]);
-
-
-    const handleNextPage = () => {
-        if (currentPage * itemsPerPage < totalProducts) {
-            setCurrentPage(prev => prev + 1);
+    const handleStockChange = async (e, productId, shopId) => {
+        const newQty = Number(e.target.value);
+        if (isNaN(newQty) || newQty < 0) return; // Basic validation
+        try {
+            await db.collection("products").doc(productId).update({ [`stockByShop.${shopId}`]: newQty });
+        } catch (error) {
+            console.error("Failed to update stock:", error);
+            onAction('show-message', { title: 'Error', message: 'Failed to update stock.', isError: true });
         }
     };
-    
-    const handlePrevPage = () => {
-        setCurrentPage(prev => Math.max(1, prev - 1));
-    };
 
-    const clearFilters = () => { setSearchTerm(''); setShopFilter(''); setVendorFilter(''); setCurrentPage(1); setPageDocs({}); };
+    return (
+        <table className="min-w-full divide-y divide-slate-700">
+            <thead className="bg-slate-900/50">
+                <tr>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Code</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Barcode</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Vendor</th>
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Cost</th>
+                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Price</th>
+                    {managedShops.map(shop => <th key={shop.id} className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">{shop.name}</th>)}
+                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-700">
+                {products.map(p => (
+                    <tr key={p.id} className="hover:bg-slate-700/50">
+                        <td className="px-4 py-3 text-sm text-slate-200">{p.code}</td>
+                        <td className="px-4 py-3 text-sm text-slate-300">{p.barcode}</td>
+                        <td className="px-4 py-3 text-sm text-slate-300">{p.name}</td>
+                        <td className="px-4 py-3 text-sm text-slate-400">{p.vendorName}</td>
+                        <td className="px-4 py-3 text-sm text-slate-300 text-right">{khrFormatter.format(p.cost)}</td>
+                        <td className="px-4 py-3 text-sm text-slate-300 text-right">{khrFormatter.format(p.price)}</td>
+                        {managedShops.map(shop => (
+                            <td key={shop.id} className="px-4 py-3 text-sm text-slate-300 text-right">
+                                {userProfile.role === 'Admin' ? (
+                                    <input type="number" defaultValue={p.stockByShop?.[shop.id] || 0} onBlur={(e) => handleStockChange(e, p.id, shop.id)} className="w-24 bg-slate-700 text-slate-100 text-right px-2 py-1 border border-slate-600 rounded-md"/>
+                                ) : (p.stockByShop?.[shop.id] || 0)}
+                            </td>
+                        ))}
+                        <td className="px-4 py-3 text-center space-x-4">
+                            <button onClick={() => onAction('show-label', p)} className="text-teal-400 hover:text-teal-300" title="Print Label"><i className="fas fa-barcode"></i></button>
+                            <button onClick={() => onAction('show-history', p)} className="text-green-400 hover:text-green-300" title="Cost History"><i className="fas fa-history"></i></button>
+                            <button onClick={() => onAction('edit', p)} className="text-blue-400 hover:text-blue-300" title="Edit"><i className="fas fa-edit"></i></button>
+                            <button onClick={() => onAction('delete', p)} className="text-red-500 hover:text-red-400" title="Delete"><i className="fas fa-trash"></i></button>
+                        </td>
+                    </tr>
+                ))}
+            </tbody>
+        </table>
+    );
+});
+
+// Component for handling pagination controls
+const ProductPagination = memo(({ currentPage, total, itemsPerPage, onNext, onPrev }) => {
+    const totalPages = Math.ceil(total / itemsPerPage);
+    if (total === 0) return null;
+
+    return (
+        <div className="flex justify-between items-center mt-4 px-2 py-2 bg-slate-900/50 rounded-b-lg">
+            <span className="text-sm text-slate-400">
+                Showing {Math.min((currentPage - 1) * itemsPerPage + 1, total)} to {Math.min(currentPage * itemsPerPage, total)} of {total} results
+            </span>
+            <div className="flex items-center gap-4">
+                <span className="text-sm text-slate-400">Page {currentPage} of {totalPages}</span>
+                <div className="flex gap-2">
+                    <button onClick={onPrev} disabled={currentPage === 1} className="px-3 py-1 bg-slate-700 rounded-md disabled:opacity-50 hover:bg-slate-600"><i className="fas fa-chevron-left"></i></button>
+                    <button onClick={onNext} disabled={currentPage >= totalPages} className="px-3 py-1 bg-slate-700 rounded-md disabled:opacity-50 hover:bg-slate-600"><i className="fas fa-chevron-right"></i></button>
+                </div>
+            </div>
+        </div>
+    );
+});
+
+// Main ProductList component, now much cleaner
+const ProductList = ({ userProfile }) => {
+    const { vendors, shops } = useData();
+    const [itemsPerPage] = useState(20);
+    const { documents: products, loading, total, page, setFilters, nextPage, prevPage, refresh } = usePaginatedFirestore('products', { itemsPerPage });
+    
+    const [modal, setModal] = useState({ type: null, data: null });
+    const [productModal, setProductModal] = useState({ show: false, product: null });
+    
+    const initialFormState = { code: '', barcode: '', name: '', vendorId: '', cost: 0, price: 0, note: '', stockByShop: {} };
+
+    // Centralized handler for actions from child components
+    const handleAction = useCallback((type, data) => {
+        switch (type) {
+            case 'edit': setProductModal({ show: true, product: data }); break;
+            case 'delete': setModal({ type: 'confirmDelete', data: data.id, title: 'Delete Product', message: `Delete ${data.name}?` }); break;
+            case 'show-history': setModal({ type: 'history', data }); break;
+            case 'show-label': setModal({ type: 'label', data }); break;
+            case 'show-message': setModal({ type: 'message', data }); break;
+        }
+    }, []);
+
+    const handleFilterChange = useCallback((newFilters) => {
+        setFilters(prev => ({ ...prev, ...newFilters }));
+    }, [setFilters]);
 
     const handleDelete = async (id) => {
         try {
             await db.collection("products").doc(id).delete();
-            setModal({ type: 'message', data: { title: 'Success', message: 'Product deleted.' } });
-            setCurrentPage(1); setPageDocs({}); // Refresh
+            handleAction('show-message', { title: 'Success', message: 'Product deleted.' });
+            refresh();
         } catch (error) {
-            setModal({ type: 'message', data: { title: 'Error', message: 'Failed to delete product.', isError: true } });
+            handleAction('show-message', { title: 'Error', message: 'Failed to delete product.', isError: true });
         }
     };
     
     const handleSaveProduct = async (formData, editId) => {
         const selectedVendor = vendors.find(v => v.id === formData.vendorId);
-        const dataToSave = {
-            ...formData,
-            cost: parseFloat(formData.cost),
-            price: parseFloat(formData.price),
-            vendorName: selectedVendor?.name || ''
-        };
+        const dataToSave = { ...formData, cost: parseFloat(formData.cost), price: parseFloat(formData.price), vendorName: selectedVendor?.name || '' };
         try {
             if (editId) await db.collection("products").doc(editId).update(dataToSave);
             else await db.collection("products").add(dataToSave);
-            setModal({ type: 'message', data: { title: 'Success', message: `Product ${editId ? 'updated' : 'added'}.` } });
+            handleAction('show-message', { title: 'Success', message: `Product ${editId ? 'updated' : 'added'}.` });
             setProductModal({ show: false, product: null });
-            setCurrentPage(1); setPageDocs({}); // Refresh
+            refresh();
         } catch (error) {
-            setModal({ type: 'message', data: { title: 'Error', message: 'Failed to save product.', isError: true } });
+            handleAction('show-message', { title: 'Error', message: 'Failed to save product.', isError: true });
         }
+    };
+
+    const handleImport = async (file) => {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = async (evt) => {
+                try {
+                    const workbook = XLSX.read(evt.target.result, { type: 'buffer' });
+                    const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+                    if (json.length === 0) throw new Error("File is empty or wrong format.");
+                    
+                    let created = 0, updated = 0, errors = 0;
+                    for (const row of json) {
+                         try {
+                            if (!row.code || !row.vendorName) { errors++; continue; }
+                            const vendor = vendors.find(v => v.name === row.vendorName);
+                            if (!vendor) { errors++; continue; }
+                            const productData = {
+                                code: row.code, barcode: row.barcode || '', name: row.name || '',
+                                vendorId: vendor.id, vendorName: vendor.name, cost: parseFloat(row.cost) || 0,
+                                price: parseFloat(row.price) || 0, note: row.note || '', stockByShop: {}
+                            };
+                            const productQuery = await db.collection("products").where("code", "==", row.code).limit(1).get();
+                            if (!productQuery.empty) {
+                                await db.collection("products").doc(productQuery.docs[0].id).update(productData);
+                                updated++;
+                            } else {
+                                await db.collection("products").add(productData);
+                                created++;
+                            }
+                        } catch { errors++; }
+                    }
+                    handleAction('show-message', { title: 'Import Complete', message: `${created} created, ${updated} updated, ${errors} failed.` });
+                    refresh();
+                    resolve();
+                } catch (error) {
+                    handleAction('show-message', { title: 'Import Error', message: error.message, isError: true });
+                    reject(error);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        });
     };
     
-    const handleAddNewProduct = () => {
-        // This part needs to query the last product code to generate a new one.
-        // For simplicity, we'll keep the existing logic, but a more robust solution would query Firestore.
-        setProductModal({ show: true, product: { ...initialFormState, code: `DF_${Date.now()}` } });
-    };
+    const handleExport = async () => {
+        const allProductsSnapshot = await db.collection("products").orderBy("name").get();
+        const allProducts = allProductsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-    const openDeleteAllModal = () => setModal({ type: 'confirmDeleteAll', title: 'DANGER: Delete All Products', message: 'Are you sure you want to delete ALL products? This cannot be undone.' });
+        const managedShops = shops.filter(s => s.manageStock);
+        const headers = ['Code', 'Barcode', 'Name', 'Vendor', 'Cost', 'Price', 'Note', ...managedShops.map(s => s.name)];
 
-    const handleDeleteAllProducts = async () => {
-        setModal({ type: 'message', data: { title: 'Processing...', message: 'Deleting all products...' } });
-        try {
-            const productsRef = db.collection("products");
-            let querySnapshot = await productsRef.limit(500).get();
-            let deletedCount = 0;
-            while (querySnapshot.size > 0) {
-                const batch = db.batch();
-                querySnapshot.docs.forEach(doc => batch.delete(doc.ref));
-                await batch.commit();
-                deletedCount += querySnapshot.size;
-                querySnapshot = await productsRef.limit(500).get();
-            }
-            setModal({ type: 'message', data: { title: 'Success', message: `Deleted ${deletedCount} products.` } });
-            setCurrentPage(1); setPageDocs({});
-        } catch (error) {
-            setModal({ type: 'message', data: { title: 'Error', message: 'An error occurred.', isError: true } });
-        }
+        const data = allProducts.map(p => {
+            const row = {
+                'Code': p.code,
+                'Barcode': p.barcode,
+                'Name': p.name,
+                'Vendor': p.vendorName,
+                'Cost': p.cost,
+                'Price': p.price,
+                'Note': p.note
+            };
+            managedShops.forEach(shop => {
+                row[shop.name] = p.stockByShop?.[shop.id] || 0;
+            });
+            return row;
+        });
+
+        const ws = XLSX.utils.json_to_sheet(data, { header: headers });
+        
+        const colWidths = [ {wch:15}, {wch:15}, {wch:40}, {wch:20}, {wch:12}, {wch:12}, {wch:20}, ...managedShops.map(() => ({wch: 15}))];
+        ws['!cols'] = colWidths;
+
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Products");
+        XLSX.writeFile(wb, "products_export.xlsx");
     };
 
     const handleDownloadTemplate = () => {
@@ -2059,194 +2398,59 @@ const ProductList = ({ userProfile }) => {
         XLSX.utils.book_append_sheet(wb, ws, "Products");
         XLSX.writeFile(wb, "product_import_template.xlsx");
     };
-
-    const handleFileUpload = (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        setIsImporting(true);
-        const reader = new FileReader();
-        reader.onload = async (evt) => {
-            try {
-                const workbook = XLSX.read(evt.target.result, { type: 'buffer' });
-                const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
-                if (json.length === 0) throw new Error("File is empty or wrong format.");
-
-                let created = 0, updated = 0, errors = 0;
-                await Promise.all(json.map(async (row) => {
-                    try {
-                        if (!row.code) { errors++; return; }
-                        const vendor = vendors.find(v => v.name === row.vendorName);
-                        if (!vendor) { errors++; return; }
-                        const productData = {
-                            code: row.code, barcode: row.barcode || '', name: row.name || '',
-                            vendorId: vendor.id, vendorName: vendor.name, cost: parseFloat(row.cost) || 0,
-                            price: parseFloat(row.price) || 0, note: row.note || '', stockByShop: {}
-                        };
-                        const productQuery = await db.collection("products").where("code", "==", row.code).limit(1).get();
-                        if (!productQuery.empty) {
-                            await db.collection("products").doc(productQuery.docs[0].id).update(productData);
-                            updated++;
-                        } else {
-                            await db.collection("products").add(productData);
-                            created++;
-                        }
-                    } catch { errors++; }
-                }));
-                setModal({ type: 'message', data: { title: 'Import Complete', message: `${created} created, ${updated} updated, ${errors} failed.` } });
-                setCurrentPage(1); setPageDocs({});
-            } catch (error) {
-                setModal({ type: 'message', data: { title: 'Import Error', message: error.message, isError: true } });
-            } finally {
-                setIsImporting(false);
-                if(fileInputRef.current) fileInputRef.current.value = "";
-            }
-        };
-        reader.readAsArrayBuffer(file);
-    };
-
-    const handleExportToExcel = async () => {
-        // To export all, we need to fetch all. This can be slow for large datasets.
-        const allProducts = [];
-        let lastVisible = null;
-        while(true) {
-            let query = db.collection("products").orderBy("name").limit(500);
-            if(lastVisible) {
-                query = query.startAfter(lastVisible);
-            }
-            const snapshot = await query.get();
-            if (snapshot.empty) break;
-            snapshot.forEach(doc => allProducts.push({ id: doc.id, ...doc.data() }));
-            lastVisible = snapshot.docs[snapshot.docs.length - 1];
-        }
-
-        const data = allProducts.map(p => ({ 'Code': p.code, 'Barcode': p.barcode, 'Name': p.name, 'Vendor': p.vendorName, 'Cost': p.cost, 'Price': p.price, 'Note': p.note }));
-        const ws = XLSX.utils.json_to_sheet(data);
-        const wb = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(wb, ws, "Products");
-        XLSX.writeFile(wb, "products_export.xlsx");
-    };
-
-    const handleStockChange = async (e, productId, shopId) => {
-        const newQty = Number(e.target.value);
-        if (isNaN(newQty) || newQty < 0) {
-            setModal({ type: 'message', data: { title: 'Error', message: 'Invalid quantity.', isError: true } });
-            return;
-        }
+    
+    const handleDeleteAll = async () => {
+        handleAction('show-message', { title: 'Processing...', message: 'Deleting all products...' });
         try {
-            await db.collection("products").doc(productId).update({ [`stockByShop.${shopId}`]: newQty });
+            const productsRef = db.collection("products");
+            let querySnapshot = await productsRef.limit(500).get();
+            while (querySnapshot.size > 0) {
+                const batch = db.batch();
+                querySnapshot.docs.forEach(doc => batch.delete(doc.ref));
+                await batch.commit();
+                querySnapshot = await productsRef.limit(500).get();
+            }
+            handleAction('show-message', { title: 'Success', message: `All products deleted.` });
+            refresh();
         } catch (error) {
-            setModal({ type: 'message', data: { title: 'Error', message: 'Failed to update stock.', isError: true } });
+            handleAction('show-message', { title: 'Error', message: 'An error occurred while deleting products.', isError: true });
         }
     };
-
+    
     return (
         <div className="space-y-6">
-            <MessageModal {...modal.data} show={modal.type === 'message'} onClose={() => setModal({ type: null })} />
-            <ConfirmationModal title={modal.title} message={modal.message} show={modal.type === 'confirmDelete' || modal.type === 'confirmDeleteAll'}
-                onConfirm={() => {
-                    if (modal.type === 'confirmDelete') handleDelete(modal.data);
-                    else if (modal.type === 'confirmDeleteAll') handleDeleteAllProducts();
-                    setModal({ type: null });
-                }}
-                onCancel={() => setModal({ type: null })}
-            />
-            {historyModal.show && <CostHistoryModal product={historyModal.product} onClose={() => setHistoryModal({ show: false })} />}
-            {labelModal.show && <ProductLabelModal product={labelModal.product} onClose={() => setLabelModal({ show: false })} />}
-            {productModal.show && <ProductModal show={productModal.show} productToEdit={productModal.product} onSave={handleSaveProduct} onClose={() => setProductModal({ show: false })} />}
+            {modal.type === 'message' && <MessageModal {...modal.data} show={true} onClose={() => setModal({ type: null })} />}
+            {modal.type === 'confirmDelete' && <ConfirmationModal {...modal} show={true} onConfirm={() => { handleDelete(modal.data); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
+            {modal.type === 'confirmDeleteAll' && <ConfirmationModal {...modal} show={true} onConfirm={() => { handleDeleteAll(); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
+            {modal.type === 'history' && <CostHistoryModal product={modal.data} onClose={() => setModal({ type: null })} />}
+            {modal.type === 'label' && <ProductLabelModal product={modal.data} onClose={() => setModal({ type: null })} />}
+            {productModal.show && <ProductModal show={true} productToEdit={productModal.product} onSave={handleSaveProduct} onClose={() => setProductModal({ show: false, product: null })} />}
 
-            <TableCard title={`Existing Products (${totalProducts})`}>
-                 <div className="mb-4 px-1 grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <input type="text" placeholder="Search..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="md:col-span-1 bg-slate-700 text-slate-100 px-4 py-2 border border-slate-600 rounded-md"/>
-                     <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-3 gap-4">
-                        <select value={shopFilter} onChange={e => setShopFilter(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md">
-                            <option value="">All Shops</option>
-                            {shops.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                        </select>
-                        <select value={vendorFilter} onChange={e => setVendorFilter(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md">
-                            <option value="">All Vendors</option>
-                            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                        </select>
-                        <button onClick={clearFilters} className="bg-slate-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-400 flex items-center justify-center gap-2">
-                            <i className="fas fa-times-circle"></i> Clear
-                        </button>
-                    </div>
-                </div>
-                 <div className="mb-4 px-1 flex flex-wrap gap-2 items-center justify-between">
-                    <button onClick={handleAddNewProduct} className="bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 flex items-center gap-2">
-                        <i className="fas fa-plus"></i> Add Product
-                    </button>
-                    <div className="flex flex-wrap gap-2 items-center justify-end">
-                        <button onClick={handleDownloadTemplate} className="bg-cyan-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-cyan-700 flex items-center gap-2"><i className="fas fa-download"></i> Template</button>
-                        <input type="file" ref={fileInputRef} onChange={handleFileUpload} style={{ display: 'none' }} accept=".xlsx, .xls, .csv" />
-                        <button onClick={() => fileInputRef.current.click()} disabled={isImporting} className="bg-indigo-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-indigo-700 flex items-center gap-2 disabled:bg-indigo-800">
-                            {isImporting ? <div className="loader"></div> : <i className="fas fa-upload"></i>} {isImporting ? 'Importing...' : 'Import'}
-                        </button>
-                        <button onClick={handleExportToExcel} className="bg-green-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-green-700 flex items-center gap-2"><i className="fas fa-file-excel"></i> Export</button>
-                        {userProfile?.role === 'Admin' && <button onClick={openDeleteAllModal} className="bg-red-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-red-800 flex items-center gap-2"><i className="fas fa-exclamation-triangle"></i> Delete All</button>}
-                    </div>
-                </div>
-                {loading ? <div className="flex justify-center p-8"><div className="loader"></div></div> : products.length === 0 ? <p className="text-center p-4 text-slate-400">No products found.</p> : (
+            <TableCard title={`Existing Products (${total})`}>
+                <ProductFilters onFilterChange={handleFilterChange} onClear={refresh} />
+                <ProductActions 
+                    onAddNew={() => setProductModal({ show: true, product: { ...initialFormState, code: `DF_${Date.now()}` } })}
+                    onImport={handleImport}
+                    onExport={handleExport}
+                    onTemplate={handleDownloadTemplate}
+                    onDeleteAll={() => setModal({ type: 'confirmDeleteAll', title: 'DANGER: Delete All Products', message: 'Are you sure you want to delete ALL products? This cannot be undone.'})}
+                    userProfile={userProfile}
+                />
+                {loading ? (
+                    <div className="flex justify-center p-8"><div className="loader"></div></div>
+                ) : products.length === 0 ? (
+                    <p className="text-center p-4 text-slate-400">No products found for the current filters.</p>
+                ) : (
                     <>
-                        <table className="min-w-full divide-y divide-slate-700">
-                            <thead className="bg-slate-900/50">
-                                <tr>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Code</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Barcode</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
-                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Vendor</th>
-                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Cost</th>
-                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Price</th>
-                                    {managedShops.map(shop => <th key={shop.id} className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">{shop.name}</th>)}
-                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-slate-700">
-                                {products.map(p => (
-                                    <tr key={p.id} className="hover:bg-slate-700/50">
-                                        <td className="px-4 py-3 text-sm text-slate-200">{p.code}</td>
-                                        <td className="px-4 py-3 text-sm text-slate-300">{p.barcode}</td>
-                                        <td className="px-4 py-3 text-sm text-slate-300">{p.name}</td>
-                                        <td className="px-4 py-3 text-sm text-slate-400">{p.vendorName}</td>
-                                        <td className="px-4 py-3 text-sm text-slate-300 text-right">{khrFormatter.format(p.cost)}</td>
-                                        <td className="px-4 py-3 text-sm text-slate-300 text-right">{khrFormatter.format(p.price)}</td>
-                                        {managedShops.map(shop => (
-                                            <td key={shop.id} className="px-4 py-3 text-sm text-slate-300 text-right">
-                                                {userProfile.role === 'Admin' ? (
-                                                    <input type="number" defaultValue={p.stockByShop?.[shop.id] || 0} onBlur={(e) => handleStockChange(e, p.id, shop.id)} className="w-24 bg-slate-700 text-slate-100 text-right px-2 py-1 border border-slate-600 rounded-md"/>
-                                                ) : (p.stockByShop?.[shop.id] || 0)}
-                                            </td>
-                                        ))}
-                                        <td className="px-4 py-3 text-center space-x-4">
-                                            <button onClick={() => setLabelModal({ show: true, product: p })} className="text-teal-400 hover:text-teal-300" title="Print Label"><i className="fas fa-barcode"></i></button>
-                                            <button onClick={() => setHistoryModal({ show: true, product: p })} className="text-green-400 hover:text-green-300" title="Cost History"><i className="fas fa-history"></i></button>
-                                            <button onClick={() => setProductModal({ show: true, product: p })} className="text-blue-400 hover:text-blue-300" title="Edit"><i className="fas fa-edit"></i></button>
-                                            <button onClick={() => setModal({ type: 'confirmDelete', data: p.id })} className="text-red-500 hover:text-red-400" title="Delete"><i className="fas fa-trash"></i></button>
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                        <div className="flex justify-between items-center mt-4 px-2 py-2 bg-slate-900/50 rounded-b-lg">
-                            <div className="flex items-center gap-2">
-                                <span className="text-sm text-slate-400">Rows:</span>
-                                <select value={itemsPerPage} onChange={(e) => {setItemsPerPage(Number(e.target.value)); setCurrentPage(1); setLastDoc(null);}} className="bg-slate-700 text-slate-200 text-sm rounded-md p-1 border border-slate-600">
-                                    {[20, 50, 100, 200].map(size => <option key={size} value={size}>{size}</option>)}
-                                </select>
-                            </div>
-                            <div className="flex items-center gap-4">
-                                <span className="text-sm text-slate-400">Page {currentPage} of {Math.ceil(totalProducts / itemsPerPage)}</span>
-                                <div className="flex gap-2">
-                                    <button onClick={handlePrevPage} disabled={currentPage === 1} className="px-3 py-1 bg-slate-700 rounded-md disabled:opacity-50 hover:bg-slate-600"><i className="fas fa-chevron-left"></i></button>
-                                    <button onClick={handleNextPage} disabled={currentPage * itemsPerPage >= totalProducts} className="px-3 py-1 bg-slate-700 rounded-md disabled:opacity-50 hover:bg-slate-600"><i className="fas fa-chevron-right"></i></button>
-                                </div>
-                            </div>
-                        </div>
+                        <ProductTable products={products} onAction={handleAction} userProfile={userProfile} />
+                        <ProductPagination currentPage={page} total={total} itemsPerPage={itemsPerPage} onNext={nextPage} onPrev={prevPage} />
                     </>
                 )}
             </TableCard>
         </div>
     );
 };
+
 
 const ProductModal = ({ show, onClose, productToEdit, onSave }) => {
     const { vendors } = useData();
@@ -2268,7 +2472,7 @@ const ProductModal = ({ show, onClose, productToEdit, onSave }) => {
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                         <div>
                             <label className="block text-sm font-medium text-slate-300 mb-1">Product Code</label>
-                            <input type="text" name="code" value={formData.code} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md read-only:bg-slate-800" required readOnly={productToEdit && !productToEdit.id} />
+                            <input type="text" name="code" value={formData.code} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md read-only:bg-slate-800" required readOnly={!!productToEdit?.id} />
                         </div>
                         <div>
                             <label className="block text-sm font-medium text-slate-300 mb-1">Barcode</label>
