@@ -114,7 +114,6 @@ const { useState, useEffect, useCallback, useMemo, useRef, createContext, useCon
 // Application Data Context
 const DataContext = createContext(null);
 const DataProvider = ({ children }) => {
-    // Products are loaded on-demand in ProductList, but we still load them here for Fuse search on other pages.
     const { data: products, loading: productsLoading } = useCollection('products');
     const { data: vendors, loading: vendorsLoading } = useCollection('vendors');
     const { data: shops, loading: shopsLoading } = useCollection('shops');
@@ -194,95 +193,6 @@ const useDebounce = (value, delay) => {
     }, [value, delay]);
     return debouncedValue;
 };
-
-// ** REFACTORED HOOK ** for handling paginated and filtered Firestore queries
-const usePaginatedFirestore = (collectionName, { itemsPerPage = 20, initialFilters = {} }) => {
-    const [state, setState] = useState({
-        loading: true,
-        error: null,
-        documents: [],
-        total: 0,
-        page: 1,
-    });
-    const [filters, setFilters] = useState(initialFilters);
-    const pageSnapshots = useRef({ first: [null], last: null }); // Stores first doc of each page and last doc of current page
-
-    // Memoized fetch function to avoid re-creation on every render
-    const fetchData = useCallback(async (newPage, startAfterDoc = null) => {
-        setState(s => ({ ...s, loading: true, error: null }));
-        try {
-            // Build the base query with filters
-            let query = db.collection(collectionName);
-            if (filters.vendorId) {
-                query = query.where('vendorId', '==', filters.vendorId);
-            }
-            if (filters.name) {
-                // Firestore range filter for "starts with" search
-                query = query.where('name', '>=', filters.name).where('name', '<=', filters.name + '\uf8ff');
-            }
-
-            // Get total count for pagination info
-            const totalSnapshot = await query.get();
-            const total = totalSnapshot.size;
-
-            // Apply ordering and pagination
-            let paginatedQuery = query.orderBy("name");
-            if (startAfterDoc) {
-                paginatedQuery = paginatedQuery.startAfter(startAfterDoc);
-            }
-            paginatedQuery = paginatedQuery.limit(itemsPerPage);
-
-            const snapshot = await paginatedQuery.get();
-            const newDocs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            
-            // Update snapshot refs for next/prev page logic
-            pageSnapshots.current.last = snapshot.docs[snapshot.docs.length - 1] || null;
-            if (newPage > pageSnapshots.current.first.length - 1) {
-                 pageSnapshots.current.first.push(snapshot.docs[0] || null);
-            }
-
-            setState({
-                loading: false,
-                error: null,
-                documents: newDocs,
-                total,
-                page: newPage,
-            });
-        } catch (err) {
-            console.error("Error fetching paginated data:", err);
-            setState(s => ({ ...s, loading: false, error: err.message, documents: [], total: 0 }));
-        }
-    }, [collectionName, itemsPerPage, JSON.stringify(filters)]);
-
-    // Effect to refetch data when filters change, resetting to page 1
-    useEffect(() => {
-        pageSnapshots.current = { first: [null], last: null }; // Reset pagination on filter change
-        fetchData(1, null);
-    }, [fetchData]);
-
-    const nextPage = () => {
-        if (state.page * itemsPerPage < state.total) {
-            fetchData(state.page + 1, pageSnapshots.current.last);
-        }
-    };
-
-    const prevPage = () => {
-        if (state.page > 1) {
-            // The document to start *after* for the previous page is the one before the first doc of the current page
-            const prevPageStartAfter = pageSnapshots.current.first[state.page - 2] || null;
-            fetchData(state.page - 1, prevPageStartAfter);
-        }
-    };
-    
-    // Function to trigger a full refresh to the first page
-    const refresh = useCallback(() => {
-        pageSnapshots.current = { first: [null], last: null };
-        fetchData(1, null);
-    }, [fetchData]);
-
-    return { ...state, setFilters, nextPage, prevPage, refresh };
-};
-
 
 // --- 4. UTILITY FUNCTIONS ---
 
@@ -522,15 +432,24 @@ const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
     const [quantity, setQuantity] = useState(1);
     const [note, setNote] = useState('');
     
+    // New state for vendor search
+    const [vendorSearch, setVendorSearch] = useState('');
+    const [vendorSearchResults, setVendorSearchResults] = useState([]);
+    const [selectedVendor, setSelectedVendor] = useState(null);
+    
     const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
 
-    const fuse = useProductSearch();
-    const debouncedSearchTerm = useDebounce(productSearch, 250);
+    const productFuse = useProductSearch();
+    const debouncedProductSearch = useDebounce(productSearch, 250);
+    
+    const vendorFuse = useMemo(() => new Fuse(vendors, { keys: ['name'], threshold: 0.4 }), [vendors]);
+    const debouncedVendorSearch = useDebounce(vendorSearch, 250);
 
     const resetForm = useCallback(() => {
         setPoId(''); setShopId(''); setVendorId(''); setPoNumber('');
         setReqDate(new Date().toLocaleDateString('en-CA'));
         setItems([]); resetAddItemForm();
+        setVendorSearch(''); setSelectedVendor(null); setVendorSearchResults([]);
     }, []);
     
     useEffect(() => {
@@ -540,10 +459,15 @@ const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
             setPoNumber(poDataToEdit.poNumber);
             if (requestDateObj) setReqDate(requestDateObj.toLocaleDateString('en-CA'));
             setItems(poDataToEdit.items);
+            const initialVendor = vendors.find(v => v.id === poDataToEdit.vendorId);
+            if(initialVendor) {
+                setSelectedVendor(initialVendor);
+                setVendorSearch(initialVendor.name);
+            }
         } else {
             resetForm();
         }
-    }, [poDataToEdit, resetForm]);
+    }, [poDataToEdit, resetForm, vendors]);
 
     useEffect(() => {
         if (!poId && shopId && vendorId) {
@@ -558,13 +482,22 @@ const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
     }, [shopId, vendorId, poId, shops, vendors]);
     
     useEffect(() => {
-        if (fuse && debouncedSearchTerm.length > 1 && !selectedProduct) {
-            const results = fuse.search(debouncedSearchTerm, { limit: 50 });
+        if (productFuse && debouncedProductSearch.length > 1 && !selectedProduct) {
+            const results = productFuse.search(debouncedProductSearch, { limit: 50 });
             setSearchResults(results.map(result => result.item));
         } else {
             setSearchResults([]);
         }
-    }, [debouncedSearchTerm, fuse, selectedProduct]);
+    }, [debouncedProductSearch, productFuse, selectedProduct]);
+
+    useEffect(() => {
+        if (vendorFuse && debouncedVendorSearch.length > 1 && !selectedVendor) {
+            const results = vendorFuse.search(debouncedVendorSearch, { limit: 10 });
+            setVendorSearchResults(results.map(result => result.item));
+        } else {
+            setVendorSearchResults([]);
+        }
+    }, [debouncedVendorSearch, vendorFuse, selectedVendor]);
 
     const handleProductSearch = (e) => {
         setProductSearch(e.target.value);
@@ -575,6 +508,19 @@ const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
         setSelectedProduct(product); 
         setProductSearch(product.name);
         setSearchResults([]);
+    };
+
+    const handleVendorSearch = (e) => {
+        setVendorSearch(e.target.value);
+        setSelectedVendor(null);
+        setVendorId('');
+    };
+
+    const selectVendor = (vendor) => {
+        setSelectedVendor(vendor);
+        setVendorId(vendor.id);
+        setVendorSearch(vendor.name);
+        setVendorSearchResults([]);
     };
     
     const resetAddItemForm = () => {
@@ -671,12 +617,18 @@ const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
                             {shops.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                         </select>
                     </div>
-                    <div>
+                    <div className="relative">
                         <label className="block text-sm font-medium text-slate-300 mb-1">Vendor</label>
-                        <select value={vendorId} onChange={(e) => setVendorId(e.target.value)} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md">
-                            <option value="">Select Vendor</option>
-                            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                        </select>
+                        <input type="text" value={vendorSearch} onChange={handleVendorSearch} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" placeholder="Search vendor..." autoComplete="off" />
+                        {vendorSearchResults.length > 0 && (
+                            <div className="absolute z-20 w-full bg-slate-800 border border-slate-600 rounded-md mt-1 shadow-lg max-h-60 overflow-y-auto">
+                                {vendorSearchResults.map(v => (
+                                    <div key={v.id} onClick={() => selectVendor(v)} className="p-2 cursor-pointer hover:bg-slate-700">
+                                        <p className="font-semibold text-slate-200">{v.name}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                     <div>
                         <label className="block text-sm font-medium text-slate-300 mb-1">PO No.</label>
@@ -1050,24 +1002,21 @@ const POPreviewModal = ({ po, onClose }) => {
     };
 
     const handleExportToExcel = () => {
-        // --- Define Styles ---
         const fontStyle = { name: "Ang DaunKeo", sz: 11 };
         const centeredWhiteOnDarkStyle = {
             font: { ...fontStyle, color: { rgb: "FFFFFF" } },
             alignment: { horizontal: "center", vertical: "center" },
-            fill: { fgColor: { rgb: "2A3347" } } // Dark slate color
+            fill: { fgColor: { rgb: "2A3347" } }
         };
         const defaultStyle = { font: fontStyle };
         const headerStyle = { font: { ...fontStyle, bold: true } };
 
-        // --- Prepare Data ---
         const poDate = safeToDate(po.requestDate);
         const formattedDate = poDate ? `${String(poDate.getDate()).padStart(2, '0')}-${String(poDate.getMonth() + 1).padStart(2, '0')}-${poDate.getFullYear()}` : 'N/A';
         
         const wb = XLSX.utils.book_new();
         const ws_data = [];
 
-        // --- Build Header ---
         ws_data.push([{v: 'Purchase Order', s: { font: { ...fontStyle, sz: 16, bold: true } } }]);
         if (po.status === 'audited') {
             ws_data.push([{v: 'Audited', s: { font: { ...fontStyle, color: { rgb: "22C55E" }}}}]);
@@ -1093,7 +1042,6 @@ const POPreviewModal = ({ po, onClose }) => {
         }
         ws_data.push([]);
 
-        // --- Build Table ---
         const tableHeader = ['No', 'Product Code', 'Barcode', 'Name', 'QTY', 'Cost(៛)', 'Cost($)', 'Sub-Total', po.status === 'audited' ? 'CheckUp' : 'Note'];
         ws_data.push(tableHeader.map(h => ({ v: h, s: headerStyle })));
 
@@ -1114,11 +1062,8 @@ const POPreviewModal = ({ po, onClose }) => {
             const costUSD = po.exchangeRate ? (cost / po.exchangeRate) : null;
 
             ws_data.push([
-                { v: index + 1, s: defaultStyle },
-                { v: item.code, s: defaultStyle },
-                { v: item.barcode, s: defaultStyle },
-                { v: item.name, s: defaultStyle },
-                { v: qty, t: 'n', s: defaultStyle },
+                { v: index + 1, s: defaultStyle }, { v: item.code, s: defaultStyle }, { v: item.barcode, s: defaultStyle },
+                { v: item.name, s: defaultStyle }, { v: qty, t: 'n', s: defaultStyle },
                 { v: cost, t: 'n', s: centeredWhiteOnDarkStyle, z: '#,##0' },
                 { v: costUSD, t: 'n', s: centeredWhiteOnDarkStyle, z: '"$"#,##0.00' },
                 { v: subTotal, t: 'n', s: centeredWhiteOnDarkStyle, z: '#,##0' },
@@ -1128,7 +1073,6 @@ const POPreviewModal = ({ po, onClose }) => {
         
         ws_data.push([]);
 
-        // --- Build Footer ---
         const totalAuditedAmountKHR = po.status === 'audited' ? po.items.reduce((sum, item) => {
             const khr = parseFloat(item.auditedTotalKHR) || 0;
             const usdInKhr = (parseFloat(item.auditedTotalUSD) || 0) * (parseFloat(po.exchangeRate) || 0);
@@ -1141,21 +1085,13 @@ const POPreviewModal = ({ po, onClose }) => {
             ws_data.push([null, null, null, null, null, null, {v: 'Audited Total (USD):', s: headerStyle}, {v: totalAuditedAmountKHR / po.exchangeRate, t: 'n', s: centeredWhiteOnDarkStyle, z: '"$"#,##0.00'}]);
         }
 
-        // --- Create Worksheet and Download ---
         const ws = XLSX.utils.aoa_to_sheet(ws_data);
         ws['!cols'] = [ {wch:5}, {wch:15}, {wch:15}, {wch:40}, {wch:8}, {wch:12}, {wch:12}, {wch:15}, {wch:20} ];
-        
-        // Set page layout
-        ws['!pageSetup'] = {
-            orientation: 'landscape',
-            paper: 9, // A4
-            margins: { left: 0.6, right: 0.6, top: 0.8, bottom: 0.8, header: 0.8, footer: 0.8 }
-        };
+        ws['!pageSetup'] = { orientation: 'landscape', paper: 9, margins: { left: 0.6, right: 0.6, top: 0.8, bottom: 0.8, header: 0.8, footer: 0.8 } };
 
         XLSX.utils.book_append_sheet(wb, ws, 'Purchase Order');
         XLSX.writeFile(wb, `PO-${po.poNumber}.xlsx`);
     };
-
 
     const poDate = safeToDate(po.requestDate);
     const auditedDate = safeToDate(po.auditedAt);
@@ -1220,11 +1156,8 @@ const POPreviewModal = ({ po, onClose }) => {
                                             const auditedTotalUSD = parseFloat(item.auditedTotalUSD) || 0;
                                             const rate = parseFloat(po.exchangeRate) || 0;
                                             
-                                            if (auditedTotalKHR > 0) {
-                                                cost = auditedTotalKHR / auditedQtyNum;
-                                            } else if (auditedTotalUSD > 0 && rate > 0) {
-                                                cost = (auditedTotalUSD * rate) / auditedQtyNum;
-                                            }
+                                            if (auditedTotalKHR > 0) cost = auditedTotalKHR / auditedQtyNum;
+                                            else if (auditedTotalUSD > 0 && rate > 0) cost = (auditedTotalUSD * rate) / auditedQtyNum;
                                         }
                                     }
 
@@ -1300,7 +1233,6 @@ const POAuditPage = ({ poDataToAudit, setPage, userProfile }) => {
     const [auditedByName, setAuditedByName] = useState(userProfile.name || '');
     const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
     
-    // State for adding new products
     const [productSearch, setProductSearch] = useState('');
     const [searchResults, setSearchResults] = useState([]);
     const [selectedProduct, setSelectedProduct] = useState(null);
@@ -1348,17 +1280,9 @@ const POAuditPage = ({ poDataToAudit, setPage, userProfile }) => {
         setAuditedItems(prevItems => [
             ...prevItems,
             {
-                productId: product.id,
-                code: product.code,
-                barcode: product.barcode || '',
-                name: product.name,
-                vendorName: product.vendorName || '',
-                originalQuantity: 0,
-                originalCost: product.cost,
-                auditedQty: 1,
-                auditedTotalKHR: product.cost,
-                auditedTotalUSD: '',
-                checkUp: 'New Item'
+                productId: product.id, code: product.code, barcode: product.barcode || '', name: product.name,
+                vendorName: product.vendorName || '', originalQuantity: 0, originalCost: product.cost,
+                auditedQty: 1, auditedTotalKHR: product.cost, auditedTotalUSD: '', checkUp: 'New Item'
             }
         ]);
         setProductSearch('');
@@ -2119,33 +2043,71 @@ const ProductDataPage = ({ userProfile }) => {
 const ProductFilters = memo(({ onFilterChange, onClear }) => {
     const { vendors } = useData();
     const [searchTerm, setSearchTerm] = useState('');
-    const [vendorFilter, setVendorFilter] = useState('');
+    const [vendorSearch, setVendorSearch] = useState('');
+    const [vendorSearchResults, setVendorSearchResults] = useState([]);
+    const [selectedVendor, setSelectedVendor] = useState(null);
+
     const debouncedSearchTerm = useDebounce(searchTerm, 500);
+    const debouncedVendorSearch = useDebounce(vendorSearch, 500);
+    const vendorFuse = useMemo(() => new Fuse(vendors, { keys: ['name'], threshold: 0.4 }), [vendors]);
 
     useEffect(() => {
-        onFilterChange({ name: debouncedSearchTerm, vendorId: vendorFilter });
-    }, [debouncedSearchTerm, vendorFilter, onFilterChange]);
+        onFilterChange({ name: debouncedSearchTerm, vendorId: selectedVendor ? selectedVendor.id : '' });
+    }, [debouncedSearchTerm, selectedVendor]);
+
+    useEffect(() => {
+        if (debouncedVendorSearch && !selectedVendor) {
+            const results = vendorFuse.search(debouncedVendorSearch);
+            setVendorSearchResults(results.map(r => r.item));
+        } else {
+            setVendorSearchResults([]);
+        }
+    }, [debouncedVendorSearch, vendorFuse, selectedVendor]);
 
     const handleClear = () => {
         setSearchTerm('');
-        setVendorFilter('');
+        setVendorSearch('');
+        setSelectedVendor(null);
         onClear();
+    };
+
+    const selectVendor = (vendor) => {
+        setSelectedVendor(vendor);
+        setVendorSearch(vendor.name);
+        setVendorSearchResults([]);
     };
 
     return (
         <div className="mb-4 px-1 grid grid-cols-1 md:grid-cols-3 gap-4">
             <input 
                 type="text" 
-                placeholder="Search by name..." 
+                placeholder="Search by name, code, barcode..." 
                 value={searchTerm} 
                 onChange={(e) => setSearchTerm(e.target.value)} 
                 className="md:col-span-1 bg-slate-700 text-slate-100 px-4 py-2 border border-slate-600 rounded-md"
             />
             <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <select value={vendorFilter} onChange={e => setVendorFilter(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md">
-                    <option value="">All Vendors</option>
-                    {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                </select>
+                <div className="relative">
+                    <input
+                        type="text"
+                        placeholder="Search vendor..."
+                        value={vendorSearch}
+                        onChange={(e) => {
+                            setVendorSearch(e.target.value);
+                            setSelectedVendor(null);
+                        }}
+                        className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md"
+                    />
+                    {vendorSearchResults.length > 0 && (
+                        <div className="absolute z-20 w-full bg-slate-800 border border-slate-600 rounded-md mt-1 shadow-lg max-h-60 overflow-y-auto">
+                            {vendorSearchResults.map(v => (
+                                <div key={v.id} onClick={() => selectVendor(v)} className="p-2 cursor-pointer hover:bg-slate-700">
+                                    <p className="font-semibold text-slate-200">{v.name}</p>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
                 <button onClick={handleClear} className="bg-slate-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-400 flex items-center justify-center gap-2">
                     <i className="fas fa-times-circle"></i> Clear
                 </button>
@@ -2194,7 +2156,7 @@ const ProductTable = memo(({ products, onAction, userProfile }) => {
 
     const handleStockChange = async (e, productId, shopId) => {
         const newQty = Number(e.target.value);
-        if (isNaN(newQty) || newQty < 0) return; // Basic validation
+        if (isNaN(newQty) || newQty < 0) return;
         try {
             await db.collection("products").doc(productId).update({ [`stockByShop.${shopId}`]: newQty });
         } catch (error) {
@@ -2267,18 +2229,17 @@ const ProductPagination = memo(({ currentPage, total, itemsPerPage, onNext, onPr
     );
 });
 
-// Main ProductList component, now much cleaner
+// Main ProductList component, now using client-side filtering
 const ProductList = ({ userProfile }) => {
-    const { vendors, shops } = useData();
+    const { products: allProducts, vendors, shops, productsLoading } = useData();
     const [itemsPerPage] = useState(20);
-    const { documents: products, loading, total, page, setFilters, nextPage, prevPage, refresh } = usePaginatedFirestore('products', { itemsPerPage });
-    
+    const [currentPage, setCurrentPage] = useState(1);
+    const [filters, setFilters] = useState({ name: '', vendorId: '' });
     const [modal, setModal] = useState({ type: null, data: null });
     const [productModal, setProductModal] = useState({ show: false, product: null });
     
     const initialFormState = { code: '', barcode: '', name: '', vendorId: '', cost: 0, price: 0, note: '', stockByShop: {} };
 
-    // Centralized handler for actions from child components
     const handleAction = useCallback((type, data) => {
         switch (type) {
             case 'edit': setProductModal({ show: true, product: data }); break;
@@ -2290,14 +2251,44 @@ const ProductList = ({ userProfile }) => {
     }, []);
 
     const handleFilterChange = useCallback((newFilters) => {
+        setCurrentPage(1);
         setFilters(prev => ({ ...prev, ...newFilters }));
-    }, [setFilters]);
+    }, []);
+    
+    const refresh = useCallback(() => {
+        setCurrentPage(1);
+        setFilters({ name: '', vendorId: '' });
+    }, []);
+
+    const filteredProducts = useMemo(() => {
+        if (!allProducts) return [];
+        const searchTerm = filters.name.toLowerCase();
+        return allProducts.filter(product => {
+            const vendorMatch = filters.vendorId ? product.vendorId === filters.vendorId : true;
+            if (!vendorMatch) return false;
+
+            if (!searchTerm) return true;
+            const nameMatch = product.name.toLowerCase().includes(searchTerm);
+            const codeMatch = product.code && product.code.toLowerCase().includes(searchTerm);
+            const barcodeMatch = product.barcode && product.barcode.toLowerCase().includes(searchTerm);
+            
+            return nameMatch || codeMatch || barcodeMatch;
+        }).sort((a, b) => a.name.localeCompare(b.name));
+    }, [allProducts, filters]);
+
+    const paginatedProducts = useMemo(() => {
+        const startIndex = (currentPage - 1) * itemsPerPage;
+        return filteredProducts.slice(startIndex, startIndex + itemsPerPage);
+    }, [filteredProducts, currentPage, itemsPerPage]);
+
+    const total = filteredProducts.length;
+    const nextPage = () => setCurrentPage(p => Math.min(p + 1, Math.ceil(total / itemsPerPage)));
+    const prevPage = () => setCurrentPage(p => Math.max(p - 1, 1));
 
     const handleDelete = async (id) => {
         try {
             await db.collection("products").doc(id).delete();
             handleAction('show-message', { title: 'Success', message: 'Product deleted.' });
-            refresh();
         } catch (error) {
             handleAction('show-message', { title: 'Error', message: 'Failed to delete product.', isError: true });
         }
@@ -2311,7 +2302,6 @@ const ProductList = ({ userProfile }) => {
             else await db.collection("products").add(dataToSave);
             handleAction('show-message', { title: 'Success', message: `Product ${editId ? 'updated' : 'added'}.` });
             setProductModal({ show: false, product: null });
-            refresh();
         } catch (error) {
             handleAction('show-message', { title: 'Error', message: 'Failed to save product.', isError: true });
         }
@@ -2348,7 +2338,6 @@ const ProductList = ({ userProfile }) => {
                         } catch { errors++; }
                     }
                     handleAction('show-message', { title: 'Import Complete', message: `${created} created, ${updated} updated, ${errors} failed.` });
-                    refresh();
                     resolve();
                 } catch (error) {
                     handleAction('show-message', { title: 'Import Error', message: error.message, isError: true });
@@ -2360,33 +2349,17 @@ const ProductList = ({ userProfile }) => {
     };
     
     const handleExport = async () => {
-        const allProductsSnapshot = await db.collection("products").orderBy("name").get();
-        const allProducts = allProductsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
         const managedShops = shops.filter(s => s.manageStock);
         const headers = ['Code', 'Barcode', 'Name', 'Vendor', 'Cost', 'Price', 'Note', ...managedShops.map(s => s.name)];
 
         const data = allProducts.map(p => {
-            const row = {
-                'Code': p.code,
-                'Barcode': p.barcode,
-                'Name': p.name,
-                'Vendor': p.vendorName,
-                'Cost': p.cost,
-                'Price': p.price,
-                'Note': p.note
-            };
-            managedShops.forEach(shop => {
-                row[shop.name] = p.stockByShop?.[shop.id] || 0;
-            });
+            const row = { 'Code': p.code, 'Barcode': p.barcode, 'Name': p.name, 'Vendor': p.vendorName, 'Cost': p.cost, 'Price': p.price, 'Note': p.note };
+            managedShops.forEach(shop => { row[shop.name] = p.stockByShop?.[shop.id] || 0; });
             return row;
         });
 
         const ws = XLSX.utils.json_to_sheet(data, { header: headers });
-        
-        const colWidths = [ {wch:15}, {wch:15}, {wch:40}, {wch:20}, {wch:12}, {wch:12}, {wch:20}, ...managedShops.map(() => ({wch: 15}))];
-        ws['!cols'] = colWidths;
-
+        ws['!cols'] = [ {wch:15}, {wch:15}, {wch:40}, {wch:20}, {wch:12}, {wch:12}, {wch:20}, ...managedShops.map(() => ({wch: 15}))];
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, "Products");
         XLSX.writeFile(wb, "products_export.xlsx");
@@ -2411,7 +2384,6 @@ const ProductList = ({ userProfile }) => {
                 querySnapshot = await productsRef.limit(500).get();
             }
             handleAction('show-message', { title: 'Success', message: `All products deleted.` });
-            refresh();
         } catch (error) {
             handleAction('show-message', { title: 'Error', message: 'An error occurred while deleting products.', isError: true });
         }
@@ -2436,14 +2408,14 @@ const ProductList = ({ userProfile }) => {
                     onDeleteAll={() => setModal({ type: 'confirmDeleteAll', title: 'DANGER: Delete All Products', message: 'Are you sure you want to delete ALL products? This cannot be undone.'})}
                     userProfile={userProfile}
                 />
-                {loading ? (
+                {productsLoading ? (
                     <div className="flex justify-center p-8"><div className="loader"></div></div>
-                ) : products.length === 0 ? (
+                ) : paginatedProducts.length === 0 ? (
                     <p className="text-center p-4 text-slate-400">No products found for the current filters.</p>
                 ) : (
                     <>
-                        <ProductTable products={products} onAction={handleAction} userProfile={userProfile} />
-                        <ProductPagination currentPage={page} total={total} itemsPerPage={itemsPerPage} onNext={nextPage} onPrev={prevPage} />
+                        <ProductTable products={paginatedProducts} onAction={handleAction} userProfile={userProfile} />
+                        <ProductPagination currentPage={currentPage} total={total} itemsPerPage={itemsPerPage} onNext={nextPage} onPrev={prevPage} />
                     </>
                 )}
             </TableCard>
