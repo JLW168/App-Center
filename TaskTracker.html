@@ -51,7 +51,7 @@
         // --- Start: React & Firebase Imports ---
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, setPersistence, browserSessionPersistence, browserLocalPersistence, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, getDocs, addDoc, doc, getDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, where, orderBy, collectionGroup, limit } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, getDocs, addDoc, doc, getDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, where, orderBy, collectionGroup, limit, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import React, { useState, useEffect, useRef, createContext, useContext, useMemo, useCallback, useLayoutEffect } from "https://esm.sh/react@18.2.0";
         import ReactDOM from "https://esm.sh/react-dom@18.2.0/client";
         // --- End: React & Firebase Imports ---
@@ -70,6 +70,16 @@
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
+        
+        // --- Enable Offline Persistence ---
+        enableIndexedDbPersistence(db)
+          .catch((err) => {
+            if (err.code == 'failed-precondition') {
+              console.warn('Firestore persistence failed: Multiple tabs open.');
+            } else if (err.code == 'unimplemented') {
+              console.warn('Firestore persistence failed: Browser not supported.');
+            }
+          });
         // --- End: Firebase Configuration ---
 
         // --- Start: Constants and Icons ---
@@ -94,8 +104,10 @@
         };
         // --- End: Constants and Icons ---
 
-        // --- Start: Authentication Context ---
+        // --- Start: Contexts ---
         const AuthContext = createContext();
+        const DataContext = createContext();
+
         const AuthProvider = ({ children }) => {
             const [user, setUser] = useState(null);
             const [isAuthReady, setIsAuthReady] = useState(false);
@@ -166,121 +178,110 @@
 
             return React.createElement(AuthContext.Provider, { value: authValue }, children);
         };
+
+        const DataProvider = ({ children }) => {
+            const { user } = useContext(AuthContext);
+            const [isLoading, setIsLoading] = useState(true);
+
+            const safelyParseJSON = (key, defaultValue) => {
+                try {
+                    const item = localStorage.getItem(key);
+                    return item ? JSON.parse(item) : defaultValue;
+                } catch (e) {
+                    console.error(`Error parsing JSON from localStorage key "${key}":`, e);
+                    return defaultValue;
+                }
+            };
+
+            const [tasks, setTasks] = useState(() => safelyParseJSON('jlw-tasks', []));
+            const [history, setHistory] = useState(() => safelyParseJSON('jlw-history', []));
+            const [shops, setShops] = useState(() => safelyParseJSON('jlw-shops', []));
+            const [employees, setEmployees] = useState(() => safelyParseJSON('jlw-employees', []));
+
+            useEffect(() => {
+                if (!user) {
+                    setIsLoading(false);
+                    return;
+                }
+
+                const collectionsToSync = {
+                    tasks: { setter: setTasks, query: query(collectionGroup(db, 'tasks')) },
+                    history: { setter: setHistory, query: query(collectionGroup(db, 'history')) },
+                    shops: { setter: setShops, query: collection(db, 'shops') },
+                    employees: { setter: setEmployees, query: collection(db, 'employees') },
+                };
+
+                const listeners = Object.entries(collectionsToSync).map(([name, config]) => {
+                    return onSnapshot(config.query, snapshot => {
+                        const data = snapshot.docs.map(d => ({
+                            id: d.id, ...d.data(),
+                            ...( (name === 'tasks' || name === 'history') && { uid: d.ref.path.split('/')[1] } )
+                        }));
+                        config.setter(data);
+                        localStorage.setItem(`jlw-${name}`, JSON.stringify(data));
+                    }, err => console.error(`Error fetching ${name}:`, err));
+                });
+                
+                setIsLoading(false);
+
+                return () => listeners.forEach(unsub => unsub());
+            }, [user]);
+
+            const value = useMemo(() => ({ tasks, history, shops, employees, isLoading }), [tasks, history, shops, employees, isLoading]);
+            return React.createElement(DataContext.Provider, { value }, children);
+        };
+
         const useAuth = () => useContext(AuthContext);
-        // --- End: Authentication Context ---
+        const useData = () => useContext(DataContext);
+        // --- End: Contexts ---
 
         // --- Start: Custom Hooks ---
         const useTasks = () => {
+            const { tasks: allTasks, employees } = useData();
             const { user, isAdmin, userRole, userShopId } = useAuth();
-            const [tasks, setTasks] = useState([]);
 
-            useEffect(() => {
-                if (!user) {
-                    setTasks([]);
-                    return;
+            return useMemo(() => {
+                if (!user) return [];
+                if (isAdmin) return allTasks;
+
+                if (userRole === 'Shop Manager' && userShopId) {
+                    const shopStaffEmails = employees
+                        .filter(e => e.assignedShop === userShopId && e.role === 'Staff')
+                        .map(e => e.email)
+                        .filter(Boolean);
+                    const relevantEmails = [...shopStaffEmails, user.email];
+                    return allTasks.filter(task => relevantEmails.includes(task.userEmail));
                 }
 
-                let unsubscribe;
-
-                const setupSubscription = async () => {
-                    try {
-                        if (isAdmin) {
-                            const q = query(collectionGroup(db, CONSTANTS.COLLECTIONS.TASKS));
-                            unsubscribe = onSnapshot(q, snapshot => {
-                                setTasks(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] })));
-                            });
-                        } else if (userRole === 'Shop Manager' && userShopId) {
-                            const employeesRef = collection(db, CONSTANTS.COLLECTIONS.EMPLOYEES);
-                            const shopEmployeesQuery = query(employeesRef, where("assignedShop", "==", userShopId), where("role", "==", "Staff"));
-                            const querySnapshot = await getDocs(shopEmployeesQuery);
-                            
-                            const relevantEmails = querySnapshot.docs.map(doc => doc.data().email).filter(Boolean);
-                            relevantEmails.push(user.email);
-
-                            const q = query(collectionGroup(db, CONSTANTS.COLLECTIONS.TASKS));
-                            unsubscribe = onSnapshot(q, (snapshot) => {
-                                const allTasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] }));
-                                const filteredTasks = allTasks.filter(task => relevantEmails.includes(task.userEmail));
-                                setTasks(filteredTasks);
-                            });
-                        } else {
-                            const q = query(collection(db, CONSTANTS.COLLECTIONS.USERS, user.uid, CONSTANTS.COLLECTIONS.TASKS));
-                            unsubscribe = onSnapshot(q, snapshot => {
-                                setTasks(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] })));
-                            });
-                        }
-                    } catch (error) {
-                        console.error("Error setting up tasks subscription:", error);
-                    }
-                };
-
-                setupSubscription();
-
-                return () => {
-                    if (unsubscribe) unsubscribe();
-                };
-            }, [user, isAdmin, userRole, userShopId]);
-
-            return tasks;
+                return allTasks.filter(task => task.userEmail === user.email);
+            }, [allTasks, employees, user, isAdmin, userRole, userShopId]);
         };
 
         const useHistory = () => {
+            const { history: allHistory, employees } = useData();
             const { user, isAdmin, userRole, userShopId } = useAuth();
-            const [history, setHistory] = useState([]);
 
-            useEffect(() => {
-                if (!user) {
-                    setHistory([]);
-                    return;
+            return useMemo(() => {
+                if (!user) return [];
+                let filteredHistory;
+
+                if (isAdmin) {
+                    filteredHistory = allHistory;
+                } else if (userRole === 'Shop Manager' && userShopId) {
+                    const shopStaffEmails = employees
+                        .filter(e => e.assignedShop === userShopId && e.role === 'Staff')
+                        .map(e => e.email)
+                        .filter(Boolean);
+                    const relevantEmails = [...shopStaffEmails, user.email];
+                    filteredHistory = allHistory.filter(item => relevantEmails.includes(item.userEmail));
+                } else {
+                    filteredHistory = allHistory.filter(item => item.userEmail === user.email);
                 }
-
-                let unsubscribe;
-
-                const setupSubscription = async () => {
-                    try {
-                        if (isAdmin) {
-                            const q = query(collectionGroup(db, CONSTANTS.COLLECTIONS.HISTORY));
-                            unsubscribe = onSnapshot(q, snapshot => {
-                                const historyData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] }));
-                                historyData.sort((a, b) => (b.completedTimestamp?.seconds || 0) - (a.completedTimestamp?.seconds || 0));
-                                setHistory(historyData);
-                            });
-                        } else if (userRole === 'Shop Manager' && userShopId) {
-                            const employeesRef = collection(db, CONSTANTS.COLLECTIONS.EMPLOYEES);
-                            const shopEmployeesQuery = query(employeesRef, where("assignedShop", "==", userShopId), where("role", "==", "Staff"));
-                            const querySnapshot = await getDocs(shopEmployeesQuery);
-                            
-                            const relevantEmails = querySnapshot.docs.map(doc => doc.data().email).filter(Boolean);
-                            relevantEmails.push(user.email);
-
-                            const q = query(collectionGroup(db, CONSTANTS.COLLECTIONS.HISTORY));
-                            unsubscribe = onSnapshot(q, (snapshot) => {
-                                const allHistory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] }));
-                                const filteredHistory = allHistory.filter(item => relevantEmails.includes(item.userEmail));
-                                filteredHistory.sort((a, b) => (b.completedTimestamp?.seconds || 0) - (a.completedTimestamp?.seconds || 0));
-                                setHistory(filteredHistory);
-                            });
-                        } else {
-                            const q = query(collection(db, CONSTANTS.COLLECTIONS.USERS, user.uid, CONSTANTS.COLLECTIONS.HISTORY), orderBy('completedTimestamp', 'desc'));
-                            unsubscribe = onSnapshot(q, snapshot => {
-                                setHistory(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), uid: doc.ref.path.split('/')[1] })));
-                            });
-                        }
-                    } catch (error) {
-                        console.error("Error setting up history subscription:", error);
-                    }
-                };
-
-                setupSubscription();
-
-                return () => {
-                    if (unsubscribe) unsubscribe();
-                };
-            }, [user, isAdmin, userRole, userShopId]);
-
-            return history;
+                
+                return [...filteredHistory].sort((a, b) => (b.completedTimestamp?.seconds || 0) - (a.completedTimestamp?.seconds || 0));
+            }, [allHistory, employees, user, isAdmin, userRole, userShopId]);
         };
-
+        
         const useMediaQuery = (query) => {
             const [matches, setMatches] = useState(window.matchMedia(query).matches);
             useEffect(() => {
@@ -291,41 +292,30 @@
             }, [query]);
             return matches;
         };
-        
-        const useCollection = (collectionName) => {
-            const [data, setData] = useState([]);
-            const [loading, setLoading] = useState(true);
-            const [error, setError] = useState(null);
-
-            useEffect(() => {
-                if (!collectionName) { setLoading(false); return; };
-                const unsubscribe = onSnapshot(collection(db, collectionName), 
-                (querySnapshot) => {
-                    setData(querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-                    setError(null);
-                    setLoading(false);
-                }, 
-                (err) => {
-                    console.error(`Error fetching ${collectionName}:`, err);
-                    setError(err);
-                    setData([]);
-                    setLoading(false);
-                });
-                return () => unsubscribe();
-            }, [collectionName]);
-            return { data, loading, error };
-        };
         // --- End: Custom Hooks ---
         
         // --- Start: Main App Structure ---
         const App = () => {
             const { user, isAuthReady } = useAuth();
-            if (!isAuthReady) return React.createElement("div", { className: "flex justify-center items-center min-h-screen bg-slate-900" }, React.createElement(LoadingSpinner, { text: "Loading Application..." }));
-            return user ? React.createElement(MainApp) : React.createElement(Login);
+            const { isLoading } = useData();
+
+            if (!isAuthReady) {
+                return React.createElement("div", { className: "flex justify-center items-center min-h-screen bg-slate-900" }, React.createElement(LoadingSpinner, { text: "Authenticating..." }));
+            }
+            
+            if (!user) {
+                return React.createElement(Login);
+            }
+
+            if (isLoading) {
+                return React.createElement("div", { className: "flex justify-center items-center min-h-screen bg-slate-900" }, React.createElement(LoadingSpinner, { text: "Syncing Data..." }));
+            }
+
+            return React.createElement(MainApp);
         };
         
         const MainApp = () => {
-            const { permissions, isAuthReady, isLoadingPermissions } = useAuth();
+            const { permissions, isLoadingPermissions } = useAuth();
             const [page, setPage] = useState('');
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [editingItem, setEditingItem] = useState(null);
@@ -333,10 +323,10 @@
             const [isSidebarOpen, setIsSidebarOpen] = useState(false);
             
             useEffect(() => {
-                if (isAuthReady && !isLoadingPermissions && permissions.length > 0) {
+                if (!isLoadingPermissions && permissions.length > 0) {
                     setPage(permissions[0]);
                 }
-            }, [permissions, isAuthReady, isLoadingPermissions]);
+            }, [permissions, isLoadingPermissions]);
 
             const openModal = useCallback((item = null, context = 'task') => {
                 setEditingItem(item);
@@ -447,7 +437,7 @@
         // --- End: Core UI Components ---
 
         // --- Start: Pages ---
-        const DashboardPage = () => {
+        const DashboardPage = React.memo(() => {
             const { user, userName } = useAuth();
             const tasks = useTasks();
             const history = useHistory();
@@ -503,9 +493,9 @@
                     )
                 )
             );
-        };
+        });
 
-        const BoardPage = ({ openModal }) => {
+        const BoardPage = React.memo(({ openModal }) => {
             const tasks = useTasks();
             const history = useHistory();
             const [filters, setFilters] = useState({ shop: '', staff: '', date: '' });
@@ -582,17 +572,16 @@
                     })
                 )
             );
-        };
+        });
         
-        const SettingsPage = () => {
+        const SettingsPage = React.memo(() => {
             const [activeTab, setActiveTab] = useState('shops');
-            const { data: shops, loading: shopsLoading, error: shopsError } = useCollection(CONSTANTS.COLLECTIONS.SHOPS);
-            const { data: staff, loading: staffLoading, error: staffError } = useCollection(CONSTANTS.COLLECTIONS.EMPLOYEES);
+            const { shops, employees } = useData();
             
-            const TabButton = ({ tabName, title, error }) => (
+            const TabButton = ({ tabName, title }) => (
                 React.createElement("button", {
-                    onClick: () => !error && setActiveTab(tabName), disabled: !!error, title: error ? `Could not load ${title}: Insufficient permissions.` : title,
-                    className: `px-3 py-2 text-sm font-medium rounded-md transition-colors duration-200 flex-grow text-center sm:flex-grow-0 ${ activeTab === tabName ? 'bg-blue-600 text-white shadow-md' : 'bg-slate-700 text-slate-300 hover:bg-slate-600' } ${ error ? 'bg-red-900/50 text-red-400 cursor-not-allowed opacity-75' : '' }`
+                    onClick: () => setActiveTab(tabName),
+                    className: `px-3 py-2 text-sm font-medium rounded-md transition-colors duration-200 flex-grow text-center sm:flex-grow-0 ${ activeTab === tabName ? 'bg-blue-600 text-white shadow-md' : 'bg-slate-700 text-slate-300 hover:bg-slate-600' }`
                 }, title)
             );
 
@@ -628,27 +617,20 @@
                 ]
             }), [shops]);
 
-            const ErrorDisplay = ({ name }) => (
-                React.createElement("div", {className: "bg-red-900/50 border-l-4 border-red-700 text-red-400 p-4 rounded-md"}, 
-                    React.createElement("p", {className: "font-bold"}, "Permission Error"),
-                    React.createElement("p", null, `Could not load ${name}. Please check your Firestore security rules to allow read access.`)
-                )
-            );
-
             return (
                 React.createElement("div", { className: "space-y-6" },
                     React.createElement("h1", { className: "text-3xl font-bold text-slate-100" }, "Application Settings"),
                      React.createElement("div", { className: "flex flex-wrap gap-2 bg-slate-900 p-1 rounded-lg" },
-                         React.createElement(TabButton, { tabName: "shops", title: "Shops", error: shopsError }),
-                         React.createElement(TabButton, { tabName: "staff", title: "Staff List", error: staffError })
+                         React.createElement(TabButton, { tabName: "shops", title: "Shops" }),
+                         React.createElement(TabButton, { tabName: "staff", title: "Staff List" })
                      ),
                      React.createElement("div", null,
-                        activeTab === 'shops' && (shopsLoading ? React.createElement(LoadingSpinner) : shopsError ? React.createElement(ErrorDisplay, { name: "Shops" }) : React.createElement(SettingsCRUD, { title: "Shop", collectionName: CONSTANTS.COLLECTIONS.SHOPS, items: shops, ...shopConfig })),
-                        activeTab === 'staff' && (staffLoading ? React.createElement(LoadingSpinner) : staffError ? React.createElement(ErrorDisplay, { name: "Staff List" }) : React.createElement(SettingsCRUD, { title: "Staff", collectionName: CONSTANTS.COLLECTIONS.EMPLOYEES, items: staff, ...staffConfig }))
+                        activeTab === 'shops' && React.createElement(SettingsCRUD, { title: "Shop", collectionName: CONSTANTS.COLLECTIONS.SHOPS, items: shops, ...shopConfig }),
+                        activeTab === 'staff' && React.createElement(SettingsCRUD, { title: "Staff", collectionName: CONSTANTS.COLLECTIONS.EMPLOYEES, items: employees, ...staffConfig })
                      )
                 )
             )
-        }
+        });
         // --- End: Pages ---
 
         // --- Start: Reusable & Core Components ---
@@ -662,14 +644,14 @@
             )
         );
 
-        const Login = () => {
+        const Login = React.memo(() => {
             const [email, setEmail] = useState('');
             const [password, setPassword] = useState('');
             const [rememberMe, setRememberMe] = useState(false);
             const [error, setError] = useState('');
             const [showPassword, setShowPassword] = useState(false);
 
-            const handleLogin = async (e) => {
+            const handleLogin = useCallback(async (e) => {
                 e.preventDefault();
                 setError('');
                 try {
@@ -687,7 +669,7 @@
                     }
                     setError(message);
                 }
-            };
+            }, [email, password, rememberMe]);
 
             return React.createElement("div", { className: "flex items-center justify-center min-h-screen p-4" },
                 React.createElement("div", { className: "w-full max-w-5xl bg-slate-800 rounded-2xl shadow-2xl flex flex-col md:flex-row overflow-hidden" },
@@ -729,9 +711,9 @@
                     )
                 )
             );
-        };
+        });
 
-        const KanbanBoard = ({ tasks, onMove, onEdit, onDelete }) => {
+        const KanbanBoard = React.memo(({ tasks, onMove, onEdit, onDelete }) => {
             const columns = useMemo(() => [
                 { id: 'todo', title: 'To Do', color: 'red-400' },
                 { id: 'inprogress', title: 'In Progress', color: 'yellow-400' },
@@ -749,7 +731,7 @@
                     onDelete,
                 }))
             );
-        };
+        });
 
         const KanbanColumn = ({ status, title, color, tasks, onMove, onEdit, onDelete }) => {
             return React.createElement("div", { className: "bg-slate-800 rounded-xl shadow-md flex flex-col" },
@@ -896,9 +878,13 @@
                         React.createElement("div", null, React.createElement("p", { className: "font-semibold text-slate-300" }, "In Progress"), React.createElement("p", null, formatDate(task.progressTimestamp))),
                         React.createElement("div", null, React.createElement("p", { className: "font-semibold text-slate-300" }, "Completed"), React.createElement("p", null, formatDate(task.completedTimestamp)))
                     ),
-                    isAdmin && React.createElement("div", { className: "flex justify-end space-x-2 pt-2 border-t border-slate-700" },
-                        React.createElement("button", { onClick: () => onEdit(task), className: "text-indigo-400 hover:text-indigo-300 text-sm font-semibold" }, "Edit"),
-                        React.createElement("button", { onClick: () => onDelete(task), className: "text-red-500 hover:text-red-400 text-sm font-semibold" }, "Delete")
+                    isAdmin && React.createElement("div", { className: "flex justify-end space-x-4 pt-2 border-t border-slate-700" },
+                        React.createElement("button", { onClick: () => onEdit(task), className: "text-indigo-400 hover:text-indigo-300", title: "Edit" },
+                            React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }, React.createElement("path", { d: "M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" }))
+                        ),
+                        React.createElement("button", { onClick: () => onDelete(task), className: "text-red-500 hover:text-red-400", title: "Delete" },
+                            React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }, React.createElement("polyline", { points: "3 6 5 6 21 6" }), React.createElement("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }), React.createElement("line", { x1: "10", y1: "11", x2: "10", y2: "17" }), React.createElement("line", { x1: "14", y1: "11", x2: "14", y2: "17" }))
+                        )
                     )
                 )
             );
@@ -938,8 +924,14 @@
                                 React.createElement("td", { className: "px-2 py-3 sm:p-4 text-sm text-slate-400" }, formatDate(task.progressTimestamp)),
                                 React.createElement("td", { className: "px-2 py-3 sm:p-4 text-sm text-slate-400" }, formatDate(task.completedTimestamp)),
                                 isAdmin && React.createElement("td", { className: "px-2 py-3 sm:p-4 text-right" },
-                                    React.createElement("button", { onClick: () => onEdit(task), className: "text-indigo-400 hover:text-indigo-300 mr-4 text-sm font-semibold" }, "Edit"),
-                                    React.createElement("button", { onClick: () => onDelete(task), className: "text-red-500 hover:text-red-400 text-sm font-semibold" }, "Delete")
+                                    React.createElement("div", { className: "flex items-center justify-end space-x-4" },
+                                        React.createElement("button", { onClick: () => onEdit(task), className: "text-indigo-400 hover:text-indigo-300", title: "Edit" },
+                                            React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }, React.createElement("path", { d: "M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" }))
+                                        ),
+                                        React.createElement("button", { onClick: () => onDelete(task), className: "text-red-500 hover:text-red-400", title: "Delete" },
+                                            React.createElement("svg", { xmlns: "http://www.w3.org/2000/svg", width: "16", height: "16", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round" }, React.createElement("polyline", { points: "3 6 5 6 21 6" }), React.createElement("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }), React.createElement("line", { x1: "10", y1: "11", x2: "10", y2: "17" }), React.createElement("line", { x1: "14", y1: "11", x2: "14", y2: "17" }))
+                                        )
+                                    )
                                 )
                             ))
                         )
@@ -1214,7 +1206,13 @@
 
         // --- Start: App Initialization ---
         const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(React.createElement(AuthProvider, null, React.createElement(App)));
+        root.render(
+            React.createElement(AuthProvider, null, 
+                React.createElement(DataProvider, null,
+                    React.createElement(App)
+                )
+            )
+        );
         // --- End: App Initialization ---
     </script>
 </body>
