@@ -394,12 +394,17 @@
             const handleCloseModal = useCallback(() => { setModalOpen(false); setEditingEmployee(null); }, []);
 
             const handleSaveEmployee = useCallback(async (employeeData) => {
-                const { doc, updateDoc, addDoc, collection, serverTimestamp } = window.firebaseSDK;
+                const { doc, updateDoc, addDoc, collection, serverTimestamp, getDocs, query, where, writeBatch } = window.firebaseSDK;
                 // Sanitize salary before saving
                 const salaryToSave = parseFloat(String(employeeData.salary).replace(/[^0-9.-]/g, '')) || 0;
                 const dataToSave = { ...employeeData, salary: salaryToSave };
                 try {
+                    let savedEmployeeId;
+                    let savedEmployeeName = dataToSave.name;
+                    let savedEmployeeShop = dataToSave.shop;
+
                     if (dataToSave.id) {
+                        savedEmployeeId = dataToSave.id;
                         const { id, ...data } = dataToSave;
                         const originalData = employees.find(e => e.id === id);
                         await updateDoc(doc(db, 'employees', id), data);
@@ -415,6 +420,7 @@
                         });
                     } else {
                         const newDocRef = await addDoc(collection(db, 'employees'), dataToSave);
+                        savedEmployeeId = newDocRef.id;
                         // Log the add action
                         await addDoc(collection(db, "userLogs"), { 
                             userId: auth.currentUser.uid, 
@@ -426,6 +432,25 @@
                             updatedData: dataToSave 
                         });
                     }
+
+                    // Auto-update supervisor for the shop if the saved employee is a Shop Manager
+                    if (dataToSave.role === 'Shop Manager' && savedEmployeeShop) {
+                        console.log(`Updating supervisor for shop: ${savedEmployeeShop} to ${savedEmployeeName}`);
+                        const shopEmployeesQuery = query(collection(db, "employees"), where("shop", "==", savedEmployeeShop));
+                        const querySnapshot = await getDocs(shopEmployeesQuery);
+                        
+                        const batch = writeBatch(db);
+                        querySnapshot.forEach((employeeDoc) => {
+                            // Update supervisor for everyone in the shop EXCEPT the manager themselves
+                            if (employeeDoc.id !== savedEmployeeId) {
+                                const empRef = doc(db, 'employees', employeeDoc.id);
+                                batch.update(empRef, { supervisor: savedEmployeeName });
+                            }
+                        });
+                        await batch.commit();
+                        console.log("Batch update for supervisors completed.");
+                    }
+
                     handleCloseModal();
                 } catch (e) { console.error("Error saving employee:", e); }
             }, [db, auth, employees, handleCloseModal]);
@@ -897,7 +922,7 @@
                         }
                     } else { // Multi-day leave
                         const diffTime = end.getTime() - start.getTime();
-                        const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+                        const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24)) + 1;
                         newFormData.numberOfDays = diffDays;
                         newFormData.leaveSession = 'Full Day'; // Force full day for multi-day
                     }
@@ -988,9 +1013,12 @@
                     (!selectedShop || req.shop === selectedShop) && 
                     (!selectedMonth || (req.leaveDate && req.leaveDate.startsWith(selectedMonth)))
                 );
+                const pending = filtered.filter(req => req.status === 'Pending').sort((a, b) => (b.requestDate?.toDate() || 0) - (a.requestDate?.toDate() || 0));
+                const history = filtered.filter(req => req.status !== 'Pending').sort((a, b) => (b.requestDate?.toDate() || 0) - (a.requestDate?.toDate() || 0));
+
                 return {
-                    pendingRequests: filtered.filter(req => req.status === 'Pending'),
-                    historyRequests: filtered.filter(req => req.status !== 'Pending')
+                    pendingRequests: pending,
+                    historyRequests: history
                 };
             }, [leaveRequests, selectedShop, selectedMonth]);
             
@@ -1113,9 +1141,13 @@
                     (!selectedShop || req.shop === selectedShop) && 
                     (req.reqDate && (!selectedMonth || req.reqDate.startsWith(selectedMonth)))
                 );
+                
+                const pending = filtered.filter(req => req.status === 'Pending').sort((a, b) => (b.submissionDate?.toDate() || 0) - (a.submissionDate?.toDate() || 0));
+                const history = filtered.filter(req => req.status !== 'Pending').sort((a, b) => (b.submissionDate?.toDate() || 0) - (a.submissionDate?.toDate() || 0));
+
                 return {
-                    pendingRequests: filtered.filter(req => req.status === 'Pending'),
-                    historyRequests: filtered.filter(req => req.status !== 'Pending')
+                    pendingRequests: pending,
+                    historyRequests: history
                 };
             }, [otRequests, selectedShop, selectedMonth]);
             
@@ -1251,8 +1283,18 @@
                         const diffMillis = endDate - startDate;
                         const diffHours = diffMillis / (1000 * 60 * 60);
                         
-                        // Assuming an 8-hour workday to calculate "days"
-                        const otDays = diffHours / 8;
+                        // REVISED LOGIC: Per user request, specific durations are handled differently.
+                        // 4 hours (e.g. 5pm-9pm) and 5 hours (e.g. 7:30am-12:30pm) both count as 0.5 days.
+                        // Durations between 4 and 5 hours are treated as a half day.
+                        // Other durations are calculated against a standard 8-hour OT day.
+                        let otDays = 0;
+                        const OT_HOURS_PER_DAY = 8;
+
+                        if (diffHours >= 4 && diffHours <= 5) {
+                            otDays = 0.5;
+                        } else {
+                            otDays = diffHours / OT_HOURS_PER_DAY;
+                        }
                         
                         setFormData(prev => ({ ...prev, numberOfOTDays: otDays > 0 ? otDays.toFixed(2) : 0 }));
                     }
@@ -1300,21 +1342,23 @@
         const AttendanceReportPage = ({ userProfile }) => {
             const [activeTab, setActiveTab] = useState('daily');
             const { data: leaveRequests } = useCollection('leaveRequests');
+            const { data: otRequests } = useCollection('otRequests');
             return (
                 <TabbedPage tabs={{ daily: 'Daily Report', monthly: 'No. Work Day' }} activeTab={activeTab} setActiveTab={setActiveTab}>
-                    <div id="daily"><DailyReportTab userProfile={userProfile} leaveRequests={leaveRequests} /></div>
-                    <div id="monthly"><WorkDayReportTab userProfile={userProfile} /></div>
+                    <div id="daily"><DailyReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} /></div>
+                    <div id="monthly"><WorkDayReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} /></div>
                 </TabbedPage>
             );
         };
 
-        const DailyReportTab = ({ userProfile, leaveRequests }) => {
+        const DailyReportTab = ({ userProfile, leaveRequests, otRequests }) => {
             const { db } = useFirebase();
             const { data: attendance } = useCollection('attendance');
             const { data: shops } = useCollection('shops');
             const { data: employees } = useCollection('employees');
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
             const [recordToDelete, setRecordToDelete] = useState(null);
 
             useEffect(() => {
@@ -1323,47 +1367,85 @@
                 }
             }, [userProfile]);
 
+            const employeesInShop = useMemo(() => {
+                if (!selectedShop) return [];
+                return employees.filter(emp => emp.shop === selectedShop && emp.status === 'Active');
+            }, [selectedShop, employees]);
+
             const attendanceReport = useMemo(() => {
+                const [year, month] = selectedMonth.split('-').map(Number);
+
+                // 1. Filter attendance records based on selected criteria
+                const filteredAttendance = attendance.filter(record => {
+                    if (!record.timestamp) return false;
+                    const recordDate = record.timestamp.toDate();
+                    const shopMatch = !selectedShop || record.shop === selectedShop;
+                    const monthMatch = recordDate.getFullYear() === year && (recordDate.getMonth() + 1) === month;
+                    const employeeMatch = !selectedEmployeeId || record.employeeId === selectedEmployeeId;
+                    return shopMatch && monthMatch && employeeMatch;
+                });
+
+                // 2. Group records by employee and day to find the earliest check-in and latest check-out
                 const recordsByEmployeeDay = {};
-                const filteredAttendance = attendance.filter(record => record.timestamp && (!selectedShop || record.shop === selectedShop) && (!selectedMonth || record.timestamp.toDate().toISOString().startsWith(selectedMonth)));
-                
-                // Group attendance records by employee and day
                 filteredAttendance.forEach(record => {
                     const date = record.timestamp.toDate();
-                    const dateKey = date.toISOString().split('T')[0];
+                    const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
                     const employeeKey = `${record.employeeId}_${dateKey}`;
                     if (!recordsByEmployeeDay[employeeKey]) { recordsByEmployeeDay[employeeKey] = { date: dateKey, employeeId: record.employeeId, employeeName: record.employeeName, shop: record.shop, checkIn: null, checkOut: null, docIds: [] }; }
-                    // Find earliest check-in and latest check-out
                     if (record.type === 'in' && (!recordsByEmployeeDay[employeeKey].checkIn || date < recordsByEmployeeDay[employeeKey].checkIn)) { recordsByEmployeeDay[employeeKey].checkIn = date; }
                     if (record.type === 'out' && (!recordsByEmployeeDay[employeeKey].checkOut || date > recordsByEmployeeDay[employeeKey].checkOut)) { recordsByEmployeeDay[employeeKey].checkOut = date; }
                     recordsByEmployeeDay[employeeKey].docIds.push(record.id);
                 });
 
+                // 3. Map the grouped records into the final report format with all calculations
                 const reportArray = Object.values(recordsByEmployeeDay).map(record => {
-                    let totalHours = '';
-                    if (record.checkIn && record.checkOut) { totalHours = ((record.checkOut.getTime() - record.checkIn.getTime()) / 3600000).toFixed(2) + ' hours'; }
-                    let isLate = false;
                     const employee = employees.find(e => e.id === record.employeeId);
-                    if (record.checkIn && employee) {
-                        const shift = employee.shift || 'AM';
-                        const checkInHour = record.checkIn.getHours(); const checkInMinute = record.checkIn.getMinutes();
-                        if ((shift === 'AM' || shift === 'APM') && (checkInHour > 7 || (checkInHour === 7 && checkInMinute >= 35))) { isLate = true; } 
-                        else if (shift === 'PM' && (checkInHour > 12 || (checkInHour === 12 && checkInMinute >= 35))) { isLate = true; }
+                    
+                    let totalHours = '';
+                    if (record.checkIn && record.checkOut) {
+                        totalHours = ((record.checkOut.getTime() - record.checkIn.getTime()) / 3600000).toFixed(2) + ' hours';
                     }
 
-                    const isOnLeave = leaveRequests.some(lr =>
+                    let isLate = false;
+                    if (record.checkIn && employee) {
+                        const shift = employee.shift || 'AM';
+                        const checkInHour = record.checkIn.getHours();
+                        const checkInMinute = record.checkIn.getMinutes();
+                        if ((shift === 'AM' || shift === 'APM') && (checkInHour > 7 || (checkInHour === 7 && checkInMinute >= 35))) isLate = true;
+                        else if (shift === 'PM' && (checkInHour > 12 || (checkInHour === 12 && checkInMinute >= 35))) isLate = true;
+                    }
+
+                    const approvedLeave = leaveRequests.find(lr =>
                         lr.staffId === record.employeeId &&
                         lr.status === 'Approved' &&
                         record.date >= lr.leaveDate &&
-                        record.date < lr.returnDate
+                        record.date <= lr.returnDate
                     );
 
-                    return { ...record, checkIn: record.checkIn ? record.checkIn.toLocaleTimeString() : '', checkOut: record.checkOut ? record.checkOut.toLocaleTimeString() : '', totalHours, isLate, isOnLeave: isOnLeave ? 'Y' : 'N' };
+                    let isOnLeave = 'N';
+                    if (approvedLeave) {
+                        const session = approvedLeave.leaveSession || 'Full Day';
+                        isOnLeave = session === 'Full Day' ? 'Y-Full Day' : `Y-${session}`;
+                    }
+
+                    const isOnOT = otRequests.some(ot =>
+                        ot.staffId === record.employeeId &&
+                        ot.status === 'Approved' &&
+                        ot.reqDate === record.date
+                    );
+                    const otStatus = isOnOT ? 'Y' : 'N';
+
+                    return {
+                        ...record,
+                        checkIn: record.checkIn ? record.checkIn.toLocaleTimeString() : '',
+                        checkOut: record.checkOut ? record.checkOut.toLocaleTimeString() : '',
+                        totalHours, isLate, isOnLeave, otStatus
+                    };
                 });
                 
-                return reportArray.sort((a, b) => b.date.localeCompare(a.date)); // Sort by date descending
+                return reportArray.sort((a, b) => b.date.localeCompare(a.date) || a.employeeName.localeCompare(b.employeeName));
 
-            }, [attendance, selectedShop, selectedMonth, employees, leaveRequests]);
+            }, [attendance, selectedShop, selectedMonth, selectedEmployeeId, employees, leaveRequests, otRequests]);
 
             const handleDelete = async () => {
                 if (!recordToDelete?.docIds) return;
@@ -1384,6 +1466,7 @@
                     'Check Out': report.checkOut,
                     'Total Hours': report.totalHours,
                     'On Leave': report.isOnLeave,
+                    'OT Status': report.otStatus,
                     'Late Check-In': report.isLate ? 'Yes' : 'No'
                 }));
 
@@ -1391,7 +1474,7 @@
                 const workbook = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(workbook, worksheet, "Daily Attendance");
 
-                worksheet["!cols"] = [ { wch: 12 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 12 }, { wch: 15 } ];
+                worksheet["!cols"] = [ { wch: 12 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 12 }, { wch: 15 } ];
                 
                 XLSX.writeFile(workbook, `Daily_Attendance_Report_${selectedMonth}.xlsx`);
             }, [attendanceReport, selectedMonth]);
@@ -1402,27 +1485,34 @@
                         <CardTitle>Daily Attendance Report</CardTitle>
                         <div className="flex flex-wrap gap-4 items-center">
                             {userProfile?.role === 'Admin' && (
-                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
                                     <option value="">All Shops</option>
                                     {shops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                            {userProfile?.role === 'Admin' && selectedShop && (
+                                <select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">All Staff</option>
+                                    {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                                 </select>
                             )}
                             <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
                             <button onClick={handleExportExcel} className="bg-green-600 text-white px-4 py-2 rounded-lg shadow hover:bg-green-700 transition-colors flex items-center gap-2"><i className="fas fa-file-excel"></i> Excel</button>
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check In</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check Out</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Hour</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Leave Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{attendanceReport.map((report, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.date}</td><td className="px-4 py-4 text-sm text-slate-200">{report.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shop}</td><td className={`px-4 py-4 text-sm ${report.isLate ? 'text-red-400 font-semibold' : 'text-slate-300'}`}>{report.checkIn}</td><td className="px-4 py-4 text-sm text-slate-300">{report.checkOut}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalHours}</td><td className="px-4 py-4 text-sm text-center text-slate-300">{report.isOnLeave}</td><td className="px-4 py-4 text-center whitespace-nowrap">{userProfile?.role === 'Admin' && (<button onClick={() => setRecordToDelete(report)} className="text-red-500 hover:text-red-400" title="Delete"><i className="fas fa-trash"></i></button>)}</td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check In</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check Out</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Hour</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Leave Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">OT Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{attendanceReport.map((report) => (<tr key={`${report.employeeId}-${report.date}`} className="transition-colors hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.date}</td><td className="px-4 py-4 text-sm text-slate-200">{report.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shop}</td><td className={`px-4 py-4 text-sm font-semibold ${report.isLate ? 'text-orange-400' : 'text-slate-300 font-normal'}`}>{report.checkIn}</td><td className="px-4 py-4 text-sm text-slate-300">{report.checkOut}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalHours}</td><td className="px-4 py-4 text-sm text-center text-slate-300">{report.isOnLeave}</td><td className="px-4 py-4 text-sm text-center text-slate-300">{report.otStatus}</td><td className="px-4 py-4 text-center whitespace-nowrap">{userProfile?.role === 'Admin' && report.docIds.length > 0 && (<button onClick={() => setRecordToDelete(report)} className="text-red-500 hover:text-red-400" title="Delete"><i className="fas fa-trash"></i></button>)}</td></tr>))}</tbody></table></div>
                     <ConfirmationModal isOpen={!!recordToDelete} onClose={() => setRecordToDelete(null)} onConfirm={handleDelete} title="Delete Attendance Record" message={`Are you sure you want to delete all attendance records for ${recordToDelete?.employeeName} on ${recordToDelete?.date}? This action cannot be undone.`} />
                 </Card>
             );
         };
         
-        const WorkDayReportTab = ({ userProfile }) => {
+        const WorkDayReportTab = ({ userProfile, leaveRequests, otRequests }) => {
             const { data: attendance } = useCollection('attendance');
             const { data: shops } = useCollection('shops');
-            const { data: leaveRequests } = useCollection('leaveRequests');
+            const { data: employees } = useCollection('employees');
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
             
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin') {
@@ -1430,9 +1520,19 @@
                 }
             }, [userProfile]);
 
+            const employeesInShop = useMemo(() => {
+                if (!selectedShop) return [];
+                return employees.filter(emp => emp.shop === selectedShop && emp.status === 'Active');
+            }, [selectedShop, employees]);
+
             const workDayReport = useMemo(() => {
                 const recordsByEmployeeMonth = {};
-                const filteredAttendance = attendance.filter(record => record.timestamp && (!selectedShop || record.shop === selectedShop) && (!selectedMonth || record.timestamp.toDate().toISOString().startsWith(selectedMonth)));
+                const filteredAttendance = attendance.filter(record => 
+                    record.timestamp && 
+                    (!selectedShop || record.shop === selectedShop) && 
+                    (!selectedMonth || record.timestamp.toDate().toISOString().startsWith(selectedMonth)) &&
+                    (!selectedEmployeeId || record.employeeId === selectedEmployeeId)
+                );
                 
                 filteredAttendance.forEach(record => {
                     const date = record.timestamp.toDate();
@@ -1456,8 +1556,14 @@
                               lr.status === 'Approved' &&
                               lr.leaveDate.startsWith(group.month)
                     );
-
                     const totalLeave = employeeLeaves.reduce((acc, curr) => acc + (parseFloat(curr.numberOfDays) || 0), 0);
+
+                    const employeeOTs = otRequests.filter(
+                        ot => ot.staffId === group.employeeId &&
+                              ot.status === 'Approved' &&
+                              ot.reqDate.startsWith(group.month)
+                    );
+                    const totalOT = employeeOTs.reduce((acc, curr) => acc + (parseFloat(curr.numberOfOTDays) || 0), 0);
                     
                     const dailyRecords = {};
                     group.records.forEach(rec => {
@@ -1485,12 +1591,13 @@
                         dueTime: `${month}-${year.substring(2)}`, 
                         shopName: group.shop, 
                         staffName: group.employeeName, 
-                        workDays, 
+                        workDays,
+                        totalOT,
                         totalLeave, 
                         totalHours: totalHours > 0 ? totalHours.toFixed(2) + ' hours' : '' 
                     };
                 });
-            }, [attendance, leaveRequests, selectedShop, selectedMonth]);
+            }, [attendance, leaveRequests, otRequests, selectedShop, selectedMonth, selectedEmployeeId]);
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = workDayReport.map(rec => ({
@@ -1498,6 +1605,7 @@
                     'Shop Name': rec.shopName,
                     'Staff Name': rec.staffName,
                     'No. Work Day': rec.workDays,
+                    'Total OT': rec.totalOT,
                     'Total Leave No': rec.totalLeave,
                     'Total Hour': rec.totalHours.replace(' hours', ''),
                 }));
@@ -1505,7 +1613,7 @@
                 const workbook = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(workbook, worksheet, "Monthly Work Day Report");
                 
-                worksheet["!cols"] = [ { wch: 18 }, { wch: 20 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 } ];
+                worksheet["!cols"] = [ { wch: 18 }, { wch: 20 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 } ];
                 
                 XLSX.writeFile(workbook, `Monthly_Work_Day_Report_${selectedMonth}.xlsx`);
             }, [workDayReport, selectedMonth]);
@@ -1516,16 +1624,22 @@
                         <CardTitle>Monthly Work Day Report</CardTitle>
                         <div className="flex flex-wrap gap-4 items-center">
                             {userProfile?.role === 'Admin' && (
-                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
                                     <option value="">All Shops</option>
                                     {shops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                             {userProfile?.role === 'Admin' && selectedShop && (
+                                <select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">All Staff</option>
+                                    {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                                 </select>
                             )}
                             <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
                             <button onClick={handleExportExcel} className="bg-green-600 text-white px-4 py-2 rounded-lg shadow hover:bg-green-700 transition-colors flex items-center gap-2"><i className="fas fa-file-excel"></i> Excel</button>
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Due Time (MM-YY)</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No. Work Day</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Leave No</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Hour</th></tr></thead><tbody className="divide-y divide-slate-700">{workDayReport.map((report, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.dueTime}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shopName}</td><td className="px-4 py-4 text-sm text-slate-200">{report.staffName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.workDays}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalLeave}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalHours}</td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Due Time (MM-YY)</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No. Work Day</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total OT</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Leave No</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Hour</th></tr></thead><tbody className="divide-y divide-slate-700">{workDayReport.map((report, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.dueTime}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shopName}</td><td className="px-4 py-4 text-sm text-slate-200">{report.staffName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.workDays}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalOT > 0 ? report.totalOT.toFixed(2) : 0}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalLeave}</td><td className="px-4 py-4 text-sm text-slate-300">{report.totalHours}</td></tr>))}</tbody></table></div>
                 </Card>
             );
         };
@@ -2460,5 +2574,3 @@
     </script>
 </body>
 </html>
-
-
