@@ -306,21 +306,31 @@
                 setLoading(true);
                 setError('');
                 try {
-                    const { signInWithEmailAndPassword, signOut, collection, query, where, getDocs } = window.firebaseSDK;
+                    const { signInWithEmailAndPassword, signOut, collection, query, where, getDocs, doc, updateDoc } = window.firebaseSDK;
                     const userCredential = await signInWithEmailAndPassword(auth, email, password);
                     const user = userCredential.user;
-                    // Verify user has an active employee profile before allowing login
-                    const q = query(collection(db, "employees"), where("uid", "==", user.uid));
+                    
+                    // Verify user has an active employee profile by email
+                    const q = query(collection(db, "employees"), where("email", "==", user.email));
                     const querySnapshot = await getDocs(q);
 
                     if (querySnapshot.empty) {
                         await signOut(auth);
                         setError("No employee record found for this user.");
                     } else {
-                        const employeeDoc = querySnapshot.docs[0].data();
-                        if (employeeDoc.status !== 'Active') {
+                        const employeeDoc = querySnapshot.docs[0];
+                        const employeeData = employeeDoc.data();
+
+                        if (employeeData.status !== 'Active') {
                             await signOut(auth);
                             setError("Your account is inactive. Please contact HR.");
+                        } else {
+                            // Automatically link UID if it's missing or incorrect.
+                            if (!employeeData.uid || employeeData.uid !== user.uid) {
+                                const employeeDocRef = doc(db, 'employees', employeeDoc.id);
+                                await updateDoc(employeeDocRef, { uid: user.uid });
+                            }
+                            // Login is successful; onAuthStateChanged will handle profile loading.
                         }
                     }
                 } catch (err) {
@@ -356,7 +366,7 @@
                 <TabbedPage tabs={{ active: 'Active Employees', salaryReport: 'Salary Revise Report', former: 'Resigned/Terminated' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="active"><ActiveEmployeesTab userProfile={userProfile} /></div>
                     <div id="salaryReport"><SalaryReviseReportTab userProfile={userProfile} /></div>
-                    <div id="former"><FormerEmployeesTab /></div>
+                    <div id="former"><FormerEmployeesTab userProfile={userProfile} /></div>
                 </TabbedPage>
             );
         };
@@ -479,16 +489,16 @@
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = filteredEmployees.map(emp => ({ 
-                    'Name': emp.name, 'Position': emp.position, 'Shop': emp.shop, 
+                    'Name': emp.name, 'Position': emp.position, 'Role': emp.role, 'Shop': emp.shop, 
                     'Join Date': emp.joinedDate, 'Worked Duration': Utils.calculateWorkedDuration(emp.joinedDate), 
-                    'Shift': emp.shift, 'Telephone': emp.tel, 
+                    'Shift': emp.shift, 'Telephone': emp.tel, 'Email': emp.email, 
                     'Salary (KHR)': parseFloat(String(emp.salary).replace(/[^0-9.-]/g, '')) || 0 
                 }));
                 const worksheet = XLSX.utils.json_to_sheet(dataToExport);
                 const workbook = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(workbook, worksheet, "Active Employees");
                 // Set column widths for better readability
-                worksheet["!cols"] = [ { wch: 25 }, { wch: 20 }, { wch: 15 }, { wch: 12 }, { wch: 15 }, { wch: 10 }, { wch: 15 }, { wch: 15 } ];
+                worksheet["!cols"] = [ { wch: 25 }, { wch: 20 }, { wch: 15 }, { wch: 15 }, { wch: 12 }, { wch: 15 }, { wch: 10 }, { wch: 15 }, { wch: 30 }, { wch: 15 } ];
                 XLSX.writeFile(workbook, "Active_Employees.xlsx");
             }, [filteredEmployees]);
 
@@ -587,7 +597,6 @@
                                 <div className="md:col-span-full"><hr className="border-slate-700 my-2"/></div>
                                 {/* System & Permissions */}
                                 <div><label className="text-sm font-medium text-slate-400">Email</label><input type="email" name="email" value={formData.email || ''} onChange={handleChange} className="input" /></div>
-                                <div><label className="text-sm font-medium text-slate-400">UID</label><input name="uid" value={formData.uid || ''} onChange={handleChange} className="input" /></div>
                                 <div><label className="text-sm font-medium text-slate-400">Role</label><select name="role" value={formData.role || 'Staff'} onChange={handleChange} className="select"><option>Admin</option><option>Shop Manager</option><option>Staff</option></select></div>
                                 <div className="md:col-span-2 lg:col-span-3"><label className="text-sm font-medium text-slate-400">Address</label><textarea name="address" value={formData.address || ''} onChange={handleChange} className="input" rows="3"></textarea></div>
                                 <div className="md:col-span-2 lg:col-span-3">
@@ -617,17 +626,71 @@
             );
         };
         
-        const FormerEmployeesTab = () => {
+        const FormerEmployeesTab = ({ userProfile }) => {
+            const { db, auth } = useFirebase();
+            const [isModalOpen, setModalOpen] = useState(false);
+            const [editingEmployee, setEditingEmployee] = useState(null);
+            const [employeeToDelete, setEmployeeToDelete] = useState(null);
             const { data: employees } = useCollection('employees');
+
             const formerEmployees = useMemo(() => employees.filter(e => e.status === 'Resigned' || e.status === 'Terminated'), [employees]);
+
+            const handleOpenModal = useCallback((employee = null) => { setEditingEmployee(employee); setModalOpen(true); }, []);
+            const handleCloseModal = useCallback(() => { setModalOpen(false); setEditingEmployee(null); }, []);
+            
+            const handleSaveEmployee = useCallback(async (employeeData) => {
+                const { doc, updateDoc, addDoc, collection, serverTimestamp } = window.firebaseSDK;
+                const salaryToSave = parseFloat(String(employeeData.salary).replace(/[^0-9.-]/g, '')) || 0;
+                const dataToSave = { ...employeeData, salary: salaryToSave };
+                try {
+                    if (dataToSave.id) {
+                        const { id, ...data } = dataToSave;
+                        const originalData = employees.find(e => e.id === id);
+                        await updateDoc(doc(db, 'employees', id), data);
+                        await addDoc(collection(db, "userLogs"), { 
+                            userId: auth.currentUser.uid, 
+                            action: 'Update Former Employee',
+                            targetId: id,
+                            targetName: data.name,
+                            timestamp: serverTimestamp(), 
+                            originalData, 
+                            updatedData: data 
+                        });
+                    }
+                    handleCloseModal();
+                } catch (e) { console.error("Error saving employee:", e); }
+            }, [db, auth, employees, handleCloseModal]);
+            
+            const handleDeleteConfirm = useCallback(async () => {
+                if (!employeeToDelete) return;
+                try { 
+                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'employees', employeeToDelete.id)); 
+                    const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
+                    await addDoc(collection(db, "userLogs"), { 
+                        userId: auth.currentUser.uid, 
+                        action: 'Delete Employee Record',
+                        targetId: employeeToDelete.id,
+                        targetName: employeeToDelete.name,
+                        timestamp: serverTimestamp(), 
+                        originalData: employeeToDelete, 
+                        updatedData: null 
+                    });
+                } catch (e) { 
+                    console.error(`Error deleting employee:`, e); 
+                } finally {
+                    setEmployeeToDelete(null);
+                }
+            }, [db, auth, employeeToDelete]);
 
             return (
                 <Card>
                     <h3 className="text-xl font-semibold text-slate-100 mb-6">Resigned/Terminated Employees</h3>
                     {/* Desktop Table */}
-                    <div className="overflow-x-auto hidden md:block"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th></tr></thead><tbody className="divide-y divide-slate-700">{formerEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.statusChangeDate || 'N/A'}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shop}</td><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>{emp.status}</span></td><td className="px-4 py-4 text-sm text-slate-300">{emp.reasonForLeaving}</td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto hidden md:block"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{formerEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.statusChangeDate || 'N/A'}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shop}</td><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>{emp.status}</span></td><td className="px-4 py-4 text-sm text-slate-300">{emp.reasonForLeaving}</td><td className="px-4 py-4 text-center whitespace-nowrap">{userProfile?.role === 'Admin' && (<><button onClick={() => handleOpenModal(emp)} className="text-blue-400 hover:text-blue-300 mr-4"><i className="fas fa-edit"></i></button><button onClick={() => setEmployeeToDelete(emp)} className="text-red-500 hover:text-red-400"><i className="fas fa-trash"></i></button></>)}</td></tr>))}</tbody></table></div>
                     {/* Mobile Cards */}
-                    <div className="grid grid-cols-1 gap-4 md:hidden">{formerEmployees.map(emp => (<div key={emp.id} className="bg-slate-700/50 rounded-lg p-4 space-y-3"><div className="flex justify-between items-start"><div><p className="font-bold text-lg text-slate-100">{emp.name}</p><p className="text-sm text-slate-300">{emp.shop}</p></div><span className={`px-2 py-1 text-xs font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-200 text-yellow-900' : 'bg-red-200 text-red-900'}`}>{emp.status}</span></div><div className="text-sm pt-2 border-t border-slate-600"><p><span className="text-slate-400">Date: </span><span className="text-slate-200 font-medium">{emp.statusChangeDate || 'N/A'}</span></p><p><span className="text-slate-400">Reason: </span><span className="text-slate-200 font-medium">{emp.reasonForLeaving || 'N/A'}</span></p></div></div>))}</div>
+                    <div className="grid grid-cols-1 gap-4 md:hidden">{formerEmployees.map(emp => (<div key={emp.id} className="bg-slate-700/50 rounded-lg p-4 space-y-3"><div className="flex justify-between items-start"><div><p className="font-bold text-lg text-slate-100">{emp.name}</p><p className="text-sm text-slate-300">{emp.shop}</p></div><div className="flex items-center space-x-3"><span className={`px-2 py-1 text-xs font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-200 text-yellow-900' : 'bg-red-200 text-red-900'}`}>{emp.status}</span>{userProfile?.role === 'Admin' && (<><button onClick={() => handleOpenModal(emp)} className="text-blue-400 hover:text-blue-300"><i className="fas fa-edit"></i></button><button onClick={() => setEmployeeToDelete(emp)} className="text-red-500 hover:text-red-400"><i className="fas fa-trash"></i></button></>)}</div></div><div className="text-sm pt-2 border-t border-slate-600"><p><span className="text-slate-400">Date: </span><span className="text-slate-200 font-medium">{emp.statusChangeDate || 'N/A'}</span></p><p><span className="text-slate-400">Reason: </span><span className="text-slate-200 font-medium">{emp.reasonForLeaving || 'N/A'}</span></p></div></div>))}</div>
+                    <EmployeeModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveEmployee} employee={editingEmployee} userProfile={userProfile} />
+                    <ConfirmationModal isOpen={!!employeeToDelete} onClose={() => setEmployeeToDelete(null)} onConfirm={handleDeleteConfirm} title="Delete Employee Record" message={`Are you sure you want to permanently delete the record for ${employeeToDelete?.name}? This action cannot be undone.`} />
                 </Card>
             );
         };
@@ -2804,7 +2867,5 @@
     </script>
 </body>
 </html>
-
-
 
 
