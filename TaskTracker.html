@@ -98,13 +98,15 @@
             else if (err.code == 'unimplemented') console.warn('Firestore persistence failed: Browser not supported.');
         });
 
-        // --- Constants & Icons ---
+        // --- Constants ---
         const COLLECTIONS = {
             SHOPS: 'shops', EMPLOYEES: 'employees', USERS: 'users',
             TASKS: 'tasks', HISTORY: 'history', SETTINGS: 'settings',
             USER_SETTINGS: 'userSettings'
         };
         const ADMIN_EMAIL = 'jlw@jlw.com';
+        const ROLES = { ADMIN: 'Admin', SHOP_MANAGER: 'Shop Manager', STAFF: 'Staff' };
+        const KANBAN_STATUS = { TODO: 'todo', IN_PROGRESS: 'inprogress', AUDITING: 'auditing', DONE: 'done' };
 
         const ICONS = {
             DASHBOARD: React.createElement("svg", { "xmlns": "http://www.w3.org/2000/svg", "width": "24", "height": "24", "viewBox": "0 0 24 24", "fill": "none", "stroke": "currentColor", "strokeWidth": "2", "strokeLinecap": "round", "strokeLinejoin": "round" }, React.createElement("rect", { "x": "3", "y": "3", "width": "7", "height": "7" }), React.createElement("rect", { "x": "14", "y": "3", "width": "7", "height": "7" }), React.createElement("rect", { "x": "14", "y": "14", "width": "7", "height": "7" }), React.createElement("rect", { "x": "3", "y": "14", "width": "7", "height": "7" })),
@@ -157,35 +159,22 @@
                         if (user.email === ADMIN_EMAIL) {
                             newAuthData = {
                                 ...newAuthData, isAdmin: true, permissions: ['dashboard', 'board', 'reports', 'settings'],
-                                userName: 'Admin', userRole: 'Admin'
+                                userName: 'Admin', userRole: ROLES.ADMIN
                             };
                         } else {
                             const q = query(collection(db, COLLECTIONS.EMPLOYEES), where("email", "==", user.email));
                             const employeeSnapshot = await getDocs(q);
                             if (!employeeSnapshot.empty) {
                                 const employeeDoc = employeeSnapshot.docs[0];
-                                // Link UID on login if it doesn't exist
                                 if (!employeeDoc.data().uid) {
-                                    try {
-                                        await updateDoc(doc(db, COLLECTIONS.EMPLOYEES, employeeDoc.id), { uid: user.uid });
-                                    } catch (e) { console.error("Failed to link UID to employee record:", e); }
+                                    await updateDoc(doc(db, COLLECTIONS.EMPLOYEES, employeeDoc.id), { uid: user.uid });
                                 }
-                                const { role = 'Staff', name = '', pagePermissions = [], assignedShops = [] } = employeeDoc.data();
+                                const { role = ROLES.STAFF, name = '', pagePermissions = [], assignedShops = [] } = employeeDoc.data();
                                 
-                                if (role === 'admin') {
-                                     newAuthData = {
-                                        ...newAuthData,
-                                        isAdmin: true,
-                                        permissions: ['dashboard', 'board', 'reports', 'settings'],
-                                        userName: name,
-                                        userRole: 'Admin'
-                                    };
-                                } else {
-                                    newAuthData = { ...newAuthData, userName: name, userRole: role, permissions: pagePermissions, userShopIds: assignedShops };
-                                    if (assignedShops?.length > 0) {
-                                        const shopDocs = await Promise.all(assignedShops.map(id => getDoc(doc(db, COLLECTIONS.SHOPS, id))));
-                                        newAuthData.userShop = shopDocs.filter(d => d.exists()).map(d => d.data().name).join(', ');
-                                    }
+                                newAuthData = { ...newAuthData, userName: name, userRole: role, permissions: pagePermissions, userShopIds: assignedShops };
+                                if (assignedShops?.length > 0) {
+                                    const shopDocs = await Promise.all(assignedShops.map(id => getDoc(doc(db, COLLECTIONS.SHOPS, id))));
+                                    newAuthData.userShop = shopDocs.filter(d => d.exists()).map(d => d.data().name).join(', ');
                                 }
                             }
                         }
@@ -246,7 +235,11 @@
                             }));
                         }
                         setData(prev => ({ ...prev, [name]: items }));
-                        localStorage.setItem(`jlw-${name}`, JSON.stringify(items));
+                        try {
+                            localStorage.setItem(`jlw-${name}`, JSON.stringify(items));
+                        } catch (e) {
+                            console.error("Error writing to localStorage", e);
+                        }
                     }, err => console.error(`Error fetching ${name}:`, err))
                 );
                 
@@ -271,7 +264,7 @@
 
                 if (isAdmin) return dataOfActiveStaff;
 
-                if (userRole === 'Shop Manager' && userShopIds?.length > 0) {
+                if (userRole === ROLES.SHOP_MANAGER && userShopIds?.length > 0) {
                     const shopStaffEmails = new Set(employees
                         .filter(e => e.status === 'Active' && e.assignedShops?.some(id => userShopIds.includes(id)))
                         .map(e => e.email)
@@ -307,22 +300,107 @@
         
         const useTaskDuration = (task) => {
             const [duration, setDuration] = useState(null);
-
             useEffect(() => {
                 let intervalId = null;
-                if (task.status === 'inprogress' && task.progressTimestamp) {
+                if (task.status === KANBAN_STATUS.IN_PROGRESS && task.progressTimestamp) {
                     const updateDuration = () => setDuration(formatLiveDuration(task.progressTimestamp));
                     updateDuration();
                     intervalId = setInterval(updateDuration, 1000);
-                } else if (task.status === 'auditing' && task.progressTimestamp && task.workCompletedTimestamp) {
+                } else if (task.status === KANBAN_STATUS.AUDITING && task.progressTimestamp && task.workCompletedTimestamp) {
                     setDuration(formatFixedDuration(task.progressTimestamp.seconds, task.workCompletedTimestamp.seconds));
                 } else {
                     setDuration(null);
                 }
                 return () => clearInterval(intervalId);
             }, [task.status, task.progressTimestamp, task.workCompletedTimestamp]);
-
             return duration;
+        };
+
+        const useAppFilters = (initialFilters = {}) => {
+            const { user, isAdmin, userRole, userName, userShop, userShopIds } = useAuth();
+            const { shops, employees } = useData();
+            const [filters, setFilters] = useState({ shop: '', staff: '', ...initialFilters });
+            const defaultsApplied = useRef(false);
+
+            // Effect to set the default filter state once when data is first loaded.
+            useEffect(() => {
+                if (defaultsApplied.current || !userRole) return;
+                
+                // For roles that need shop data, wait for it to be loaded.
+                if (userRole === ROLES.SHOP_MANAGER && shops.length === 0 && userShopIds.length > 0) {
+                    return;
+                }
+
+                const newDefaults = {};
+                if (userRole === ROLES.STAFF) {
+                    newDefaults.shop = userShop;
+                    newDefaults.staff = userName;
+                } else if (userRole === ROLES.SHOP_MANAGER && userShopIds.length === 1) {
+                    const singleShop = shops.find(s => s.id === userShopIds[0]);
+                    newDefaults.shop = singleShop ? singleShop.name : '';
+                }
+                
+                setFilters(prev => ({...prev, ...newDefaults}));
+                defaultsApplied.current = true;
+                
+            }, [userRole, userName, userShop, userShopIds, shops]);
+
+            // Reset the flag if the user logs in or out.
+            useEffect(() => {
+                defaultsApplied.current = false;
+            }, [user]);
+
+            const handleFilterChange = useCallback((e) => {
+                const { name, value, type, checked } = e.target;
+                const newValue = type === 'checkbox' ? checked : value;
+
+                setFilters(prev => {
+                    const newState = { ...prev, [name]: newValue };
+                    if (name === 'shop') newState.staff = '';
+                    return newState;
+                });
+            }, []);
+
+            const shopOptions = useMemo(() => {
+                if (isAdmin) return [...new Set(shops.map(s => s.name).filter(Boolean))];
+                if (userRole === ROLES.SHOP_MANAGER) return shops.filter(s => userShopIds.includes(s.id)).map(s => s.name);
+                return userShop ? [userShop] : [];
+            }, [isAdmin, shops, userShop, userShopIds, userRole]);
+
+            const staffOptions = useMemo(() => {
+                const activeEmployees = employees.filter(e => e.status === 'Active');
+                
+                // For Staff, the list is just their own name.
+                if (userRole === ROLES.STAFF) {
+                    return userName ? [userName] : [];
+                }
+
+                // Determine the base pool of staff the user can view.
+                // Admin sees everyone; Shop Manager sees staff from all their assigned shops.
+                const viewableStaffPool = (() => {
+                    if (isAdmin) {
+                        return activeEmployees;
+                    }
+                    if (userRole === ROLES.SHOP_MANAGER) {
+                        return activeEmployees.filter(e => e.assignedShops?.some(sid => userShopIds.includes(sid)));
+                    }
+                    return []; // Should not be reached for Admin/Manager
+                })();
+
+                // If a specific shop is selected in the filter, filter the pool down.
+                if (filters.shop) {
+                    const selectedShopId = shops.find(s => s.name === filters.shop)?.id;
+                    if (selectedShopId) {
+                        const staffInSelectedShop = viewableStaffPool.filter(e => e.assignedShops?.includes(selectedShopId));
+                        return [...new Set(staffInSelectedShop.map(e => e.name).filter(Boolean))];
+                    }
+                }
+                
+                // If "All Shops" is selected, return the entire viewable pool.
+                return [...new Set(viewableStaffPool.map(e => e.name).filter(Boolean))];
+            }, [employees, userRole, userShopIds, userName, filters.shop, shops, isAdmin]);
+
+            return { filters, setFilters, handleFilterChange, shopOptions, staffOptions };
         };
 
         // --- Utility Functions ---
@@ -334,13 +412,14 @@
             const m = Math.floor((totalSeconds % 3600) / 60);
             const s = Math.floor(totalSeconds % 60);
             
-            const parts = [];
-            if (d > 0) parts.push(`${d}d`);
-            if (h > 0) parts.push(`${h}h`);
-            if (m > 0) parts.push(`${m}m`);
-            if (s > 0 || parts.length === 0) parts.push(`${s}s`);
+            const parts = [
+                d > 0 && `${d}d`,
+                h > 0 && `${h}h`,
+                m > 0 && `${m}m`,
+                (s > 0 || totalSeconds === 0) && `${s}s`,
+            ].filter(Boolean);
 
-            return parts.slice(0, 2).join(' ');
+            return parts.length > 0 ? parts.slice(0, 2).join(' ') : '0s';
         };
         
         const formatLiveDuration = (startTime) => {
@@ -501,15 +580,15 @@
                 }
 
                 return {
-                    todo: tasks.filter(t => t.status === 'todo').length,
-                    inprogress: tasks.filter(t => t.status === 'inprogress').length,
-                    auditing: tasks.filter(t => t.status === 'auditing').length,
+                    todo: tasks.filter(t => t.status === KANBAN_STATUS.TODO).length,
+                    inprogress: tasks.filter(t => t.status === KANBAN_STATUS.IN_PROGRESS).length,
+                    auditing: tasks.filter(t => t.status === KANBAN_STATUS.AUDITING).length,
                     doneToday: userHistory.filter(h => h.completedTimestamp && new Date(h.completedTimestamp.seconds * 1000).toDateString() === now.toDateString()).length,
                     averageScore
                 };
             }, [tasks, history, user.email]);
 
-            const priorityTasks = useMemo(() => tasks.filter(t => t.status === 'todo').slice(0, 5), [tasks]);
+            const priorityTasks = useMemo(() => tasks.filter(t => t.status === KANBAN_STATUS.TODO).slice(0, 5), [tasks]);
             const recentHistory = useMemo(() => history.slice(0, 5), [history]);
 
             return React.createElement("div", { className: "space-y-8" },
@@ -524,7 +603,7 @@
                     React.createElement(StatCard, { title: "Completed Today", value: stats.doneToday, color: "border-green-500" }),
                     React.createElement(StatCard, { title: "Your Monthly Score", value: stats.averageScore, color: "border-purple-500" })
                 ),
-                userRole === 'Shop Manager' && React.createElement(StaffScoreDashboard, null),
+                userRole === ROLES.SHOP_MANAGER && React.createElement(StaffScoreDashboard, null),
                 React.createElement("div", { className: "grid grid-cols-1 lg:grid-cols-2 gap-8" },
                     React.createElement(DashboardList, { title: "Priority Tasks", items: priorityTasks, emptyMessage: "No tasks in 'To Do'. Great job!", renderItem: task => React.createElement(React.Fragment, null, React.createElement("p", { className: "font-medium text-slate-200" }, task.text), React.createElement("p", { className: "text-xs text-slate-400" }, `${task.shopName || 'N/A'} - ${task.staffName || 'N/A'}`)) }),
                     React.createElement(DashboardList, { title: "Recent Activity", items: recentHistory, emptyMessage: "No recent completed tasks.", renderItem: task => React.createElement(React.Fragment, null, React.createElement("p", { className: "font-medium text-slate-200" }, task.text), React.createElement("p", { className: "text-xs text-slate-400" }, `Completed by ${task.staffName || 'N/A'}`)) })
@@ -627,19 +706,7 @@
             const { employees, shops } = useData();
             const history = useFilteredHistory();
 
-            const [filters, setFilters] = useState({ shop: '', staff: '', dateRange: 'current_month' });
-
-            useEffect(() => {
-                if (userRole === 'Shop Manager' && userShopIds.length > 0 && shops.length > 0) {
-                    const defaultShopName = shops.find(s => s.id === userShopIds[0])?.name;
-                    if (defaultShopName) setFilters(prev => ({ ...prev, shop: defaultShopName }));
-                }
-            }, [userRole, userShopIds, shops]);
-
-            const handleFilterChange = useCallback((e) => {
-                const { name, value } = e.target;
-                setFilters(prev => ({ ...prev, [name]: value }));
-            }, []);
+            const { filters, handleFilterChange, shopOptions, staffOptions } = useAppFilters();
 
             const filteredReportHistory = useMemo(() => {
                 const now = new Date();
@@ -694,42 +761,17 @@
                 return { totalTasks: filteredReportHistory.length, avgScore, avgDuration, leaderboard, chartData };
             }, [filteredReportHistory]);
             
-            const shopOptions = useMemo(() => {
-                if (isAdmin) return [...new Set(shops.map(s => s.name).filter(Boolean))];
-                if (userRole === 'Shop Manager') return shops.filter(s => userShopIds.includes(s.id)).map(s => s.name);
-                return [shops.find(s => userShopIds.includes(s.id))?.name].filter(Boolean);
-            }, [isAdmin, shops, userShopIds, userRole]);
-
-            const staffOptions = useMemo(() => {
-                const activeEmployees = employees.filter(e => e.status === 'Active');
-                if (isAdmin) {
-                    if (filters.shop) {
-                        const selectedShopId = shops.find(s => s.name === filters.shop)?.id;
-                        return activeEmployees.filter(e => e.assignedShops?.includes(selectedShopId)).map(e => e.name);
-                    }
-                    return activeEmployees.map(e => e.name);
-                }
-                if (userRole === 'Shop Manager') {
-                    return activeEmployees.filter(e => e.assignedShops?.some(sid => userShopIds.includes(sid))).map(e => e.name);
-                }
-                return [];
-            }, [isAdmin, employees, userShopIds, filters.shop, shops, userRole]);
-            
             return React.createElement("div", { className: "space-y-8" },
                 React.createElement("div", { className: "pt-8 mt-8 border-t border-slate-700/50" },
                     React.createElement("h1", { className: "text-3xl font-bold text-slate-100" }, "Performance Reports"),
                     React.createElement("p", { className: "text-slate-400 mt-1" }, "Analyze team and individual performance.")
                 ),
                 React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 p-4 bg-slate-800 rounded-lg" },
-                    React.createElement("select", { name: "dateRange", value: filters.dateRange, onChange: handleFilterChange, className: "input" },
+                    React.createElement("select", { name: "dateRange", value: filters.dateRange || 'current_month', onChange: handleFilterChange, className: "input" },
                         React.createElement("option", { value: "current_month" }, "This Month"), React.createElement("option", { value: "last_month" }, "Last Month"), React.createElement("option", { value: "last_3_months" }, "Last 3 Months")
                     ),
-                    React.createElement("select", { name: "shop", value: filters.shop, onChange: handleFilterChange, className: "input", disabled: userRole === 'Staff' },
-                        React.createElement("option", { value: "" }, "All Shops"), shopOptions.map(name => React.createElement("option", { key: name, value: name }, name))
-                    ),
-                    React.createElement("select", { name: "staff", value: filters.staff, onChange: handleFilterChange, className: "input" },
-                        React.createElement("option", { value: "" }, "All Staff"), staffOptions.map(name => React.createElement("option", { key: name, value: name }, name))
-                    )
+                    React.createElement(FilterSelect, { label: "Filter by Shop", name: "shop", value: filters.shop, onChange: handleFilterChange, options: shopOptions.map(s => s.name || s), disabled: userRole === ROLES.STAFF, simple: true }),
+                    React.createElement(FilterSelect, { label: "Filter by Staff", name: "staff", value: filters.staff, onChange: handleFilterChange, options: staffOptions.map(s => s.name), disabled: false, simple: true })
                 ),
                 React.createElement("div", { className: "grid grid-cols-1 sm:grid-cols-3 gap-6" },
                     React.createElement(ReportStatCard, { title: "Total Tasks Completed", value: reportData.totalTasks }),
@@ -766,52 +808,15 @@
         // Board Page
         const BoardPage = React.memo(({ openModal }) => {
             const tasks = useFilteredTasks();
-            const { isAdmin, userRole, userName, userShop, userShopIds } = useAuth();
-            const { shops, employees } = useData();
+            const { isAdmin, userRole, userName } = useAuth();
             const [processingTaskIds, setProcessingTaskIds] = useState(() => new Set());
-            const [filters, setFilters] = useState({ 
-                shop: (userRole !== 'Admin' && userShopIds?.length === 1) ? userShop : '',
-                staff: userRole === 'Staff' ? userName : '',
-                shopManagerOnly: false
-            });
             
-            const handleFilterChange = useCallback((e) => {
-                const { name, value, type, checked } = e.target;
-                setFilters(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
-            }, []);
-            
-            const shopOptions = useMemo(() => {
-                if (isAdmin) return [...new Set(shops.map(s => s.name).filter(Boolean))];
-                if (userRole === 'Shop Manager') return shops.filter(s => userShopIds.includes(s.id)).map(s => s.name);
-                return userShop ? [userShop] : [];
-            }, [isAdmin, shops, userShop, userShopIds, userRole]);
-
-            const staffOptions = useMemo(() => {
-                const activeEmployees = employees.filter(e => e.status === 'Active');
-                
-                if (userRole === 'Staff') {
-                    return userName ? [userName] : [];
-                }
-
-                // Base list of employees for Admin or Shop Manager
-                let availableEmployees = (userRole === 'Shop Manager')
-                    ? activeEmployees.filter(e => e.assignedShops?.some(sid => userShopIds.includes(sid)))
-                    : activeEmployees;
-
-                // If a specific shop is selected in the filter, further refine the list
-                if (filters.shop) {
-                    const selectedShopId = shops.find(s => s.name === filters.shop)?.id;
-                    availableEmployees = availableEmployees.filter(e => selectedShopId && e.assignedShops?.includes(selectedShopId));
-                }
-                
-                return [...new Set(availableEmployees.map(e => e.name).filter(Boolean))];
-
-            }, [employees, userRole, userShopIds, userName, filters.shop, shops]);
+            const { filters, handleFilterChange, shopOptions, staffOptions } = useAppFilters({ shopManagerOnly: false });
 
             const filteredTasks = useMemo(() => tasks.filter(task => {
-                const shopMatch = filters.shop ? task.shopName === filters.shop : true;
-                const staffMatch = filters.staff ? task.staffName === filters.staff : true;
-                const managerOnlyMatch = filters.shopManagerOnly ? task.creatorRole === 'Shop Manager' : true;
+                const shopMatch = !filters.shop || task.shopName === filters.shop;
+                const staffMatch = !filters.staff || task.staffName === filters.staff;
+                const managerOnlyMatch = !filters.shopManagerOnly || task.creatorRole === ROLES.SHOP_MANAGER;
                 return shopMatch && staffMatch && managerOnlyMatch;
             }), [tasks, filters]);
 
@@ -823,34 +828,30 @@
                 try {
                     switch(action) {
                         case 'move':
-                            if (payload.newStatus === 'done') {
-                                if (isAdmin) { // Admins auto-approve
+                            if (payload.newStatus === KANBAN_STATUS.DONE) {
+                                if (isAdmin) { // Admins can auto-approve their own tasks to history
                                     const { id, ...taskData } = task;
                                     await addDoc(collection(db, COLLECTIONS.USERS, task.uid, COLLECTIONS.HISTORY), { ...taskData, status: 'done', completedTimestamp: serverTimestamp() });
                                     await deleteDoc(taskRef);
-                                } else { // Staff send for audit
-                                    await updateDoc(taskRef, { status: 'auditing', workCompletedTimestamp: serverTimestamp() });
+                                } else { // Staff members send tasks to audit
+                                    await updateDoc(taskRef, { status: KANBAN_STATUS.AUDITING, workCompletedTimestamp: serverTimestamp() });
                                 }
                             } else {
                                 const updateData = { status: payload.newStatus };
-                                if (payload.newStatus === 'inprogress' && !task.progressTimestamp) {
+                                if (payload.newStatus === KANBAN_STATUS.IN_PROGRESS && !task.progressTimestamp) {
                                     updateData.progressTimestamp = serverTimestamp();
                                 }
-                                if (payload.comment) {
-                                    updateData.auditComment = payload.comment;
-                                }
+                                if (payload.comment) updateData.auditComment = payload.comment;
                                 await updateDoc(taskRef, updateData);
                             }
                             break;
                         case 'approve':
                             const { id, ...taskData } = task;
                             const dataForHistory = {
-                                ...taskData, status: 'done', completedTimestamp: serverTimestamp(),
+                                ...taskData, status: KANBAN_STATUS.DONE, completedTimestamp: serverTimestamp(),
                                 auditorName: userName, auditorRole: userRole, auditScore: payload.score,
                             };
-                            if (payload.comment) {
-                                dataForHistory.auditComment = payload.comment;
-                            }
+                            if (payload.comment) dataForHistory.auditComment = payload.comment;
                             await addDoc(collection(db, COLLECTIONS.USERS, task.uid, COLLECTIONS.HISTORY), dataForHistory);
                             await deleteDoc(taskRef);
                             if (window.confetti) confetti({ particleCount: 150, spread: 90, origin: { x: 0.5, y: 0.5 } });
@@ -874,8 +875,8 @@
                 React.createElement("div", null,
                     React.createElement("h1", { className: "text-3xl font-bold text-slate-100 mb-2" }, "Task Manager"),
                     React.createElement("div", { className: "flex flex-col sm:flex-row gap-4 mb-6 p-4 bg-slate-800 rounded-lg items-center" },
-                        React.createElement(FilterSelect, { label: "Filter by Shop", name: "shop", value: filters.shop, onChange: handleFilterChange, options: shopOptions, disabled: userRole === 'Staff' }),
-                        React.createElement(FilterSelect, { label: "Filter by Staff", name: "staff", value: filters.staff, onChange: handleFilterChange, options: staffOptions, disabled: userRole === 'Staff' }),
+                        React.createElement(FilterSelect, { label: "Filter by Shop", name: "shop", value: filters.shop, onChange: handleFilterChange, options: shopOptions, disabled: userRole === ROLES.STAFF }),
+                        React.createElement(FilterSelect, { label: "Filter by Staff", name: "staff", value: filters.staff, onChange: handleFilterChange, options: staffOptions, disabled: userRole === ROLES.STAFF }),
                         isAdmin && React.createElement("div", { className: "flex items-center pt-6" },
                             React.createElement("input", { id: "shopManagerOnly", name: "shopManagerOnly", type: "checkbox", checked: filters.shopManagerOnly, onChange: handleFilterChange, className: "h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 bg-slate-600" }),
                             React.createElement("label", { htmlFor: "shopManagerOnly", className: "ml-2 text-sm text-slate-200 whitespace-nowrap" }, "Shop Managers Only")
@@ -887,21 +888,25 @@
             );
         });
 
-        const FilterSelect = React.memo(({ label, name, value, onChange, options, disabled }) => (
-            React.createElement("div", { className: "flex-1 w-full" },
-                React.createElement("label", { htmlFor: `${name}-filter`, className: "block text-sm font-medium text-slate-400 mb-1" }, label),
-                React.createElement("select", { id: `${name}-filter`, name, value, onChange, className: "input w-full", disabled }, 
+        const FilterSelect = React.memo(({ label, name, value, onChange, options, disabled, simple = false }) => {
+            const wrapperClass = simple ? "" : "flex-1 w-full";
+            const selectClass = simple ? "input text-sm" : "input w-full";
+            const labelEl = simple ? null : React.createElement("label", { htmlFor: `${name}-filter`, className: "block text-sm font-medium text-slate-400 mb-1" }, label);
+
+            return React.createElement("div", { className: wrapperClass },
+                labelEl,
+                React.createElement("select", { id: `${name}-filter`, name, value, onChange, className: selectClass, disabled }, 
                     React.createElement("option", { value: "" }, `All ${name.charAt(0).toUpperCase() + name.slice(1)}s`),
                     options.map(opt => React.createElement("option", { key: opt, value: opt }, opt))
                 )
-            )
-        ));
+            );
+        });
 
         const KanbanBoard = React.memo(({ tasks, onTaskAction, onEdit, processingTaskIds }) => {
             const columns = useMemo(() => [
-                { id: 'todo', title: 'To Do', color: 'red-400', tasks: tasks.filter(t => t.status === 'todo') },
-                { id: 'inprogress', title: 'In Progress', color: 'yellow-400', tasks: tasks.filter(t => t.status === 'inprogress') },
-                { id: 'auditing', title: 'Task Auditing', color: 'blue-400', tasks: tasks.filter(t => t.status === 'auditing') },
+                { id: KANBAN_STATUS.TODO, title: 'To Do', color: 'red-400', tasks: tasks.filter(t => t.status === KANBAN_STATUS.TODO) },
+                { id: KANBAN_STATUS.IN_PROGRESS, title: 'In Progress', color: 'yellow-400', tasks: tasks.filter(t => t.status === KANBAN_STATUS.IN_PROGRESS) },
+                { id: KANBAN_STATUS.AUDITING, title: 'Task Auditing', color: 'blue-400', tasks: tasks.filter(t => t.status === KANBAN_STATUS.AUDITING) },
             ], [tasks]);
             return React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" },
                 columns.map(col => React.createElement(KanbanColumn, { key: col.id, ...col, onTaskAction, onEdit, processingTaskIds }))
@@ -923,29 +928,15 @@
         ));
 
         const TaskCard = React.memo(({ task, onEdit, onTaskAction, processingTaskIds }) => {
-            const { isAdmin, userRole, userShopIds } = useAuth();
-            const isProcessing = processingTaskIds.has(task.id);
             const duration = useTaskDuration(task);
-            const [selectedScore, setSelectedScore] = useState('');
-            const [returnComment, setReturnComment] = useState('');
-
-            const canApprove = useMemo(() => 
-                (isAdmin && task.creatorRole === 'Shop Manager') || 
-                (userRole === 'Shop Manager' && task.creatorRole === 'Staff' && userShopIds.includes(task.shopId)),
-                [isAdmin, userRole, userShopIds, task.creatorRole, task.shopId]
-            );
-
-            const canReturn = useMemo(() => 
-                isAdmin || (userRole === 'Shop Manager' && userShopIds.includes(task.shopId)),
-                [isAdmin, userRole, userShopIds, task.shopId]
-            );
-
+            
             const getMoveButtons = () => {
+                const isProcessing = processingTaskIds.has(task.id);
                 switch (task.status) {
-                    case 'todo': return React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: 'inprogress' }), className: "px-3 py-1 text-xs bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700" }, "In Progress");
-                    case 'inprogress': return React.createElement(React.Fragment, null,
-                        React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: 'todo' }), className: "px-3 py-1 text-xs bg-slate-600 text-slate-200 font-semibold rounded-lg hover:bg-slate-500" }, "To Do"),
-                        React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: 'done' }), className: `px-3 py-1 text-xs bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 ${isProcessing && 'opacity-50'}`, disabled: isProcessing }, isProcessing ? 'Completing...' : 'Complete')
+                    case KANBAN_STATUS.TODO: return React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: KANBAN_STATUS.IN_PROGRESS }), className: "px-3 py-1 text-xs bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700" }, "In Progress");
+                    case KANBAN_STATUS.IN_PROGRESS: return React.createElement(React.Fragment, null,
+                        React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: KANBAN_STATUS.TODO }), className: "px-3 py-1 text-xs bg-slate-600 text-slate-200 font-semibold rounded-lg hover:bg-slate-500" }, "To Do"),
+                        React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: KANBAN_STATUS.DONE }), className: `px-3 py-1 text-xs bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 ${isProcessing && 'opacity-50'}`, disabled: isProcessing }, isProcessing ? 'Completing...' : 'Complete')
                     );
                     default: return null;
                 }
@@ -959,35 +950,53 @@
                 React.createElement("div", { className: "mt-3 pt-3 border-t border-slate-600 text-xs text-slate-400 space-y-1.5" },
                     task.auditComment && React.createElement(InfoRow, { icon: '💬', label: 'Comment', value: React.createElement("span", { className: "text-yellow-400 font-semibold italic" }, task.auditComment) }),
                     task.taskTimestamp && React.createElement(InfoRow, { icon: '📅', label: 'Date', value: formatFullDateTime(task.taskTimestamp) }),
-                    duration && React.createElement(InfoRow, { icon: '⏱️', label: task.status === 'auditing' ? 'Time Taken' : 'Duration', value: duration }),
-                    task.status === 'auditing' && React.createElement(InfoRow, { icon: '✅', label: 'Completed', value: formatFullDateTime(task.workCompletedTimestamp) }),
+                    duration && React.createElement(InfoRow, { icon: '⏱️', label: task.status === KANBAN_STATUS.AUDITING ? 'Time Taken' : 'Duration', value: duration }),
+                    task.status === KANBAN_STATUS.AUDITING && React.createElement(InfoRow, { icon: '✅', label: 'Completed', value: formatFullDateTime(task.workCompletedTimestamp) }),
                     task.creatorName && task.creatorName !== task.staffName && React.createElement(InfoRow, { icon: '🧑', label: 'Assigned by', value: React.createElement("span", { className: "text-red-500 font-semibold" }, task.creatorName) }),
                     task.staffName && React.createElement(InfoRow, { icon: '👤', label: 'Staff', value: task.staffName }),
                     task.shopName && React.createElement(InfoRow, { icon: '🏢', label: 'Shop', value: task.shopName })
                 ),
                 React.createElement("div", { className: "mt-3 pt-3 border-t border-slate-600" },
-                    (task.status === 'auditing' && canReturn) ? (
-                        React.createElement("div", { className: "space-y-3" },
-                            React.createElement("textarea", { 
-                                value: returnComment, 
-                                onChange: (e) => setReturnComment(e.target.value), 
-                                className: "input w-full text-sm p-2", 
-                                rows: "2",
-                                placeholder: "Add a comment before returning..." 
-                            }),
-                            canApprove && React.createElement("select", { value: selectedScore, onChange: (e) => setSelectedScore(e.target.value), className: "input w-full text-sm p-2" },
-                                React.createElement("option", {value: ""}, "Select a score..."),
-                                ["30%", "50%", "70%", "90%", "100%"].map(s => React.createElement("option", { key: s, value: s }, s))
-                            ),
-                            React.createElement("div", { className: "flex justify-end items-center gap-2" }, 
-                                React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: 'inprogress', comment: returnComment }), className: `px-4 py-2 text-sm bg-yellow-600 text-white font-semibold rounded-lg hover:bg-yellow-700 ${(!returnComment || isProcessing) && 'opacity-50'}`, disabled: !returnComment || isProcessing }, "Return"),
-                                canApprove && React.createElement("button", { onClick: () => onTaskAction('approve', task, { score: selectedScore, comment: returnComment }), className: `px-4 py-2 text-sm bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 ${(isProcessing || !selectedScore) && 'opacity-50'}`, disabled: isProcessing || !selectedScore }, isProcessing ? 'Approving...' : 'Approve')
-                            )
-                        )
-                    ) : React.createElement("div", { className: "flex justify-end space-x-2" }, getMoveButtons())
+                    task.status === KANBAN_STATUS.AUDITING 
+                    ? React.createElement(TaskAuditControls, { task, onTaskAction, isProcessing: processingTaskIds.has(task.id) }) 
+                    : React.createElement("div", { className: "flex justify-end space-x-2" }, getMoveButtons())
                 )
             );
         });
+
+        const TaskAuditControls = ({ task, onTaskAction, isProcessing }) => {
+            const { isAdmin, userRole, userShopIds } = useAuth();
+            const [selectedScore, setSelectedScore] = useState('');
+            const [returnComment, setReturnComment] = useState('');
+
+            const canApprove = useMemo(() => 
+                isAdmin || (userRole === ROLES.SHOP_MANAGER && task.creatorRole === ROLES.STAFF && userShopIds.includes(task.shopId)),
+                [isAdmin, userRole, userShopIds, task.creatorRole, task.shopId]
+            );
+
+            const canReturn = useMemo(() => 
+                isAdmin || (userRole === ROLES.SHOP_MANAGER && userShopIds.includes(task.shopId)),
+                [isAdmin, userRole, userShopIds, task.shopId]
+            );
+
+            if (!canReturn) return null;
+
+            return React.createElement("div", { className: "space-y-3" },
+                React.createElement("textarea", { 
+                    value: returnComment, onChange: (e) => setReturnComment(e.target.value), 
+                    className: "input w-full text-sm p-2", rows: "2",
+                    placeholder: "Add a comment before returning or approving..." 
+                }),
+                canApprove && React.createElement("select", { value: selectedScore, onChange: (e) => setSelectedScore(e.target.value), className: "input w-full text-sm p-2" },
+                    React.createElement("option", {value: ""}, "Select a score..."),
+                    ["30%", "50%", "70%", "90%", "100%"].map(s => React.createElement("option", { key: s, value: s }, s))
+                ),
+                React.createElement("div", { className: "flex justify-end items-center gap-2" }, 
+                    React.createElement("button", { onClick: () => onTaskAction('move', task, { newStatus: KANBAN_STATUS.IN_PROGRESS, comment: returnComment }), className: `px-4 py-2 text-sm bg-yellow-600 text-white font-semibold rounded-lg hover:bg-yellow-700 ${(!returnComment || isProcessing) && 'opacity-50'}`, disabled: !returnComment || isProcessing }, "Return"),
+                    canApprove && React.createElement("button", { onClick: () => onTaskAction('approve', task, { score: selectedScore, comment: returnComment }), className: `px-4 py-2 text-sm bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 ${(isProcessing || !selectedScore) && 'opacity-50'}`, disabled: isProcessing || !selectedScore }, isProcessing ? 'Approving...' : 'Approve')
+                )
+            );
+        };
         
         const InfoRow = React.memo(({ icon, label, value }) => React.createElement("div", { className: "flex items-center" }, React.createElement("span", { className: "mr-2" }, icon), React.createElement("p", null, React.createElement("span", { className: "font-medium text-slate-300" }, `${label}: `), value)));
         
@@ -1021,51 +1030,20 @@
         });
 
         const HistoryView = React.memo(({ history, onEdit, onDelete, isAdmin, onViewComment }) => {
-            const { userRole, userShop, userName, userShopIds } = useAuth();
-            const { shops, employees } = useData();
+            const { userRole } = useAuth();
             const [currentPage, setCurrentPage] = useState(1);
-            const [filters, setFilters] = useState({
-                shop: (userRole !== 'Admin' && userShopIds?.length === 1) ? userShop : '',
-                staff: userRole === 'Staff' ? userName : '',
+            const { filters, setFilters, handleFilterChange, shopOptions, staffOptions } = useAppFilters({
                 date: new Date().toISOString().slice(0, 7),
                 shopManagerOnly: false
             });
             
             useEffect(() => { setCurrentPage(1); }, [filters]);
 
-            const shopOptions = useMemo(() => {
-                if (isAdmin) return [...new Set(shops.map(s => s.name).filter(Boolean))];
-                if (userRole === 'Shop Manager') return shops.filter(s => userShopIds.includes(s.id)).map(s => s.name);
-                return userShop ? [userShop] : [];
-            }, [isAdmin, shops, userShop, userShopIds, userRole]);
-
-            const staffOptions = useMemo(() => {
-                const activeEmployees = employees.filter(e => e.status === 'Active');
-
-                if (userRole === 'Staff') {
-                    return userName ? [userName] : [];
-                }
-
-                let availableEmployees;
-                if (userRole === 'Shop Manager') {
-                    availableEmployees = activeEmployees.filter(e => e.assignedShops?.some(sid => userShopIds.includes(sid)));
-                } else if (isAdmin) {
-                    availableEmployees = activeEmployees;
-                } else {
-                     return userName ? [userName] : [];
-                }
-                if (filters.shop) {
-                    const selectedShopId = shops.find(s => s.name === filters.shop)?.id;
-                    availableEmployees = availableEmployees.filter(e => selectedShopId && e.assignedShops?.includes(selectedShopId));
-                }
-                return [...new Set(availableEmployees.map(e => e.name).filter(Boolean))];
-            }, [employees, userRole, userShopIds, userName, filters.shop, shops, isAdmin]);
-
             const filteredHistory = useMemo(() => history.filter(task => {
                 const shopMatch = !filters.shop || task.shopName === filters.shop;
                 const staffMatch = !filters.staff || task.staffName === filters.staff;
                 const dateMatch = !filters.date || (task.completedTimestamp && new Date(task.completedTimestamp.seconds * 1000).toISOString().slice(0, 7) === filters.date);
-                const managerOnlyMatch = !filters.shopManagerOnly || task.creatorRole === 'Shop Manager';
+                const managerOnlyMatch = !filters.shopManagerOnly || task.creatorRole === ROLES.SHOP_MANAGER;
                 return shopMatch && staffMatch && dateMatch && managerOnlyMatch;
             }), [history, filters]);
             
@@ -1095,7 +1073,7 @@
             }, [filteredHistory, filters.date]);
 
             return React.createElement("div", { className: "bg-slate-800 p-4 sm:p-6 rounded-lg" },
-                React.createElement(HistoryFilters, { filters, setFilters, shopOptions, staffOptions, isAdmin, userRole }),
+                React.createElement(HistoryFilters, { filters, onFilterChange: handleFilterChange, shopOptions, staffOptions, isAdmin, userRole }),
                 React.createElement("div", {className: "flex justify-end mb-4"}, 
                     React.createElement("button", { onClick: handleExport, className: "bg-green-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-green-700" }, "Export to Excel")
                 ),
@@ -1111,27 +1089,16 @@
             );
         });
 
-        const HistoryFilters = React.memo(({ filters, setFilters, shopOptions, staffOptions, isAdmin, userRole }) => {
-            const handleFilterChange = useCallback((e) => {
-                const { name, value, type, checked } = e.target;
-                setFilters(prev => {
-                    const newState = { ...prev, [name]: type === 'checkbox' ? checked : value };
-                    if (name === 'shop') {
-                        newState.staff = ''; // Reset staff filter when shop changes
-                    }
-                    return newState;
-                });
-            }, [setFilters]);
-            
-            return React.createElement("div", { className: "flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4" },
+        const HistoryFilters = React.memo(({ filters, onFilterChange, shopOptions, staffOptions, isAdmin, userRole }) => (
+            React.createElement("div", { className: "flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4" },
                 React.createElement("div", { className: "w-full sm:w-auto flex flex-col sm:flex-row flex-wrap items-center gap-2 sm:gap-4" },
-                    React.createElement("select", { name: "shop", value: filters.shop, onChange: handleFilterChange, className: "input w-full sm:w-auto text-sm", disabled: userRole === 'Staff' }, React.createElement("option", { value: "" }, "All Shops"), shopOptions.map(name => React.createElement("option", { key: name, value: name }, name))),
-                    React.createElement("select", { name: "staff", value: filters.staff, onChange: handleFilterChange, className: "input w-full sm:w-auto text-sm", disabled: userRole === 'Staff' }, React.createElement("option", { value: "" }, "All Staff"), staffOptions.map(name => React.createElement("option", { key: name, value: name }, name))),
-                    React.createElement("input", { name: "date", type: "month", value: filters.date, onChange: handleFilterChange, className: "input w-full sm:w-auto text-sm" }),
-                    isAdmin && React.createElement("div", {className: "flex items-center"}, React.createElement("input", { id: "historyShopManagerOnly", name: "shopManagerOnly", type: "checkbox", checked: filters.shopManagerOnly, onChange: handleFilterChange, className: "h-4 w-4" }), React.createElement("label", { htmlFor: "historyShopManagerOnly", className: "ml-2 text-sm" }, "Shop Managers Only"))
+                    React.createElement("select", { name: "shop", value: filters.shop, onChange: onFilterChange, className: "input w-full sm:w-auto text-sm", disabled: userRole === ROLES.STAFF }, React.createElement("option", { value: "" }, "All Shops"), shopOptions.map(name => React.createElement("option", { key: name, value: name }, name))),
+                    React.createElement("select", { name: "staff", value: filters.staff, onChange: onFilterChange, className: "input w-full sm:w-auto text-sm", disabled: userRole === ROLES.STAFF }, React.createElement("option", { value: "" }, "All Staff"), staffOptions.map(name => React.createElement("option", { key: name, value: name }, name))),
+                    React.createElement("input", { name: "date", type: "month", value: filters.date, onChange: onFilterChange, className: "input w-full sm:w-auto text-sm" }),
+                    isAdmin && React.createElement("div", {className: "flex items-center"}, React.createElement("input", { id: "historyShopManagerOnly", name: "shopManagerOnly", type: "checkbox", checked: filters.shopManagerOnly, onChange: onFilterChange, className: "h-4 w-4" }), React.createElement("label", { htmlFor: "historyShopManagerOnly", className: "ml-2 text-sm" }, "Shop Managers Only"))
                 )
-            );
-        });
+            )
+        ));
         
         const HistoryTableHeader = React.memo(({ isAdmin }) => (
             React.createElement("thead", { className: "bg-slate-700/50" }, React.createElement("tr", null,
@@ -1268,11 +1235,11 @@
 
             const staffConfig = useMemo(() => {
                 const roleOptions = [
-                    {id: 'Shop Manager', name: 'Shop Manager'},
-                    {id: 'Staff', name: 'Staff'}
+                    {id: ROLES.SHOP_MANAGER, name: ROLES.SHOP_MANAGER},
+                    {id: ROLES.STAFF, name: ROLES.STAFF}
                 ];
                 if (isAdmin) {
-                    roleOptions.push({id: 'admin', name: 'Admin'});
+                    roleOptions.push({id: 'admin', name: ROLES.ADMIN});
                 }
 
                 const fields = [
@@ -1429,43 +1396,35 @@
             const { user, userName, userShop, userRole, userShopIds } = useAuth();
             const { shops, employees } = useData();
             const isEditing = !!itemToEdit;
-            const canAssign = (userRole === 'Admin' || userRole === 'Shop Manager') && !isEditing;
+            const canAssign = (userRole === ROLES.ADMIN || userRole === ROLES.SHOP_MANAGER) && !isEditing;
             const [isAssigningEnabled, setIsAssigningEnabled] = useState(canAssign);
 
             const getInitialState = useCallback(() => {
                 const d = itemToEdit?.taskTimestamp ? new Date(itemToEdit.taskTimestamp.seconds ? itemToEdit.taskTimestamp.seconds * 1000 : itemToEdit.taskTimestamp) : new Date();
                 
                 let initialStaffName = '';
-                if (itemToEdit) {
-                    initialStaffName = itemToEdit.staffName || '';
-                } else if (userRole === 'Staff') {
-                    initialStaffName = userName;
-                } else if (canAssign && !isAssigningEnabled) {
-                    initialStaffName = userName;
-                }
+                if (isEditing) initialStaffName = itemToEdit.staffName || '';
+                else if (userRole === ROLES.STAFF) initialStaffName = userName;
+                else if (canAssign && !isAssigningEnabled) initialStaffName = userName;
 
                 return {
                     text: itemToEdit?.text || '', date: d.toISOString().split('T')[0], time: d.toTimeString().slice(0, 5),
                     staffName: initialStaffName,
-                    shopName: itemToEdit?.shopName || (userRole === 'Staff' ? userShop : ''),
+                    shopName: itemToEdit?.shopName || (userRole === ROLES.STAFF ? userShop : ''),
                 };
-            }, [itemToEdit, userName, userShop, userRole, canAssign, isAssigningEnabled]);
+            }, [itemToEdit, userName, userShop, userRole, canAssign, isAssigningEnabled, isEditing]);
 
             const [taskData, setTaskData] = useState(getInitialState);
 
             useEffect(() => {
                 if (canAssign) {
-                    if (isAssigningEnabled) {
-                        setTaskData(prev => ({ ...prev, staffName: '' }));
-                    } else {
-                        setTaskData(prev => ({ ...prev, staffName: userName }));
-                    }
+                    setTaskData(prev => ({ ...prev, staffName: isAssigningEnabled ? '' : userName }));
                 }
             }, [isAssigningEnabled, canAssign, userName]);
 
             const shopOptions = useMemo(() => {
-                if (userRole === 'Admin') return shops;
-                if (userRole === 'Shop Manager') return shops.filter(s => userShopIds.includes(s.id));
+                if (userRole === ROLES.ADMIN) return shops;
+                if (userRole === ROLES.SHOP_MANAGER) return shops.filter(s => userShopIds.includes(s.id));
                 return [];
             }, [shops, userRole, userShopIds]);
             
@@ -1474,20 +1433,17 @@
                 const selectedShopId = shops.find(s => s.name === taskData.shopName)?.id;
                 if (!selectedShopId) return [];
 
-                return employees.filter(e => 
-                    e.status === 'Active' && 
-                    e.assignedShops?.includes(selectedShopId)
-                );
+                return employees.filter(e => e.status === 'Active' && e.assignedShops?.includes(selectedShopId));
             }, [employees, shops, taskData.shopName, canAssign, isAssigningEnabled]);
 
             const handleChange = useCallback((e) => { 
                 const { name, value } = e.target;
                 setTaskData(prev => {
                     const newState = {...prev, [name]: value};
-                    if (name === 'shopName') newState.staffName = isAssigningEnabled ? '' : userName;
+                    if (name === 'shopName' && canAssign) newState.staffName = isAssigningEnabled ? '' : userName;
                     return newState;
                 });
-            }, [isAssigningEnabled, userName]);
+            }, [isAssigningEnabled, userName, canAssign]);
 
             const handleSubmit = useCallback(async (e) => {
                 e.preventDefault();
@@ -1500,18 +1456,18 @@
                 };
                 
                 try {
-                    if (context === 'history') {
+                    if (context === 'history' && isEditing) {
                         await updateDoc(doc(db, COLLECTIONS.USERS, itemToEdit.uid, COLLECTIONS.HISTORY, itemToEdit.id), dataToSave);
                     } else if (isEditing) {
                         await updateDoc(doc(db, COLLECTIONS.USERS, itemToEdit.uid, COLLECTIONS.TASKS, itemToEdit.id), dataToSave);
-                    } else {
+                    } else { // Adding a new task
                         let assigneeUid = user.uid;
                         let assigneeEmail = user.email;
 
                         if (canAssign && isAssigningEnabled) {
                             const assignee = employees.find(e => e.name === taskData.staffName);
-                            if (!assignee || !assignee.uid) {
-                                console.error("Selected staff has no UID. Cannot assign task.");
+                            if (!assignee?.uid) {
+                                alert("Selected staff has not logged in yet and cannot be assigned tasks.");
                                 return;
                             }
                             assigneeUid = assignee.uid;
@@ -1519,7 +1475,7 @@
                         }
                         
                         await addDoc(collection(db, COLLECTIONS.USERS, assigneeUid, COLLECTIONS.TASKS), { 
-                            ...dataToSave, status: 'todo', createdAt: serverTimestamp(), 
+                            ...dataToSave, status: KANBAN_STATUS.TODO, createdAt: serverTimestamp(), 
                             userEmail: assigneeEmail, creatorRole: userRole, creatorName: userName
                         });
                     }
@@ -1528,7 +1484,7 @@
             }, [taskData, context, itemToEdit, user, userRole, userName, onClose, shops, employees, isEditing, canAssign, isAssigningEnabled]);
 
             const renderShopInput = () => {
-                if ((userRole === 'Admin' || userRole === 'Shop Manager') && !isEditing) {
+                if ((userRole === ROLES.ADMIN || userRole === ROLES.SHOP_MANAGER) && !isEditing) {
                     return React.createElement("select", { name: "shopName", value: taskData.shopName, onChange: handleChange, className: "input", required: true },
                         React.createElement("option", { value: "" }, "Select Shop"),
                         shopOptions.map(s => React.createElement("option", { key: s.id, value: s.name }, s.name))
@@ -1541,11 +1497,7 @@
                 if (canAssign && isAssigningEnabled) {
                     return React.createElement("select", { name: "staffName", value: taskData.staffName, onChange: handleChange, className: "input", required: true, disabled: !taskData.shopName },
                         React.createElement("option", { value: "" }, staffOptions.length > 0 ? "Select Staff" : "No staff in this shop"),
-                        staffOptions.map(e => React.createElement("option", { 
-                            key: e.id, 
-                            value: e.name, 
-                            disabled: !e.uid 
-                        }, `${e.name}${!e.uid ? ' (needs login)' : ''}`))
+                        staffOptions.map(e => React.createElement("option", { key: e.id, value: e.name, disabled: !e.uid }, `${e.name}${!e.uid ? ' (needs login)' : ''}`))
                     );
                 }
                 return React.createElement("input", { value: taskData.staffName, className: "input", disabled: true });
@@ -1553,7 +1505,7 @@
 
             return React.createElement("div", { className: "modal-overlay", onClick: onClose },
                 React.createElement("div", { className: "modal-content", onClick: e => e.stopPropagation() },
-                    React.createElement("h2", { className: "text-2xl font-bold mb-6" }, itemToEdit ? `Edit ${context}` : 'Add New Task'),
+                    React.createElement("h2", { className: "text-2xl font-bold mb-6" }, isEditing ? `Edit ${context}` : 'Add New Task'),
                     React.createElement("form", { onSubmit: handleSubmit, className: "space-y-4" },
                         React.createElement("div", { className: "grid grid-cols-2 gap-4"},
                             React.createElement("div", null, React.createElement("label", { className: "text-sm font-medium" }, "Date"), React.createElement("input", { name: "date", type: "date", value: taskData.date, onChange: handleChange, className: "input", required: true })),
@@ -1563,14 +1515,8 @@
                             React.createElement("input", { type: "checkbox", id: "assign-task-checkbox", checked: isAssigningEnabled, onChange: e => setIsAssigningEnabled(e.target.checked), className: "h-4 w-4 rounded border-slate-500 bg-slate-600 text-blue-500 focus:ring-blue-600" }),
                             React.createElement("label", { htmlFor: "assign-task-checkbox", className: "ml-2 text-sm font-medium" }, "Assign Task to Staff")
                         ),
-                        React.createElement("div", null, 
-                            React.createElement("label", { className: "text-sm font-medium" }, "Shop"), 
-                            renderShopInput()
-                        ),
-                        React.createElement("div", null, 
-                            React.createElement("label", { className: "text-sm font-medium" }, "Staff"), 
-                            renderStaffInput()
-                        ),
+                        React.createElement("div", null, React.createElement("label", { className: "text-sm font-medium" }, "Shop"), renderShopInput()),
+                        React.createElement("div", null, React.createElement("label", { className: "text-sm font-medium" }, "Staff"), renderStaffInput()),
                         React.createElement("textarea", { name: "text", value: taskData.text, onChange: handleChange, className: "input", rows: "3", placeholder: "Task Description...", required: true }),
                         React.createElement("div", { className: "mt-6 flex justify-end space-x-4" },
                             React.createElement("button", { type: "button", onClick: onClose, className: "bg-slate-600 px-4 py-2 rounded-lg" }, "Cancel"),
@@ -1586,7 +1532,6 @@
             const [searchTerm, setSearchTerm] = useState('');
             const [formState, setFormState] = useState({});
             const [isModalOpen, setIsModalOpen] = useState(false);
-            const { shops } = useData();
 
             const openModal = useCallback((item = null) => {
                 setEditingItem(item);
@@ -1607,11 +1552,8 @@
                 setFormState(prev => {
                     if (type === 'checkbox') {
                         const currentValues = prev[name] || [];
-                        if (checked) {
-                            return { ...prev, [name]: [...currentValues, value] };
-                        } else {
-                            return { ...prev, [name]: currentValues.filter(v => v !== value) };
-                        }
+                        if (checked) return { ...prev, [name]: [...currentValues, value] };
+                        return { ...prev, [name]: currentValues.filter(v => v !== value) };
                     }
                     return { ...prev, [name]: value };
                 });
@@ -1630,9 +1572,7 @@
                         await addDoc(collection(db, collectionName), dataToSave);
                     }
                     closeModal();
-                } catch (error) {
-                    console.error(`Error saving ${title}:`, error);
-                }
+                } catch (error) { console.error(`Error saving ${title}:`, error); }
             }, [formState, editingItem, collectionName, title, closeModal]);
 
             const handleDelete = useCallback(async (id) => {
@@ -1712,15 +1652,8 @@
             const [isVisible, setIsVisible] = useState(false);
 
             useEffect(() => {
-                if (memo?.isActive) {
-                    if (memo.targetRole === 'all' || (memo.targetRole === 'shopManager' && userRole === 'Shop Manager')) {
-                        setIsVisible(true);
-                    } else {
-                        setIsVisible(false);
-                    }
-                } else {
-                    setIsVisible(false);
-                }
+                const shouldShow = memo?.isActive && (memo.targetRole === 'all' || (memo.targetRole === 'shopManager' && userRole === ROLES.SHOP_MANAGER));
+                setIsVisible(shouldShow);
             }, [memo, userRole]);
 
             if (!isVisible) return null;
@@ -1750,4 +1683,6 @@
     </script>
 </body>
 </html>
+
+
 
