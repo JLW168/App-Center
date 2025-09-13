@@ -191,59 +191,43 @@
         const DataProvider = ({ children }) => {
             const { user, isAdmin, userRole, userShopIds } = useAuth();
             const [data, setData] = useState({ tasks: [], history: [], shops: [], employees: [], memo: {} });
-            const [employees, setEmployees] = useState([]); // Local state for employees to avoid dependency cycle issues
 
-            // Subscribe to shops and employees first, as they are needed for other queries
+            // Subscribe to shops, employees, and memo (these are small collections)
             useEffect(() => {
                 if (!user) return;
                 const unsubShops = onSnapshot(collection(db, 'shops'), snapshot => {
-                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-                    setData(prev => ({ ...prev, shops: items }));
+                    setData(prev => ({ ...prev, shops: snapshot.docs.map(d => ({ id: d.id, ...d.data() })) }));
                 });
                 const unsubEmployees = onSnapshot(collection(db, 'employees'), snapshot => {
-                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-                    setEmployees(items); // Use local state
-                    setData(prev => ({ ...prev, employees: items }));
+                    setData(prev => ({ ...prev, employees: snapshot.docs.map(d => ({ id: d.id, ...d.data() })) }));
                 });
-                return () => { unsubShops(); unsubEmployees(); };
+                const unsubMemo = onSnapshot(doc(db, COLLECTIONS.SETTINGS, 'memo'), (doc) => {
+                    setData(prev => ({ ...prev, memo: doc.exists() ? doc.data() : { message: '', isActive: false } }));
+                });
+                return () => { unsubShops(); unsubEmployees(); unsubMemo(); };
             }, [user]);
             
-            // Subscribe to tasks and history with dynamic queries
+            // Subscribe to tasks and history with role-based queries
             useEffect(() => {
-                if (!user || (userRole === ROLES.SHOP_MANAGER && !employees.length)) {
-                    // Reset tasks and history if user logs out or manager has no employees data yet
+                if (!user) {
                     setData(prev => ({...prev, tasks: [], history: []}));
                     return;
                 }
 
                 let tasksQuery, historyQuery;
 
-                if (isAdmin) {
-                    tasksQuery = query(collectionGroup(db, 'tasks'));
-                    historyQuery = query(collectionGroup(db, 'history'));
-                } else if (userRole === ROLES.SHOP_MANAGER) {
-                    const managerEmails = employees
-                        .filter(e => e.assignedShops?.some(id => userShopIds.includes(id)))
-                        .map(e => e.email);
-                    managerEmails.push(user.email); // Include manager's own tasks/history
-
-                    if (managerEmails.length > 0) {
-                        // Firestore 'in' query supports up to 30 items.
-                        const emailsToQuery = managerEmails.slice(0, 30);
-                        tasksQuery = query(collectionGroup(db, 'tasks'), where('userEmail', 'in', emailsToQuery));
-                        historyQuery = query(collectionGroup(db, 'history'), where('userEmail', 'in', emailsToQuery));
-                    } else {
-                        // Manager with no staff assigned, just get their own items.
-                        tasksQuery = query(collectionGroup(db, 'tasks'), where('userEmail', '==', user.email));
-                        historyQuery = query(collectionGroup(db, 'history'), where('userEmail', '==', user.email));
-                    }
-                } else { // Staff role
+                // For Staff, query their own subcollection directly (most efficient)
+                if (userRole === ROLES.STAFF) {
                     tasksQuery = query(collection(db, COLLECTIONS.USERS, user.uid, 'tasks'));
                     historyQuery = query(collection(db, COLLECTIONS.USERS, user.uid, 'history'));
+                } 
+                // For Admin and Shop Manager, we can't efficiently query across all user subcollections without an index.
+                // So, we fetch all and filter on the client. This resolves the index error.
+                else { 
+                    tasksQuery = query(collectionGroup(db, 'tasks'));
+                    historyQuery = query(collectionGroup(db, 'history'));
                 }
                 
-                if (!tasksQuery) return; // Queries are not ready
-
                 const unsubTasks = onSnapshot(tasksQuery, (snapshot) => {
                     const items = snapshot.docs.map(d => ({ id: d.id, ...d.data(), uid: d.ref.path.split('/')[1] }));
                     setData(prev => ({ ...prev, tasks: items }));
@@ -255,16 +239,7 @@
                 }, err => console.error(`Error fetching history:`, err));
 
                 return () => { unsubTasks(); unsubHistory(); };
-            }, [user, isAdmin, userRole, userShopIds, employees]); // Re-run when auth changes or employees list is updated
-
-            // Subscription for memo setting
-            useEffect(() => {
-                if (!user) return;
-                const unsubMemo = onSnapshot(doc(db, COLLECTIONS.SETTINGS, 'memo'), (doc) => {
-                    setData(prev => ({ ...prev, memo: doc.exists() ? doc.data() : { message: '', isActive: false } }));
-                });
-                return () => unsubMemo();
-            }, [user]);
+            }, [user, userRole]); // Re-run only when user or role changes.
 
             const value = useMemo(() => data, [data]);
             return React.createElement(DataContext.Provider, { value }, children);
@@ -274,21 +249,43 @@
         const useFilteredData = (dataType) => {
             const data = useData()[dataType] || [];
             const { employees } = useData();
-            const { user } = useAuth();
+            const { user, isAdmin, userRole, userShopIds } = useAuth();
 
             return useMemo(() => {
                 if (!user || !employees.length) return [];
-                // Data from provider is already scoped by role.
-                // This client-side filter just ensures we only show data for 'Active' employees.
+                
                 const activeEmails = new Set(employees.filter(e => e.status === 'Active').map(e => e.email));
-                return data.filter(item => item.userEmail && activeEmails.has(item.userEmail));
-            }, [data, employees, user]);
+                const activeData = data.filter(item => item.userEmail && activeEmails.has(item.userEmail));
+
+                // For Staff, data is already pre-filtered by the query, but we add an extra check.
+                if (userRole === ROLES.STAFF) {
+                    return activeData.filter(item => item.userEmail === user.email);
+                }
+
+                // For Admin, show all active data.
+                if (isAdmin) {
+                    return activeData;
+                }
+                
+                // For Shop Manager, filter by staff in their shops.
+                if (userRole === ROLES.SHOP_MANAGER) {
+                    const managerEmails = new Set(
+                        employees
+                            .filter(e => e.assignedShops?.some(id => userShopIds.includes(id)))
+                            .map(e => e.email)
+                    );
+                    managerEmails.add(user.email); // Include manager's own tasks/history
+                    return activeData.filter(item => managerEmails.has(item.userEmail));
+                }
+
+                return []; // Default to empty array
+            }, [data, employees, user, isAdmin, userRole, userShopIds]);
         };
 
         const useFilteredTasks = () => useFilteredData('tasks');
         const useFilteredHistory = () => {
             const history = useFilteredData('history');
-            return useMemo(() => [...history].sort((a, b) => (b.completedTimestamp?.seconds || 0) - (a.completedTimestamp?.seconds || 0)), [history]);
+            return useMemo(() => [...history].sort((a, b) => (b.progressTimestamp?.seconds || 0) - (a.progressTimestamp?.seconds || 0)), [history]);
         };
         
         const useOnlineStatus = () => {
@@ -484,7 +481,7 @@
                 settings: React.createElement(SettingsPage),
             };
 
-            if (!permissions.length) return React.createElement("div", { className: "text-center p-8" }, React.createElement("h1", { className: "text-2xl font-bold text-yellow-500" }, "Awaiting Permissions..."));
+            if (!permissions.length) return React.createElement("div", { className: "text-center p-8" }, React.createElement("h1", { className: "text-2xl font-bold text-yellow-500" }, "រក្សាស្នាមញញឹម​ រួចបន្តដំណើរទៅមុខទៀត !"));
             if (!page || !permissions.includes(page)) return React.createElement("div", { className: "text-center p-8" }, React.createElement("h1", { className: "text-2xl font-bold text-red-500" }, "Access Denied"));
             
             return pages[page] || null;
@@ -799,12 +796,22 @@
         ));
 
         const KanbanBoard = React.memo(({ tasks, ...props }) => {
-            const sortedTasks = useMemo(() => [...tasks].sort((a,b) => (a.taskTimestamp?.seconds || 0) - (b.taskTimestamp?.seconds || 0)), [tasks]);
-            const columns = useMemo(() => [
-                { id: KANBAN_STATUS.TODO, title: 'To Do', color: 'red-400', tasks: sortedTasks.filter(t => t.status === KANBAN_STATUS.TODO) },
-                { id: KANBAN_STATUS.IN_PROGRESS, title: 'In Progress', color: 'yellow-400', tasks: sortedTasks.filter(t => t.status === KANBAN_STATUS.IN_PROGRESS) },
-                { id: KANBAN_STATUS.AUDITING, title: 'Task Auditing', color: 'blue-400', tasks: sortedTasks.filter(t => t.status === KANBAN_STATUS.AUDITING) },
-            ], [sortedTasks]);
+            const columns = useMemo(() => {
+                const todoTasks = tasks.filter(t => t.status === KANBAN_STATUS.TODO)
+                    .sort((a, b) => (b.taskTimestamp?.seconds || 0) - (a.taskTimestamp?.seconds || 0));
+
+                const inProgressTasks = tasks.filter(t => t.status === KANBAN_STATUS.IN_PROGRESS)
+                    .sort((a, b) => (b.progressTimestamp?.seconds || 0) - (a.progressTimestamp?.seconds || 0));
+
+                const auditingTasks = tasks.filter(t => t.status === KANBAN_STATUS.AUDITING)
+                    .sort((a, b) => (b.workCompletedTimestamp?.seconds || 0) - (a.workCompletedTimestamp?.seconds || 0));
+
+                return [
+                    { id: KANBAN_STATUS.TODO, title: 'To Do', color: 'red-400', tasks: todoTasks },
+                    { id: KANBAN_STATUS.IN_PROGRESS, title: 'In Progress', color: 'yellow-400', tasks: inProgressTasks },
+                    { id: KANBAN_STATUS.AUDITING, title: 'Task Auditing', color: 'blue-400', tasks: auditingTasks },
+                ];
+            }, [tasks]);
             return React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" },
                 columns.map(col => React.createElement(KanbanColumn, { key: col.id, ...col, ...props }))
             );
@@ -1530,5 +1537,3 @@
     </script>
 </body>
 </html>
-
-
