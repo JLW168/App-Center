@@ -70,7 +70,7 @@
         // --- React & Firebase Imports ---
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, setPersistence, browserSessionPersistence, browserLocalPersistence, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, getDocs, addDoc, doc, getDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, where, collectionGroup, enableIndexedDbPersistence, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { initializeFirestore, collection, getDocs, addDoc, doc, getDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, where, collectionGroup, persistentLocalCache, persistentMultipleTabManager, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-analytics.js";
         import React, { useState, useEffect, useRef, createContext, useContext, useMemo, useCallback } from "https://esm.sh/react@18.2.0";
         import ReactDOM from "https://esm.sh/react-dom@18.2.0/client";
@@ -89,12 +89,16 @@
         const app = initializeApp(firebaseConfig);
         const analytics = getAnalytics(app);
         const auth = getAuth(app);
-        const db = getFirestore(app);
-        
-        enableIndexedDbPersistence(db).catch((err) => {
-            if (err.code == 'failed-precondition') console.warn('Firestore persistence failed: Multiple tabs open.');
-            else if (err.code == 'unimplemented') console.warn('Firestore persistence failed: Browser not supported.');
-        });
+        let db;
+        try {
+            db = initializeFirestore(app, {
+                localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+            });
+            console.log("Firestore persistence enabled.");
+        } catch (error) {
+            console.warn("Could not enable Firestore persistence:", error.message);
+            db = initializeFirestore(app, {});
+        }
 
         // --- Constants & Icons ---
         const COLLECTIONS = {
@@ -185,31 +189,81 @@
         };
         
         const DataProvider = ({ children }) => {
-            const { user } = useAuth();
+            const { user, isAdmin, userRole, userShopIds } = useAuth();
             const [data, setData] = useState({ tasks: [], history: [], shops: [], employees: [], memo: {} });
+            const [employees, setEmployees] = useState([]); // Local state for employees to avoid dependency cycle issues
 
-            const useCollectionSubscription = (collectionName, firestoreQuery) => {
-                useEffect(() => {
-                    if (!user) return;
-                    const unsub = onSnapshot(firestoreQuery, (snapshot) => {
-                        const items = snapshot.docs.map(d => ({ id: d.id, ...d.data(), ...((collectionName === 'tasks' || collectionName === 'history') && { uid: d.ref.path.split('/')[1], collection: collectionName }) }));
-                        setData(prev => ({ ...prev, [collectionName]: items }));
-                    }, err => console.error(`Error fetching ${collectionName}:`, err));
-                    return () => unsub();
-                }, [user, collectionName, firestoreQuery]);
-            };
-
-            useCollectionSubscription('tasks', query(collectionGroup(db, 'tasks')));
-            useCollectionSubscription('history', query(collectionGroup(db, 'history')));
-            useCollectionSubscription('shops', collection(db, 'shops'));
-            useCollectionSubscription('employees', collection(db, 'employees'));
-            
+            // Subscribe to shops and employees first, as they are needed for other queries
             useEffect(() => {
                 if (!user) return;
-                const unsub = onSnapshot(doc(db, COLLECTIONS.SETTINGS, 'memo'), (doc) => {
+                const unsubShops = onSnapshot(collection(db, 'shops'), snapshot => {
+                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setData(prev => ({ ...prev, shops: items }));
+                });
+                const unsubEmployees = onSnapshot(collection(db, 'employees'), snapshot => {
+                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setEmployees(items); // Use local state
+                    setData(prev => ({ ...prev, employees: items }));
+                });
+                return () => { unsubShops(); unsubEmployees(); };
+            }, [user]);
+            
+            // Subscribe to tasks and history with dynamic queries
+            useEffect(() => {
+                if (!user || (userRole === ROLES.SHOP_MANAGER && !employees.length)) {
+                    // Reset tasks and history if user logs out or manager has no employees data yet
+                    setData(prev => ({...prev, tasks: [], history: []}));
+                    return;
+                }
+
+                let tasksQuery, historyQuery;
+
+                if (isAdmin) {
+                    tasksQuery = query(collectionGroup(db, 'tasks'));
+                    historyQuery = query(collectionGroup(db, 'history'));
+                } else if (userRole === ROLES.SHOP_MANAGER) {
+                    const managerEmails = employees
+                        .filter(e => e.assignedShops?.some(id => userShopIds.includes(id)))
+                        .map(e => e.email);
+                    managerEmails.push(user.email); // Include manager's own tasks/history
+
+                    if (managerEmails.length > 0) {
+                        // Firestore 'in' query supports up to 30 items.
+                        const emailsToQuery = managerEmails.slice(0, 30);
+                        tasksQuery = query(collectionGroup(db, 'tasks'), where('userEmail', 'in', emailsToQuery));
+                        historyQuery = query(collectionGroup(db, 'history'), where('userEmail', 'in', emailsToQuery));
+                    } else {
+                        // Manager with no staff assigned, just get their own items.
+                        tasksQuery = query(collectionGroup(db, 'tasks'), where('userEmail', '==', user.email));
+                        historyQuery = query(collectionGroup(db, 'history'), where('userEmail', '==', user.email));
+                    }
+                } else { // Staff role
+                    tasksQuery = query(collection(db, COLLECTIONS.USERS, user.uid, 'tasks'));
+                    historyQuery = query(collection(db, COLLECTIONS.USERS, user.uid, 'history'));
+                }
+                
+                if (!tasksQuery) return; // Queries are not ready
+
+                const unsubTasks = onSnapshot(tasksQuery, (snapshot) => {
+                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data(), uid: d.ref.path.split('/')[1] }));
+                    setData(prev => ({ ...prev, tasks: items }));
+                }, err => console.error(`Error fetching tasks:`, err));
+
+                const unsubHistory = onSnapshot(historyQuery, (snapshot) => {
+                    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data(), uid: d.ref.path.split('/')[1] }));
+                    setData(prev => ({ ...prev, history: items }));
+                }, err => console.error(`Error fetching history:`, err));
+
+                return () => { unsubTasks(); unsubHistory(); };
+            }, [user, isAdmin, userRole, userShopIds, employees]); // Re-run when auth changes or employees list is updated
+
+            // Subscription for memo setting
+            useEffect(() => {
+                if (!user) return;
+                const unsubMemo = onSnapshot(doc(db, COLLECTIONS.SETTINGS, 'memo'), (doc) => {
                     setData(prev => ({ ...prev, memo: doc.exists() ? doc.data() : { message: '', isActive: false } }));
                 });
-                return () => unsub();
+                return () => unsubMemo();
             }, [user]);
 
             const value = useMemo(() => data, [data]);
@@ -220,21 +274,15 @@
         const useFilteredData = (dataType) => {
             const data = useData()[dataType] || [];
             const { employees } = useData();
-            const { user, isAdmin, userRole, userShopIds } = useAuth();
+            const { user } = useAuth();
 
             return useMemo(() => {
-                if (!user) return [];
+                if (!user || !employees.length) return [];
+                // Data from provider is already scoped by role.
+                // This client-side filter just ensures we only show data for 'Active' employees.
                 const activeEmails = new Set(employees.filter(e => e.status === 'Active').map(e => e.email));
-                const activeData = data.filter(item => activeEmails.has(item.userEmail));
-
-                if (isAdmin) return activeData;
-                if (userRole === ROLES.SHOP_MANAGER) {
-                    const managerEmails = new Set(employees.filter(e => e.assignedShops?.some(id => userShopIds.includes(id))).map(e => e.email));
-                    managerEmails.add(user.email);
-                    return activeData.filter(item => managerEmails.has(item.userEmail));
-                }
-                return activeData.filter(item => item.userEmail === user.email);
-            }, [data, employees, user, isAdmin, userRole, userShopIds]);
+                return data.filter(item => item.userEmail && activeEmails.has(item.userEmail));
+            }, [data, employees, user]);
         };
 
         const useFilteredTasks = () => useFilteredData('tasks');
@@ -1482,6 +1530,5 @@
     </script>
 </body>
 </html>
-
 
 
