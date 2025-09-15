@@ -986,6 +986,11 @@
             
             const { data: shops } = useCollection('shops');
             const { data: attendance } = useCollection('attendance');
+            const { data: leaveRequests } = useCollection('leaveRequests');
+            const { data: otRequests } = useCollection('otRequests');
+            const { data: staffLoans } = useCollection('staffLoans');
+            const { data: employeeStates } = useCollection('employeeStates');
+            const { data: salaryRevisions } = useCollection('salaryRevisions');
             
             const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
 
@@ -1076,6 +1081,79 @@
 
             const canCheck = distance !== null && userShop && distance <= (parseFloat(userShop.radius) || 500);
 
+            const expectedSalaryCalculations = useMemo(() => {
+                if (!userProfile) return {};
+
+                const currentMonthStr = new Date().toISOString().slice(0, 7);
+
+                // --- Filter all data for the current user and current month ---
+                const userSalaryRevisions = (salaryRevisions || []).filter(rev => rev.staffId === userProfile.id);
+                const userEmployeeStates = (employeeStates || []).filter(es => es.staffId === userProfile.id && es.date.startsWith(currentMonthStr));
+                const userLeaveRequests = (leaveRequests || []).filter(lr => lr.staffId === userProfile.id && lr.leaveDate.startsWith(currentMonthStr));
+                const userOtRequests = (otRequests || []).filter(ot => ot.staffId === userProfile.id && ot.reqDate.startsWith(currentMonthStr));
+                const userActiveLoan = (staffLoans || []).find(loan => loan.staffId === userProfile.id && loan.status === 'Active');
+                const userAttendanceForMonth = (attendance || []).filter(rec => rec.employeeId === userProfile.id && rec.timestamp?.toDate().toISOString().startsWith(currentMonthStr));
+
+                // --- Perform Calculations (Copied & adapted from PayrollCalculatorTab) ---
+                const applicableRevisions = userSalaryRevisions
+                    .filter(rev => rev.effectiveDate && rev.effectiveDate <= `${currentMonthStr}-31`)
+                    .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
+                
+                const baseSalary = applicableRevisions.length > 0
+                    ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
+                    : (parseFloat(String(userProfile.salary).replace(/[^0-9.-]/g, '')) || 0);
+
+                const [year, month] = currentMonthStr.split('-');
+                const daysInMonth = new Date(year, month, 0).getDate();
+                const salaryPerDay = baseSalary / daysInMonth;
+                
+                const engagements = userEmployeeStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+                const lateDeductionsAmount = userEmployeeStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+                const totalLateDays = userEmployeeStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late')).length;
+                const otherDeductions = userEmployeeStates.filter(es => es.statusState === 'Deduction' && !es.note?.includes('CheckIn Late')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+                
+                const loanDeduction = userActiveLoan ? parseFloat(userActiveLoan.agreedMonthlyDeduction) || 0 : 0;
+                
+                const leaveDays = userLeaveRequests.filter(lr => lr.status === 'Approved').reduce((acc, curr) => acc + (parseFloat(curr.numberOfDays) || 0), 0);
+                const otDays = userOtRequests.filter(ot => ot.status === 'Approved').reduce((acc, curr) => acc + (parseFloat(curr.numberOfOTDays) || 0), 0);
+
+                const dailyRecords = {};
+                userAttendanceForMonth.forEach(rec => { 
+                    const dayKey = rec.timestamp.toDate().toISOString().split('T')[0]; 
+                    if (!dailyRecords[dayKey]) dailyRecords[dayKey] = []; 
+                    dailyRecords[dayKey].push({ date: rec.timestamp.toDate(), type: rec.type }); 
+                });
+                
+                let workDays = 0;
+                Object.values(dailyRecords).forEach(dayRecords => {
+                    const checkIns = dayRecords.filter(r => r.type === 'in').sort((a,b) => a.date - b.date);
+                    const checkOuts = dayRecords.filter(r => r.type === 'out').sort((a,b) => b.date - a.date);
+                    if(checkIns.length > 0 && checkOuts.length > 0) {
+                        const diffHours = (checkOuts[0].date.getTime() - checkIns[0].date.getTime()) / 3600000;
+                        if (diffHours >= 4) workDays += 1;
+                        else if (diffHours > 1) workDays += 0.5;
+                    }
+                });
+
+                let givenOffDays = 0;
+                if (workDays >= 28) givenOffDays = 4;
+                else if (workDays >= 21) givenOffDays = 3;
+                else if (workDays >= 14) givenOffDays = 2;
+                else if (workDays >= 7) givenOffDays = 1;
+                
+                const daysToPayFor = (workDays || 0) + (givenOffDays || 0) - (leaveDays || 0);
+                const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
+                
+                const otSalary = salaryPerDay * (otDays || 0);
+                const grossSalarySoFar = baseSalaryEarned + otSalary + engagements;
+                
+                const totalDeductionsSoFar = loanDeduction + lateDeductionsAmount + otherDeductions;
+                
+                const netSalarySoFar = grossSalarySoFar - totalDeductionsSoFar;
+
+                return { netSalarySoFar, grossSalarySoFar, totalDeductionsSoFar, workDays, givenOffDays, otDays, leaveDays, totalLateDays, loanDeduction, engagements };
+            }, [userProfile, salaryRevisions, employeeStates, leaveRequests, otRequests, staffLoans, attendance]);
+
             return (
                 <Card className="max-w-2xl mx-auto"><div className="flex flex-col items-center justify-center p-4 sm:p-8 space-y-8">
                     <div className="text-center">
@@ -1091,7 +1169,62 @@
                             </select>
                         </div>
                     )}
-                    <div className="flex gap-4"><button onClick={handleCheckAction} disabled={lastAction?.type === 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type === 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}>{loading && lastAction?.type !== 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check In'}</button><button onClick={handleCheckAction} disabled={lastAction?.type !== 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type !== 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-slate-600 text-white hover:bg-slate-500'}`}>{loading && lastAction?.type === 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check Out'}</button></div><div className={`p-4 rounded-lg text-center w-full max-w-md ${canCheck ? 'bg-green-900/50 border-green-700' : 'bg-red-900/50 border-red-700'} border`}><p className="font-medium text-lg text-slate-100">{status}</p></div><div className="text-center text-sm text-slate-400"><p>Welcome, <span className="font-bold text-slate-200">{userProfile?.name}</span></p><p>Your selected shop is <span className="font-bold text-slate-200">{selectedShopForCheckIn || 'N/A'}</span></p>{lastAction && (<p className="mt-2">Last action: Checked <span className="font-semibold text-slate-200">{lastAction.type}</span> at <span className="font-semibold text-slate-200">{lastAction.timestamp?.toDate().toLocaleTimeString()}</span></p>)}</div></div></Card>
+                    <div className="flex gap-4"><button onClick={handleCheckAction} disabled={lastAction?.type === 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type === 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}>{loading && lastAction?.type !== 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check In'}</button><button onClick={handleCheckAction} disabled={lastAction?.type !== 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type !== 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-slate-600 text-white hover:bg-slate-500'}`}>{loading && lastAction?.type === 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check Out'}</button></div><div className={`p-4 rounded-lg text-center w-full max-w-md ${canCheck ? 'bg-green-900/50 border-green-700' : 'bg-red-900/50 border-red-700'} border`}><p className="font-medium text-lg text-slate-100">{status}</p></div><div className="text-center text-sm text-slate-400"><p>Welcome, <span className="font-bold text-slate-200">{userProfile?.name}</span></p><p>Your selected shop is <span className="font-bold text-slate-200">{selectedShopForCheckIn || 'N/A'}</span></p>{lastAction && (<p className="mt-2">Last action: Checked <span className="font-semibold text-slate-200">{lastAction.type}</span> at <span className="font-semibold text-slate-200">{lastAction.timestamp?.toDate().toLocaleTimeString()}</span></p>)}</div>
+                    {/* New Salary Preview Section */}
+                    <div className="w-full max-w-md mt-8 p-4 bg-slate-700/50 border border-slate-600 rounded-lg">
+                        <h4 className="text-lg font-semibold text-slate-100 text-center mb-4">Salary Earned So Far (This Month)</h4>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            {/* Earnings Column */}
+                            <div className="space-y-2">
+                                <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">Earnings</h5>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Work Day(s):</span>
+                                    <span className="font-semibold text-slate-200">{expectedSalaryCalculations.workDays || 0}</span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Give Off Day(s):</span>
+                                    <span className="font-semibold text-slate-200">{expectedSalaryCalculations.givenOffDays || 0}</span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">OT Day(s):</span>
+                                    <span className="font-semibold text-slate-200">{expectedSalaryCalculations.otDays || 0}</span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Engagement:</span>
+                                    <span className="font-semibold text-slate-200">{Utils.formatCurrency(expectedSalaryCalculations.engagements)}</span>
+                                </div>
+                                <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm">
+                                    <span className="font-bold text-green-400">Gross Earnings:</span>
+                                    <span className="font-bold text-green-400">{Utils.formatCurrency(expectedSalaryCalculations.grossSalarySoFar)}</span>
+                                </div>
+                            </div>
+                            {/* Deductions Column */}
+                            <div className="space-y-2">
+                                <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">Deductions</h5>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Leave Day(s):</span>
+                                    <span className="font-semibold text-slate-200">{expectedSalaryCalculations.leaveDays || 0}</span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Total Late:</span>
+                                    <span className="font-semibold text-slate-200">{expectedSalaryCalculations.totalLateDays || 0}</span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm">
+                                    <span className="text-slate-400">Loan Deductible:</span>
+                                    <span className="font-semibold text-slate-200">{Utils.formatCurrency(expectedSalaryCalculations.loanDeduction)}</span>
+                                </div>
+                                <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm">
+                                    <span className="font-bold text-red-400">Total Deductions:</span>
+                                    <span className="font-bold text-red-400">{Utils.formatCurrency(expectedSalaryCalculations.totalDeductionsSoFar)}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div className="mt-4 pt-4 border-t border-slate-600 flex justify-between items-center">
+                            <span className="font-bold text-slate-200">Net Salary To Date:</span>
+                            <span className="text-xl font-bold text-blue-400">{Utils.formatCurrency(expectedSalaryCalculations.netSalarySoFar)}</span>
+                        </div>
+                    </div>
+                </div></Card>
             );
         };
 
@@ -2894,7 +3027,10 @@
 
             const employeesInShop = useMemo(() => {
                 if (!selectedShop) return [];
-                return employees.filter(emp => emp.shop === selectedShop && emp.status === 'Active');
+                return employees.filter(emp => {
+                    const employeeShops = Array.isArray(emp.shop) ? emp.shop : [emp.shop];
+                    return employeeShops.includes(selectedShop) && emp.status === 'Active';
+                });
             }, [selectedShop, employees]);
 
             const filteredRecords = useMemo(() => {
@@ -3556,12 +3692,6 @@
     </script>
 </body>
 </html>
-
-
-
-
-
-
 
 
 
