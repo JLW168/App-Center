@@ -397,9 +397,35 @@
 
             return { filters, handleFilterChange, shopOptions, staffOptions };
         };
+        
+        const useComments = (taskId, taskUid, context) => {
+            const [comments, setComments] = useState([]);
+
+            useEffect(() => {
+                if (!taskId || !taskUid) return;
+                
+                const collectionPath = context === 'history'
+                    ? collection(db, COLLECTIONS.USERS, taskUid, COLLECTIONS.HISTORY, taskId, COLLECTIONS.COMMENTS)
+                    : collection(db, COLLECTIONS.ALL_TASKS, taskId, COLLECTIONS.COMMENTS);
+                
+                const q = query(collectionPath, orderBy('createdAt', 'asc'));
+
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    setComments(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+                });
+
+                return () => unsubscribe();
+            }, [taskId, taskUid, context]);
+
+            return comments;
+        };
 
         // --- Utility Functions ---
         const createNotification = async (userId, message) => {
+            if (!userId) {
+                console.warn("Notification creation skipped: No userId provided.");
+                return;
+            }
             try {
                 await addDoc(collection(db, COLLECTIONS.USERS, userId, COLLECTIONS.NOTIFICATIONS), {
                     message,
@@ -1531,7 +1557,6 @@
 
             const getInitialState = useCallback(() => {
                 const d = itemToEdit?.taskTimestamp ? new Date(itemToEdit.taskTimestamp.seconds ? itemToEdit.taskTimestamp.seconds * 1000 : itemToEdit.taskTimestamp) : new Date();
-                
                 let initialStaffName = '';
                 if (isEditing) initialStaffName = itemToEdit.staffName || '';
                 else if (userRole === ROLES.STAFF) initialStaffName = userName;
@@ -1546,6 +1571,8 @@
             }, [itemToEdit, userName, userShopIds, userRole, canAssign, isAssigningEnabled, isEditing, shops]);
 
             const [taskData, setTaskData] = useState(getInitialState);
+            const comments = useComments(itemToEdit?.id, itemToEdit?.uid, context);
+            const [newComment, setNewComment] = useState("");
 
             useEffect(() => {
                 if (canAssign) {
@@ -1563,7 +1590,6 @@
                 if (!canAssign || !isAssigningEnabled || !taskData.shopName) return [];
                 const selectedShopId = shops.find(s => s.name === taskData.shopName)?.id;
                 if (!selectedShopId) return [];
-
                 return employees.filter(e => e.status === 'Active' && e.assignedShops?.includes(selectedShopId));
             }, [employees, shops, taskData.shopName, canAssign, isAssigningEnabled]);
             
@@ -1591,6 +1617,40 @@
                     });
                 }
             }, [isAssigningEnabled, userName, canAssign, taskTemplates, shops]);
+            
+            const handleCommentSubmit = useCallback(async (e) => {
+                e.preventDefault();
+                if (!newComment.trim() || !itemToEdit) return;
+                
+                const commentData = {
+                    text: newComment,
+                    authorName: userName,
+                    authorId: user.uid,
+                    createdAt: serverTimestamp()
+                };
+
+                const batch = writeBatch(db);
+                const mainCollection = context === 'history' ? collection(db, COLLECTIONS.USERS, itemToEdit.uid, COLLECTIONS.HISTORY, itemToEdit.id, COLLECTIONS.COMMENTS) : collection(db, COLLECTIONS.ALL_TASKS, itemToEdit.id, COLLECTIONS.COMMENTS);
+                const userTaskCollection = collection(db, COLLECTIONS.USERS, itemToEdit.uid, COLLECTIONS.TASKS, itemToEdit.id, COLLECTIONS.COMMENTS);
+                
+                batch.set(doc(mainCollection), commentData);
+                if (context !== 'history') {
+                   batch.set(doc(userTaskCollection), commentData);
+                }
+                
+                await batch.commit();
+
+                // Notify other party
+                const isStaff = user.uid === itemToEdit.uid;
+                const creator = employees.find(e => e.name === itemToEdit.creatorName);
+                if (isStaff && creator?.uid) { // Staff commented, notify creator
+                    createNotification(creator.uid, `${userName} commented on task: "${itemToEdit.text.substring(0,20)}..."`);
+                } else if (!isStaff) { // Manager/Admin commented, notify staff
+                    createNotification(itemToEdit.uid, `${userName} commented on task: "${itemToEdit.text.substring(0,20)}..."`);
+                }
+
+                setNewComment("");
+            }, [newComment, itemToEdit, context, userName, user.uid, employees]);
 
             const handleSubmit = useCallback(async (e) => {
                 e.preventDefault();
@@ -1611,6 +1671,7 @@
                         const userTaskRef = doc(db, COLLECTIONS.USERS, itemToEdit.uid, COLLECTIONS.TASKS, itemToEdit.id);
                         const allTasksRef = doc(db, COLLECTIONS.ALL_TASKS, itemToEdit.id);
                         batch.update(userTaskRef, dataToSave);
+                        batch.update(allTasksRef, dataToSave);
                     } else { 
                         let assigneeUid = user.uid;
                         let assigneeEmail = user.email;
@@ -1618,8 +1679,7 @@
                         if (canAssign && isAssigningEnabled) {
                             const assignee = employees.find(e => e.name === taskData.staffName);
                             if (!assignee?.uid) {
-                                alert("Selected staff has not logged in yet and cannot be assigned tasks.");
-                                return;
+                                alert("Selected staff has not logged in yet and cannot be assigned tasks."); return;
                             }
                             assigneeUid = assignee.uid;
                             assigneeEmail = assignee.email;
@@ -1699,7 +1759,37 @@
                             React.createElement("button", { type: "button", onClick: onClose, className: "bg-slate-600 px-4 py-2 rounded-lg" }, "Cancel"),
                             React.createElement("button", { type: "submit", className: "bg-blue-600 text-white px-4 py-2 rounded-lg" }, `Save ${isEditing ? 'Changes' : 'Task'}`)
                         )
-                    )
+                    ),
+                    isEditing && React.createElement(CommunicationLog, { comments, onCommentSubmit: handleCommentSubmit, newComment, setNewComment })
+                )
+            );
+        };
+        
+        const CommunicationLog = ({ comments, onCommentSubmit, newComment, setNewComment }) => {
+            const { user } = useAuth();
+            const messagesEndRef = useRef(null);
+            
+            useEffect(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }, [comments]);
+            
+            return React.createElement("div", { className: "mt-6 pt-4 border-t border-slate-700" },
+                React.createElement("h3", { className: "text-lg font-semibold mb-2" }, "Communication Log"),
+                React.createElement("div", { className: "chat-messages bg-slate-800/50 p-2 rounded-lg h-48 overflow-y-auto flex flex-col gap-2" },
+                    comments.length > 0 ? comments.map(comment => {
+                        const isCurrentUser = comment.authorId === user.uid;
+                        return React.createElement("div", { key: comment.id, className: `flex flex-col ${isCurrentUser ? 'items-end' : 'items-start'}` },
+                            React.createElement("div", { className: `max-w-xs px-3 py-2 rounded-lg ${isCurrentUser ? 'bg-blue-600' : 'bg-slate-600'}` },
+                                React.createElement("p", { className: "text-sm" }, comment.text)
+                            ),
+                            React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, `${comment.authorName} - ${formatFullDateTime(comment.createdAt)}`)
+                        );
+                    }) : React.createElement("p", { className: "text-sm text-slate-400 text-center p-4" }, "No comments yet."),
+                    React.createElement("div", { ref: messagesEndRef })
+                ),
+                React.createElement("form", { onSubmit: onCommentSubmit, className: "mt-2 flex gap-2" },
+                    React.createElement("input", { value: newComment, onChange: (e) => setNewComment(e.target.value), className: "input flex-grow", placeholder: "Type a message..." }),
+                    React.createElement("button", { type: "submit", className: "bg-blue-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-700" }, "Send")
                 )
             );
         };
@@ -1897,6 +1987,3 @@
     </script>
 </body>
 </html>
-
-
-
