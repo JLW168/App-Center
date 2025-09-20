@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Product Search</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    
+    <!-- React & Babel for JSX in Browser -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Firebase SDKs (Compat version for script tags) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+    
+    <!-- Helper Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+
+    <!-- Custom Styles -->
+    <style>
+        body {
+            background-color: #0f172a; /* bg-slate-900 */
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        .loader {
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid #3b82f6; /* blue-500 */
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        @keyframes fade-in-up {
+            from { opacity: 0; transform: translateY(20px) scale(0.95); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .animate-fade-in-up {
+            animation: fade-in-up 0.3s ease-out forwards;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+// --- 1. SETUP & CONFIGURATION ---
+
+// Firebase Initialization
+const firebaseConfig = {
+    apiKey: "AIzaSyAsw_K2LarDunqh9ePnSRuMjXrzd6WZ1EI",
+    authDomain: "posystem-3e373.firebaseapp.com",
+    projectId: "posystem-3e373",
+    storageBucket: "posystem-3e373.appspot.com",
+    messagingSenderId: "783169032599",
+    appId: "1:783169032599:web:d44e8956e790a7f9b3b4d2",
+    measurementId: "G-G6B8H6HSQC"
+};
+const app = firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+// --- Enable Offline Persistence ---
+db.enablePersistence().catch((err) => {
+    if (err.code == 'failed-precondition') {
+        console.warn('Firebase persistence failed: multiple tabs open.');
+    } else if (err.code == 'unimplemented') {
+        console.warn('Firebase persistence is not available in this browser.');
+    }
+});
+
+// React Hooks
+const { useState, useEffect, useCallback, useMemo, useRef, createContext, useContext, memo } = React;
+
+// --- 2. GLOBAL CONTEXTS (State Management) ---
+
+// Online Status Context
+const OnlineStatusContext = createContext(true);
+const OnlineStatusProvider = ({ children }) => {
+    const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+    useEffect(() => {
+        const handleOnline = () => setIsOnline(true);
+        const handleOffline = () => setIsOnline(false);
+
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+
+        return () => {
+            window.removeEventListener('online', handleOnline);
+            window.removeEventListener('offline', handleOffline);
+        };
+    }, []);
+    
+    return (
+        <OnlineStatusContext.Provider value={isOnline}>
+            {children}
+        </OnlineStatusContext.Provider>
+    );
+};
+const useIsOnline = () => useContext(OnlineStatusContext);
+
+// Application Data Context
+const DataContext = createContext(null);
+const DataProvider = ({ children }) => {
+    const { data: products, loading: productsLoading } = useCollection('products');
+    const { data: vendors, loading: vendorsLoading } = useCollection('vendors');
+
+    const isLoading = vendorsLoading || productsLoading;
+
+    // Enhance products with vendorName for easier searching/display
+    const productsWithVendorNames = useMemo(() => {
+        if (productsLoading || vendorsLoading) return [];
+        const vendorMap = new Map(vendors.map(v => [v.id, v.name]));
+        return products.map(p => ({
+            ...p,
+            vendorName: vendorMap.get(p.vendorId) || 'Unknown Vendor'
+        }));
+    }, [products, vendors, productsLoading, vendorsLoading]);
+
+    const value = { products: productsWithVendorNames, vendors, isLoading };
+
+    return (
+        <DataContext.Provider value={value}>
+            {children}
+        </DataContext.Provider>
+    );
+};
+const useData = () => useContext(DataContext);
+
+// --- 3. CUSTOM HOOKS (Reusable Logic) ---
+
+// Manages user authentication state
+const useAuth = () => {
+    const [authState, setAuthState] = useState({ loading: true, userProfile: null });
+
+    useEffect(() => {
+        const unsubscribe = auth.onAuthStateChanged(async (firebaseUser) => {
+            if (firebaseUser) {
+                try {
+                    const querySnapshot = await db.collection("users").where("uid", "==", firebaseUser.uid).get();
+                    if (!querySnapshot.empty) {
+                        const userDoc = querySnapshot.docs[0];
+                        setAuthState({ loading: false, userProfile: { id: userDoc.id, ...userDoc.data() } });
+                    } else {
+                        await auth.signOut(); // User exists in Auth but not in 'users' collection
+                    }
+                } catch (error) {
+                    console.error("Error fetching user profile:", error);
+                    await auth.signOut();
+                }
+            } else {
+                setAuthState({ loading: false, userProfile: null });
+            }
+        });
+        return () => unsubscribe();
+    }, []);
+
+    return authState;
+};
+
+// Fetches a Firestore collection with real-time updates
+const useCollection = (collectionName) => {
+    const [data, setData] = useState([]);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        const unsubscribe = db.collection(collectionName).onSnapshot((querySnapshot) => {
+            const items = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setData(items);
+            setLoading(false);
+        }, (error) => {
+            console.error(`Error fetching ${collectionName}:`, error);
+            setLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, [collectionName]);
+
+    return { data, loading };
+};
+
+// Delays updating a value until a certain time has passed
+const useDebounce = (value, delay) => {
+    const [debouncedValue, setDebouncedValue] = useState(value);
+    useEffect(() => {
+        const handler = setTimeout(() => setDebouncedValue(value), delay);
+        return () => clearTimeout(handler);
+    }, [value, delay]);
+    return debouncedValue;
+};
+
+// --- 4. UTILITY FUNCTIONS ---
+
+// Formatter for currency
+const khrFormatter = new Intl.NumberFormat('en-US');
+
+// --- 5. REUSABLE UI COMPONENTS ---
+
+const Card = memo(({ children, className = '' }) => (
+    <div className={`bg-slate-800/50 p-4 md:p-6 rounded-lg shadow-lg border border-slate-700 ${className}`}>
+        {children}
+    </div>
+));
+
+const OnlineStatusIndicator = () => {
+    const isOnline = useIsOnline();
+    return (
+        <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold ${isOnline ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'} border ${isOnline ? 'border-green-500/30' : 'border-red-500/30'}`}>
+            <div className={`w-2 h-2 rounded-full animate-pulse ${isOnline ? 'bg-green-400' : 'bg-red-400'}`}></div>
+            <span>{isOnline ? 'Online' : 'Offline Mode'}</span>
+        </div>
+    );
+};
+
+const TableCard = memo(({ title, children }) => (
+    <Card>
+        <h4 className="text-lg md:text-xl font-semibold text-slate-200 mb-4">{title}</h4>
+        <div className="overflow-x-auto">{children}</div>
+    </Card>
+));
+
+const LoadingScreen = ({ message, iconClass = 'fa-spinner fa-spin' }) => (
+    <div className="flex items-center justify-center h-screen bg-slate-900">
+        <div className="text-center">
+            <i className={`fas ${iconClass} text-5xl text-blue-500 mb-4`}></i>
+            <h3 className="text-3xl font-bold text-slate-200">{message}</h3>
+        </div>
+    </div>
+);
+
+const Modal = ({ children, show, maxWidth = 'max-w-4xl' }) => {
+    if (!show) return null;
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-70 backdrop-blur-sm">
+            <div className={`bg-slate-800 border border-slate-600 rounded-lg shadow-xl w-full ${maxWidth} max-h-[95vh] flex flex-col text-slate-200 animate-fade-in-up`}>
+                {children}
+            </div>
+        </div>
+    );
+};
+
+const ModalHeader = memo(({ title, onClose }) => (
+    <div className="p-5 border-b border-slate-700 flex justify-between items-center">
+        <h3 className="text-lg md:text-xl font-semibold text-slate-100">{title}</h3>
+        <button onClick={onClose} className="text-slate-400 hover:text-slate-100 text-2xl transition-colors">&times;</button>
+    </div>
+));
+
+const ModalBody = memo(({ children }) => (
+    <div className="p-4 md:p-6 flex-grow overflow-auto">{children}</div>
+));
+
+// --- 6. AUTHENTICATION ---
+
+const LoginPage = () => {
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [showPassword, setShowPassword] = useState(false);
+    const [error, setError] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    const handleLogin = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        setError('');
+        try {
+            await auth.signInWithEmailAndPassword(email, password);
+        } catch (err) {
+            setError("Failed to login. Please check your credentials.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+            <div className="w-full max-w-md mx-auto bg-slate-800 rounded-2xl shadow-xl p-8 border border-slate-700">
+                <div className="text-center mb-8">
+                    <i className="fas fa-search text-5xl text-blue-500"></i>
+                    <h1 className="text-3xl font-bold text-slate-100 mt-4">Product Search</h1>
+                    <p className="text-slate-400">Please sign in to continue</p>
+                </div>
+                <form onSubmit={handleLogin} className="space-y-6">
+                    {error && <div className="bg-red-500/20 text-red-300 p-3 rounded-lg text-sm text-center border border-red-500/30">{error}</div>}
+                    <div>
+                        <label htmlFor="login-email" className="block text-sm font-medium text-slate-300">Email Address</label>
+                        <input type="email" id="login-email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full bg-slate-700 text-slate-100 px-4 py-2 mt-1 border border-slate-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required />
+                    </div>
+                    <div>
+                        <label htmlFor="login-password" className="block text-sm font-medium text-slate-300">Password</label>
+                        <div className="relative">
+                            <input type={showPassword ? 'text' : 'password'} id="login-password" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full bg-slate-700 text-slate-100 px-4 py-2 mt-1 border border-slate-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 pr-10" required />
+                            <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute inset-y-0 right-0 px-3 flex items-center text-slate-400 hover:text-slate-200">
+                                <i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div>
+                        <button type="submit" disabled={loading} className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-800 focus:ring-blue-500 disabled:bg-blue-800 transition">
+                            {loading ? <div className="loader"></div> : 'Sign In'}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+// --- 7. SEARCH FEATURE COMPONENTS ---
+
+const VendorSearchFilter = ({ vendors, selectedVendor, onVendorSelect }) => {
+    const [vendorSearch, setVendorSearch] = useState('');
+    const [vendorSearchResults, setVendorSearchResults] = useState([]);
+    const searchContainerRef = useRef(null);
+
+    const debouncedVendorSearch = useDebounce(vendorSearch, 300);
+    const vendorFuse = useMemo(() => new Fuse(vendors, { keys: ['name'], threshold: 0.4 }), [vendors]);
+
+    useEffect(() => {
+        if (debouncedVendorSearch && !selectedVendor) {
+            const results = vendorFuse.search(debouncedVendorSearch, { limit: 10 });
+            setVendorSearchResults(results.map(result => result.item));
+        } else {
+            setVendorSearchResults([]);
+        }
+    }, [debouncedVendorSearch, vendorFuse, selectedVendor]);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        const handleClickOutside = (event) => {
+            if (searchContainerRef.current && !searchContainerRef.current.contains(event.target)) {
+                setVendorSearchResults([]);
+            }
+        };
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, []);
+
+    const handleVendorSearchChange = (e) => {
+        setVendorSearch(e.target.value);
+        if (selectedVendor) onVendorSelect(null); // Clear selection when user types again
+    };
+
+    const handleSelectVendor = (vendor) => {
+        onVendorSelect(vendor);
+        setVendorSearch(vendor.name);
+        setVendorSearchResults([]);
+    };
+    
+    return (
+        <div className="relative" ref={searchContainerRef}>
+            <label htmlFor="vendor-search-input" className="block text-sm font-medium text-slate-300 mb-1">Filter by Vendor</label>
+            <input 
+                id="vendor-search-input" type="text"
+                value={vendorSearch} onChange={handleVendorSearchChange}
+                className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md"
+                placeholder="Search and select a vendor..." autoComplete="off"
+            />
+            {vendorSearchResults.length > 0 && (
+                <div className="absolute z-10 w-full bg-slate-800 border border-slate-600 rounded-md mt-1 shadow-lg max-h-60 overflow-y-auto">
+                    {vendorSearchResults.map(v => (
+                        <div key={v.id} onClick={() => handleSelectVendor(v)} className="p-2 cursor-pointer hover:bg-slate-700 text-slate-200">{v.name}</div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
+
+const BarcodeScannerModal = ({ show, onClose, onScanSuccess }) => {
+    const scannerRef = useRef(null);
+    const [errorMessage, setErrorMessage] = useState('');
+
+    useEffect(() => {
+        if (show) {
+            setErrorMessage('');
+            const html5QrCode = new Html5Qrcode("barcode-reader");
+            scannerRef.current = html5QrCode;
+
+            const successCallback = (decodedText, decodedResult) => {
+                onScanSuccess(decodedText);
+            };
+
+            const config = { fps: 10, qrbox: { width: 250, height: 150 } };
+
+            html5QrCode.start({ facingMode: "environment" }, config, successCallback)
+                .catch(err => {
+                    setErrorMessage("Could not start scanner. Please ensure camera permissions are enabled.");
+                    console.error("Scanner start error:", err);
+                });
+
+            return () => {
+                if (scannerRef.current && scannerRef.current.isScanning) {
+                    scannerRef.current.stop().catch(err => {
+                        console.error("Failed to stop scanner on cleanup.", err);
+                    });
+                }
+            };
+        }
+    }, [show, onScanSuccess]);
+
+    if (!show) return null;
+
+    return (
+        <Modal show={show} onClose={onClose} maxWidth="max-w-lg">
+            <ModalHeader title="Scan Barcode" onClose={onClose} />
+            <ModalBody>
+                {errorMessage && <p className="text-red-400 bg-red-500/20 p-3 rounded-md text-center mb-4">{errorMessage}</p>}
+                <div id="barcode-reader" style={{ width: '100%', minHeight: '250px' }}></div>
+            </ModalBody>
+        </Modal>
+    );
+};
+
+
+const ProductSearch = () => {
+    const { products, vendors } = useData();
+    const [productSearch, setProductSearch] = useState('');
+    const [selectedVendor, setSelectedVendor] = useState(null);
+    const [searchResults, setSearchResults] = useState([]);
+    const [isScannerOpen, setIsScannerOpen] = useState(false);
+    
+    const debouncedProductSearch = useDebounce(productSearch, 300);
+    
+    const productFuse = useMemo(() => new Fuse(products, {
+        keys: ['name', 'code', 'barcode'], threshold: 0.4, minMatchCharLength: 2, includeScore: true,
+    }), [products]);
+
+    useEffect(() => {
+        if (!productFuse) return;
+        
+        let finalResults = [];
+        const vendorIdToFilter = selectedVendor?.id;
+
+        if (debouncedProductSearch.length > 0) {
+            const results = productFuse.search(debouncedProductSearch, { limit: 100 }).map(result => result.item);
+            finalResults = vendorIdToFilter ? results.filter(p => p.vendorId === vendorIdToFilter) : results;
+        } else if (vendorIdToFilter) {
+            finalResults = products.filter(p => p.vendorId === vendorIdToFilter);
+        }
+        
+        setSearchResults(finalResults);
+        
+    }, [debouncedProductSearch, selectedVendor, productFuse, products]);
+
+    const tableTitle = useMemo(() => {
+        if (productSearch) return `Results for "${productSearch}"`;
+        if (selectedVendor) return `All Products for ${selectedVendor.name}`;
+        return `Search Results`;
+    }, [productSearch, selectedVendor]);
+
+    const handleScanSuccess = (decodedText) => {
+        setProductSearch(decodedText);
+        setIsScannerOpen(false);
+    };
+
+    return (
+        <div className="space-y-6 mt-6">
+            <BarcodeScannerModal 
+                show={isScannerOpen} 
+                onClose={() => setIsScannerOpen(false)}
+                onScanSuccess={handleScanSuccess}
+            />
+            <Card>
+                <h4 className="text-xl font-semibold text-slate-200 mb-4">Product Search</h4>
+                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+                    <div className="md:col-span-2 relative">
+                        <label htmlFor="product-search-input" className="block text-sm font-medium text-slate-300 mb-1">Search Product (Code, Barcode, Name)</label>
+                        <div className="flex items-center gap-2">
+                            <input 
+                                id="product-search-input" type="text" value={productSearch} 
+                                onChange={(e) => setProductSearch(e.target.value)}
+                                className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" 
+                                autoComplete="off" placeholder="Start typing to search all products..."
+                            />
+                            <button 
+                                type="button"
+                                onClick={() => setIsScannerOpen(true)}
+                                className="flex-shrink-0 bg-blue-600 text-white font-bold p-2 rounded-lg hover:bg-blue-700 transition flex items-center justify-center aspect-square"
+                                title="Scan Barcode"
+                            >
+                                <i className="fas fa-barcode text-xl"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <VendorSearchFilter vendors={vendors} selectedVendor={selectedVendor} onVendorSelect={setSelectedVendor} />
+                </div>
+            </Card>
+
+            <TableCard title={tableTitle}>
+                {searchResults.length === 0 ? (
+                    <p className="p-4 text-slate-400 text-center">
+                        {productSearch || selectedVendor ? 'No products found.' : 'Please start typing or select a vendor to see results.'}
+                    </p>
+                ) : (
+                    <table className="min-w-full divide-y divide-slate-700">
+                        <thead className="bg-slate-900/50">
+                            <tr>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Code</th>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Barcode</th>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Product Name</th>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Vendor</th>
+                                <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Selling Price</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-700">
+                            {searchResults.map((item) => (
+                                <tr key={item.id}>
+                                    <td className="px-2 py-2 text-sm text-slate-300">{item.code}</td>
+                                    <td className="px-2 py-2 text-sm text-slate-300">{item.barcode || 'N/A'}</td>
+                                    <td className="px-2 py-2 text-sm text-slate-300">{item.name}</td>
+                                    <td className="px-2 py-2 text-sm text-slate-400">{item.vendorName || 'N/A'}</td>
+                                    <td className="px-2 py-2 text-sm text-right text-slate-300">៛{khrFormatter.format(item.price || 0)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
+            </TableCard>
+        </div>
+    );
+};
+
+// --- 8. MAIN PAGE COMPONENT ---
+const ProductSearchPage = ({ userProfile }) => (
+    <div className="space-y-6">
+        <header className="bg-slate-800 shadow-md p-4 flex justify-between items-center z-30 border-b border-slate-700 rounded-lg">
+            <div className="flex items-center gap-4">
+                <h2 className="text-xl md:text-2xl font-bold text-slate-100">Product Search</h2>
+                <OnlineStatusIndicator />
+            </div>
+            <div className="flex items-center">
+                <div className="text-right">
+                    <div className="font-semibold text-slate-200">{userProfile.name}</div>
+                    <div className="text-sm text-slate-400">{userProfile.role}</div>
+                </div>
+                <button onClick={() => auth.signOut()} title="Logout" className="ml-4 bg-slate-700 text-slate-300 w-10 h-10 rounded-full hover:bg-slate-600 hover:text-white transition flex items-center justify-center">
+                    <i className="fas fa-sign-out-alt"></i>
+                </button>
+            </div>
+        </header>
+        <ProductSearch />
+    </div>
+);
+
+
+// --- 9. ROOT APP COMPONENT ---
+
+const AuthenticatedApp = ({ userProfile }) => {
+    const { isLoading: dataIsLoading } = useData();
+
+    if (dataIsLoading) {
+        return <LoadingScreen message="Loading Application Data..." iconClass="fa-database" />;
+    }
+    
+    return (
+        <div className="bg-slate-800 min-h-screen text-slate-300">
+            <main className="p-4 sm:p-6">
+                <ProductSearchPage userProfile={userProfile} />
+            </main>
+        </div>
+    );
+};
+
+function App() {
+    const { loading: authLoading, userProfile } = useAuth();
+
+    if (authLoading) {
+        return <LoadingScreen message="Authenticating..." />;
+    }
+
+    if (!userProfile) {
+        return <LoginPage />;
+    }
+
+    return (
+        <OnlineStatusProvider>
+            <DataProvider>
+                <AuthenticatedApp userProfile={userProfile} />
+            </DataProvider>
+        </OnlineStatusProvider>
+    );
+}
+
+// --- 10. RENDER THE APP ---
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
+root.render(<App />);
+
+    </script>
+</body>
+</html>
+
