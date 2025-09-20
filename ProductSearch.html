@@ -115,13 +115,50 @@ const OnlineStatusProvider = ({ children }) => {
 };
 const useIsOnline = () => useContext(OnlineStatusContext);
 
+// Sync Status Context
+const SyncContext = createContext(null);
+const SyncProvider = ({ children }) => {
+    const [lastSyncTime, setLastSyncTime] = useState(() => {
+        const savedTime = localStorage.getItem('lastSyncTime');
+        return savedTime ? new Date(parseInt(savedTime, 10)) : null;
+    });
+    const [isSyncing, setIsSyncing] = useState(false);
+
+    const updateLastSyncTime = useCallback(() => {
+        const now = new Date();
+        setLastSyncTime(now);
+        localStorage.setItem('lastSyncTime', now.getTime().toString());
+    }, []);
+
+    const manualSync = useCallback(() => {
+        setIsSyncing(true);
+        // Simulate a sync process for visual feedback
+        setTimeout(() => setIsSyncing(false), 2000); 
+    }, []);
+
+    const value = { lastSyncTime, isSyncing, updateLastSyncTime, manualSync };
+
+    return <SyncContext.Provider value={value}>{children}</SyncContext.Provider>;
+};
+const useSync = () => useContext(SyncContext);
+
+
 // Application Data Context
 const DataContext = createContext(null);
 const DataProvider = ({ children }) => {
-    const { data: products, loading: productsLoading } = useCollection('products');
-    const { data: vendors, loading: vendorsLoading } = useCollection('vendors');
+    const { updateLastSyncTime } = useSync();
+    const { data: products, loading: productsLoading } = useCollection('products', { onDataReceived: updateLastSyncTime });
+    const { data: vendors, loading: vendorsLoading } = useCollection('vendors', { onDataReceived: updateLastSyncTime });
 
     const isLoading = vendorsLoading || productsLoading;
+
+    // Once data has loaded successfully for the first time, set a flag
+    // so subsequent visits don't show the main loading screen.
+    useEffect(() => {
+        if (!isLoading && (products.length > 0 || vendors.length > 0)) {
+            localStorage.setItem('appDataLoadedOnce', 'true');
+        }
+    }, [isLoading, products, vendors]);
 
     // Enhance products with vendorName for easier searching/display
     const productsWithVendorNames = useMemo(() => {
@@ -152,17 +189,31 @@ const useAuth = () => {
     useEffect(() => {
         const unsubscribe = auth.onAuthStateChanged(async (firebaseUser) => {
             if (firebaseUser) {
-                try {
-                    const querySnapshot = await db.collection("users").where("uid", "==", firebaseUser.uid).get();
-                    if (!querySnapshot.empty) {
-                        const userDoc = querySnapshot.docs[0];
-                        setAuthState({ loading: false, userProfile: { id: userDoc.id, ...userDoc.data() } });
-                    } else {
-                        await auth.signOut(); // User exists in Auth but not in 'users' collection
+                // Handle anonymous guest users
+                if (firebaseUser.isAnonymous) {
+                    setAuthState({
+                        loading: false,
+                        userProfile: {
+                            id: firebaseUser.uid,
+                            name: 'Guest User',
+                            role: 'General',
+                            permissions: [] // No special permissions needed for search app
+                        }
+                    });
+                } else { // Handle registered users
+                    try {
+                        const querySnapshot = await db.collection("users").where("uid", "==", firebaseUser.uid).get();
+                        if (!querySnapshot.empty) {
+                            const userDoc = querySnapshot.docs[0];
+                            setAuthState({ loading: false, userProfile: { id: userDoc.id, ...userDoc.data() } });
+                        } else {
+                            // If user is in Auth but not in 'users' collection, sign out
+                            await auth.signOut();
+                        }
+                    } catch (error) {
+                        console.error("Error fetching user profile:", error);
+                        await auth.signOut();
                     }
-                } catch (error) {
-                    console.error("Error fetching user profile:", error);
-                    await auth.signOut();
                 }
             } else {
                 setAuthState({ loading: false, userProfile: null });
@@ -175,25 +226,30 @@ const useAuth = () => {
 };
 
 // Fetches a Firestore collection with real-time updates
-const useCollection = (collectionName) => {
+const useCollection = (collectionName, options = {}) => {
+    const { onDataReceived } = options;
+    const [loading, setLoading] = useState(!localStorage.getItem('appDataLoadedOnce'));
     const [data, setData] = useState([]);
-    const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         const unsubscribe = db.collection(collectionName).onSnapshot((querySnapshot) => {
             const items = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
             setData(items);
-            setLoading(false);
+            
+            if (loading) setLoading(false);
+            if (onDataReceived) onDataReceived();
+
         }, (error) => {
             console.error(`Error fetching ${collectionName}:`, error);
             setLoading(false);
         });
 
         return () => unsubscribe();
-    }, [collectionName]);
+    }, [collectionName, onDataReceived]);
 
     return { data, loading };
 };
+
 
 // Delays updating a value until a certain time has passed
 const useDebounce = (value, delay) => {
@@ -210,6 +266,29 @@ const useDebounce = (value, delay) => {
 // Formatter for currency
 const khrFormatter = new Intl.NumberFormat('en-US');
 
+// Formats a date object into a relative time string (e.g., "5 minutes ago")
+const formatRelativeTime = (date) => {
+    if (!date) return 'never';
+    const now = new Date();
+    const seconds = Math.round((now - date) / 1000);
+
+    if (seconds < 5) return 'just now';
+    if (seconds < 60) return `${seconds} seconds ago`;
+    
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} minute${minutes > 1 ? 's' : ''} ago`;
+
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
+
+    // For older dates, show the actual time/date
+    if (now.toDateString() === date.toDateString()) {
+        return `today at ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    }
+    return date.toLocaleDateString();
+};
+
+
 // --- 5. REUSABLE UI COMPONENTS ---
 
 const Card = memo(({ children, className = '' }) => (
@@ -222,7 +301,7 @@ const OnlineStatusIndicator = () => {
     const isOnline = useIsOnline();
     return (
         <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold ${isOnline ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'} border ${isOnline ? 'border-green-500/30' : 'border-red-500/30'}`}>
-            <div className={`w-2 h-2 rounded-full animate-pulse ${isOnline ? 'bg-green-400' : 'bg-red-400'}`}></div>
+            <div className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-400' : 'bg-red-400'}`}></div>
             <span>{isOnline ? 'Online' : 'Offline Mode'}</span>
         </div>
     );
@@ -302,6 +381,17 @@ const LoginPage = () => {
         }
     };
 
+    const handleGuestLogin = async () => {
+        setLoading(true);
+        setError('');
+        try {
+            await auth.signInAnonymously();
+        } catch (err) {
+            setError("Could not sign in as a guest. Please try again.");
+            setLoading(false);
+        }
+    };
+
     return (
         <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
             <div className="w-full max-w-md mx-auto bg-slate-800 rounded-2xl shadow-xl p-8 border border-slate-700">
@@ -310,8 +400,8 @@ const LoginPage = () => {
                     <h1 className="text-3xl font-bold text-slate-100 mt-4">Product Search</h1>
                     <p className="text-slate-400">Please sign in to continue</p>
                 </div>
+                {error && <div className="bg-red-500/20 text-red-300 p-3 rounded-lg text-sm text-center border border-red-500/30 mb-6">{error}</div>}
                 <form onSubmit={handleLogin} className="space-y-6">
-                    {error && <div className="bg-red-500/20 text-red-300 p-3 rounded-lg text-sm text-center border border-red-500/30">{error}</div>}
                     <div>
                         <label htmlFor="login-email" className="block text-sm font-medium text-slate-300">Email Address</label>
                         <input type="email" id="login-email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full bg-slate-700 text-slate-100 px-4 py-2 mt-1 border border-slate-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required />
@@ -346,6 +436,15 @@ const LoginPage = () => {
                         </button>
                     </div>
                 </form>
+                <div className="relative my-6">
+                    <div className="absolute inset-0 flex items-center" aria-hidden="true"><div className="w-full border-t border-slate-600" /></div>
+                    <div className="relative flex justify-center text-sm"><span className="px-2 bg-slate-800 text-slate-400">Or</span></div>
+                </div>
+                <div>
+                    <button onClick={handleGuestLogin} disabled={loading} className="w-full flex justify-center py-3 px-4 border border-slate-600 rounded-md shadow-sm text-sm font-medium text-slate-200 bg-slate-700 hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-800 focus:ring-blue-500 disabled:bg-slate-800 transition">
+                       Continue as a General User
+                    </button>
+                </div>
             </div>
         </div>
     );
@@ -573,21 +672,53 @@ const ProductSearch = () => {
 };
 
 // --- 8. MAIN PAGE COMPONENT ---
+const SyncStatus = () => {
+    const { lastSyncTime, isSyncing, manualSync } = useSync();
+    const [relativeTime, setRelativeTime] = useState(() => formatRelativeTime(lastSyncTime));
+
+    useEffect(() => {
+        const timer = setInterval(() => {
+            setRelativeTime(formatRelativeTime(lastSyncTime));
+        }, 30000); // Update every 30 seconds
+        return () => clearInterval(timer);
+    }, [lastSyncTime]);
+    
+    return (
+        <div className="flex items-center gap-4">
+            <div className="text-right">
+                <p className="text-xs text-slate-400">Last updated: {relativeTime}</p>
+            </div>
+            <button 
+                onClick={manualSync} 
+                disabled={isSyncing}
+                className="bg-slate-700 text-slate-300 w-8 h-8 rounded-full hover:bg-slate-600 hover:text-white transition flex items-center justify-center disabled:opacity-50 disabled:cursor-wait"
+                title="Refresh Data"
+            >
+                <i className={`fas fa-sync ${isSyncing ? 'fa-spin' : ''}`}></i>
+            </button>
+        </div>
+    );
+};
+
 const ProductSearchPage = ({ userProfile }) => (
     <div className="space-y-6">
         <header className="bg-slate-800 shadow-md p-4 flex justify-between items-center z-30 border-b border-slate-700 rounded-lg">
             <div className="flex items-center gap-4">
-                <h2 className="text-xl md:text-2xl font-bold text-slate-100">Product Search</h2>
+                <h2 className="text-xl md:text-2xl font-bold text-slate-100 hidden sm:block">Product Search</h2>
                 <OnlineStatusIndicator />
             </div>
-            <div className="flex items-center">
-                <div className="text-right">
-                    <div className="font-semibold text-slate-200">{userProfile.name}</div>
-                    <div className="text-sm text-slate-400">{userProfile.role}</div>
+            <div className="flex items-center gap-4">
+                 <SyncStatus />
+                 <div className="h-8 border-l border-slate-600"></div>
+                 <div className="flex items-center">
+                    <div className="text-right">
+                        <div className="font-semibold text-slate-200">{userProfile.name}</div>
+                        <div className="text-sm text-slate-400">{userProfile.role}</div>
+                    </div>
+                    <button onClick={() => auth.signOut()} title="Logout" className="ml-4 bg-slate-700 text-slate-300 w-10 h-10 rounded-full hover:bg-slate-600 hover:text-white transition flex items-center justify-center">
+                        <i className="fas fa-sign-out-alt"></i>
+                    </button>
                 </div>
-                <button onClick={() => auth.signOut()} title="Logout" className="ml-4 bg-slate-700 text-slate-300 w-10 h-10 rounded-full hover:bg-slate-600 hover:text-white transition flex items-center justify-center">
-                    <i className="fas fa-sign-out-alt"></i>
-                </button>
             </div>
         </header>
         <ProductSearch />
@@ -626,9 +757,11 @@ function App() {
 
     return (
         <OnlineStatusProvider>
-            <DataProvider>
-                <AuthenticatedApp userProfile={userProfile} />
-            </DataProvider>
+            <SyncProvider>
+                <DataProvider>
+                    <AuthenticatedApp userProfile={userProfile} />
+                </DataProvider>
+            </SyncProvider>
         </OnlineStatusProvider>
     );
 }
