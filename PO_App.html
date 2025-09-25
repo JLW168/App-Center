@@ -1757,13 +1757,13 @@ const InventoryPage = ({ setPage, userProfile }) => {
             {activeTab === 'drafts' && <TransferReport title="Draft Transfers" transfers={getTransfersByStatus('draft')} loading={transfersLoading} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} />}
             {activeTab === 'active-transfer' && <TransferReport title="Active Transfers" transfers={getTransfersByStatus('active')} loading={transfersLoading} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} />}
             {activeTab === 'transfer-report' && <TransferReport title="Internal Transfer History" transfers={getTransfersByStatus('done')} loading={transfersLoading} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} />}
-            {activeTab === 'internal-transfer' && <InternalTransfer transferDataToEdit={transferDataToEdit} userProfile={userProfile} setActiveTab={setActiveTab} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} />}
+            {activeTab === 'internal-transfer' && <InternalTransfer transferDataToEdit={transferDataToEdit} userProfile={userProfile} setActiveTab={setActiveTab} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} activeTransfers={getTransfersByStatus('active')} />}
             {viewReqTransfer && <TransferAuditModal transferData={viewReqTransfer} onClose={() => setViewReqTransfer(null)} />}
         </div>
     );
 };
 
-const InternalTransfer = ({ userProfile, setActiveTab, transferDataToEdit, onEdit, onViewReq }) => {
+const InternalTransfer = ({ userProfile, setActiveTab, transferDataToEdit, onEdit, onViewReq, activeTransfers }) => {
     const { shops } = useData();
     const [transferId, setTransferId] = useState('');
     const [fromShopId, setFromShopId] = useState('');
@@ -1787,6 +1787,23 @@ const InternalTransfer = ({ userProfile, setActiveTab, transferDataToEdit, onEdi
 
     const fuse = useProductSearch();
     const debouncedSearchTerm = useDebounce(productSearch, 250);
+
+    const demandedStock = useMemo(() => {
+        if (!activeTransfers || activeTransfers.length === 0 || !fromShopId) {
+            return {};
+        }
+
+        const demand = {};
+        activeTransfers.forEach(transfer => {
+            // Only consider transfers from the currently selected "From" shop
+            if (transfer.fromShopId === fromShopId) {
+                transfer.items.forEach(item => {
+                    demand[item.productId] = (demand[item.productId] || 0) + item.quantity;
+                });
+            }
+        });
+        return demand;
+    }, [activeTransfers, fromShopId]);
 
     const resetForm = useCallback(() => {
         setTransferId(''); setFromShopId(''); setToShopId(''); setTransferNo('');
@@ -1878,13 +1895,34 @@ const InternalTransfer = ({ userProfile, setActiveTab, transferDataToEdit, onEdi
 
     const handleAddItem = (e) => {
         e.preventDefault();
-        if (!selectedProduct) {
-            setModalInfo({ show: true, title: 'Error', message: 'Please select a valid product.', isError: true });
+        if (!selectedProduct || !fromShopId) {
+            setModalInfo({ show: true, title: 'Error', message: 'Please select a product and a "From" shop first.', isError: true });
             return;
         }
+
+        const fromShop = shops.find(s => s.id === fromShopId);
+        const requestedQty = Number(quantity);
+
+        // Only perform stock validation if the 'From' shop is configured to manage stock
+        if (fromShop?.manageStock) {
+            const physicalStock = selectedProduct?.stockByShop?.[fromShopId] || 0;
+            const committedStock = demandedStock[selectedProduct.id] || 0;
+            const availableStock = physicalStock - committedStock;
+
+            if (requestedQty > availableStock) {
+                setModalInfo({ 
+                    show: true, 
+                    title: 'Insufficient Stock', 
+                    message: `Cannot transfer ${requestedQty}. Available: ${availableStock} (On Hand: ${physicalStock}, Committed: ${committedStock})`, 
+                    isError: true 
+                });
+                return;
+            }
+        }
+        
         setItems(prev => [...prev, {
             productId: selectedProduct.id, code: selectedProduct.code, barcode: selectedProduct.barcode || '', name: selectedProduct.name,
-            quantity: Number(quantity), cost: selectedProduct.cost, note,
+            quantity: requestedQty, cost: selectedProduct.cost, note,
         }]);
         setSelectedProduct(null); setProductSearch(''); setQuantity(1); setNote('');
         searchInputRef.current?.focus();
@@ -2324,13 +2362,19 @@ const TransferAuditModal = ({ transferData, onClose }) => {
             const transferRef = db.collection("internalTransfers").doc(transferData.id);
             batch.update(transferRef, { status: 'done', items, totalAmount: newTotalAmount, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
 
-            items.forEach(item => {
-                const productRef = db.collection("products").doc(item.productId);
+            items.forEach((auditedItem, index) => {
+                const productRef = db.collection("products").doc(auditedItem.productId);
+                const originalItem = transferData.items[index];
+                const originalQty = originalItem?.quantity || 0;
+                const receivedQty = auditedItem.quantity || 0;
+                
                 if (fromShop?.manageStock) {
-                    batch.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-item.quantity) });
+                    // Decrement the FROM shop by the ORIGINAL requested quantity
+                    batch.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-originalQty) });
                 }
-                if (toShop?.manageStock) {
-                    batch.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(item.quantity) });
+                if (toShop?.manageStock && receivedQty > 0) {
+                    // Increment the TO shop by the NEW received quantity
+                    batch.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
                 }
             });
             
@@ -3582,6 +3626,9 @@ root.render(<App />);
     </script>
 </body>
 </html>
+
+
+
 
 
 
