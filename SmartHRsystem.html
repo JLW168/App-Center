@@ -263,85 +263,91 @@
             return { data, loading };
         };
         
+        // NEW: Standalone payroll calculation logic
+        const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction) => {
+            if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
+
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions } = allData;
+
+            // --- 1. Filter data for the selected employee and month ---
+            const monthAttendance = (attendance || []).filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(selectedMonth));
+            const monthLeave = (leaveRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.leaveDate.startsWith(selectedMonth));
+            const monthOT = (otRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.reqDate.startsWith(selectedMonth));
+            const monthStates = (employeeStates || []).filter(r => r.staffId === employee.id && r.date.startsWith(selectedMonth));
+            const activeLoan = (staffLoans || []).find(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth));
+
+            // --- 2. Calculate inputs automatically ---
+            const leaveDays = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
+            const otDays = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+            const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : (activeLoan ? parseFloat(activeLoan.agreedMonthlyDeduction) || 0 : 0);
+            const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('Late @')).length;
+
+            const dailyRecords = {};
+            monthAttendance.forEach(rec => { const dayKey = rec.timestamp.toDate().toISOString().split('T')[0]; if (!dailyRecords[dayKey]) dailyRecords[dayKey] = []; dailyRecords[dayKey].push({ date: rec.timestamp.toDate(), type: rec.type }); });
+            
+            let workDays = 0;
+            let noCheckOutCount = 0;
+            const todayStr = new Date().toISOString().split('T')[0];
+
+            Object.entries(dailyRecords).forEach(([dayKey, dayRecs]) => {
+                const ins = dayRecs.filter(r => r.type === 'in').sort((a,b) => a.date - b.date);
+                const outs = dayRecs.filter(r => r.type === 'out').sort((a,b) => b.date - a.date);
+                if (ins.length > 0 && outs.length > 0) {
+                    const diffHours = (outs[0].date.getTime() - ins[0].date.getTime()) / 3600000;
+                    if (diffHours >= 7) workDays += 1;
+                    else if (diffHours >= 4) workDays += 0.5;
+                } else if (ins.length > 0 && dayKey < todayStr) {
+                    noCheckOutCount += 1;
+                }
+            });
+
+            let givenOffDays = 0;
+            if (workDays >= 28) givenOffDays = 4;
+            else if (workDays >= 21) givenOffDays = 3;
+            else if (workDays >= 14) givenOffDays = 2;
+            else if (workDays >= 7) givenOffDays = 1;
+
+            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, loanDeduction, totalLateDays, noCheckOutCount };
+            
+            // --- 3. Perform Final Salary Calculations ---
+            const applicableRevisions = (salaryRevisions || [])
+                .filter(rev => rev.staffId === employee.id && rev.effectiveDate && rev.effectiveDate <= `${selectedMonth}-31`)
+                .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
+            
+            const baseSalary = applicableRevisions.length > 0
+                ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
+                : (parseFloat(String(employee.salary).replace(/[^0-9.-]/g, '')) || 0);
+
+            const [year, month] = selectedMonth.split('-');
+            const daysInMonth = new Date(year, month, 0).getDate();
+            const salaryPerDay = baseSalary / daysInMonth;
+            const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+            
+            const lateDeductionsAmount = monthStates.filter(es => {
+                if (!(es.statusState === 'Deduction' && es.note?.includes('Late @'))) return false;
+                const hasLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && es.date < lr.returnDate);
+                return !hasLeave;
+            }).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+            
+            const otherDeductions = monthStates.filter(es => es.statusState === 'Deduction' && !es.note?.includes('Late @')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+
+            const daysToPayFor = (workDays || 0) + (givenOffDays || 0) - (leaveDays || 0);
+            const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
+            const otSalary = salaryPerDay * (otDays || 0);
+            const grossSalary = baseSalaryEarned + otSalary + engagements;
+            const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions;
+            const netSalary = grossSalary - totalDeductions;
+
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount };
+
+            return { inputs: autoInputs, calculations };
+        };
+        
         // NEW: Centralized Payroll Calculator Hook
         const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction) => {
             return useMemo(() => {
-                if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
-
-                const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions } = allData;
-
-                // --- 1. Filter data for the selected employee and month ---
-                const monthAttendance = (attendance || []).filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(selectedMonth));
-                const monthLeave = (leaveRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.leaveDate.startsWith(selectedMonth));
-                const monthOT = (otRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.reqDate.startsWith(selectedMonth));
-                const monthStates = (employeeStates || []).filter(r => r.staffId === employee.id && r.date.startsWith(selectedMonth));
-                const activeLoan = (staffLoans || []).find(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth));
-
-                // --- 2. Calculate inputs automatically ---
-                const leaveDays = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
-                const otDays = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
-                const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : (activeLoan ? parseFloat(activeLoan.agreedMonthlyDeduction) || 0 : 0);
-                const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('Late @')).length;
-
-                const dailyRecords = {};
-                monthAttendance.forEach(rec => { const dayKey = rec.timestamp.toDate().toISOString().split('T')[0]; if (!dailyRecords[dayKey]) dailyRecords[dayKey] = []; dailyRecords[dayKey].push({ date: rec.timestamp.toDate(), type: rec.type }); });
-                
-                let workDays = 0;
-                let noCheckOutCount = 0;
-                const todayStr = new Date().toISOString().split('T')[0];
-
-                Object.entries(dailyRecords).forEach(([dayKey, dayRecs]) => {
-                    const ins = dayRecs.filter(r => r.type === 'in').sort((a,b) => a.date - b.date);
-                    const outs = dayRecs.filter(r => r.type === 'out').sort((a,b) => b.date - a.date);
-                    if (ins.length > 0 && outs.length > 0) {
-                        const diffHours = (outs[0].date.getTime() - ins[0].date.getTime()) / 3600000;
-                        if (diffHours >= 7) workDays += 1;
-                        else if (diffHours >= 4) workDays += 0.5;
-                    } else if (ins.length > 0 && dayKey < todayStr) {
-                        noCheckOutCount += 1;
-                    }
-                });
-
-                let givenOffDays = 0;
-                if (workDays >= 28) givenOffDays = 4;
-                else if (workDays >= 21) givenOffDays = 3;
-                else if (workDays >= 14) givenOffDays = 2;
-                else if (workDays >= 7) givenOffDays = 1;
-
-                const autoInputs = { workDays, givenOffDays, otDays, leaveDays, loanDeduction, totalLateDays, noCheckOutCount };
-                
-                // --- 3. Perform Final Salary Calculations ---
-                const applicableRevisions = (salaryRevisions || [])
-                    .filter(rev => rev.staffId === employee.id && rev.effectiveDate && rev.effectiveDate <= `${selectedMonth}-31`)
-                    .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
-                
-                const baseSalary = applicableRevisions.length > 0
-                    ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
-                    : (parseFloat(String(employee.salary).replace(/[^0-9.-]/g, '')) || 0);
-
-                const [year, month] = selectedMonth.split('-');
-                const daysInMonth = new Date(year, month, 0).getDate();
-                const salaryPerDay = baseSalary / daysInMonth;
-                const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
-                
-                const lateDeductionsAmount = monthStates.filter(es => {
-                    if (!(es.statusState === 'Deduction' && es.note?.includes('Late @'))) return false;
-                    const hasLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && es.date < lr.returnDate);
-                    return !hasLeave;
-                }).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
-                
-                const otherDeductions = monthStates.filter(es => es.statusState === 'Deduction' && !es.note?.includes('Late @')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
-
-                const daysToPayFor = (workDays || 0) + (givenOffDays || 0) - (leaveDays || 0);
-                const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
-                const otSalary = salaryPerDay * (otDays || 0);
-                const grossSalary = baseSalaryEarned + otSalary + engagements;
-                const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions;
-                const netSalary = grossSalary - totalDeductions;
-
-                const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount };
-
-                return { inputs: autoInputs, calculations };
+                // The complex logic is now in a separate function.
+                return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction);
             }, [employee, selectedMonth, allData, manualLoanDeduction]);
         };
         // --- END REACT & FIREBASE SETUP ---
@@ -1315,6 +1321,9 @@
             const [selectedShopForCheckIn, setSelectedShopForCheckIn] = useState('');
             const [alertModal, setAlertModal] = useState({ isOpen: false, message: '' }); // State for the new alert modal
             
+            // NEW: State for month filter
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+
             // Fetch all data needed for the payroll hook
             const allData = {
                 shops: useCollection('shops').data,
@@ -1409,9 +1418,8 @@
 
             const canCheck = distance !== null && userShop && distance <= (parseFloat(userShop.radius) || 500);
 
-            // Use the new centralized hook
-            const currentMonthStr = new Date().toISOString().slice(0, 7);
-            const { inputs, calculations } = usePayrollCalculator(userProfile, currentMonthStr, allData);
+            // Use the new centralized hook with the selected month
+            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData);
 
             return (
                 <Card className="max-w-2xl mx-auto"><div className="flex flex-col items-center justify-center p-4 sm:p-8 space-y-8">
@@ -1431,7 +1439,10 @@
                     <div className="flex gap-4"><button onClick={handleCheckAction} disabled={lastAction?.type === 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type === 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}>{loading && lastAction?.type !== 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check In'}</button><button onClick={handleCheckAction} disabled={lastAction?.type !== 'in' || !canCheck || loading} className={`px-8 py-3 text-lg font-semibold rounded-lg shadow-md transition-colors transform hover:scale-105 ${lastAction?.type !== 'in' || !canCheck || loading ? 'bg-slate-700 text-slate-500 cursor-not-allowed' : 'bg-slate-600 text-white hover:bg-slate-500'}`}>{loading && lastAction?.type === 'in' ? <i className="fas fa-spinner fa-spin"></i> : 'Check Out'}</button></div><div className={`p-4 rounded-lg text-center w-full max-w-md ${canCheck ? 'bg-green-900/50 border-green-700' : 'bg-red-900/50 border-red-700'} border`}><p className="font-medium text-lg text-slate-100">{status}</p></div><div className="text-center text-sm text-slate-400"><p>Welcome, <span className="font-bold text-slate-200">{userProfile?.name}</span></p><p>Your selected shop is <span className="font-bold text-slate-200">{selectedShopForCheckIn || 'N/A'}</span></p>{lastAction && (<p className="mt-2">Last action: Checked <span className="font-semibold text-slate-200">{lastAction.type}</span> at <span className="font-semibold text-slate-200">{lastAction.timestamp?.toDate().toLocaleTimeString()}</span></p>)}</div>
                     {/* New Salary Preview Section */}
                     <div className="w-full max-w-md mt-8 p-4 bg-slate-700/50 border border-slate-600 rounded-lg">
-                        <h4 className="text-lg font-semibold text-slate-100 text-center mb-4">ប្រាក់ខែរកបាន ខែនេះ</h4>
+                        <div className="flex justify-between items-center mb-4">
+                             <h4 className="text-lg font-semibold text-slate-100">ប្រាក់ខែរកបាន</h4>
+                             <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input !mt-0 w-auto" />
+                        </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             {/* Earnings Column */}
                             <div className="space-y-2">
@@ -1449,6 +1460,7 @@
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">មកយឺតសរុប :</span><span className="font-semibold text-slate-200">{inputs.totalLateDays || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">គ្មាន-CheckOut :</span><span className="font-semibold text-slate-200">{inputs.noCheckOutCount || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">បំណុលរំលួស :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(inputs.loanDeduction)}</span></div>
+                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ការកាត់ផ្សេងៗ :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.otherDeductions)}</span></div>
                                 <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-red-400">ការកាត់ប្រាក់សរុប :</span><span className="font-bold text-red-400">{Utils.formatCurrency(calculations.totalDeductions)}</span></div>
                             </div>
                         </div>
@@ -3389,7 +3401,7 @@
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <h3 className="text-xl font-semibold text-slate-100">Engagements / Deductions</h3>
                         <div className="flex flex-wrap gap-4 items-center">
-                            {(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (
+                            {userProfile?.role === 'Admin' && (
                                 <>
                                     <input
                                         type="file"
@@ -3402,6 +3414,10 @@
                                     <Button variant="secondary" icon="fa-upload" onClick={triggerFileUpload} disabled={isImporting}>
                                         {isImporting ? 'Importing...' : 'Import'}
                                     </Button>
+                                </>
+                            )}
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (
+                                <>
                                     <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
                                     <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add</Button>
                                 </>
@@ -4055,13 +4071,282 @@
             const positionListColumns = [{ header: 'Position', accessor: 'position' }, { header: 'Note', accessor: 'note' }];
 
             return (
-                <TabbedPage tabs={{ shop: 'Shop Properties', position: 'Position Management', memo: 'Memo Alert' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                <TabbedPage tabs={{ shop: 'Shop Properties', position: 'Position Management', memo: 'Memo Alert', triggerSalary: 'Trigger Salary' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop"><SettingsCRUD title="Shop" collectionName="shops" items={shops} formFields={shopFormFields} listColumns={shopListColumns} /></div>
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
                     <div id="memo"><MemoAlertTab /></div>
+                    <div id="triggerSalary"><TriggerSalaryTab /></div>
                 </TabbedPage>
             );
         }
+
+        // NEW: Component for manually triggering payroll for a whole shop
+        const TriggerSalaryTab = () => {
+            const { db, userProfile } = useFirebase();
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [triggerConfirmed, setTriggerConfirmed] = useState(false);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [processLog, setProcessLog] = useState([]);
+            const [processComplete, setProcessComplete] = useState(false);
+
+            // NEW: State for automatic payroll schedules
+            const { data: payrollSchedules, loading: schedulesLoading } = useCollection('payrollSchedules');
+            const [scheduleSettings, setScheduleSettings] = useState({});
+            const [isSavingSchedules, setIsSavingSchedules] = useState(false);
+
+            // Fetch all data needed for calculations in one go, using one-time fetches for efficiency
+            const { data: allShops, loading: shopsLoading } = useStaticCollection('shops');
+            const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
+            const { data: attendance, loading: attendanceLoading } = useStaticCollection('attendance');
+            const { data: leaveRequests, loading: leaveLoading } = useStaticCollection('leaveRequests');
+            const { data: otRequests, loading: otLoading } = useStaticCollection('otRequests');
+            const { data: staffLoans, loading: loansLoading } = useStaticCollection('staffLoans');
+            const { data: employeeStates, loading: statesLoading } = useStaticCollection('employeeStates');
+            const { data: salaryRevisions, loading: revisionsLoading } = useStaticCollection('salaryRevisions');
+
+            // NEW: Populate schedule settings state from Firestore data
+            useEffect(() => {
+                if (payrollSchedules) {
+                    const settingsMap = payrollSchedules.reduce((acc, schedule) => {
+                        // Use shop's main doc ID as the key for consistency
+                        acc[schedule.id] = { triggerDay: schedule.triggerDay || '', isEnabled: schedule.isEnabled || false };
+                        return acc;
+                    }, {});
+                    setScheduleSettings(settingsMap);
+                }
+            }, [payrollSchedules]);
+
+            const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
+
+            const handleTriggerPayroll = async () => {
+                if (!triggerConfirmed || !selectedShop || !selectedMonth || !allDataReady) {
+                    alert("Please select a shop, month, and confirm the action.");
+                    return;
+                }
+
+                setIsProcessing(true);
+                setProcessLog([]);
+                setProcessComplete(false);
+
+                const { writeBatch, collection, doc, serverTimestamp, getDocs, query, where } = window.firebaseSDK;
+
+                const allData = { shops, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
+
+                let employeesToProcess = [];
+                if (selectedShop === 'ALL_SHOPS') {
+                    employeesToProcess = employees.filter(e => e.status === 'Active');
+                } else {
+                    employeesToProcess = employees.filter(e => e.status === 'Active' && (Array.isArray(e.shop) ? e.shop.includes(selectedShop) : e.shop === selectedShop));
+                }
+
+                if (employeesToProcess.length === 0) {
+                    setProcessLog(['No active employees found for the selected shop.']);
+                    setIsProcessing(false);
+                    return;
+                }
+                
+                // Check if payroll for this shop/month already exists to prevent duplicates
+                const payrollCheckQuery = query(collection(db, "payrollHistory"), where("month", "==", selectedMonth), where("shop", "==", selectedShop));
+                const existingPayrollSnap = await getDocs(payrollCheckQuery);
+                if (!existingPayrollSnap.empty) {
+                     setProcessLog(prev => [...prev, `Warning: Payroll for ${selectedShop} for ${selectedMonth} may already exist. Please check history.`]);
+                }
+
+                setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
+
+                let successCount = 0;
+                for (const employee of employeesToProcess) {
+                    await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
+                    setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
+
+                    // Here we call the logic from our hook, but directly.
+                    // This is a simplified version; in a real large-scale app, this would be a backend function.
+                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData);
+                    
+                    if (calculations.netSalary !== undefined) {
+                        const batch = writeBatch(db);
+                        
+                        const shopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
+                        const payrollData = { month: selectedMonth, shop: shopName, employeeId: employee.id, employeeName: employee.name, baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, manualInputs: inputs, calculations: calculations, createdAt: serverTimestamp() };
+                        
+                        const payrollDocRef = doc(collection(db, "payrollHistory"));
+                        batch.set(payrollDocRef, payrollData);
+                        
+                        // Handle loan deduction logic
+                        if (inputs.loanDeduction > 0) {
+                            const activeLoan = staffLoans.find(loan => loan.staffId === employee.id && loan.status === 'Active');
+                            if (activeLoan) {
+                                const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
+                                const newBalance = activeLoan.loanAmount - newTotalPaid;
+                                const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
+                                
+                                const loanDocRef = doc(db, 'staffLoans', activeLoan.id);
+                                batch.update(loanDocRef, { totalPaid: newTotalPaid, status: newStatus });
+                                
+                                const paymentDocRef = doc(collection(db, 'loanPayments'));
+                                batch.set(paymentDocRef, { paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, staffId: employee.id, staffName: employee.name, shop: shopName, loanId: activeLoan.id, amountPaid: inputs.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll trigger" });
+                            }
+                        }
+                        
+                        try {
+                            await batch.commit();
+                            successCount++;
+                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully saved for ${employee.name}.`]);
+                        } catch (error) {
+                             setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
+                        }
+                    } else {
+                         setProcessLog(prev => [...prev.slice(0, -1), `[Skipped] Could not calculate salary for ${employee.name}.`]);
+                    }
+                }
+
+                setProcessLog(prev => [...prev, `\nProcess finished. Successfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`]);
+                setIsProcessing(false);
+                setProcessComplete(true);
+                setTriggerConfirmed(false); // Reset confirmation checkbox
+            };
+
+            // NEW: Filter shops that the current user can manage for the auto-scheduler
+            const managedShops = useMemo(() => {
+                if (!userProfile || !allShops) return [];
+                if (userProfile.role === 'Admin') return allShops;
+                if (userProfile.role === 'Shop Manager') {
+                    const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                    return allShops.filter(s => userShops.includes(s.name));
+                }
+                return [];
+            }, [userProfile, allShops]);
+
+            // NEW: Handler for input changes in the schedule settings form
+            const handleScheduleChange = (shopId, field, value) => {
+                setScheduleSettings(prev => {
+                    const currentShopSettings = prev[shopId] || {};
+                    return {
+                        ...prev,
+                        [shopId]: { ...currentShopSettings, [field]: value }
+                    };
+                });
+            };
+
+            // NEW: Handler to save all schedule settings to Firestore
+            const handleSaveSchedules = async () => {
+                setIsSavingSchedules(true);
+                const { writeBatch, doc, setDoc } = window.firebaseSDK;
+                const batch = writeBatch(db);
+
+                managedShops.forEach(shop => {
+                    const settings = scheduleSettings[shop.id];
+                    if (settings) {
+                        const scheduleRef = doc(db, 'payrollSchedules', shop.id);
+                        const day = parseInt(settings.triggerDay, 10);
+                        batch.set(scheduleRef, {
+                            shopName: shop.name,
+                            triggerDay: (day >= 1 && day <= 31) ? day : null, // Save valid day or null
+                            isEnabled: !!settings.isEnabled
+                        }, { merge: true });
+                    }
+                });
+
+                try {
+                    await batch.commit();
+                    alert('Payroll schedules saved successfully!');
+                } catch (error) {
+                    console.error("Error saving payroll schedules:", error);
+                    alert('Failed to save schedules.');
+                } finally {
+                    setIsSavingSchedules(false);
+                }
+            };
+
+
+            return (
+                <Card>
+                    <CardTitle>Trigger Bulk Salary Calculation</CardTitle>
+                    <div className="max-w-xl mx-auto space-y-6">
+                        <p className="text-slate-400">This tool allows you to generate payroll for all active employees in a selected shop for a specific month. The results will be saved to the Payroll History.</p>
+                        
+                        <div>
+                            <label className="text-sm font-medium text-slate-400">Select Month</label>
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" disabled={isProcessing} />
+                        </div>
+
+                        <div>
+                            <label className="text-sm font-medium text-slate-400">Select Shop</label>
+                            <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select" disabled={isProcessing}>
+                                <option value="">-- Select a Shop --</option>
+                                <option value="ALL_SHOPS">All Shops (Admin Only)</option>
+                                {allShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                            </select>
+                        </div>
+                        
+                        <div className="p-4 border border-yellow-600 bg-yellow-900/20 rounded-lg space-y-3">
+                            <h4 className="font-bold text-yellow-300">Confirmation</h4>
+                            <div className="flex items-start">
+                                <input id="confirm-trigger" type="checkbox" checked={triggerConfirmed} onChange={e => setTriggerConfirmed(e.target.checked)} className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 mt-1" disabled={isProcessing} />
+                                <label htmlFor="confirm-trigger" className="ml-3 text-sm text-slate-300">I understand that this action will generate and save payroll records for all employees in the selected shop and month. This may overwrite existing records if run multiple times.</label>
+                            </div>
+                        </div>
+
+                        <Button 
+                            onClick={handleTriggerPayroll} 
+                            disabled={!triggerConfirmed || isProcessing || !selectedShop || !allDataReady}
+                            variant="danger"
+                            className="w-full py-3 text-base"
+                        >
+                            {isProcessing ? <><i className="fas fa-spinner fa-spin"></i> Processing...</> : <><i className="fas fa-bolt"></i> Trigger Payroll Generation</>}
+                        </Button>
+                        
+                        {(isProcessing || processLog.length > 0) && (
+                            <div className="mt-6">
+                                <h4 className="font-semibold text-slate-200">Processing Log:</h4>
+                                <pre className="mt-2 bg-slate-900/70 p-4 rounded-lg text-sm text-slate-300 h-64 overflow-y-auto font-mono">
+                                    {processLog.join('\n')}
+                                </pre>
+                            </div>
+                        )}
+                        {processComplete && (
+                             <div className="mt-4 p-4 text-center bg-green-900/50 border border-green-700 rounded-lg">
+                                <p className="font-semibold text-green-300">Process Complete!</p>
+                            </div>
+                        )}
+                    </div>
+                    {/* --- NEW: AUTOMATIC PAYROLL SCHEDULE SECTION --- */}
+                    <div className="mt-12 pt-8 border-t border-slate-700">
+                        <CardTitle>Automatic Payroll Schedule</CardTitle>
+                        <div className="max-w-xl mx-auto space-y-6">
+                            <p className="text-slate-400">Set a day of the month to automatically trigger payroll generation. The system will prompt the first Admin or Manager who logs in on or after this day to run the payroll for the current month.</p>
+                            
+                            {schedulesLoading ? (
+                                <p>Loading schedules...</p>
+                            ) : managedShops.length > 0 ? (
+                                <div className="space-y-4">
+                                    {managedShops.map(shop => (
+                                        <div key={shop.id} className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-center p-3 bg-slate-700/50 rounded-lg">
+                                            <label className="font-medium text-slate-200 sm:col-span-1">{shop.name}</label>
+                                            <div className="flex items-center gap-2">
+                                                <label className="text-sm text-slate-400">Day:</label>
+                                                <input type="number" min="1" max="31" placeholder="e.g., 28" value={scheduleSettings[shop.id]?.triggerDay || ''} onChange={e => handleScheduleChange(shop.id, 'triggerDay', e.target.value)} className="input w-24" />
+                                            </div>
+                                            <div className="flex items-center justify-self-start sm:justify-self-end">
+                                                <input id={`enable-${shop.id}`} type="checkbox" checked={!!scheduleSettings[shop.id]?.isEnabled} onChange={e => handleScheduleChange(shop.id, 'isEnabled', e.target.checked)} className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600" />
+                                                <label htmlFor={`enable-${shop.id}`} className="ml-2 text-sm text-slate-300">Enable Auto-Trigger</label>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <p className="text-slate-500">No shops available to schedule.</p>
+                            )}
+
+                            <Button onClick={handleSaveSchedules} disabled={isSavingSchedules || schedulesLoading} variant="primary" className="w-full py-3 text-base">
+                                {isSavingSchedules ? <><i className="fas fa-spinner fa-spin"></i> Saving Schedules...</> : <><i className="fas fa-save"></i> Save Schedules</>}
+                            </Button>
+                        </div>
+                    </div>
+                </Card>
+            );
+        };
 
         // Generic component for CRUD operations (Create, Read, Update, Delete)
         function SettingsCRUD({ title, collectionName, items, formFields, listColumns }) {
