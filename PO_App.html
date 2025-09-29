@@ -1800,6 +1800,7 @@
         const [isDropdownOpen, setIsDropdownOpen] = useState(false);
         const [highlightedIndex, setHighlightedIndex] = useState(-1);
         const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
+        const [availableStockInfo, setAvailableStockInfo] = useState(null);
         
         const searchInputRef = useRef(null);
         const qtyInputRef = useRef(null);
@@ -1842,6 +1843,22 @@
                 resetForm();
             }
         }, [transferDataToEdit, resetForm]);
+
+        useEffect(() => {
+            if (selectedProduct && fromShopId) {
+                const fromShop = shops.find(s => s.id === fromShopId);
+                if (fromShop?.manageStock) {
+                    const physicalStock = selectedProduct.stockByShop?.[fromShopId] || 0;
+                    const committedStock = demandedStock[selectedProduct.id] || 0;
+                    const available = physicalStock - committedStock;
+                    setAvailableStockInfo({ physical: physicalStock, committed: committedStock, available });
+                } else {
+                    setAvailableStockInfo(null); // Reset if shop doesn't manage stock
+                }
+            } else {
+                setAvailableStockInfo(null); // Reset if no product/shop selected
+            }
+        }, [selectedProduct, fromShopId, shops, demandedStock]);
 
         useEffect(() => {
             // This effect handles the auto-generation of the transfer number FOR NEW TRANSFERS ONLY.
@@ -2040,7 +2057,7 @@
                     <h4 className="text-xl font-semibold text-slate-200 mb-4">Add Product</h4>
                     <form onSubmit={handleAddItem} onKeyDown={handleFormKeyDown}>
                         <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
-                            <div className="md:col-span-7 relative" ref={searchContainerRef}>
+                            <div className="md:col-span-5 relative" ref={searchContainerRef}>
                                 <label className="block text-sm font-medium text-slate-300 mb-1">Select Product</label>
                                 <input 
                                     ref={searchInputRef} type="text" value={productSearch} 
@@ -2061,6 +2078,20 @@
                                         ))}
                                     </div>
                                 )}
+                            </div>
+                            <div className="md:col-span-2">
+                                <label className="block text-sm font-medium text-slate-300 mb-1">Available Stock</label>
+                                <div className="w-full bg-slate-800 text-slate-300 px-3 py-2 border border-slate-700 rounded-md h-10 flex items-center justify-center text-sm">
+                                    {availableStockInfo !== null ? (
+                                        <div className="text-center" title={`On Hand: ${availableStockInfo.physical}\nCommitted in other transfers: ${availableStockInfo.committed}`}>
+                                            <span className={`font-bold text-lg ${availableStockInfo.available > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                {availableStockInfo.available}
+                                            </span>
+                                        </div>
+                                    ) : (
+                                        <span className="text-slate-500">-</span>
+                                    )}
+                                </div>
                             </div>
                             <div className="md:col-span-1">
                                 <label className="block text-sm font-medium text-slate-300 mb-1">QTY</label>
@@ -2485,31 +2516,59 @@
             const newTotalAmount = items.reduce((sum, item) => sum + ((item.quantity || 0) * (item.cost || 0)), 0);
 
             try {
-                const batch = db.batch();
-                const transferRef = db.collection("internalTransfers").doc(transferData.id);
-                batch.update(transferRef, { status: 'done', items, totalAmount: newTotalAmount, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                // --- MODIFICATION START: Use a Firestore Transaction ---
+                await db.runTransaction(async (transaction) => {
+                    const productRefs = items.map(item => db.collection("products").doc(item.productId));
+                    const productDocs = await Promise.all(productRefs.map(ref => transaction.get(ref)));
 
-                items.forEach((auditedItem, index) => {
-                    const productRef = db.collection("products").doc(auditedItem.productId);
-                    const originalItem = transferData.items[index];
-                    const originalQty = originalItem?.quantity || 0;
-                    const receivedQty = auditedItem.quantity || 0;
-                    
-                    if (fromShop?.manageStock) {
-                        // Decrement the FROM shop by the ORIGINAL requested quantity
-                        batch.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-originalQty) });
+                    // Step 1: Validate all items BEFORE making any changes
+                    for (let i = 0; i < items.length; i++) {
+                        const productDoc = productDocs[i];
+                        const originalItem = transferData.items[i];
+                        const originalQty = originalItem?.quantity || 0;
+
+                        if (!productDoc.exists) {
+                            throw new Error(`Product ${originalItem.name} not found.`);
+                        }
+
+                        if (fromShop?.manageStock) {
+                            const currentStock = productDoc.data().stockByShop?.[fromShop.id] || 0;
+                            if (currentStock < originalQty) {
+                                throw new Error(`Insufficient stock for ${originalItem.name}. Available: ${currentStock}, Requested: ${originalQty}. Please correct the stock level before completing.`);
+                            }
+                        }
                     }
-                    if (toShop?.manageStock && receivedQty > 0) {
-                        // Increment the TO shop by the NEW received quantity
-                        batch.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
-                    }
+
+                    // Step 2: If validation passes, perform all updates
+                    const transferRef = db.collection("internalTransfers").doc(transferData.id);
+                    transaction.update(transferRef, { status: 'done', items, totalAmount: newTotalAmount, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+
+                    productDocs.forEach((productDoc, index) => {
+                        const auditedItem = items[index];
+                        const originalItem = transferData.items[index];
+                        const originalQty = originalItem?.quantity || 0;
+                        const receivedQty = auditedItem.quantity || 0;
+                        
+                        if (fromShop?.manageStock) {
+                            transaction.update(productDoc.ref, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-originalQty) });
+                        }
+                        if (toShop?.manageStock && receivedQty > 0) {
+                            transaction.update(productDoc.ref, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
+                        }
+                    });
                 });
+                // --- MODIFICATION END ---
                 
-                await batch.commit();
                 setModalInfo({ show: true, title: 'Success', message: 'Transfer completed and stock updated.' });
                 onClose();
             } catch (error) {
-                setModalInfo({ show: true, title: 'Error', message: 'Failed to complete transfer.', isError: true });
+                console.error("Transaction failed: ", error); // Log the detailed error
+                setModalInfo({ 
+                    show: true, 
+                    title: 'Transaction Error', 
+                    message: `Failed to complete transfer. Reason: ${error.message}`, 
+                    isError: true 
+                });
             }
         };
 
@@ -3753,5 +3812,8 @@
         </script>
     </body>
     </html>
+
+
+
 
 
