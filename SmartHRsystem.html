@@ -276,6 +276,20 @@
             const monthStates = (employeeStates || []).filter(r => r.staffId === employee.id && r.date.startsWith(selectedMonth));
             const activeLoan = (staffLoans || []).find(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth));
 
+            // --- MOVED UP: Calculate Base Salary & Salary Per Day first, as it's needed for penalty calculation ---
+            const [year, month] = selectedMonth.split('-').map(Number);
+            const daysInMonth = new Date(year, month, 0).getDate();
+            const applicableRevisions = (salaryRevisions || [])
+                .filter(rev => rev.staffId === employee.id && rev.effectiveDate && rev.effectiveDate <= `${selectedMonth}-31` && rev.status === 'Approved')
+                .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
+            
+            const baseSalary = applicableRevisions.length > 0
+                ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
+                : (parseFloat(String(employee.salary).replace(/[^0-9.-]/g, '')) || 0);
+            
+            const salaryPerDay = baseSalary > 0 && daysInMonth > 0 ? baseSalary / daysInMonth : 0;
+
+
             // --- 2. Calculate inputs automatically ---
             const leaveDays = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
             const otDays = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
@@ -317,31 +331,38 @@
                 }
             });
 
-            // NEW: Calculate Absent days.
-            // This logic assumes a Mon-Fri work week. It counts past weekdays in the month
-            // where the employee had no attendance record and was not on approved leave.
-            const [year, month] = selectedMonth.split('-').map(Number);
-            const daysInMonth = new Date(year, month, 0).getDate();
+            // NEW: Calculate Absent days & Penalty for absence on a rejected leave day.
+            const attendedDays = new Set(Object.keys(dailyRecords));
+            let absentDays = 0;
+            let rejectedLeavePenaltyAmount = 0; // Initialize penalty amount
             const today = new Date();
             today.setHours(0, 0, 0, 0);
 
-            const attendedDays = new Set(Object.keys(dailyRecords));
-
-            let absentDays = 0;
             for (let day = 1; day <= daysInMonth; day++) {
                 const currentDay = new Date(year, month - 1, day);
                 if (currentDay >= today) break; // Don't count today or future days
 
-                // FIX: Format the loop's date key in local timezone to match dailyRecords.
                 const loop_year = currentDay.getFullYear();
                 const loop_month = String(currentDay.getMonth() + 1).padStart(2, '0');
                 const loop_day = String(currentDay.getDate()).padStart(2, '0');
                 const dayKey = `${loop_year}-${loop_month}-${loop_day}`;
 
-
-                // REVISED: An absence is now any past day without an attendance record (No Check-In/Out), regardless of leave status.
+                // An absence is a past day with no attendance record.
                 if (!attendedDays.has(dayKey)) {
                     absentDays++;
+
+                    // Check if there was a REJECTED leave request for this absent day.
+                    const hadRejectedLeave = (leaveRequests || []).some(
+                        lr => lr.staffId === employee.id &&
+                              lr.status === 'Rejected' &&
+                              // Check if the absent day falls within the rejected leave period.
+                              dayKey >= lr.leaveDate && dayKey < lr.returnDate 
+                    );
+                    
+                    if (hadRejectedLeave) {
+                        // Apply penalty: Salary per day x 2
+                        rejectedLeavePenaltyAmount += (salaryPerDay * 2);
+                    }
                 }
             }
             
@@ -354,15 +375,6 @@
             const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance };
 
             // --- 3. Perform Final Salary Calculations ---
-            const applicableRevisions = (salaryRevisions || [])
-                .filter(rev => rev.staffId === employee.id && rev.effectiveDate && rev.effectiveDate <= `${selectedMonth}-31` && rev.status === 'Approved')
-                .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
-            
-            const baseSalary = applicableRevisions.length > 0
-                ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
-                : (parseFloat(String(employee.salary).replace(/[^0-9.-]/g, '')) || 0);
-
-            const salaryPerDay = baseSalary / daysInMonth;
             const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
             
             const lateDeductionsAmount = monthStates.filter(es => {
@@ -378,12 +390,12 @@
             const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
             const otSalary = salaryPerDay * (otDays || 0);
             const grossSalary = baseSalaryEarned + otSalary + engagements;
-            // CORRECTED: Removed the direct No-CheckOut calculation from the total deductions.
-            const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions;
+            // CORRECTED & UPDATED: Added the new penalty to total deductions.
+            const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions + rejectedLeavePenaltyAmount;
             const netSalary = grossSalary - totalDeductions;
 
-            // CORRECTED: Removed `noCheckOutDeductions` from the returned calculation object.
-            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount };
+            // CORRECTED & UPDATED: Added new penalty amount to the returned calculations object.
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount };
 
             return { inputs: autoInputs, calculations };
         };
@@ -3103,6 +3115,13 @@
                                 <div className="flex justify-between text-sm" title="Absent + No-CheckOut"><p>No-Attendance</p><p>{manualInputs.noAttendance || 0}</p></div>
                                 <div className="flex justify-between text-sm"><p>Loan Deduction</p><p>{Utils.formatCurrency(manualInputs.loanDeduction)}</p></div>
                                 <div className="flex justify-between text-sm"><p>Other Deductions</p><p>{Utils.formatCurrency(calculations.otherDeductions)}</p></div>
+                                {/* NEW: Display the rejected leave penalty if it exists */}
+                                {calculations.rejectedLeavePenaltyAmount > 0 && (
+                                    <div className="flex justify-between text-sm text-red-700 font-semibold" title="Penalty: Absence on a day with a rejected leave request. (Salary Per Day x 2)">
+                                        <p>Penalty Leave Rejected</p>
+                                        <p>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
+                                    </div>
+                                )}
                                 <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Total Deductions</p><p className="text-red-600">{Utils.formatCurrency(calculations.totalDeductions)}</p></div>
                             </div>
                         </div>
@@ -4316,11 +4335,16 @@
                 </Card>
             );
         };
-
-        const SettingsPage = () => {
+        const SettingsPage = ({ initialTab = 'shop' }) => {
             const { data: shops } = useStaticCollection('shops'); // Use one-time fetch
             const { data: positions } = useStaticCollection('positions'); // Use one-time fetch
-            const [activeTab, setActiveTab] = useState('shop');
+            const [activeTab, setActiveTab] = useState(initialTab);
+
+            // NEW: Effect to update the active tab if the initialTab prop changes
+            // This allows the Dashboard to control which tab is shown.
+            useEffect(() => {
+                setActiveTab(initialTab);
+            }, [initialTab]);
 
             // Configuration for the generic CRUD component for Shops
             const shopFormFields = [{ name: 'name', label: 'Shop Name', required: true }, { name: 'latitude', label: 'Latitude' }, { name: 'longitude', label: 'Longitude' }, { name: 'radius', label: 'Radius (m)', type: 'number' }, { name: 'note', label: 'Note', fullWidth: true }];
@@ -4350,11 +4374,6 @@
             const [processLog, setProcessLog] = useState([]);
             const [processComplete, setProcessComplete] = useState(false);
 
-            // NEW: State for automatic payroll schedules
-            const { data: payrollSchedules, loading: schedulesLoading } = useCollection('payrollSchedules');
-            const [scheduleSettings, setScheduleSettings] = useState({});
-            const [isSavingSchedules, setIsSavingSchedules] = useState(false);
-
             // Fetch all data needed for calculations in one go, using one-time fetches for efficiency
             const { data: allShops, loading: shopsLoading } = useStaticCollection('shops');
             const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
@@ -4364,18 +4383,6 @@
             const { data: staffLoans, loading: loansLoading } = useStaticCollection('staffLoans');
             const { data: employeeStates, loading: statesLoading } = useStaticCollection('employeeStates');
             const { data: salaryRevisions, loading: revisionsLoading } = useStaticCollection('salaryRevisions');
-
-            // NEW: Populate schedule settings state from Firestore data
-            useEffect(() => {
-                if (payrollSchedules) {
-                    const settingsMap = payrollSchedules.reduce((acc, schedule) => {
-                        // Use shop's main doc ID as the key for consistency
-                        acc[schedule.id] = { triggerDay: schedule.triggerDay || '', isEnabled: schedule.isEnabled || false };
-                        return acc;
-                    }, {});
-                    setScheduleSettings(settingsMap);
-                }
-            }, [payrollSchedules]);
 
             const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
 
@@ -4467,59 +4474,6 @@
                 setTriggerConfirmed(false); // Reset confirmation checkbox
             };
 
-            // NEW: Filter shops that the current user can manage for the auto-scheduler
-            const managedShops = useMemo(() => {
-                if (!userProfile || !allShops) return [];
-                if (userProfile.role === 'Admin') return allShops;
-                if (userProfile.role === 'Shop Manager') {
-                    const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                    return allShops.filter(s => userShops.includes(s.name));
-                }
-                return [];
-            }, [userProfile, allShops]);
-
-            // NEW: Handler for input changes in the schedule settings form
-            const handleScheduleChange = (shopId, field, value) => {
-                setScheduleSettings(prev => {
-                    const currentShopSettings = prev[shopId] || {};
-                    return {
-                        ...prev,
-                        [shopId]: { ...currentShopSettings, [field]: value }
-                    };
-                });
-            };
-
-            // NEW: Handler to save all schedule settings to Firestore
-            const handleSaveSchedules = async () => {
-                setIsSavingSchedules(true);
-                const { writeBatch, doc, setDoc } = window.firebaseSDK;
-                const batch = writeBatch(db);
-
-                managedShops.forEach(shop => {
-                    const settings = scheduleSettings[shop.id];
-                    if (settings) {
-                        const scheduleRef = doc(db, 'payrollSchedules', shop.id);
-                        const day = parseInt(settings.triggerDay, 10);
-                        batch.set(scheduleRef, {
-                            shopName: shop.name,
-                            triggerDay: (day >= 1 && day <= 31) ? day : null, // Save valid day or null
-                            isEnabled: !!settings.isEnabled
-                        }, { merge: true });
-                    }
-                });
-
-                try {
-                    await batch.commit();
-                    alert('Payroll schedules saved successfully!');
-                } catch (error) {
-                    console.error("Error saving payroll schedules:", error);
-                    alert('Failed to save schedules.');
-                } finally {
-                    setIsSavingSchedules(false);
-                }
-            };
-
-
             return (
                 <Card>
                     <CardTitle>Trigger Bulk Salary Calculation</CardTitle>
@@ -4570,39 +4524,6 @@
                                 <p className="font-semibold text-green-300">Process Complete!</p>
                             </div>
                         )}
-                    </div>
-                    {/* --- NEW: AUTOMATIC PAYROLL SCHEDULE SECTION --- */}
-                    <div className="mt-12 pt-8 border-t border-slate-700">
-                        <CardTitle>Automatic Payroll Schedule</CardTitle>
-                        <div className="max-w-xl mx-auto space-y-6">
-                            <p className="text-slate-400">Set a day of the month to automatically trigger payroll generation. The system will prompt the first Admin or Manager who logs in on or after this day to run the payroll for the current month.</p>
-                            
-                            {schedulesLoading ? (
-                                <p>Loading schedules...</p>
-                            ) : managedShops.length > 0 ? (
-                                <div className="space-y-4">
-                                    {managedShops.map(shop => (
-                                        <div key={shop.id} className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-center p-3 bg-slate-700/50 rounded-lg">
-                                            <label className="font-medium text-slate-200 sm:col-span-1">{shop.name}</label>
-                                            <div className="flex items-center gap-2">
-                                                <label className="text-sm text-slate-400">Day:</label>
-                                                <input type="number" min="1" max="31" placeholder="e.g., 28" value={scheduleSettings[shop.id]?.triggerDay || ''} onChange={e => handleScheduleChange(shop.id, 'triggerDay', e.target.value)} className="input w-24" />
-                                            </div>
-                                            <div className="flex items-center justify-self-start sm:justify-self-end">
-                                                <input id={`enable-${shop.id}`} type="checkbox" checked={!!scheduleSettings[shop.id]?.isEnabled} onChange={e => handleScheduleChange(shop.id, 'isEnabled', e.target.checked)} className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600" />
-                                                <label htmlFor={`enable-${shop.id}`} className="ml-2 text-sm text-slate-300">Enable Auto-Trigger</label>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            ) : (
-                                <p className="text-slate-500">No shops available to schedule.</p>
-                            )}
-
-                            <Button onClick={handleSaveSchedules} disabled={isSavingSchedules || schedulesLoading} variant="primary" className="w-full py-3 text-base">
-                                {isSavingSchedules ? <><i className="fas fa-spinner fa-spin"></i> Saving Schedules...</> : <><i className="fas fa-save"></i> Save Schedules</>}
-                            </Button>
-                        </div>
                     </div>
                 </Card>
             );
@@ -4735,8 +4656,13 @@
                     </div>
                     <div className="flex items-center gap-2 sm:gap-4 flex-shrink-0">
                         {userProfile && (<div className="text-right hidden sm:block"><span className="text-sm text-slate-400">Welcome, </span><span className="font-medium text-slate-200">{userProfile.name}</span></div>)}
-                        {showNotifications && <NotificationBell pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} onNotificationClick={onNotificationClick} />}
-                        
+                        {showNotifications && (
+                            <NotificationBell
+                                pendingLeaves={pendingLeaves}
+                                pendingOTs={pendingOTs}
+                                onNotificationClick={onNotificationClick}
+                            />
+                        )}
                         <button onClick={handleLogout} title="Logout" className="bg-slate-700 text-slate-300 w-10 h-10 rounded-full hover:bg-slate-600 hover:text-white transition duration-150 flex items-center justify-center flex-shrink-0"><i className="fas fa-sign-out-alt"></i></button>
                     </div>
                 </header>
@@ -4934,7 +4860,5 @@
     </script>
 </body>
 </html>
-
-
 
 
