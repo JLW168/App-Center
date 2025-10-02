@@ -1474,9 +1474,37 @@
 
             const handleCheckAction = useCallback(async () => {
                 setLoading(true);
-                setStatus("Getting fresh location for check action...");
+                setStatus("Verifying and saving attendance...");
                 
                 try {
+                    const { addDoc, collection, serverTimestamp, getDocs, query, where } = window.firebaseSDK;
+                    const nextActionType = lastAction?.type === 'in' ? 'out' : 'in';
+                    const checkInTimestamp = new Date();
+                    const todayStr = checkInTimestamp.toISOString().split('T')[0];
+
+                    // --- FIX: Prevent Double Check-In ---
+                    if (nextActionType === 'in') {
+                        const startOfDay = new Date(todayStr);
+                        startOfDay.setHours(0, 0, 0, 0);
+                        const endOfDay = new Date(todayStr);
+                        endOfDay.setHours(23, 59, 59, 999);
+
+                        const checkInQuery = query(collection(db, 'attendance'), 
+                            where("employeeId", "==", userProfile.id),
+                            where("type", "==", "in"),
+                            where("timestamp", " >= ", startOfDay),
+                            where("timestamp", " <= ", endOfDay)
+                        );
+                        const existingCheckInSnap = await getDocs(checkInQuery);
+                        if (!existingCheckInSnap.empty) {
+                            const existingTime = existingCheckInSnap.docs[0].data().timestamp.toDate().toLocaleTimeString();
+                            setAlertModal({ isOpen: true, message: `You have already checked in today at ${existingTime}.` });
+                            setStatus(`Check-in already recorded for today.`);
+                            setLoading(false);
+                            return; // Stop execution
+                        }
+                    }
+                    
                     // Step 1: Get a fresh location reading.
                     const { location: freshLocation, distance: freshDistance, shop } = await getLocation(true);
 
@@ -1488,10 +1516,6 @@
                     }
                     
                     // Step 3: Proceed with saving the attendance record.
-                    const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
-                    const nextActionType = lastAction?.type === 'in' ? 'out' : 'in';
-                    const checkInTimestamp = new Date();
-                    
                     await addDoc(collection(db, 'attendance'), { employeeId: userProfile.id, employeeName: userProfile.name, shop: selectedShopForCheckIn, timestamp: serverTimestamp(), type: nextActionType, location: freshLocation });
                     
                     // Step 4: Handle late check-in logic if applicable.
@@ -1502,21 +1526,30 @@
                         let isLate = (shift === 'AM' || shift === 'APM') ? (checkInHour > 7 || (checkInHour === 7 && checkInMinute >= 35)) : (shift === 'PM') ? (checkInHour > 12 || (checkInHour === 12 && checkInMinute >= 35)) : false;
                         
                         if (isLate) {
-                            const todayStr = checkInTimestamp.toISOString().split('T')[0];
                             const approvedLeaveToday = (allData.leaveRequests || []).find(lr => lr.staffId === userProfile.id && lr.status === 'Approved' && todayStr >= lr.leaveDate && todayStr < lr.returnDate);
                             if (!approvedLeaveToday) {
-                                const pendingLeaveToday = (allData.leaveRequests || []).find(lr => lr.staffId === userProfile.id && lr.status === 'Pending' && lr.leaveDate === todayStr);
-                                if (pendingLeaveToday) { setAlertModal({ isOpen: true, message: 'Your leave request for today is pending. A late deduction has been applied.' }); }
-                                const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-                                await addDoc(collection(db, 'employeeStates'), { staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: 5000, note: `Late @${formattedTime}` });
+                                // --- FIX: Prevent Double Late Deduction ---
+                                const deductionQuery = query(collection(db, 'employeeStates'), 
+                                    where("staffId", "==", userProfile.id), 
+                                    where("date", "==", todayStr),
+                                    where("statusState", "==", "Deduction")
+                                );
+                                const existingDeductionSnap = await getDocs(deductionQuery);
+
+                                if (existingDeductionSnap.empty) {
+                                    const pendingLeaveToday = (allData.leaveRequests || []).find(lr => lr.staffId === userProfile.id && lr.status === 'Pending' && lr.leaveDate === todayStr);
+                                    if (pendingLeaveToday) { setAlertModal({ isOpen: true, message: 'Your leave request for today is pending. A late deduction has been applied.' }); }
+                                    const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+                                    await addDoc(collection(db, 'employeeStates'), { staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: 5000, note: `Late @${formattedTime}` });
+                                } else {
+                                    console.log("Late deduction for today already exists. Skipping duplicate.");
+                                }
                             }
                         }
                     }
-                    // REVISED: Show a success alert modal instead of just updating the status text.
                     setAlertModal({ isOpen: true, message: `Successfully checked ${nextActionType} at ${checkInTimestamp.toLocaleTimeString()}.` });
-                    setStatus(`Last action: Checked ${nextActionType}.`); // Keep a simple status for the main display
+                    setStatus(`Last action: Checked ${nextActionType}.`);
                 } catch (error) {
-                    // Error is already set by getLocation, but we can add a fallback.
                     if (!status.includes('permission') && !status.includes('Could not get')) {
                         setStatus("Failed to record attendance.");
                     }
@@ -1887,7 +1920,7 @@
         
         // Component: A single card for displaying a request in the mobile view
         const RequestCard = memo(({ request, userProfile, config, onUpdateStatus, onEdit, onDelete }) => {
-            const { cardFields } = config;
+            const { cardFields, title } = config;
 
             return (
                 <div className="bg-slate-700/50 rounded-lg p-4 space-y-3 flex flex-col">
@@ -1905,10 +1938,24 @@
                                 <p className="text-slate-200 font-medium">{field.value(request)}</p>
                             </div>
                         ))}
-                        <div className="col-span-2">
-                            <p className="text-slate-400">Reason</p>
-                            <p className="text-slate-200 font-medium whitespace-pre-wrap">{request.reason}</p>
-                        </div>
+                        {/* Custom layout for Leave vs other request types */}
+                        {title === 'Leave Request' ? (
+                            <>
+                                <div>
+                                    <p className="text-slate-400">Type</p>
+                                    <p className="text-slate-200 font-medium">{request.leaveType}</p>
+                                </div>
+                                <div>
+                                    <p className="text-slate-400">Reason</p>
+                                    <p className="text-slate-200 font-medium whitespace-pre-wrap">{request.reason}</p>
+                                </div>
+                            </>
+                        ) : (
+                            <div className="col-span-2">
+                                <p className="text-slate-400">Reason</p>
+                                <p className="text-slate-200 font-medium whitespace-pre-wrap">{request.reason}</p>
+                            </div>
+                        )}
                     </div>
                     <div className="flex justify-end space-x-3 pt-2">
                         {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && userProfile.id !== request.staffId)) && request.status === 'Pending' && (
@@ -2151,7 +2198,6 @@
                     { label: 'Session', value: (req) => req.leaveSession || '-' },
                     { label: 'Supervisor', value: (req) => req.supervisor },
                     { label: 'Submitted', value: (req) => Utils.formatRequestDate(req.requestDate) },
-                    { label: 'Type', value: (req) => req.leaveType },
                 ],
                 tableColumns: [
                     { header: 'Request Date', accessor: (req) => Utils.formatRequestDate(req.requestDate) },
@@ -3114,60 +3160,83 @@
         // A dedicated component for rendering the payslip. It only displays data it receives.
         const PayslipPreview = memo(({ selectedEmployee, selectedMonth, manualInputs, calculations }) => {
             return (
-                <div id="payslip-preview" className="bg-white text-slate-800 p-6 rounded-lg shadow-2xl font-sans">
-                    <div className="text-center mb-6">
-                        <h2 className="text-2xl font-bold">PAYSLIP</h2>
-                        <p className="text-slate-500">For the month of {selectedMonth}</p>
-                    </div>
+                <div id="payslip-preview" className="bg-white text-slate-800 p-6 rounded-lg shadow-2xl font-sans min-h-[600px] flex flex-col">
                     {selectedEmployee ? (
-                    <>
-                        <div className="grid grid-cols-2 gap-4 mb-6 text-sm">
-                            <div>
-                                <p className="font-bold">{selectedEmployee.name}</p>
-                                <p>{selectedEmployee.position}</p>
-                                <p>Shift: {selectedEmployee.shift}</p>
+                        <>
+                            <div className="text-center mb-6">
+                                <h3 className="text-2xl font-bold text-slate-900">Payslip</h3>
+                                <p className="text-slate-500">For the month of {selectedMonth}</p>
                             </div>
-                            <div className="text-right">
-                                <p>Shop: {Array.isArray(selectedEmployee.shop) ? selectedEmployee.shop.join(', ') : selectedEmployee.shop}</p>
-                                <p>Base Salary: {Utils.formatCurrency(calculations.baseSalary)}</p>
-                                <p>Worked Dur.: {Utils.calculateWorkedDuration(selectedEmployee.joinedDate)}</p>
+
+                            <div className="grid grid-cols-2 gap-4 border-b border-slate-200 pb-4 mb-4">
+                                <div>
+                                    <p className="text-sm text-slate-500">Employee Name</p>
+                                    <p className="font-semibold text-slate-800">{selectedEmployee.name}</p>
+                                </div>
+                                <div>
+                                    <p className="text-sm text-slate-500">Position</p>
+                                    <p className="font-semibold text-slate-800">{selectedEmployee.position}</p>
+                                </div>
+                                <div>
+                                    <p className="text-sm text-slate-500">Shop</p>
+                                    <p className="font-semibold text-slate-800">{Array.isArray(selectedEmployee.shop) ? selectedEmployee.shop.join(', ') : selectedEmployee.shop}</p>
+                                </div>
+                                <div>
+                                    <p className="text-sm text-slate-500">Month</p>
+                                    <p className="font-semibold text-slate-800">{selectedMonth}</p>
+                                </div>
                             </div>
-                        </div>
-                        <div className="grid grid-cols-2 gap-6">
-                            <div className="space-y-2 p-4 border-t-4 border-green-500 bg-green-50 rounded-b-lg">
-                                <h3 className="text-lg font-semibold text-slate-900">Earnings</h3>
-                                <div className="flex justify-between text-sm"><p>Work Days</p><p>{manualInputs.workDays || 0}</p></div>
-                                <div className="flex justify-between text-sm"><p>Given Off Days</p><p>{manualInputs.givenOffDays || 0}</p></div>
-                                <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
-                                <div className="flex justify-between text-sm"><p>OT Salary</p><p>{Utils.formatCurrency(calculations.otSalary)}</p></div>
-                                <div className="flex justify-between text-sm"><p>Engagements</p><p>{Utils.formatCurrency(calculations.engagements)}</p></div>
-                                <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Gross Salary</p><p>{Utils.formatCurrency(calculations.grossSalary)}</p></div>
+                            
+                            <div className="flex-grow">
+                                <div className="grid grid-cols-2 gap-x-8 gap-y-2">
+                                    {/* Earnings */}
+                                    <p className="font-semibold text-slate-800 col-span-2 border-b border-slate-200 pb-1 mb-1">Earnings</p>
+                                    <p className="text-slate-600">Base Salary</p>
+                                    <p className="text-right font-mono text-slate-800">{Utils.formatCurrency(calculations.baseSalary)}</p>
+
+                                    <p className="text-slate-600">Base Salary Earned</p>
+                                    <p className="text-right font-mono text-slate-800">{Utils.formatCurrency(calculations.baseSalaryEarned)}</p>
+
+                                    <p className="text-slate-600">OT Salary</p>
+                                    <p className="text-right font-mono text-slate-800">{Utils.formatCurrency(calculations.otSalary)}</p>
+
+                                    <p className="text-slate-600">Engagements</p>
+                                    <p className="text-right font-mono text-slate-800">{Utils.formatCurrency(calculations.engagements)}</p>
+
+                                    <p className="font-semibold text-slate-800 pt-2 border-t border-slate-200">Gross Salary</p>
+                                    <p className="text-right font-semibold font-mono text-slate-800 pt-2 border-t border-slate-200">{Utils.formatCurrency(calculations.grossSalary)}</p>
+
+                                    {/* Deductions */}
+                                    <p className="font-semibold text-slate-800 col-span-2 border-b border-slate-200 pb-1 mb-1 mt-4">Deductions</p>
+                                    <p className="text-slate-600">Loan Deduction</p>
+                                    <p className="text-right font-mono text-red-600">{Utils.formatCurrency(manualInputs.loanDeduction)}</p>
+
+                                    <p className="text-slate-600">Late Deductions</p>
+                                    <p className="text-right font-mono text-red-600">{Utils.formatCurrency(calculations.lateDeductionsAmount)}</p>
+                                    
+                                    <p className="text-slate-600">Rejected Leave Penalty</p>
+                                    <p className="text-right font-mono text-red-600">{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
+
+                                    <p className="text-slate-600">Other Deductions</p>
+                                    <p className="text-right font-mono text-red-600">{Utils.formatCurrency(calculations.otherDeductions)}</p>
+
+                                    <p className="font-semibold text-slate-800 pt-2 border-t border-slate-200">Total Deductions</p>
+                                    <p className="text-right font-semibold font-mono text-red-600 pt-2 border-t border-slate-200">{Utils.formatCurrency(calculations.totalDeductions)}</p>
+                                </div>
                             </div>
-                            <div className="space-y-2 p-4 border-t-4 border-red-500 bg-red-50 rounded-b-lg">
-                                <h3 className="text-lg font-semibold text-slate-900">Deductions</h3>
-                                <div className="flex justify-between text-sm"><p>Leave Days</p><p className="text-red-600">-{manualInputs.leaveDays || 0}</p></div>
-                                <div className="flex justify-between text-sm"><p>Late ({manualInputs.totalLateDays || 0})</p><p>{Utils.formatCurrency(calculations.lateDeductionsAmount)}</p></div>
-                                {/* REVISED: Changed No-CheckOut to No-Attendance */}
-                                <div className="flex justify-between text-sm" title="Absent + No-CheckOut"><p>No-Attendance</p><p>{manualInputs.noAttendance || 0}</p></div>
-                                <div className="flex justify-between text-sm"><p>Loan Deduction</p><p>{Utils.formatCurrency(manualInputs.loanDeduction)}</p></div>
-                                <div className="flex justify-between text-sm"><p>Other Deductions</p><p>{Utils.formatCurrency(calculations.otherDeductions)}</p></div>
-                                {/* NEW: Display the rejected leave penalty if it exists */}
-                                {calculations.rejectedLeavePenaltyAmount > 0 && (
-                                    <div className="flex justify-between text-sm text-red-700 font-semibold" title="Penalty: Absence on a day with a rejected leave request. (Salary Per Day x 2)">
-                                        <p>Penalty Leave Rejected</p>
-                                        <p>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
-                                    </div>
-                                )}
-                                <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Total Deductions</p><p className="text-red-600">{Utils.formatCurrency(calculations.totalDeductions)}</p></div>
+                            
+                            <div className="mt-6 pt-4 border-t-2 border-dashed border-slate-300 text-right">
+                                <p className="text-sm text-slate-600">Net Salary</p>
+                                <p className="text-3xl font-bold text-blue-900">{Utils.formatCurrency(calculations.netSalary)}</p>
                             </div>
-                        </div>
-                        <div className="mt-6 p-4 bg-blue-100 border border-blue-300 rounded-lg text-center">
-                            <p className="text-sm font-semibold text-blue-800">NET SALARY</p>
-                            <p className="text-3xl font-bold text-blue-900">{Utils.formatCurrency(calculations.netSalary)}</p>
-                        </div>
-                    </>
+                        </>
                     ) : (
-                        <div className="text-center py-20 text-slate-500"><i className="fas fa-file-invoice-dollar text-4xl mb-4"></i><p>Please select an employee to view the payslip.</p></div>
+                        <div className="flex-grow flex items-center justify-center text-center py-20 text-slate-500">
+                            <div>
+                                <i className="fas fa-file-invoice-dollar text-4xl mb-4"></i>
+                                <p>Please select an employee to view the payslip.</p>
+                            </div>
+                        </div>
                     )}
                 </div>
             );
@@ -3191,9 +3260,18 @@
                 salaryRevisions: useCollection('salaryRevisions').data,
             };
             const { employees, shops } = allData;
+            const allDataLoading = Object.values(allData).some(d => !d); // Simple check if any data array is missing
 
             const [manualLoanDeduction, setManualLoanDeduction] = useState(undefined);
             const [isProcessing, setIsProcessing] = useState(false);
+            
+            // NEW: States for Bulk Trigger functionality
+            const [bulkSelectedMonth, setBulkSelectedMonth] = useState(currentMonth);
+            const [bulkSelectedShop, setBulkSelectedShop] = useState('');
+            const [triggerConfirmed, setTriggerConfirmed] = useState(false);
+            const [isBulkProcessing, setIsBulkProcessing] = useState(false);
+            const [processLog, setProcessLog] = useState([]);
+            const [processComplete, setProcessComplete] = useState(false);
         
             const managedShops = useMemo(() => {
                 if (!userProfile?.shop) return [];
@@ -3329,23 +3407,167 @@
                     setIsProcessing(false);
                 }
             };
+            
+            // NEW: Bulk Trigger Logic (moved from TriggerSalaryTab)
+            const handleTriggerPayroll = async () => {
+                if (!triggerConfirmed || !bulkSelectedShop || !bulkSelectedMonth) {
+                    alert("Please select a shop, month, and confirm the action.");
+                    return;
+                }
+
+                setIsBulkProcessing(true);
+                setProcessLog([]);
+                setProcessComplete(false);
+
+                const { writeBatch, collection, doc, serverTimestamp, getDocs, query, where } = window.firebaseSDK;
+
+                let employeesToProcess = [];
+                if (bulkSelectedShop === 'ALL_SHOPS') {
+                    employeesToProcess = employees.filter(e => e.status === 'Active');
+                } else {
+                    employeesToProcess = employees.filter(e => e.status === 'Active' && (Array.isArray(e.shop) ? e.shop.includes(bulkSelectedShop) : e.shop === bulkSelectedShop));
+                }
+
+                if (employeesToProcess.length === 0) {
+                    setProcessLog(['No active employees found for the selected shop.']);
+                    setIsBulkProcessing(false);
+                    return;
+                }
+                
+                if (bulkSelectedShop !== 'ALL_SHOPS') {
+                    const payrollCheckQuery = query(collection(db, "payrollHistory"), where("month", "==", bulkSelectedMonth), where("shop", "==", bulkSelectedShop));
+                    const existingPayrollSnap = await getDocs(payrollCheckQuery);
+                    if (!existingPayrollSnap.empty) {
+                         setProcessLog(prev => [...prev, `Warning: Payroll for ${bulkSelectedShop} for ${bulkSelectedMonth} may already exist. Please check history.`]);
+                    }
+                }
+
+                setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
+
+                let successCount = 0;
+                for (const employee of employeesToProcess) {
+                    await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
+                    setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
+
+                    const { inputs, calculations } = calculatePayrollForEmployee(employee, bulkSelectedMonth, allData);
+                    
+                    if (calculations.netSalary !== undefined) {
+                        const batch = writeBatch(db);
+                        
+                        const shopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
+                        const payrollData = { month: bulkSelectedMonth, shop: shopName, employeeId: employee.id, employeeName: employee.name, baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, manualInputs: inputs, calculations: calculations, createdAt: serverTimestamp() };
+                        
+                        const payrollDocRef = doc(collection(db, "payrollHistory"));
+                        batch.set(payrollDocRef, payrollData);
+                        
+                        if (inputs.loanDeduction > 0) {
+                            const activeLoan = allData.staffLoans.find(loan => loan.staffId === employee.id && loan.status === 'Active');
+                            if (activeLoan) {
+                                const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
+                                const newBalance = activeLoan.loanAmount - newTotalPaid;
+                                const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
+                                
+                                const loanDocRef = doc(db, 'staffLoans', activeLoan.id);
+                                batch.update(loanDocRef, { totalPaid: newTotalPaid, status: newStatus });
+                                
+                                const paymentDocRef = doc(collection(db, 'loanPayments'));
+                                batch.set(paymentDocRef, { paymentDate: `${bulkSelectedMonth}-${new Date(bulkSelectedMonth.split('-')[0], bulkSelectedMonth.split('-')[1], 0).getDate()}`, staffId: employee.id, staffName: employee.name, shop: shopName, loanId: activeLoan.id, amountPaid: inputs.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll trigger" });
+                            }
+                        }
+                        
+                        try {
+                            await batch.commit();
+                            successCount++;
+                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully saved for ${employee.name}.`]);
+                        } catch (error) {
+                             setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
+                        }
+                    } else {
+                         setProcessLog(prev => [...prev.slice(0, -1), `[Skipped] Could not calculate salary for ${employee.name}.`]);
+                    }
+                }
+
+                setProcessLog(prev => [...prev, `\nProcess finished. Successfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`]);
+                setIsBulkProcessing(false);
+                setProcessComplete(true);
+                setTriggerConfirmed(false); // Reset confirmation checkbox
+            };
            
             const canSelectShop = (userProfile?.role === 'Admin' || isShopManager) && !editingRecord;
         
             return (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    <Card><CardTitle>Payroll Calculator</CardTitle><div className="space-y-6"><div className="grid grid-cols-1 md:grid-cols-3 gap-4"><div><label className="text-sm font-medium text-slate-400">Month</label><input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" /></div><div><label className="text-sm font-medium text-slate-400">Shop</label>{canSelectShop ? (<select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select"><option value="">{userProfile?.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>{availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>) : (<input value={selectedShop} className="input" disabled />)}</div><div><label className="text-sm font-medium text-slate-400">Employee</label><select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select" disabled={employeesForDropdown.length === 0}><option value="">Select Employee</option>{employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div></div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-3 text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm">Work Days</label><input type="number" name="workDays" value={autoInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Given Off Days</label><input type="number" name="givenOffDays" value={autoInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm">OT Days</label><input type="number" name="otDays" value={autoInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Leave Days</label><input type="number" name="leaveDays" value={autoInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Total Late Days</label><input type="number" name="totalLateDays" value={autoInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div><div className="pt-6 border-t border-slate-700 flex flex-col sm:flex-row gap-4">
-                        <Button variant="primary" onClick={handleSaveAndDownload} disabled={isProcessing} className="flex-1">
-                            {isProcessing ? (<><i className="fas fa-spinner fa-spin"></i> Processing...</>) : (<><i className="fas fa-save"></i> Save & Download</>)}
-                        </Button>
-                    </div></>)}</div></Card>
-                    <PayslipPreview 
-                        selectedEmployee={selectedEmployee}
-                        selectedMonth={selectedMonth}
-                        manualInputs={{...autoInputs, loanDeduction: manualLoanDeduction }}
-                        calculations={calculations}
-                    />
-                </div>
+                <>
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                        <Card><CardTitle>Payroll Calculator</CardTitle><div className="space-y-6"><div className="grid grid-cols-1 md:grid-cols-3 gap-4"><div><label className="text-sm font-medium text-slate-400">Month</label><input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" /></div><div><label className="text-sm font-medium text-slate-400">Shop</label>{canSelectShop ? (<select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select"><option value="">{userProfile?.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>{availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>) : (<input value={selectedShop} className="input" disabled />)}</div><div><label className="text-sm font-medium text-slate-400">Employee</label><select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select" disabled={employeesForDropdown.length === 0}><option value="">Select Employee</option>{employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div></div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-3 text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm">Work Days</label><input type="number" name="workDays" value={autoInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Given Off Days</label><input type="number" name="givenOffDays" value={autoInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm">OT Days</label><input type="number" name="otDays" value={autoInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Leave Days</label><input type="number" name="leaveDays" value={autoInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Total Late Days</label><input type="number" name="totalLateDays" value={autoInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div><div className="pt-6 border-t border-slate-700 flex flex-col sm:flex-row gap-4">
+                            <Button variant="primary" onClick={handleSaveAndDownload} disabled={isProcessing} className="flex-1">
+                                {isProcessing ? (<><i className="fas fa-spinner fa-spin"></i> Processing...</>) : (<><i className="fas fa-save"></i> Save & Download</>)}
+                            </Button>
+                        </div></>)}</div></Card>
+                        <PayslipPreview 
+                            selectedEmployee={selectedEmployee}
+                            selectedMonth={selectedMonth}
+                            manualInputs={{...autoInputs, loanDeduction: manualLoanDeduction }}
+                            calculations={calculations}
+                        />
+                    </div>
+                    
+                    {/* MODIFIED: Allow Shop Managers to see the bulk trigger section */}
+                    {(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (
+                        <Card className="mt-8">
+                            <CardTitle>Trigger Bulk Salary Calculation</CardTitle>
+                            <div className="max-w-xl mx-auto space-y-6">
+                                <p className="text-slate-400">This tool allows you to generate payroll for all active employees in a selected shop for a specific month. The results will be saved to the Payroll History.</p>
+                                
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Select Month</label>
+                                    <input type="month" value={bulkSelectedMonth} onChange={e => setBulkSelectedMonth(e.target.value)} className="input" disabled={isBulkProcessing} />
+                                </div>
+
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Select Shop</label>
+                                    <select value={bulkSelectedShop} onChange={e => setBulkSelectedShop(e.target.value)} className="select" disabled={isBulkProcessing}>
+                                        <option value="">-- Select a Shop --</option>
+                                        {/* MODIFIED: Conditionally show "All Shops" only for Admins */}
+                                        {userProfile?.role === 'Admin' && <option value="ALL_SHOPS">All Shops</option>}
+                                        {/* MODIFIED: availableShops is already correctly filtered for Managers */}
+                                        {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                    </select>
+                                </div>
+                                
+                                <div className="p-4 border border-yellow-600 bg-yellow-900/20 rounded-lg space-y-3">
+                                    <h4 className="font-bold text-yellow-300">Confirmation</h4>
+                                    <div className="flex items-start">
+                                        <input id="confirm-trigger" type="checkbox" checked={triggerConfirmed} onChange={e => setTriggerConfirmed(e.target.checked)} className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 mt-1" disabled={isBulkProcessing} />
+                                        <label htmlFor="confirm-trigger" className="ml-3 text-sm text-slate-300">I understand that this action will generate and save payroll records for all employees in the selected shop and month. This does not automatically check for duplicates.</label>
+                                    </div>
+                                </div>
+
+                                <Button 
+                                    onClick={handleTriggerPayroll} 
+                                    disabled={!triggerConfirmed || isBulkProcessing || !bulkSelectedShop || allDataLoading}
+                                    variant="danger"
+                                    className="w-full py-3 text-base"
+                                >
+                                    {isBulkProcessing ? <><i className="fas fa-spinner fa-spin"></i> Processing...</> : <><i className="fas fa-bolt"></i> Trigger Payroll Generation</>}
+                                </Button>
+                                
+                                {(isBulkProcessing || processLog.length > 0) && (
+                                    <div className="mt-6">
+                                        <h4 className="font-semibold text-slate-200">Processing Log:</h4>
+                                        <pre className="mt-2 bg-slate-900/70 p-4 rounded-lg text-sm text-slate-300 h-64 overflow-y-auto font-mono">
+                                            {processLog.join('\n')}
+                                        </pre>
+                                    </div>
+                                )}
+                                {processComplete && (
+                                     <div className="mt-4 p-4 text-center bg-green-900/50 border border-green-700 rounded-lg">
+                                        <p className="font-semibold text-green-300">Process Complete!</p>
+                                    </div>
+                                )}
+                            </div>
+                        </Card>
+                    )}
+                </>
             );
         };
 
@@ -4391,180 +4613,17 @@
             const positionListColumns = [{ header: 'Position', accessor: 'position' }, { header: 'Note', accessor: 'note' }];
 
             return (
-                <TabbedPage tabs={{ shop: 'Shop Properties', position: 'Position Management', memo: 'Memo Alert', triggerSalary: 'Trigger Salary' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                <TabbedPage tabs={{ shop: 'Shop Properties', position: 'Position Management', memo: 'Memo Alert' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop"><SettingsCRUD title="Shop" collectionName="shops" items={shops} formFields={shopFormFields} listColumns={shopListColumns} /></div>
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
                     <div id="memo"><MemoAlertTab /></div>
-                    <div id="triggerSalary"><TriggerSalaryTab /></div>
                 </TabbedPage>
             );
         }
 
         // NEW: Component for manually triggering payroll for a whole shop
-        const TriggerSalaryTab = () => {
-            const { db, userProfile } = useFirebase();
-            const [selectedShop, setSelectedShop] = useState('');
-            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
-            const [triggerConfirmed, setTriggerConfirmed] = useState(false);
-            const [isProcessing, setIsProcessing] = useState(false);
-            const [processLog, setProcessLog] = useState([]);
-            const [processComplete, setProcessComplete] = useState(false);
-
-            // Fetch all data needed for calculations in one go, using one-time fetches for efficiency
-            const { data: allShops, loading: shopsLoading } = useStaticCollection('shops');
-            const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
-            const { data: attendance, loading: attendanceLoading } = useStaticCollection('attendance');
-            const { data: leaveRequests, loading: leaveLoading } = useStaticCollection('leaveRequests');
-            const { data: otRequests, loading: otLoading } = useStaticCollection('otRequests');
-            const { data: staffLoans, loading: loansLoading } = useStaticCollection('staffLoans');
-            const { data: employeeStates, loading: statesLoading } = useStaticCollection('employeeStates');
-            const { data: salaryRevisions, loading: revisionsLoading } = useStaticCollection('salaryRevisions');
-
-            const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
-
-            const handleTriggerPayroll = async () => {
-                if (!triggerConfirmed || !selectedShop || !selectedMonth || !allDataReady) {
-                    alert("Please select a shop, month, and confirm the action.");
-                    return;
-                }
-
-                setIsProcessing(true);
-                setProcessLog([]);
-                setProcessComplete(false);
-
-                const { writeBatch, collection, doc, serverTimestamp, getDocs, query, where } = window.firebaseSDK;
-
-                const allData = { shops: allShops, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
-
-                let employeesToProcess = [];
-                if (selectedShop === 'ALL_SHOPS') {
-                    employeesToProcess = employees.filter(e => e.status === 'Active');
-                } else {
-                    employeesToProcess = employees.filter(e => e.status === 'Active' && (Array.isArray(e.shop) ? e.shop.includes(selectedShop) : e.shop === selectedShop));
-                }
-
-                if (employeesToProcess.length === 0) {
-                    setProcessLog(['No active employees found for the selected shop.']);
-                    setIsProcessing(false);
-                    return;
-                }
-                
-                // Check if payroll for this shop/month already exists to prevent duplicates
-                const payrollCheckQuery = query(collection(db, "payrollHistory"), where("month", "==", selectedMonth), where("shop", "==", selectedShop));
-                const existingPayrollSnap = await getDocs(payrollCheckQuery);
-                if (!existingPayrollSnap.empty) {
-                     setProcessLog(prev => [...prev, `Warning: Payroll for ${selectedShop} for ${selectedMonth} may already exist. Please check history.`]);
-                }
-
-                setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
-
-                let successCount = 0;
-                for (const employee of employeesToProcess) {
-                    await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
-                    setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
-
-                    // Here we call the logic from our hook, but directly.
-                    // This is a simplified version; in a real large-scale app, this would be a backend function.
-                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData);
-                    
-                    if (calculations.netSalary !== undefined) {
-                        const batch = writeBatch(db);
-                        
-                        const shopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
-                        const payrollData = { month: selectedMonth, shop: shopName, employeeId: employee.id, employeeName: employee.name, baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, manualInputs: inputs, calculations: calculations, createdAt: serverTimestamp() };
-                        
-                        const payrollDocRef = doc(collection(db, "payrollHistory"));
-                        batch.set(payrollDocRef, payrollData);
-                        
-                        // Handle loan deduction logic
-                        if (inputs.loanDeduction > 0) {
-                            const activeLoan = staffLoans.find(loan => loan.staffId === employee.id && loan.status === 'Active');
-                            if (activeLoan) {
-                                const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
-                                const newBalance = activeLoan.loanAmount - newTotalPaid;
-                                const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
-                                
-                                const loanDocRef = doc(db, 'staffLoans', activeLoan.id);
-                                batch.update(loanDocRef, { totalPaid: newTotalPaid, status: newStatus });
-                                
-                                const paymentDocRef = doc(collection(db, 'loanPayments'));
-                                batch.set(paymentDocRef, { paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, staffId: employee.id, staffName: employee.name, shop: shopName, loanId: activeLoan.id, amountPaid: inputs.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll trigger" });
-                            }
-                        }
-                        
-                        try {
-                            await batch.commit();
-                            successCount++;
-                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully saved for ${employee.name}.`]);
-                        } catch (error) {
-                             setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
-                        }
-                    } else {
-                         setProcessLog(prev => [...prev.slice(0, -1), `[Skipped] Could not calculate salary for ${employee.name}.`]);
-                    }
-                }
-
-                setProcessLog(prev => [...prev, `\nProcess finished. Successfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`]);
-                setIsProcessing(false);
-                setProcessComplete(true);
-                setTriggerConfirmed(false); // Reset confirmation checkbox
-            };
-
-            return (
-                <Card>
-                    <CardTitle>Trigger Bulk Salary Calculation</CardTitle>
-                    <div className="max-w-xl mx-auto space-y-6">
-                        <p className="text-slate-400">This tool allows you to generate payroll for all active employees in a selected shop for a specific month. The results will be saved to the Payroll History.</p>
-                        
-                        <div>
-                            <label className="text-sm font-medium text-slate-400">Select Month</label>
-                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" disabled={isProcessing} />
-                        </div>
-
-                        <div>
-                            <label className="text-sm font-medium text-slate-400">Select Shop</label>
-                            <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select" disabled={isProcessing}>
-                                <option value="">-- Select a Shop --</option>
-                                <option value="ALL_SHOPS">All Shops (Admin Only)</option>
-                                {allShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
-                            </select>
-                        </div>
-                        
-                        <div className="p-4 border border-yellow-600 bg-yellow-900/20 rounded-lg space-y-3">
-                            <h4 className="font-bold text-yellow-300">Confirmation</h4>
-                            <div className="flex items-start">
-                                <input id="confirm-trigger" type="checkbox" checked={triggerConfirmed} onChange={e => setTriggerConfirmed(e.target.checked)} className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 mt-1" disabled={isProcessing} />
-                                <label htmlFor="confirm-trigger" className="ml-3 text-sm text-slate-300">I understand that this action will generate and save payroll records for all employees in the selected shop and month. This may overwrite existing records if run multiple times.</label>
-                            </div>
-                        </div>
-
-                        <Button 
-                            onClick={handleTriggerPayroll} 
-                            disabled={!triggerConfirmed || isProcessing || !selectedShop || !allDataReady}
-                            variant="danger"
-                            className="w-full py-3 text-base"
-                        >
-                            {isProcessing ? <><i className="fas fa-spinner fa-spin"></i> Processing...</> : <><i className="fas fa-bolt"></i> Trigger Payroll Generation</>}
-                        </Button>
-                        
-                        {(isProcessing || processLog.length > 0) && (
-                            <div className="mt-6">
-                                <h4 className="font-semibold text-slate-200">Processing Log:</h4>
-                                <pre className="mt-2 bg-slate-900/70 p-4 rounded-lg text-sm text-slate-300 h-64 overflow-y-auto font-mono">
-                                    {processLog.join('\n')}
-                                </pre>
-                            </div>
-                        )}
-                        {processComplete && (
-                             <div className="mt-4 p-4 text-center bg-green-900/50 border border-green-700 rounded-lg">
-                                <p className="font-semibold text-green-300">Process Complete!</p>
-                            </div>
-                        )}
-                    </div>
-                </Card>
-            );
-        };
-
+        // This component is now removed as its functionality is merged into PayrollCalculatorTab.
+        
         // Generic component for CRUD operations (Create, Read, Update, Delete)
         function SettingsCRUD({ title, collectionName, items, formFields, listColumns }) {
             const { db } = useFirebase();
@@ -4896,4 +4955,5 @@
     </script>
 </body>
 </html>
+
 
