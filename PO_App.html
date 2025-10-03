@@ -1355,7 +1355,7 @@
 
     // --- 8.5 PO Audit Page ---
     const POAuditPage = ({ poDataToAudit, setPage, userProfile }) => {
-        const { shops } = useData();
+        const { shops, products } = useData();
         const [auditedItems, setAuditedItems] = useState([]);
         const [exchangeRate, setExchangeRate] = useState('');
         const [auditedByName, setAuditedByName] = useState(userProfile.name || '');
@@ -1412,9 +1412,11 @@
         };
 
         useEffect(() => {
-            if (poDataToAudit?.items) {
+            if (poDataToAudit?.items && products && products.length > 0) {
+                const productMap = new Map(products.map(p => [p.id, p]));
                 const initialAuditedItems = poDataToAudit.items.map(item => ({
                     ...item,
+                    price: productMap.get(item.productId)?.price || 0,
                     originalQuantity: item.quantity,
                     originalCost: item.cost,
                     auditedQty: item.auditedQty ?? item.quantity,
@@ -1425,7 +1427,7 @@
             }
             setExchangeRate(poDataToAudit?.exchangeRate || '');
             setAuditedByName(poDataToAudit?.auditedBy || userProfile.name || '');
-        }, [poDataToAudit, userProfile.name]);
+        }, [poDataToAudit, userProfile.name, products]);
 
         useEffect(() => {
             if (fuse && debouncedSearchTerm.length > 1 && !selectedProduct) {
@@ -1465,6 +1467,7 @@
             }
 
             const productCost = parseFloat(selectedProduct.cost) || 0;
+            const productPrice = parseFloat(selectedProduct.price) || 0;
             const qty = parseFloat(newProductQty) || 0;
             const totalKhr = newProductCostKHR !== '' ? parseFloat(newProductCostKHR) : '';
             const totalUsd = newProductCostUSD !== '' ? parseFloat(newProductCostUSD) : '';
@@ -1474,6 +1477,7 @@
                 {
                     productId: selectedProduct.id, code: selectedProduct.code, barcode: selectedProduct.barcode || '',
                     name: selectedProduct.name, vendorName: selectedProduct.vendorName || '',
+                    price: productPrice,
                     originalQuantity: 0, originalCost: productCost,
                     auditedQty: qty, auditedTotalKHR: totalKhr, auditedTotalUSD: totalUsd,
                     checkUp: 'New Item'
@@ -1676,6 +1680,7 @@
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No</th>
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Product Code</th>
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
+                                <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Selling Price</th>
                                 <th className="px-2 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Total QTY</th>
                                 <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Cost</th>
                                 <th className="px-2 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Audited QTY</th>
@@ -1707,6 +1712,7 @@
                                     <td className="px-2 py-2 text-slate-400">{index + 1}</td>
                                     <td className="px-2 py-2 text-slate-300">{item.code}</td>
                                     <td className="px-2 py-2 text-slate-300">{item.name}</td>
+                                    <td className="px-2 py-2 text-slate-300 text-right">{khrFormatter.format(item.price)}</td>
                                     <td className="px-2 py-2 text-slate-400 text-center">{item.originalQuantity}</td>
                                     <td className="px-2 py-2 text-slate-400 text-right">{khrFormatter.format(originalTotalCost)}</td>
                                     <td className="px-2 py-2"><input type="number" value={item.auditedQty} onChange={(e) => handleItemChange(index, 'auditedQty', e.target.value)} className="w-20 bg-slate-700 text-slate-100 px-2 py-1 border border-slate-600 rounded-md text-center"/></td>
@@ -1719,7 +1725,7 @@
                         </tbody>
                         <tfoot className="bg-slate-900/50">
                             <tr>
-                                <td colSpan="9" className="px-2 py-3 text-right font-bold text-slate-300 uppercase">Audited Grand Total (KHR)</td>
+                                <td colSpan="10" className="px-2 py-3 text-right font-bold text-slate-300 uppercase">Audited Grand Total (KHR)</td>
                                 <td className="px-2 py-3 text-right font-bold text-slate-200">៛{khrFormatter.format(totalAuditedAmountKHR.toFixed(2))}</td>
                             </tr>
                         </tfoot>
@@ -2516,56 +2522,78 @@
             const newTotalAmount = items.reduce((sum, item) => sum + ((item.quantity || 0) * (item.cost || 0)), 0);
 
             try {
-                // --- MODIFICATION START: Use a Firestore Transaction ---
-                await db.runTransaction(async (transaction) => {
-                    const productRefs = items.map(item => db.collection("products").doc(item.productId));
-                    const productDocs = await Promise.all(productRefs.map(ref => transaction.get(ref)));
+                // --- MODIFICATION START: Convert to Batched Writes ---
 
-                    // Step 1: Validate all items BEFORE making any changes
-                    for (let i = 0; i < items.length; i++) {
-                        const productDoc = productDocs[i];
-                        const originalItem = transferData.items[i];
-                        const originalQty = originalItem?.quantity || 0;
-
+                // Step 1: Perform validation reads first (outside a transaction/batch).
+                // This is a "read-then-write" approach. It's less atomic but necessary for large operations.
+                for (const originalItem of transferData.items) {
+                    if (fromShop?.manageStock) {
+                        const productRef = db.collection("products").doc(originalItem.productId);
+                        const productDoc = await productRef.get();
                         if (!productDoc.exists) {
                             throw new Error(`Product ${originalItem.name} not found.`);
                         }
-
-                        if (fromShop?.manageStock) {
-                            const currentStock = productDoc.data().stockByShop?.[fromShop.id] || 0;
-                            if (currentStock < originalQty) {
-                                throw new Error(`Insufficient stock for ${originalItem.name}. Available: ${currentStock}, Requested: ${originalQty}. Please correct the stock level before completing.`);
-                            }
+                        const currentStock = productDoc.data().stockByShop?.[fromShop.id] || 0;
+                        const originalQty = originalItem?.quantity || 0;
+                        if (currentStock < originalQty) {
+                             throw new Error(`Insufficient stock for ${originalItem.name}. Available: ${currentStock}, Requested: ${originalQty}. The stock level may have changed. Please re-verify.`);
                         }
                     }
+                }
 
-                    // Step 2: If validation passes, perform all updates
-                    const transferRef = db.collection("internalTransfers").doc(transferData.id);
-                    transaction.update(transferRef, { status: 'done', items, totalAmount: newTotalAmount, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                // Step 2: If validation passes, create and commit write batches.
+                const MAX_WRITES_PER_BATCH = 499; // Stay safely under the 500 limit
+                let batch = db.batch();
+                let writeCount = 0;
+                const allBatches = [];
 
-                    productDocs.forEach((productDoc, index) => {
-                        const auditedItem = items[index];
-                        const originalItem = transferData.items[index];
-                        const originalQty = originalItem?.quantity || 0;
-                        const receivedQty = auditedItem.quantity || 0;
-                        
-                        if (fromShop?.manageStock) {
-                            transaction.update(productDoc.ref, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-originalQty) });
-                        }
-                        if (toShop?.manageStock && receivedQty > 0) {
-                            transaction.update(productDoc.ref, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
-                        }
-                    });
-                });
+                // First, update the main transfer document
+                const transferRef = db.collection("internalTransfers").doc(transferData.id);
+                batch.update(transferRef, { status: 'done', items, totalAmount: newTotalAmount, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                writeCount++;
+
+                // Now, process all the product stock updates
+                for (let i = 0; i < items.length; i++) {
+                    const originalItem = transferData.items[i];
+                    const auditedItem = items[i];
+                    const productRef = db.collection("products").doc(originalItem.productId);
+                    const originalQty = originalItem?.quantity || 0;
+                    const receivedQty = auditedItem.quantity || 0;
+                    
+                    if (fromShop?.manageStock) {
+                        batch.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-originalQty) });
+                        writeCount++;
+                    }
+                    if (toShop?.manageStock && receivedQty > 0) {
+                        batch.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
+                        writeCount++;
+                    }
+
+                    // If the batch is full, push it to our array and start a new one
+                    if (writeCount >= MAX_WRITES_PER_BATCH) {
+                        allBatches.push(batch.commit());
+                        batch = db.batch();
+                        writeCount = 0;
+                    }
+                }
+
+                // Commit any remaining writes in the last batch
+                if (writeCount > 0) {
+                    allBatches.push(batch.commit());
+                }
+
+                // Wait for all batch commitments to complete
+                await Promise.all(allBatches);
+
                 // --- MODIFICATION END ---
                 
                 setModalInfo({ show: true, title: 'Success', message: 'Transfer completed and stock updated.' });
                 onClose();
             } catch (error) {
-                console.error("Transaction failed: ", error); // Log the detailed error
+                console.error("Batch write failed: ", error); // Log the detailed error
                 setModalInfo({ 
                     show: true, 
-                    title: 'Transaction Error', 
+                    title: 'Operation Error', 
                     message: `Failed to complete transfer. Reason: ${error.message}`, 
                     isError: true 
                 });
@@ -3812,6 +3840,8 @@
         </script>
     </body>
     </html>
+
+
 
 
 
