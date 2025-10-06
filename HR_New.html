@@ -1411,15 +1411,22 @@
                 return `${year}-${month}`;
             });
 
+            const { where } = window.firebaseSDK;
+
+            // PHASE 1 OPTIMIZATION: Queries for the salary preview are now filtered by the current user's ID.
+            // This applies to all roles, as this page is always a self-view, preventing the unnecessary load of all company data.
+            const staffQueryConstraints = useMemo(() => userProfile?.id ? [where("staffId", "==", userProfile.id)] : [], [userProfile?.id]);
+            const attendanceQueryConstraints = useMemo(() => userProfile?.id ? [where("employeeId", "==", userProfile.id)] : [], [userProfile?.id]);
+
             // Fetch all data needed for the payroll hook
             const allData = {
                 shops: useCollection('shops').data,
-                attendance: useCollection('attendance').data,
-                leaveRequests: useCollection('leaveRequests').data,
-                otRequests: useCollection('otRequests').data,
-                staffLoans: useCollection('staffLoans').data,
-                employeeStates: useCollection('employeeStates').data,
-                salaryRevisions: useCollection('salaryRevisions').data,
+                attendance: useCollection('attendance', attendanceQueryConstraints).data,
+                leaveRequests: useCollection('leaveRequests', staffQueryConstraints).data,
+                otRequests: useCollection('otRequests', staffQueryConstraints).data,
+                staffLoans: useCollection('staffLoans', staffQueryConstraints).data,
+                employeeStates: useCollection('employeeStates', staffQueryConstraints).data,
+                salaryRevisions: useCollection('salaryRevisions', staffQueryConstraints).data,
                 shifts: useCollection('shifts').data, // Add shifts data
             };
             
@@ -2264,12 +2271,42 @@
         // --- START ATTENDANCE REPORT PAGE ---
         const AttendanceReportPage = ({ userProfile }) => {
             const [activeTab, setActiveTab] = useState('daily');
-            const { data: leaveRequests } = useCollection('leaveRequests');
-            const { data: otRequests } = useCollection('otRequests');
+            const { db } = useFirebase();
+            const { where, query, collection, getDocs } = window.firebaseSDK;
+            const [reportData, setReportData] = useState({ leaveRequests: [], otRequests: [] });
+            const [loading, setLoading] = useState(false);
+
+            // PHASE 3 OPTIMIZATION: For Admins, we now fetch this data on-demand in the child components.
+            // For other roles, we maintain the real-time listener for a better experience on their smaller datasets.
+            const isRealTime = userProfile?.role !== 'Admin';
+            
+            const staffQueryConstraints = useMemo(() => {
+                const { role, id, shop } = userProfile || {};
+                if (role === 'Staff' && id) {
+                    return [where("staffId", "==", id)];
+                }
+                if (role === 'Shop Manager') {
+                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                    if (managedShops.length > 0) {
+                        return [where("shop", "in", managedShops)];
+                    }
+                    return [where("staffId", "==", "null")]; // No shops assigned, so return no results.
+                }
+                return []; // Admin query is built on-demand.
+            }, [userProfile]);
+            
+            // Real-time data for Staff/Managers
+            const { data: realTimeLeaveRequests } = useCollection('leaveRequests', isRealTime ? staffQueryConstraints : []);
+            const { data: realTimeOtRequests } = useCollection('otRequests', isRealTime ? staffQueryConstraints : []);
+            
+            // On-demand data for Admins (passed down)
+            const leaveRequests = isRealTime ? realTimeLeaveRequests : reportData.leaveRequests;
+            const otRequests = isRealTime ? realTimeOtRequests : reportData.otRequests;
+
             return (
                 <TabbedPage tabs={{ daily: 'Daily Report', monthly: 'No. Work Day' }} activeTab={activeTab} setActiveTab={setActiveTab}>
-                    <div id="daily"><DailyReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} /></div>
-                    <div id="monthly"><WorkDayReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} /></div>
+                    <div id="daily"><DailyReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} setAdminReportData={setReportData} setLoadingAdminReport={setLoading} isAdminLoading={loading} /></div>
+                    <div id="monthly"><WorkDayReportTab userProfile={userProfile} leaveRequests={leaveRequests} otRequests={otRequests} setAdminReportData={setReportData} setLoadingAdminReport={setLoading} isAdminLoading={loading} /></div>
                 </TabbedPage>
             );
         };
@@ -2329,20 +2366,101 @@
             );
         };
 
-        const DailyReportTab = ({ userProfile, leaveRequests, otRequests }) => {
+        const DailyReportTab = ({ userProfile, leaveRequests, otRequests, setAdminReportData, setLoadingAdminReport, isAdminLoading }) => {
             const { db } = useFirebase();
-            const { data: attendance } = useCollection('attendance');
-            const { data: shops } = useCollection('shops');
-            const { data: employees } = useCollection('employees');
-            const { data: shifts } = useCollection('shifts');
+            const { where, query, collection, getDocs } = window.firebaseSDK;
+            const [recordToDelete, setRecordToDelete] = useState(null);
+            const [recordToCorrect, setRecordToCorrect] = useState(null);
+            const [isCorrectionModalOpen, setCorrectionModalOpen] = useState(false);
+
+            // Filters State
             const [selectedShop, setSelectedShop] = useState('');
             const [filterType, setFilterType] = useState('today');
             const [customMonth, setCustomMonth] = useState(new Date().toISOString().slice(0, 7));
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
-            const [selectedShift, setSelectedShift] = useState(''); // Add state for shift filter
-            const [recordToDelete, setRecordToDelete] = useState(null);
-            const [recordToCorrect, setRecordToCorrect] = useState(null); // State for manual check-out
-            const [isCorrectionModalOpen, setCorrectionModalOpen] = useState(false);
+            const [selectedShift, setSelectedShift] = useState('');
+
+            // Data State
+            const { data: shops } = useCollection('shops');
+            const { data: employees } = useCollection('employees');
+            const { data: shifts } = useCollection('shifts');
+            
+            // PHASE 3: Data state for Admin's one-time fetches
+            const [adminAttendance, setAdminAttendance] = useState([]);
+            
+            // PHASE 2 & 3: Combined logic for fetching attendance data.
+            const isRealTime = userProfile?.role !== 'Admin';
+            const attendanceQueryConstraints = useMemo(() => {
+                // This is ONLY for real-time listeners (Staff/Manager)
+                if (!isRealTime) return []; 
+                
+                const { role, id, shop } = userProfile || {};
+                if (role === 'Staff' && id) return [where("employeeId", "==", id)];
+                
+                if (role === 'Shop Manager') {
+                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                    if (managedShops.length > 0) return [where("shop", "in", managedShops)];
+                    return [where("employeeId", "==", "null")];
+                }
+                return []; // Should not happen for real-time
+            }, [userProfile, isRealTime]);
+            
+            const { data: realTimeAttendance } = useCollection('attendance', attendanceQueryConstraints);
+            const attendance = isRealTime ? realTimeAttendance : adminAttendance;
+
+            // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN ---
+            useEffect(() => {
+                if (userProfile?.role !== 'Admin') return;
+
+                const fetchAdminData = async () => {
+                    setLoadingAdminReport(true);
+                    
+                    const startDate = new Date();
+                    const endDate = new Date();
+                    // ... [date range calculation logic from useMemo] ...
+                     switch (filterType) {
+                        case 'today': startDate.setHours(0, 0, 0, 0); endDate.setHours(23, 59, 59, 999); break;
+                        case 'yesterday': startDate.setDate(startDate.getDate() - 1); startDate.setHours(0, 0, 0, 0); endDate.setDate(endDate.getDate() - 1); endDate.setHours(23, 59, 59, 999); break;
+                        case 'thisMonth': startDate.setDate(1); startDate.setHours(0, 0, 0, 0); endDate.setMonth(endDate.getMonth() + 1); endDate.setDate(0); endDate.setHours(23, 59, 59, 999); break;
+                        case 'lastMonth': startDate.setMonth(startDate.getMonth() - 1); startDate.setDate(1); startDate.setHours(0, 0, 0, 0); endDate.setDate(0); endDate.setHours(23, 59, 59, 999); break;
+                        case 'custom': const [year, month] = customMonth.split('-').map(Number); if (year && month) { startDate.setFullYear(year, month - 1, 1); startDate.setHours(0, 0, 0, 0); endDate.setFullYear(year, month, 0); endDate.setHours(23, 59, 59, 999); } break;
+                    }
+
+                    // Base queries with date range
+                    const attendanceQuery = query(collection(db, 'attendance'), where('timestamp', '>=', startDate), where('timestamp', '<=', endDate));
+                    // FIX: Changed to a single range query to avoid composite index requirement.
+                    const leaveQuery = query(collection(db, 'leaveRequests'), where('leaveDate', '<=', endDate.toISOString().slice(0, 10)));
+                    const otQuery = query(collection(db, 'otRequests'), where('reqDate', '>=', startDate.toISOString().slice(0, 10)), where('reqDate', '<=', endDate.toISOString().slice(0, 10)));
+                    
+                    try {
+                        const [attSnap, leaveSnap, otSnap] = await Promise.all([
+                            getDocs(attendanceQuery),
+                            getDocs(leaveQuery),
+                            getDocs(otQuery)
+                        ]);
+                        
+                        setAdminAttendance(attSnap.docs.map(d => ({id: d.id, ...d.data()})));
+                        
+                        // FIX: Apply the second part of the date range filter on the client side.
+                        const filteredLeaveRequests = leaveSnap.docs
+                            .map(d => ({ id: d.id, ...d.data() }))
+                            .filter(lr => lr.returnDate >= startDate.toISOString().slice(0, 10));
+
+                        setAdminReportData({
+                            leaveRequests: filteredLeaveRequests,
+                            otRequests: otSnap.docs.map(d => ({id: d.id, ...d.data()}))
+                        });
+
+                    } catch (error) {
+                        console.error("Error fetching admin report data:", error);
+                    } finally {
+                        setLoadingAdminReport(false);
+                    }
+                };
+                
+                fetchAdminData();
+
+            }, [userProfile, filterType, customMonth, db, setLoadingAdminReport, setAdminReportData]);
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin') {
@@ -2673,16 +2791,107 @@
             );
         };
         
-        const WorkDayReportTab = ({ userProfile, leaveRequests, otRequests }) => {
-            const { data: attendance } = useCollection('attendance');
-            const { data: shops } = useCollection('shops');
-            const { data: employees } = useCollection('employees');
-            const { data: employeeStates } = useCollection('employeeStates'); // Fetch employee states for late calculation
+        const WorkDayReportTab = ({ userProfile, leaveRequests, otRequests, setAdminReportData, setLoadingAdminReport, isAdminLoading }) => {
+            const { db } = useFirebase();
+            const { where, query, collection, getDocs } = window.firebaseSDK;
+
+            // Filter States
             const [selectedShop, setSelectedShop] = useState('');
             const [filterType, setFilterType] = useState('thisMonth');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+
+            // Data States
+            const { data: shops } = useCollection('shops');
+            const { data: employees } = useCollection('employees');
             
+            // PHASE 3: Data states for Admin's one-time fetches
+            const [adminAttendance, setAdminAttendance] = useState([]);
+            const [adminEmployeeStates, setAdminEmployeeStates] = useState([]);
+
+            // PHASE 2 & 3: Combined logic for fetching data.
+            const isRealTime = userProfile?.role !== 'Admin';
+            
+            const realTimeQueryConstraints = useMemo(() => {
+                if (!isRealTime) return { attendance: [], employeeStates: [] };
+                const { role, id, shop } = userProfile || {};
+                
+                let attendanceCons = [], statesCons = [];
+
+                if (role === 'Staff' && id) {
+                    attendanceCons = [where("employeeId", "==", id)];
+                    statesCons = [where("staffId", "==", id)];
+                } else if (role === 'Shop Manager') {
+                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                    if (managedShops.length > 0) {
+                        attendanceCons = [where("shop", "in", managedShops)];
+                        statesCons = [where("shop", "in", managedShops)];
+                    } else {
+                        attendanceCons = [where("employeeId", "==", "null")];
+                        statesCons = [where("staffId", "==", "null")];
+                    }
+                }
+                return { attendance: attendanceCons, employeeStates: statesCons };
+            }, [userProfile, isRealTime]);
+
+            const { data: realTimeAttendance } = useCollection('attendance', realTimeQueryConstraints.attendance);
+            const { data: realTimeEmployeeStates } = useCollection('employeeStates', realTimeQueryConstraints.employeeStates);
+            
+            const attendance = isRealTime ? realTimeAttendance : adminAttendance;
+            const employeeStates = isRealTime ? realTimeEmployeeStates : adminEmployeeStates;
+
+             // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN ---
+            useEffect(() => {
+                if (userProfile?.role !== 'Admin') return;
+
+                const fetchAdminData = async () => {
+                    setLoadingAdminReport(true);
+                    
+                    let targetMonth;
+                    const now = new Date();
+                    switch (filterType) {
+                        case 'lastMonth': const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1); targetMonth = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`; break;
+                        case 'custom': targetMonth = selectedMonth; break;
+                        default: targetMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`; break;
+                    }
+
+                    const startDate = `${targetMonth}-01`;
+                    const endDate = `${targetMonth}-31`; // Firestore handles date strings correctly
+
+                    // Base queries with date range
+                    const attendanceQuery = query(collection(db, 'attendance'), where('timestamp', '>=', new Date(startDate)), where('timestamp', '<=', new Date(endDate + "T23:59:59")));
+                    const statesQuery = query(collection(db, 'employeeStates'), where('date', '>=', startDate), where('date', '<=', endDate));
+                    // FIX: Changed to a single range query to avoid composite index requirement.
+                    const leaveQuery = query(collection(db, 'leaveRequests'), where('leaveDate', '<=', endDate));
+                    const otQuery = query(collection(db, 'otRequests'), where('reqDate', '>=', startDate), where('reqDate', '<=', endDate));
+                    
+                    try {
+                        const [attSnap, statesSnap, leaveSnap, otSnap] = await Promise.all([ getDocs(attendanceQuery), getDocs(statesQuery), getDocs(leaveQuery), getDocs(otQuery) ]);
+                        
+                        setAdminAttendance(attSnap.docs.map(d => ({id: d.id, ...d.data()})));
+                        setAdminEmployeeStates(statesSnap.docs.map(d => ({id: d.id, ...d.data()})));
+                        
+                        // FIX: Apply the second part of the date range filter on the client side.
+                        const filteredLeaveRequests = leaveSnap.docs
+                            .map(d => ({ id: d.id, ...d.data() }))
+                            .filter(lr => lr.returnDate >= startDate);
+
+                        setAdminReportData({
+                            leaveRequests: filteredLeaveRequests,
+                            otRequests: otSnap.docs.map(d => ({id: d.id, ...d.data()}))
+                        });
+
+                    } catch (error) {
+                        console.error("Error fetching admin work day report data:", error);
+                    } finally {
+                        setLoadingAdminReport(false);
+                    }
+                };
+                
+                fetchAdminData();
+
+            }, [userProfile, filterType, selectedMonth, db, setLoadingAdminReport, setAdminReportData]);
+
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin') {
                      // For managers with multiple shops, default to showing all their shops.
@@ -3254,16 +3463,39 @@
             const [selectedMonth, setSelectedMonth] = useState(currentMonth);
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+            const { where } = window.firebaseSDK;
+
+            // PHASE 2 OPTIMIZATION: Add query constraints for Shop Managers to only load data for their shops.
+            const payrollQueryConstraints = useMemo(() => {
+                const { role, shop } = userProfile || {};
+                if (role === 'Shop Manager') {
+                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                    if (managedShops.length > 0) {
+                        // Return constraints for different collection structures
+                        return {
+                            standard: [where("shop", "in", managedShops)], // For collections with 'shop' field
+                            salary: [where("shopName", "in", managedShops)] // For 'salaryRevisions' with 'shopName' field
+                        };
+                    }
+                     // If manager has no shops, return a query that finds nothing.
+                    return {
+                        standard: [where("shop", "==", "null")],
+                        salary: [where("shopName", "==", "null")]
+                    };
+                }
+                // Admin and Staff roles will not have server-side constraints here.
+                return { standard: [], salary: [] };
+            }, [userProfile]);
             
             const allData = {
                 shops: useCollection('shops').data,
-                employees: useCollection('employees').data,
-                attendance: useCollection('attendance').data,
-                leaveRequests: useCollection('leaveRequests').data,
-                otRequests: useCollection('otRequests').data,
-                staffLoans: useCollection('staffLoans').data,
-                employeeStates: useCollection('employeeStates').data,
-                salaryRevisions: useCollection('salaryRevisions').data,
+                employees: useCollection('employees').data, // Keep all employees for dropdowns, filtering is done client-side.
+                attendance: useCollection('attendance', payrollQueryConstraints.standard).data,
+                leaveRequests: useCollection('leaveRequests', payrollQueryConstraints.standard).data,
+                otRequests: useCollection('otRequests', payrollQueryConstraints.standard).data,
+                staffLoans: useCollection('staffLoans', payrollQueryConstraints.standard).data,
+                employeeStates: useCollection('employeeStates', payrollQueryConstraints.standard).data,
+                salaryRevisions: useCollection('salaryRevisions', payrollQueryConstraints.salary).data,
             };
             const { employees, shops } = allData;
 
@@ -3426,13 +3658,65 @@
 
         const PayrollHistoryTab = ({ onEdit, userProfile }) => {
             const { db } = useFirebase();
-            const { data: history } = useCollection('payrollHistory');
-            const { data: shops } = useCollection('shops');
-            const [recordToDelete, setRecordToDelete] = useState(null);
+            const { where, query, collection, getDocs } = window.firebaseSDK;
+
+            // Filter states
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+
+            // Data states
+            const [history, setHistory] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const { data: shops } = useCollection('shops'); // Keep shops real-time for dropdowns
+
+            // PHASE 3: Fetch payroll history on-demand for all roles for consistency and performance
+            useEffect(() => {
+                const fetchHistory = async () => {
+                    if (!userProfile) return;
+                    setLoading(true);
+
+                    const { role, shop } = userProfile;
+                    let q = query(collection(db, 'payrollHistory'));
+
+                    // 1. Filter by role
+                    if (role === 'Shop Manager') {
+                        const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                        if (managedShops.length > 0) {
+                            q = query(q, where("shop", "in", managedShops));
+                        } else {
+                            q = query(q, where("shop", "==", "null")); // No shops, no data
+                        }
+                    }
+                    // Staff don't see this page, so no specific filter needed.
+
+                    // 2. Filter by selected month
+                    if (selectedMonth) {
+                        q = query(q, where("month", "==", selectedMonth));
+                    }
+                    
+                    // 3. Admin's shop filter is also applied on the server
+                    if (role === 'Admin' && selectedShop) {
+                        q = query(q, where("shop", "==", selectedShop));
+                    }
+                    
+                    try {
+                        const snapshot = await getDocs(q);
+                        const historyData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        setHistory(historyData);
+                    } catch (error) {
+                        console.error("Error fetching payroll history:", error);
+                    } finally {
+                        setLoading(false);
+                    }
+                };
+
+                fetchHistory();
+            }, [db, userProfile, selectedMonth, selectedShop]); // Refetch when filters change
+
+            const [recordToDelete, setRecordToDelete] = useState(null);
             
-            // NEW: Determine if the user is a multi-shop manager and can filter
+            // ... (rest of the component logic remains largely the same, but uses `history` state instead of `useCollection` data)
+            
             const isMultiShopManager = userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop) && userProfile.shop.length > 1;
             const canFilterByShop = userProfile?.role === 'Admin' || isMultiShopManager;
 
@@ -3445,34 +3729,23 @@
                 return [];
             }, [shops, userProfile, isMultiShopManager]);
             
-            // NEW: Set initial shop state based on user role
-            useEffect(() => { if (userProfile && userProfile.role !== 'Admin') setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || ''); }, [userProfile]);
+            // NEW: Set initial shop state based on user role - now only for Admin UI
+            useEffect(() => { 
+                if (userProfile && userProfile.role === 'Shop Manager' && !isMultiShopManager) {
+                     setSelectedShop(userProfile.shop || ''); 
+                } else {
+                    setSelectedShop('');
+                }
+            }, [userProfile, isMultiShopManager]);
 
             const { filteredHistory, totals } = useMemo(() => {
+                // Client-side filtering is now simpler as server does most of the work
                 const filtered = history.filter(rec => {
-                    if (!rec.month) return false;
-                    
-                    // Filter by selected month
-                    const dateMatch = !selectedMonth || rec.month === selectedMonth;
-                    if (!dateMatch) return false;
-
-                    // **BUG FIX**: Implement correct role-based shop filtering
-                    if (userProfile.role === 'Admin') {
-                        // Admin: If a shop is selected, filter by it. Otherwise, show all.
-                        return !selectedShop || rec.shop === selectedShop;
-                    } 
-                    else if (userProfile.role === 'Shop Manager') {
-                        const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
-                        if (selectedShop) {
-                            // A specific shop is selected from the dropdown
-                            return rec.shop === selectedShop;
-                        } else {
-                            // "All My Shops" is selected, check if record's shop is in the manager's list
-                            return managedShops.includes(rec.shop);
-                        }
+                    // For managers with multiple shops, they can further filter down from their total set of shops
+                    if (userProfile?.role === 'Shop Manager' && selectedShop) {
+                        return rec.shop === selectedShop;
                     }
-                    // Default for other roles (e.g., Staff)
-                    return !selectedShop || rec.shop === selectedShop;
+                    return true;
                 });
 
                 const sorted = [...filtered].sort((a,b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
@@ -3486,12 +3759,20 @@
                     return acc; 
                 }, { baseSalary: 0, engagements: 0, otSalary: 0, loanDeduction: 0, otherDeductions: 0, netSalary: 0 });
                 return { filteredHistory: sorted, totals };
-            }, [history, selectedShop, selectedMonth, userProfile]);
+            }, [history, selectedShop, userProfile]);
 
             const handleDelete = async () => {
                 if (!recordToDelete) return;
-                try { await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'payrollHistory', recordToDelete.id)); setRecordToDelete(null); } 
-                catch (error) { console.error("Error deleting payroll record:", error); setRecordToDelete(null); }
+                try { 
+                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'payrollHistory', recordToDelete.id)); 
+                    // Refetch data after delete
+                    // A simple way is to just refetch all, though a more advanced solution could remove it from state.
+                    setSelectedMonth(prev => `${prev}`); // Trigger useEffect refetch
+                } 
+                catch (error) { console.error("Error deleting payroll record:", error); }
+                finally {
+                    setRecordToDelete(null);
+                }
             };
 
             return (
@@ -3505,7 +3786,11 @@
                         )}
                         <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
                     </div></div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Employee</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Base Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Engagements</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">OT Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loan Deduction</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Other Deductions</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Final Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredHistory.map(rec => (<tr key={rec.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{rec.month}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.baseSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.engagements)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(rec.netSalary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete" /></>)}</div></td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="3" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.baseSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.engagements)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.loanDeduction)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otherDeductions)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.netSalary)}</td><td></td></tr></tfoot></table></div>
+                    {loading ? (
+                         <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
+                    ) : (
+                        <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Employee</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Base Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Engagements</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">OT Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loan Deduction</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Other Deductions</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Final Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredHistory.map(rec => (<tr key={rec.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{rec.month}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.baseSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.engagements)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(rec.netSalary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete" /></>)}</div></td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="3" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.baseSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.engagements)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.loanDeduction)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otherDeductions)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.netSalary)}</td><td></td></tr></tfoot></table></div>
+                    )}
                     <ConfirmationModal isOpen={!!recordToDelete} onClose={() => setRecordToDelete(null)} onConfirm={handleDelete} title="Delete Payroll Record" message="Are you sure you want to delete this payroll record? This action cannot be undone." />
                 </Card>
             );
