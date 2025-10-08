@@ -302,7 +302,7 @@
         const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction) => {
             if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
 
-            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions } = allData;
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops } = allData;
 
             // --- 1. Filter data for the selected employee and month ---
             const monthAttendance = (attendance || []).filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(selectedMonth));
@@ -331,27 +331,25 @@
             const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : (activeLoan ? parseFloat(activeLoan.agreedMonthlyDeduction) || 0 : 0);
             const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
 
+            // NEW: Get the employee's primary shop and their assigned timezone. This is crucial for all date calculations.
+            const employeeShopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
+            const employeeShop = (shops || []).find(s => s.name === employeeShopName);
+            const employeeShopTimezone = employeeShop?.timezone; // e.g., 'Asia/Phnom_Penh'
+
             const dailyRecords = {};
             monthAttendance.forEach(rec => {
-                // FIX: Format date key in local timezone to avoid UTC conversion issues.
-                const date = rec.timestamp.toDate();
-                const year = date.getFullYear();
-                const month = String(date.getMonth() + 1).padStart(2, '0');
-                const day = String(date.getDate()).padStart(2, '0');
-                const dayKey = `${year}-${month}-${day}`;
+                // FIX: Use the timezone-aware utility to get the date key based on the shop's local timezone.
+                const { localDate: dayKey } = Utils.formatDateInTimezone(rec.timestamp, employeeShopTimezone);
                 
                 if (!dailyRecords[dayKey]) dailyRecords[dayKey] = [];
-                dailyRecords[dayKey].push({ date: date, type: rec.type });
+                // Push the original Javascript Date object for time difference calculations.
+                dailyRecords[dayKey].push({ date: rec.timestamp.toDate(), type: rec.type });
             });
             
             let workDays = 0;
             let noCheckOutCount = 0;
-            // FIX: Format today's date string in local timezone.
-            const todayDate = new Date();
-            const today_year = todayDate.getFullYear();
-            const today_month = String(todayDate.getMonth() + 1).padStart(2, '0');
-            const today_day = String(todayDate.getDate()).padStart(2, '0');
-            const todayStr = `${today_year}-${today_month}-${today_day}`;
+            // FIX: Get today's date string formatted in the shop's local timezone to correctly identify past vs. present days.
+            const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => new Date() }, employeeShopTimezone);
 
 
             Object.entries(dailyRecords).forEach(([dayKey, dayRecs]) => {
@@ -370,17 +368,16 @@
             const attendedDays = new Set(Object.keys(dailyRecords));
             let absentDays = 0;
             let rejectedLeavePenaltyAmount = 0; // Initialize penalty amount
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
 
             for (let day = 1; day <= daysInMonth; day++) {
                 const currentDay = new Date(year, month - 1, day);
-                if (currentDay >= today) break; // Don't count today or future days
-
                 const loop_year = currentDay.getFullYear();
                 const loop_month = String(currentDay.getMonth() + 1).padStart(2, '0');
                 const loop_day = String(currentDay.getDate()).padStart(2, '0');
                 const dayKey = `${loop_year}-${loop_month}-${loop_day}`;
+
+                // FIX: Compare against the timezone-aware 'today' string instead of a local Date object.
+                if (dayKey >= todayStr) break; // Don't count today or future days as absent.
 
                 // An absence is a past day with no attendance record.
                 if (!attendedDays.has(dayKey)) {
@@ -484,6 +481,36 @@
                 if (days < 0) { months--; days += new Date(end.getFullYear(), end.getMonth(), 0).getDate(); }
                 if (months < 0) { years--; months += 12; }
                 return `${years}Y ${months}M ${days}D`;
+            },
+            // NEW: Timezone-aware date formatting utility
+            formatDateInTimezone: (timestamp, timezone) => {
+                // Return defaults if the timestamp is invalid
+                if (!timestamp || !timestamp.toDate) {
+                    return { localDate: 'N/A', displayDate: 'N/A', localTime: 'N/A' };
+                }
+
+                const date = timestamp.toDate();
+                // Use the provided timezone, but fall back to the user's browser timezone if it's missing.
+                const tz = timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+                try {
+                    // 'sv-SE' (Swedish) locale reliably gives the YYYY-MM-DD format.
+                    const localDate = date.toLocaleDateString('sv-SE', { timeZone: tz });
+                    
+                    // 'en-GB' gives the DD/MM/YYYY format for display purposes.
+                    const displayDate = date.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: tz });
+
+                    const localTime = date.toLocaleTimeString('en-US', {
+                        hour: '2-digit', minute: '2-digit', hour12: true, timeZone: tz
+                    });
+
+                    return { localDate, displayDate, localTime };
+                } catch (error) {
+                    console.error("Invalid timezone provided to formatter:", timezone, error);
+                    // If the provided timezone is invalid, fall back to basic UTC conversion to prevent crashes.
+                    const localDate = date.toISOString().split('T')[0];
+                    return { localDate, displayDate: localDate, localTime: date.toUTCString() };
+                }
             },
             // Haversine formula to calculate distance between two lat/lon points
             getDistance: (lat1, lon1, lat2, lon2) => {
@@ -689,7 +716,6 @@
                 { key: 'expenseReport', label: 'Expense Report' },
                 { key: 'userActivity', label: 'User Activity' },
                 { key: 'settings', label: 'Settings' },
-                { key: 'sysConfig', label: 'Sys Config' },
             ], []);
 
             // Filter shifts based on the employee's assigned shop(s)
@@ -910,13 +936,10 @@
                                     <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 p-4 border border-slate-600 rounded-lg bg-slate-700/50">
                                         {availablePages.map(page => {
                                             // A Shop Manager cannot grant permissions for these specific pages.
-                                            const isRestrictedForManager = userProfile?.role === 'Shop Manager' && ['expenseReport', 'userActivity', 'settings', 'sysConfig'].includes(page.key);
+                                            const isRestrictedForManager = userProfile?.role === 'Shop Manager' && ['expenseReport', 'userActivity', 'settings'].includes(page.key);
                                             
-                                            // 'Sys Config' permission is only available when the employee's role is 'Admin'.
-                                            const isSysConfigAndNotAdminRole = page.key === 'sysConfig' && formData.role !== 'Admin';
-
                                             // The checkbox is only disabled if the modal is view-only or if a Shop Manager is viewing a restricted permission.
-                                            const isDisabled = isViewOnly || isRestrictedForManager || isSysConfigAndNotAdminRole;
+                                            const isDisabled = isViewOnly || isRestrictedForManager;
 
                                             return (
                                                 <div key={page.key} className="flex items-center">
@@ -935,7 +958,7 @@
                             {isViewOnly ? (
                                 <>
                                     <Button type="button" variant="secondary" onClick={onClose}>Close</Button>
-                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (
+                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                         <Button type="button" variant="primary" icon="fa-edit" onClick={(e) => { e.preventDefault(); onSwitchToEdit(); }}>Edit</Button>
                                     )}
                                 </>
@@ -985,7 +1008,7 @@
 
                 const role = userProfile.role;
                 
-                if (role === 'Admin') {
+                if (role === 'Admin' || role === 'CEO') {
                     let results1 = [], results2 = [];
                     // If filtering by shop, use efficient queries
                     if (selectedShop) {
@@ -1046,23 +1069,34 @@
                 return () => { unsub1(); unsub2(); };
             }, [db, userProfile, auth.currentUser, selectedShop]);
             
-            // Memoized filtering for performance (now only for search term as status is filtered in the query)
+            // Memoized filtering for performance
             const filteredEmployees = useMemo(() => {
-                const filtered = employees.filter(e => 
-                    (e.name.toLowerCase().includes(searchTerm.toLowerCase()))
-                );
+                // Start with the base employee list
+                let filtered = [...employees];
+
+                // If the current user is NOT an Admin, filter out any employees who ARE Admins.
+                if (userProfile?.role !== 'Admin') {
+                    filtered = filtered.filter(e => e.role !== 'Admin');
+                }
+
+                // Apply the search term filter
+                if (searchTerm) {
+                    filtered = filtered.filter(e => 
+                        e.name.toLowerCase().includes(searchTerm.toLowerCase())
+                    );
+                }
                 
-                // Sort by shop name, then by employee name
+                // Sort by shop name, then by employee name (case-insensitive)
                 return filtered.sort((a, b) => {
-                    const shopA = Array.isArray(a.shop) ? a.shop[0] || '' : a.shop || '';
-                    const shopB = Array.isArray(b.shop) ? b.shop[0] || '' : b.shop || '';
+                    const shopA = (Array.isArray(a.shop) ? a.shop[0] || '' : a.shop || '').toLowerCase();
+                    const shopB = (Array.isArray(b.shop) ? b.shop[0] || '' : b.shop || '').toLowerCase();
                     if (shopA < shopB) return -1;
-                    if (shopA > b.shop) return 1;
-                    if (a.name < b.name) return -1;
-                    if (a.name > b.name) return 1;
+                    if (shopA > shopB) return 1;
+                    if (a.name.toLowerCase() < b.name.toLowerCase()) return -1;
+                    if (a.name.toLowerCase() > b.name.toLowerCase()) return 1;
                     return 0;
                 });
-            }, [employees, searchTerm]);
+            }, [employees, searchTerm, userProfile]);
 
             const handleOpenModal = useCallback((employee = null) => { setEditingEmployee(employee); setModalOpen(true); }, []);
             
@@ -1215,7 +1249,7 @@
                              <input type="text" placeholder="Search by name..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="input w-full sm:w-auto" />
                             {userProfile?.role === 'Admin' && (<select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto"><option value="">All Shops</option>{shops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>)}
                             <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
-                            {(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                 <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add</Button>
                             )}
                         </div>
@@ -1225,7 +1259,7 @@
                     ) : (
                         <>
                             {/* Desktop Table View */}
-                            <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Position</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Join Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Worked Dur.</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shift</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Tel</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.position}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.joinedDate}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate)}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shift}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.tel}</td><td className="px-4 py-4 text-sm text-slate-300 text-right whitespace-nowrap">{Utils.formatCurrency(emp.salary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4"><Button variant="icon-view" icon="fa-eye" onClick={() => handleViewModal(emp)} />{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} />)}</div></td></tr>))}</tbody></table></div>
+                            <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Position</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Join Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Worked Dur.</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shift</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Tel</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.position}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.joinedDate}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate)}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shift}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.tel}</td><td className="px-4 py-4 text-sm text-slate-300 text-right whitespace-nowrap">{Utils.formatCurrency(emp.salary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4"><Button variant="icon-view" icon="fa-eye" onClick={() => handleViewModal(emp)} />{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} />)}</div></td></tr>))}</tbody></table></div>
                         </>
                     )}
                     <EmployeeModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveEmployee} employee={editingEmployee} userProfile={userProfile} allEmployees={employees} isViewOnly={isViewOnly} onSwitchToEdit={handleSwitchToEdit} />
@@ -1295,9 +1329,9 @@
                 <Card>
                     <h3 className="text-xl font-semibold text-slate-100 mb-6">Resigned/Terminated Employees</h3>
                     {/* Desktop Table */}
-                    <div className="overflow-x-auto hidden md:block"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Worked Dur.</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{formerEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.statusChangeDate || 'N/A'}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shop}</td><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>{emp.status}</span></td><td className="px-4 py-4 text-sm text-slate-300">{emp.reasonForLeaving}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto hidden md:block"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Worked Dur.</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{formerEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.statusChangeDate || 'N/A'}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shop}</td><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>{emp.status}</span></td><td className="px-4 py-4 text-sm text-slate-300">{emp.reasonForLeaving}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></td></tr>))}</tbody></table></div>
                     {/* Mobile Cards */}
-                    <div className="grid grid-cols-1 gap-4 md:hidden">{formerEmployees.map(emp => (<div key={emp.id} className="bg-slate-700/50 rounded-lg p-4 space-y-3"><div className="flex justify-between items-start"><div><p className="font-bold text-lg text-slate-100">{emp.name}</p><p className="text-sm text-slate-300">{emp.shop}</p></div><div className="flex items-center space-x-3"><span className={`px-2 py-1 text-xs font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-200 text-yellow-900' : 'bg-red-200 text-red-900'}`}>{emp.status}</span>{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></div><div className="text-sm pt-2 border-t border-slate-600"><p><span className="text-slate-400">Date: </span><span className="text-slate-200 font-medium">{emp.statusChangeDate || 'N/A'}</span></p><p><span className="text-slate-400">Worked For: </span><span className="text-slate-200 font-medium">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</span></p><p><span className="text-slate-400">Reason: </span><span className="text-slate-200 font-medium">{emp.reasonForLeaving || 'N/A'}</span></p></div></div>))}</div>
+                    <div className="grid grid-cols-1 gap-4 md:hidden">{formerEmployees.map(emp => (<div key={emp.id} className="bg-slate-700/50 rounded-lg p-4 space-y-3"><div className="flex justify-between items-start"><div><p className="font-bold text-lg text-slate-100">{emp.name}</p><p className="text-sm text-slate-300">{emp.shop}</p></div><div className="flex items-center space-x-3"><span className={`px-2 py-1 text-xs font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-200 text-yellow-900' : 'bg-red-200 text-red-900'}`}>{emp.status}</span>{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></div><div className="text-sm pt-2 border-t border-slate-600"><p><span className="text-slate-400">Date: </span><span className="text-slate-200 font-medium">{emp.statusChangeDate || 'N/A'}</span></p><p><span className="text-slate-400">Worked For: </span><span className="text-slate-200 font-medium">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</span></p><p><span className="text-slate-400">Reason: </span><span className="text-slate-200 font-medium">{emp.reasonForLeaving || 'N/A'}</span></p></div></div>))}</div>
                     <EmployeeModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveEmployee} employee={editingEmployee} userProfile={userProfile} allEmployees={employees} />
                     <ConfirmationModal isOpen={!!employeeToDelete} onClose={() => setEmployeeToDelete(null)} onConfirm={handleDeleteConfirm} title="Delete Employee Record" message={`Are you sure you want to permanently delete the record for ${employeeToDelete?.name}? This action cannot be undone.`} />
                 </Card>
@@ -2448,9 +2482,9 @@
             const [reportData, setReportData] = useState({ leaveRequests: [], otRequests: [] });
             const [loading, setLoading] = useState(false);
 
-            // PHASE 3 OPTIMIZATION: For Admins, we now fetch this data on-demand in the child components.
+            // PHASE 3 OPTIMIZATION: For Admins/CEOs, we now fetch this data on-demand in the child components.
             // For other roles, we maintain the real-time listener for a better experience on their smaller datasets.
-            const isRealTime = userProfile?.role !== 'Admin';
+            const isRealTime = userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO';
             
             const staffQueryConstraints = useMemo(() => {
                 const { role, id, shop } = userProfile || {};
@@ -2588,10 +2622,10 @@
             const { data: realTimeAttendance } = useCollection('attendance', attendanceQueryConstraints);
             const attendance = isRealTime ? realTimeAttendance : adminAttendance;
 
-            // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN (OPTIMIZED) ---
+            // PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN (OPTIMIZED) ---
             useEffect(() => {
                 // This effect now runs whenever the main filters change.
-                if (userProfile?.role !== 'Admin') return;
+                if (userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO') return;
 
                 const fetchAdminData = async () => {
                     setLoadingAdminReport(true);
@@ -2687,183 +2721,146 @@
             }, [selectedShop, employees]);
 
             const attendanceReport = useMemo(() => {
+                // --- START PERFORMANCE FIX ---
+                // This entire block is refactored for efficiency.
                 const startDate = new Date();
                 const endDate = new Date();
 
+                // 1. Determine Date Range from Filters
                 switch (filterType) {
-                    case 'today':
-                        startDate.setHours(0, 0, 0, 0);
-                        endDate.setHours(23, 59, 59, 999);
-                        break;
-                    case 'yesterday':
-                        startDate.setDate(startDate.getDate() - 1);
-                        startDate.setHours(0, 0, 0, 0);
-                        endDate.setDate(endDate.getDate() - 1);
-                        endDate.setHours(23, 59, 59, 999);
-                        break;
-                    case 'thisMonth':
-                        startDate.setDate(1);
-                        startDate.setHours(0, 0, 0, 0);
-                        endDate.setMonth(endDate.getMonth() + 1);
-                        endDate.setDate(0);
-                        endDate.setHours(23, 59, 59, 999);
-                        break;
-                    case 'lastMonth':
-                        startDate.setMonth(startDate.getMonth() - 1);
-                        startDate.setDate(1);
-                        startDate.setHours(0, 0, 0, 0);
-                        endDate.setDate(0);
-                        endDate.setHours(23, 59, 59, 999);
-                        break;
-                    case 'custom':
-                        const [year, month] = customMonth.split('-').map(Number);
-                        if (year && month) {
-                            startDate.setFullYear(year, month - 1, 1);
-                            startDate.setHours(0, 0, 0, 0);
-                            endDate.setFullYear(year, month, 0);
-                            endDate.setHours(23, 59, 59, 999);
-                        }
-                        break;
+                    case 'today': startDate.setHours(0, 0, 0, 0); endDate.setHours(23, 59, 59, 999); break;
+                    case 'yesterday': startDate.setDate(startDate.getDate() - 1); startDate.setHours(0, 0, 0, 0); endDate.setDate(endDate.getDate() - 1); endDate.setHours(23, 59, 59, 999); break;
+                    case 'thisMonth': startDate.setDate(1); startDate.setHours(0, 0, 0, 0); endDate.setMonth(endDate.getMonth() + 1); endDate.setDate(0); endDate.setHours(23, 59, 59, 999); break;
+                    case 'lastMonth': startDate.setMonth(startDate.getMonth() - 1); startDate.setDate(1); startDate.setHours(0, 0, 0, 0); endDate.setDate(0); endDate.setHours(23, 59, 59, 999); break;
+                    case 'custom': const [year, month] = customMonth.split('-').map(Number); if (year && month) { startDate.setFullYear(year, month - 1, 1); startDate.setHours(0, 0, 0, 0); endDate.setFullYear(year, month, 0); endDate.setHours(23, 59, 59, 999); } break;
                 }
-                
-                const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
 
-                // 1. Get a list of employees to report on
+                // 2. Get a list of employees to report on, based on user role and filters.
                 const relevantEmployees = employees.filter(emp => {
                     const employeeShops = Array.isArray(emp.shop) ? emp.shop : (emp.shop ? [emp.shop] : []);
-                    let shopMatch = false;
+                    const userManagedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
 
-                    if (userProfile.role === 'Admin') {
-                        shopMatch = !selectedShop || employeeShops.includes(selectedShop);
-                    } else if (isMultiShopManager) {
-                        // Check if the employee's shops intersect with the manager's shops
-                        const isManaged = employeeShops.some(s => userProfile.shop.includes(s));
-                        // And if a filter is applied, the employee must be in that specific shop
-                        shopMatch = isManaged && (!selectedShop || employeeShops.includes(selectedShop));
-                    } else { // Single shop user
-                        shopMatch = employeeShops.includes(userProfile.shop);
-                    }
-                    const shiftMatch = !selectedShift || emp.shift === selectedShift; // Add shift match condition
-                    return emp.status === 'Active' && shopMatch && (!selectedEmployeeId || emp.id === selectedEmployeeId) && shiftMatch;
+                    let roleMatch = false;
+                    if (userProfile.role === 'Admin' || userProfile.role === 'CEO') roleMatch = true;
+                    else if (userProfile.role === 'Shop Manager') roleMatch = employeeShops.some(s => userManagedShops.includes(s));
+                    else roleMatch = emp.id === userProfile.id;
+
+                    const shopMatch = !selectedShop || employeeShops.includes(selectedShop);
+                    const shiftMatch = !selectedShift || emp.shift === selectedShift;
+                    return emp.status === 'Active' && roleMatch && shopMatch && (!selectedEmployeeId || emp.id === selectedEmployeeId) && shiftMatch;
                 });
+                
+                // --- START BUG FIX ---
+                // Create a Set of relevant employee IDs for efficient lookup.
+                const relevantEmployeeIds = new Set(relevantEmployees.map(e => e.id));
 
-                // 2. Initialize a report entry for each employee for each day in the range
+                // 3. Process ONLY the available attendance data.
                 const reportMap = new Map();
+                attendance.forEach(record => {
+                    // Only process records for employees who match the current filters (including shift).
+                    if (!relevantEmployeeIds.has(record.employeeId)) return;
+                    
+                    if (!record.timestamp) return;
+                    const recordDate = record.timestamp.toDate();
+                    if (!(recordDate >= startDate && recordDate <= endDate)) return;
+
+                    const recordShop = shops.find(s => s.name === record.shop);
+                    const { localDate: dateKey } = Utils.formatDateInTimezone(record.timestamp, recordShop?.timezone);
+                    const reportKey = `${record.employeeId}_${dateKey}`;
+
+                    if (!reportMap.has(reportKey)) {
+                        reportMap.set(reportKey, {
+                            date: dateKey,
+                            employeeId: record.employeeId,
+                            shop: record.shop,
+                            checkInRecords: [],
+                            checkOutRecords: [],
+                            docIds: []
+                        });
+                    }
+                    
+                    const entry = reportMap.get(reportKey);
+                    if (record.type === 'in') entry.checkInRecords.push(record.timestamp.toDate());
+                    if (record.type === 'out') entry.checkOutRecords.push(record.timestamp.toDate());
+                    entry.docIds.push(record.id);
+                });
+                // --- END BUG FIX ---
+
+                // 4. Intelligently add absent days for past and present dates.
+                const today = new Date();
+                today.setHours(0,0,0,0);
                 const currentDate = new Date(startDate);
-                while (currentDate <= endDate) {
+                // FIX: Changed condition from `< today` to `<= today` to include the current day
+                // when checking for absent employees. This ensures the "Today" filter shows everyone.
+                while(currentDate <= endDate && currentDate <= today) {
                     const dateKey = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
                     for (const employee of relevantEmployees) {
-                        const reportKey = `${employee.id}_${dateKey}`;
-                        reportMap.set(reportKey, { 
-                            date: dateKey, 
-                            employeeId: employee.id, 
-                            employeeName: employee.name, 
-                            assignedShop: Array.isArray(employee.shop) ? employee.shop.join(', ') : employee.shop,
-                            shop: '', // This will hold the actual check-in shop
-                            checkIn: null, 
-                            checkOut: null, 
-                            docIds: [] 
-                        });
+                         const reportKey = `${employee.id}_${dateKey}`;
+                         if (!reportMap.has(reportKey)) {
+                            // Only add an entry if the employee isn't on approved leave
+                            const approvedLeave = leaveRequests.find(lr => lr.staffId === employee.id && lr.status === 'Approved' && dateKey >= lr.leaveDate && dateKey < lr.returnDate);
+                            if (!approvedLeave) {
+                                reportMap.set(reportKey, {
+                                    date: dateKey, employeeId: employee.id, shop: '',
+                                    checkInRecords: [], checkOutRecords: [], docIds: []
+                                });
+                            }
+                         }
                     }
                     currentDate.setDate(currentDate.getDate() + 1);
                 }
-                
-                // 3. Filter attendance records once
-                const filteredAttendance = attendance.filter(record => {
-                    if (!record.timestamp) return false;
-                    const recordDate = record.timestamp.toDate();
-                    if (!(recordDate >= startDate && recordDate <= endDate)) return false;
 
-                    let shopMatch = false;
-                    if (userProfile.role === 'Admin') {
-                        shopMatch = !selectedShop || record.shop === selectedShop;
-                    } else if (isMultiShopManager) {
-                        shopMatch = userProfile.shop.includes(record.shop) && (!selectedShop || record.shop === selectedShop);
-                    } else {
-                        shopMatch = record.shop === userProfile.shop;
-                    }
+                // 5. Finalize calculations for each entry.
+                const reportArray = Array.from(reportMap.values()).map(entry => {
+                    const employee = employees.find(e => e.id === entry.employeeId);
+                    if (!employee) return null; // Skip if employee not found
 
-                    return shopMatch && (!selectedEmployeeId || record.employeeId === selectedEmployeeId);
-                });
-
-                // 4. Populate the report map with attendance data
-                filteredAttendance.forEach(record => {
-                    const date = record.timestamp.toDate();
-                    const dateKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-                    const reportKey = `${record.employeeId}_${dateKey}`;
-
-                    if (reportMap.has(reportKey)) {
-                        const entry = reportMap.get(reportKey);
-                        if (record.type === 'in' && (!entry.checkIn || date < entry.checkIn)) {
-                            entry.checkIn = date;
-                            entry.shop = record.shop; // Capture shop from the earliest check-in
-                        }
-                        if (record.type === 'out' && (!entry.checkOut || date > entry.checkOut)) {
-                            entry.checkOut = date;
-                            // If no check-in record set the shop, use the shop from the latest check-out
-                            if (!entry.shop) {
-                                entry.shop = record.shop;
-                            }
-                        }
-                        entry.docIds.push(record.id);
-                    }
-                });
-                
-                // 5. Finalize calculations (hours, leave, OT, etc.) for each entry
-                const reportArray = Array.from(reportMap.values()).map(report => {
-                    const employee = employees.find(e => e.id === report.employeeId);
+                    const checkIn = entry.checkInRecords.length > 0 ? new Date(Math.min.apply(null, entry.checkInRecords)) : null;
+                    const checkOut = entry.checkOutRecords.length > 0 ? new Date(Math.max.apply(null, entry.checkOutRecords)) : null;
                     
-                    let isLate = false;
-                    if (report.checkIn && employee) {
-                        const employeeShiftName = employee.shift;
-                        const checkInShop = report.shop; // The shop where the check-in happened
-                        const shiftDetails = (shifts || []).find(s => s.name === employeeShiftName && s.shopName === checkInShop);
-                        const checkInDate = report.checkIn; // This is already a Date object
+                    const shopDetails = shops.find(s => s.name === entry.shop);
+                    const shopTimezone = shopDetails?.timezone;
 
-                        if (shiftDetails && shiftDetails.lateThreshold) {
+                    let isLate = false;
+                    if (checkIn && employee) {
+                        const shiftDetails = (shifts || []).find(s => s.name === employee.shift && s.shopName === entry.shop);
+                        if (shiftDetails?.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
-                            const checkInHour = checkInDate.getHours();
-                            const checkInMinute = checkInDate.getMinutes();
-                            
+                            const timeInZoneString = checkIn.toLocaleTimeString('en-GB', { timeZone: shopTimezone, hour: '2-digit', minute: '2-digit' });
+                            const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
                             if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
                                 isLate = true;
                             }
                         }
                     }
 
-                    const hasActivity = report.checkIn || report.checkOut;
-                    const reportDate = new Date(report.date);
-                    reportDate.setHours(23, 59, 59, 999); // Set to end of day for comparison
-                    const today = new Date();
+                    const approvedLeave = leaveRequests.find(lr => lr.staffId === employee.id && lr.status === 'Approved' && entry.date >= lr.leaveDate && entry.date < lr.returnDate);
+                    let isOnLeave = 'N';
+                    if (approvedLeave) isOnLeave = approvedLeave.leaveSession === 'Full Day' ? 'Y-Full Day' : `Y-${approvedLeave.leaveSession}`; 
+                    else if (!checkIn && !checkOut) isOnLeave = 'Absent';
 
-                    // Check for approved leave first, then check for absence on past days
-                    const approvedLeave = leaveRequests.find(lr => lr.staffId === report.employeeId && lr.status === 'Approved' && report.date >= lr.leaveDate && report.date < lr.returnDate);
-                    let isOnLeave = 'N'; // This variable now represents the general status for the "Leave Status" column
-                    if (approvedLeave) { 
-                        isOnLeave = approvedLeave.leaveSession === 'Full Day' ? 'Y-Full Day' : `Y-${approvedLeave.leaveSession}`; 
-                    } else if (!hasActivity && reportDate < today) {
-                        // If there's no activity and the day has passed, mark as Absent
-                        isOnLeave = 'Absent';
-                    }
-
-                    const isOnOT = otRequests.some(ot => ot.staffId === report.employeeId && ot.status === 'Approved' && ot.reqDate === report.date);
+                    const isOnOT = otRequests.some(ot => ot.staffId === employee.id && ot.status === 'Approved' && ot.reqDate === entry.date);
                     const otStatus = isOnOT ? 'Y' : 'N';
                     
-                    const isSingleDayView = filterType === 'today' || filterType === 'yesterday' || filterType === 'custom';
+                    const { localTime: checkInTimeStr } = checkIn ? Utils.formatDateInTimezone({ toDate: () => checkIn }, shopTimezone) : { localTime: '' };
+                    const { localTime: checkOutTimeStr } = checkOut ? Utils.formatDateInTimezone({ toDate: () => checkOut }, shopTimezone) : { localTime: '' };
                     
-                    const displayShop = report.shop || report.assignedShop;
-
-                    // Only show records that have activity, have a specific status (Leave/Absent), or are in a single-day view.
-                    // This prevents showing future empty rows in multi-day reports.
-                    if (hasActivity || isOnLeave !== 'N' || isSingleDayView) {
-                        return { ...report, shop: displayShop, shift: employee?.shift, checkIn: report.checkIn ? report.checkIn.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '', checkOut: report.checkOut ? report.checkOut.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '', isLate, isOnLeave, otStatus };
-                    }
-                    return null;
-                }).filter(Boolean); // Remove null entries
+                    return {
+                        date: entry.date,
+                        employeeId: employee.id,
+                        employeeName: employee.name,
+                        shop: entry.shop || (Array.isArray(employee.shop) ? employee.shop.join(', ') : employee.shop),
+                        shift: employee.shift,
+                        checkIn: checkInTimeStr,
+                        checkOut: checkOutTimeStr,
+                        isLate, isOnLeave, otStatus, docIds: entry.docIds
+                    };
+                }).filter(Boolean);
                 
-                // 6. Sort the final array
+                // 6. Sort and return.
                 return reportArray.sort((a, b) => (a.shop || '').localeCompare(b.shop || '') || b.date.localeCompare(a.date) || a.employeeName.localeCompare(b.employeeName));
-            }, [attendance, selectedShop, filterType, customMonth, selectedEmployeeId, employees, leaveRequests, otRequests, selectedShift]);
+                // --- END PERFORMANCE FIX ---
+            }, [attendance, selectedShop, filterType, customMonth, selectedEmployeeId, employees, leaveRequests, otRequests, selectedShift, shops, shifts, userProfile]);
 
             const handleDelete = async () => {
                 if (!recordToDelete?.docIds) return;
@@ -2954,9 +2951,9 @@
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <CardTitle>Daily Attendance Report</CardTitle>
                         <div className="flex flex-wrap gap-4 items-center">
-                            {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                                 <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
-                                    <option value="">{userProfile?.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                    <option value="">{userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                     {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
@@ -2980,10 +2977,10 @@
                                 <option value="">All Shifts</option>
                                 {uniqueShiftNames.map(name => <option key={name} value={name}>{name}</option>)}
                             </select>
-                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                                <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shift</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check In</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check Out</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Leave Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">OT Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{attendanceReport.map((report) => (<tr key={`${report.employeeId}-${report.date}`} className="transition-colors hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.date}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shop}</td><td className="px-4 py-4 text-sm text-slate-200">{report.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shift}</td><td className={`px-4 py-4 text-sm ${report.isLate ? 'bg-red-900/60 text-red-300 font-semibold' : 'text-slate-300'}`}>{report.checkIn}</td><td className="px-4 py-4 text-sm text-slate-300">{report.checkOut}</td><td className={`px-4 py-4 text-sm text-center ${report.isOnLeave === 'Absent' ? 'text-red-400 font-semibold' : 'text-slate-300'}`}>{report.isOnLeave}</td><td className="px-4 py-4 text-sm text-center text-slate-300">{report.otStatus}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{userProfile?.role === 'Admin' && report.checkIn && !report.checkOut && (<Button variant="icon-add-time" icon="fa-clock" onClick={() => handleOpenCorrectionModal(report)} title="Add Check-Out"/>)}{userProfile?.role === 'Admin' && report.docIds.length > 0 && (<Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(report)} title="Delete" />)}</div></td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shift</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check In</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check Out</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Leave Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">OT Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{attendanceReport.map((report) => (<tr key={`${report.employeeId}-${report.date}`} className="transition-colors hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.date}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shop}</td><td className="px-4 py-4 text-sm text-slate-200">{report.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shift}</td><td className={`px-4 py-4 text-sm ${report.isLate ? 'bg-red-900/60 text-red-300 font-semibold' : 'text-slate-300'}`}>{report.checkIn}</td><td className="px-4 py-4 text-sm text-slate-300">{report.checkOut}</td><td className={`px-4 py-4 text-sm text-center ${report.isOnLeave === 'Absent' ? 'text-red-400 font-semibold' : 'text-slate-300'}`}>{report.isOnLeave}</td><td className="px-4 py-4 text-sm text-center text-slate-300">{report.otStatus}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && report.checkIn && !report.checkOut && (<Button variant="icon-add-time" icon="fa-clock" onClick={() => handleOpenCorrectionModal(report)} title="Add Check-Out"/>)}{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && report.docIds.length > 0 && (<Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(report)} title="Delete" />)}</div></td></tr>))}</tbody></table></div>
                     <ConfirmationModal isOpen={!!recordToDelete} onClose={() => setRecordToDelete(null)} onConfirm={handleDelete} title="Delete Attendance Record" message={`Are you sure you want to delete all attendance records for ${recordToDelete?.employeeName} on ${recordToDelete?.date}? This action cannot be undone.`} />
                     <ManualCheckOutModal isOpen={isCorrectionModalOpen} onClose={handleCloseCorrectionModal} onSave={handleSaveCheckOut} record={recordToCorrect} />
                 </Card>
@@ -2999,10 +2996,19 @@
             const [filterType, setFilterType] = useState('thisMonth');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+            const [selectedShift, setSelectedShift] = useState(''); // NEW: State for shift filter
 
             // Data States
             const { data: shops } = useCollection('shops');
             const { data: employees } = useCollection('employees');
+            const { data: shifts } = useCollection('shifts'); // NEW: Get shifts data
+
+            // NEW: Get unique shift names for the filter dropdown
+            const uniqueShiftNames = useMemo(() => {
+                if (!shifts) return [];
+                const shiftNames = shifts.map(s => s.name);
+                return [...new Set(shiftNames)].sort();
+            }, [shifts]);
             
             // PHASE 3: Data states for Admin's one-time fetches
             const [adminAttendance, setAdminAttendance] = useState([]);
@@ -3041,7 +3047,7 @@
 
              // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN ---
             useEffect(() => {
-                if (userProfile?.role !== 'Admin') return;
+                if (userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO') return;
 
                 const fetchAdminData = async () => {
                     setLoadingAdminReport(true);
@@ -3145,7 +3151,6 @@
                 switch (filterType) {
                     case 'lastMonth':
                         const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                        // FIX: Construct YYYY-MM from local date parts to avoid timezone issues with toISOString().
                         const year_lm = lastMonthDate.getFullYear();
                         const month_lm = String(lastMonthDate.getMonth() + 1).padStart(2, '0');
                         targetMonth = `${year_lm}-${month_lm}`;
@@ -3155,145 +3160,98 @@
                         break;
                     case 'thisMonth':
                     default:
-                        // FIX: Construct YYYY-MM from local date parts to avoid timezone issues with toISOString().
                         const year_tm = now.getFullYear();
                         const month_tm = String(now.getMonth() + 1).padStart(2, '0');
                         targetMonth = `${year_tm}-${month_tm}`;
                         break;
                 }
 
-                const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
+                // 1. Determine which employees to generate a report for based on filters
+                const employeesToReportOn = employees.filter(emp => {
+                    if (emp.status !== 'Active') return false;
 
-                const recordsByEmployeeMonth = {};
-                const filteredAttendance = attendance.filter(record => {
-                    if (!record.timestamp) return false;
-                    if (!targetMonth || !record.timestamp.toDate().toISOString().startsWith(targetMonth)) return false;
+                    const employeeShops = Array.isArray(emp.shop) ? emp.shop : (emp.shop ? [emp.shop] : []);
+                    const userManagedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
 
-                    let shopMatch = false;
-                    if (userProfile.role === 'Admin') {
-                        shopMatch = !selectedShop || record.shop === selectedShop;
-                    } else if (isMultiShopManager) {
-                        shopMatch = userProfile.shop.includes(record.shop) && (!selectedShop || record.shop === selectedShop);
-                    } else {
-                        shopMatch = record.shop === userProfile.shop;
-                    }
+                    let roleMatch = false;
+                    if (userProfile.role === 'Admin' || userProfile.role === 'CEO') roleMatch = true;
+                    else if (userProfile.role === 'Shop Manager') roleMatch = employeeShops.some(s => userManagedShops.includes(s));
+                    else roleMatch = emp.id === userProfile.id; // Staff see only themselves
+                    
+                    const shopFilterMatch = !selectedShop || employeeShops.includes(selectedShop);
+                    const employeeFilterMatch = !selectedEmployeeId || emp.id === selectedEmployeeId;
+                    const shiftFilterMatch = !selectedShift || emp.shift === selectedShift; // NEW: Add shift filter condition
 
-                    return shopMatch && (!selectedEmployeeId || record.employeeId === selectedEmployeeId);
+                    return roleMatch && shopFilterMatch && employeeFilterMatch && shiftFilterMatch; // NEW: Apply shift filter
                 });
                 
-                filteredAttendance.forEach(record => {
-                    const date = record.timestamp.toDate();
-                    const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-                    const employeeMonthKey = `${record.employeeId}_${monthKey}`;
-                    if (!recordsByEmployeeMonth[employeeMonthKey]) {
-                        recordsByEmployeeMonth[employeeMonthKey] = { 
-                            employeeId: record.employeeId, 
-                            employeeName: record.employeeName, 
-                            shop: record.shop, 
-                            month: monthKey, 
-                            records: [] 
-                        };
-                    }
-                    recordsByEmployeeMonth[employeeMonthKey].records.push({ date: date, type: record.type });
-                });
+                // 2. Generate a report row for each of those employees
+                const report = employeesToReportOn.map(employee => {
+                    const employeeShopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
+                    const employeeShop = shops.find(s => s.name === employeeShopName);
+                    const employeeShopTimezone = employeeShop?.timezone;
 
-                const report = Object.values(recordsByEmployeeMonth).map(group => {
-                    const employeeLeaves = leaveRequests.filter(
-                        lr => lr.staffId === group.employeeId &&
-                              lr.status === 'Approved' &&
-                              lr.leaveDate.startsWith(group.month)
-                    );
-                    const totalLeave = employeeLeaves.reduce((acc, curr) => acc + (parseFloat(curr.numberOfDays) || 0), 0);
+                    const monthAttendance = attendance.filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(targetMonth));
+                    const monthLeave = leaveRequests.filter(r => r.staffId === employee.id && r.status === 'Approved' && r.leaveDate.startsWith(targetMonth));
+                    const monthOT = otRequests.filter(r => r.staffId === employee.id && r.status === 'Approved' && r.reqDate.startsWith(targetMonth));
+                    const monthStates = employeeStates.filter(r => r.staffId === employee.id && r.date.startsWith(targetMonth));
 
-                    const employeeOTs = otRequests.filter(
-                        ot => ot.staffId === group.employeeId &&
-                              ot.status === 'Approved' &&
-                              ot.reqDate.startsWith(group.month)
-                    );
-                    const totalOT = employeeOTs.reduce((acc, curr) => acc + (parseFloat(curr.numberOfOTDays) || 0), 0);
+                    const totalLeave = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
+                    const totalOT = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+                    const totalLate = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late')).length;
                     
-                    // Calculate total late days for the month from employeeStates
-                    const totalLate = employeeStates.filter(es =>
-                        es.staffId === group.employeeId &&
-                        es.date.startsWith(group.month) &&
-                        es.statusState === 'Deduction' &&
-                        es.note && es.note.includes('CheckIn Late')
-                    ).length;
-
                     const dailyRecords = {};
-                    group.records.forEach(rec => {
-                        const dayKey = rec.date.toISOString().split('T')[0];
+                    monthAttendance.forEach(rec => {
+                        const { localDate: dayKey } = Utils.formatDateInTimezone(rec.timestamp, employeeShopTimezone);
                         if (!dailyRecords[dayKey]) dailyRecords[dayKey] = [];
-                        dailyRecords[dayKey].push(rec);
+                        dailyRecords[dayKey].push({ date: rec.timestamp.toDate(), type: rec.type });
                     });
-
+                    
                     let workDays = 0;
-                    let noCheckOutCount = 0; // Counter for forgotten check-outs
-                    const todayStr = new Date().toISOString().split('T')[0]; // Get today's date string
+                    let noCheckOutCount = 0;
+                    const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => new Date() }, employeeShopTimezone);
 
-                    Object.entries(dailyRecords).forEach(([dayKey, dayRecords]) => { // Use Object.entries to get the key
-                        const checkIns = dayRecords.filter(r => r.type === 'in').sort((a, b) => a.date - b.date);
-                        const checkOuts = dayRecords.filter(r => r.type === 'out').sort((a, b) => b.date - a.date);
-                        if (checkIns.length > 0 && checkOuts.length > 0) {
-                            const diffHours = (checkOuts[0].date.getTime() - checkIns[0].date.getTime()) / 3600000;
-                            // Rule: >= 7 hours is 1 day, >= 4 hours is 0.5 day
-                            if (diffHours >= 7) {
-                                workDays += 1;
-                            } else if (diffHours >= 4) {
-                                workDays += 0.5;
-                            }
-                        } else if (checkIns.length > 0 && checkOuts.length === 0) {
-                            // If there's a check-in but no check-out, increment the count,
-                            // but ONLY if the day is in the past.
-                            if (dayKey < todayStr) {
-                                noCheckOutCount += 1;
-                            }
+                    Object.entries(dailyRecords).forEach(([dayKey, dayRecs]) => {
+                        const ins = dayRecs.filter(r => r.type === 'in').sort((a,b) => a.date - b.date);
+                        const outs = dayRecs.filter(r => r.type === 'out').sort((a,b) => b.date - a.date);
+                        if (ins.length > 0 && outs.length > 0) {
+                            const diffHours = (outs[0].date.getTime() - ins[0].date.getTime()) / 3600000;
+                            if (diffHours >= 7) workDays += 1;
+                            else if (diffHours >= 4) workDays += 0.5;
+                        } else if (ins.length > 0 && dayKey < todayStr) {
+                            noCheckOutCount += 1;
                         }
                     });
 
-                    // NEW: Calculate absent days (no check-in/out at all on a past day)
-                    const [year, month] = group.month.split('-').map(Number);
+                    const [year, month] = targetMonth.split('-').map(Number);
                     const daysInMonth = new Date(year, month, 0).getDate();
                     const attendedDays = new Set(Object.keys(dailyRecords));
                     let noAbsentCount = 0;
-                    
-                    const today = new Date();
-                    today.setHours(0, 0, 0, 0); // Set to the beginning of today
-                    for (let day = 1; day <= daysInMonth; day++) {
-                        const currentDay = new Date(year, month - 1, day);
-                        if (currentDay >= today) break; // Don't check today or future days for absence
 
-                        const dayKey = `${currentDay.getFullYear()}-${String(currentDay.getMonth() + 1).padStart(2, '0')}-${String(currentDay.getDate()).padStart(2, '0')}`;
+                    for (let day = 1; day <= daysInMonth; day++) {
+                        const dayKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                        if (dayKey >= todayStr) break;
                         if (!attendedDays.has(dayKey)) {
-                            // Check if the employee was on approved leave for this day
-                            const isOnLeave = employeeLeaves.some(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
-                            if (!isOnLeave) {
-                                noAbsentCount++;
-                            }
+                            const isOnLeave = monthLeave.some(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                            if (!isOnLeave) noAbsentCount++;
                         }
                     }
 
-                    // New calculation for Total-Day
                     const totalDay = workDays + totalLeave + noCheckOutCount;
+                    const [reportYear, reportMonth] = targetMonth.split('-');
 
-                    const [reportYear, reportMonth] = group.month.split('-');
                     return { 
                         dueTime: `${reportMonth}-${reportYear.substring(2)}`, 
-                        shopName: group.shop, 
-                        staffName: group.employeeName, 
-                        workDays,
-                        totalOT,
-                        totalLeave,
-                        totalLate,
-                        noCheckOutCount,
-                        noAbsentCount, // Include the new count in the report data
-                        totalDay // Include the new Total-Day calculation
+                        shopName: employeeShopName, 
+                        staffName: employee.name, 
+                        workDays, totalOT, totalLeave, totalLate, 
+                        noCheckOutCount, noAbsentCount, totalDay
                     };
                 });
                 
                 return report.sort((a, b) => (a.shopName || '').localeCompare(b.shopName || '') || (a.staffName || '').localeCompare(b.staffName || ''));
 
-            }, [attendance, leaveRequests, otRequests, selectedShop, filterType, selectedMonth, selectedEmployeeId, employeeStates, employees]);
+            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, selectedEmployeeId, userProfile, selectedShift]); // NEW: Add selectedShift to dependencies
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = workDayReport.map(rec => ({
@@ -3313,13 +3271,11 @@
                     const now = new Date();
                     switch (filterType) {
                         case 'thisMonth':
-                            // FIX: Construct YYYY-MM from local date parts to avoid timezone issues.
                             const year_tm = now.getFullYear();
                             const month_tm = String(now.getMonth() + 1).padStart(2, '0');
                             return `Monthly_Work_Day_Report_${year_tm}-${month_tm}.xlsx`;
                         case 'lastMonth': 
                             const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                            // FIX: Construct YYYY-MM from local date parts to avoid timezone issues.
                             const year_lm = lastMonthDate.getFullYear();
                             const month_lm = String(lastMonthDate.getMonth() + 1).padStart(2, '0');
                             return `Monthly_Work_Day_Report_${year_lm}-${month_lm}.xlsx`;
@@ -3342,9 +3298,9 @@
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <CardTitle>Monthly Work Day Report</CardTitle>
                         <div className="flex flex-wrap gap-4 items-center">
-                            {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                                 <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
-                                    <option value="">{userProfile?.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                    <option value="">{userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                     {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
@@ -3362,10 +3318,15 @@
                             {filterType === 'custom' && (
                                 <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm-w-auto" />
                             )}
+                            {/* NEW: Shift Filter Dropdown */}
+                            <select value={selectedShift} onChange={e => setSelectedShift(e.target.value)} className="select w-full sm:w-auto">
+                                <option value="">All Shifts</option>
+                                {uniqueShiftNames.map(name => <option key={name} value={name}>{name}</option>)}
+                            </select>
                             <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No. Work Day</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total OT</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Leave No</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total LATE</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No-CheckOut</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No-Absent</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total-Day</th></tr></thead><tbody className="divide-y divide-slate-700">{workDayReport.map((report, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.dueTime}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shopName}</td><td className="px-4 py-4 text-sm text-slate-200">{report.staffName}</td><td className="px-4 py-4 text-sm font-semibold text-blue-400">{report.workDays}</td><td className="px-4 py-4 text-sm font-semibold text-green-400">{report.totalOT > 0 ? report.totalOT.toFixed(2) : 0}</td><td className="px-4 py-4 text-sm font-semibold text-yellow-400">{report.totalLeave}</td><td className="px-4 py-4 text-sm font-semibold text-red-400">{report.totalLate}</td><td className="px-4 py-4 text-sm font-semibold text-orange-400">{report.noCheckOutCount}</td><td className="px-4 py-4 text-sm font-semibold text-red-500">{report.noAbsentCount}</td><td className="px-4 py-4 text-sm font-semibold text-teal-400">{report.totalDay}</td></tr>))}</tbody></table></div>
+                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No. Work Day</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total OT</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Leave No</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total LATE</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No-CheckOut</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No-Absent</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total-Day</th></tr></thead><tbody className="divide-y divide-slate-700">{workDayReport.map((report, index) => (<tr key={`${report.staffName}-${report.dueTime}-${index}`} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{report.dueTime}</td><td className="px-4 py-4 text-sm text-slate-300">{report.shopName}</td><td className="px-4 py-4 text-sm text-slate-200">{report.staffName}</td><td className="px-4 py-4 text-sm font-semibold text-blue-400">{report.workDays}</td><td className="px-4 py-4 text-sm font-semibold text-green-400">{report.totalOT > 0 ? report.totalOT.toFixed(2) : 0}</td><td className="px-4 py-4 text-sm font-semibold text-yellow-400">{report.totalLeave}</td><td className="px-4 py-4 text-sm font-semibold text-red-400">{report.totalLate}</td><td className="px-4 py-4 text-sm font-semibold text-orange-400">{report.noCheckOutCount}</td><td className="px-4 py-4 text-sm font-semibold text-red-500">{report.noAbsentCount}</td><td className="px-4 py-4 text-sm font-semibold text-teal-400">{report.totalDay}</td></tr>))}</tbody></table></div>
                 </Card>
             );
         };
@@ -3391,7 +3352,7 @@
             
             const queryConstraints = useMemo(() => {
                 if (!userProfile) return [where("shop", "==", "null")];
-                if (userProfile.role === 'Admin') return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return [];
                 if (userProfile.role === 'Shop Manager') {
                     const shops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
                     if (shops.length > 0) {
@@ -3411,13 +3372,13 @@
             const [searchTerm, setSearchTerm] = useState(''); // State for the search input
 
             useEffect(() => {
-                if (userProfile && userProfile.role !== 'Admin') {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
                     setFilterShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
                 }
             }, [userProfile]);
 
             const availableShopsForFilter = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
                 if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
                     return shops.filter(s => userProfile.shop.includes(s.name));
                 }
@@ -3440,7 +3401,7 @@
             }, [selectedShop, employees]);
             
             const availableShopsForModal = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
                 if (userProfile?.role === 'Shop Manager') {
                     const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
                     return shops.filter(s => managedShops.includes(s.name));
@@ -3448,7 +3409,7 @@
                 return [];
             }, [shops, userProfile]);
 
-            const canSelectShopInModal = userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager';
+            const canSelectShopInModal = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager';
 
             const handleOpenModal = (loan = null) => {
                 setEditingLoan(loan);
@@ -3504,9 +3465,9 @@
                                 onChange={e => setSearchTerm(e.target.value)}
                                 className="input w-full sm:w-auto"
                             />
-                            {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                                 <select value={filterShop} onChange={e => setFilterShop(e.target.value)} className="select w-full sm:w-auto">
-                                    <option value="">{userProfile.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                     {availableShopsForFilter.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
@@ -3527,14 +3488,14 @@
             const { data: shops } = useCollection('shops');
 
             useEffect(() => {
-                if (userProfile && userProfile.role !== 'Admin') {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
                     setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
                 }
             }, [userProfile]);
 
             const queryConstraints = useMemo(() => {
                 if (!userProfile) return [where("shop", "==", "null")];
-                if (userProfile.role === 'Admin') {
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') {
                     return selectedShop ? [where("shop", "==", selectedShop)] : [];
                 }
                 if (userProfile.role === 'Shop Manager') {
@@ -3569,7 +3530,7 @@
             };
             
             const availableShops = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
                 if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
                     return shops.filter(s => userProfile.shop.includes(s.name));
                 }
@@ -3580,9 +3541,9 @@
                  <Card>
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <h3 className="text-xl font-semibold text-slate-100">Loan Payment History</h3>
-                        {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                             <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
-                                <option value="">{userProfile.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                 {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                             </select>
                         )}
@@ -3767,7 +3728,7 @@
             };
             
             const availableShops = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
                 if (isShopManager) {
                     return shops.filter(s => managedShops.includes(s.name));
                 }
@@ -3776,7 +3737,7 @@
 
             const employeesForDropdown = useMemo(() => {
                 let relevantEmployees = [];
-                if (userProfile?.role === 'Admin') {
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') {
                      relevantEmployees = selectedShop 
                         ? employees.filter(e => Array.isArray(e.shop) ? e.shop.includes(selectedShop) : e.shop === selectedShop)
                         : employees;
@@ -3861,11 +3822,11 @@
                 }
             };
            
-            const canSelectShop = (userProfile?.role === 'Admin' || isShopManager) && !editingRecord;
+            const canSelectShop = (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || isShopManager) && !editingRecord;
         
             return (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    <Card><CardTitle>Payroll Calculator</CardTitle><div className="space-y-6"><div className="grid grid-cols-1 md:grid-cols-3 gap-4"><div><label className="text-sm font-medium text-slate-400">Month</label><input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" /></div><div><label className="text-sm font-medium text-slate-400">Shop</label>{canSelectShop ? (<select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select"><option value="">{userProfile?.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>{availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>) : (<input value={selectedShop} className="input" disabled />)}</div><div><label className="text-sm font-medium text-slate-400">Employee</label><select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select" disabled={employeesForDropdown.length === 0}><option value="">Select Employee</option>{employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div></div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-3 text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm">Work Days</label><input type="number" name="workDays" value={autoInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Given Off Days</label><input type="number" name="givenOffDays" value={autoInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm">OT Days</label><input type="number" name="otDays" value={autoInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Leave Days</label><input type="number" name="leaveDays" value={autoInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Total Late Days</label><input type="number" name="totalLateDays" value={autoInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div><div className="pt-6 border-t border-slate-700 flex flex-col sm:flex-row gap-4">
+                    <Card><CardTitle>Payroll Calculator</CardTitle><div className="space-y-6"><div className="grid grid-cols-1 md:grid-cols-3 gap-4"><div><label className="text-sm font-medium text-slate-400">Month</label><input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input" /></div><div><label className="text-sm font-medium text-slate-400">Shop</label>{canSelectShop ? (<select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select"><option value="">{userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>{availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>) : (<input value={selectedShop} className="input" disabled />)}</div><div><label className="text-sm font-medium text-slate-400">Employee</label><select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select" disabled={employeesForDropdown.length === 0}><option value="">Select Employee</option>{employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div></div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-3 text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm">Work Days</label><input type="number" name="workDays" value={autoInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Given Off Days</label><input type="number" name="givenOffDays" value={autoInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm">OT Days</label><input type="number" name="otDays" value={autoInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Leave Days</label><input type="number" name="leaveDays" value={autoInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Total Late Days</label><input type="number" name="totalLateDays" value={autoInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm">Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div><div className="pt-6 border-t border-slate-700 flex flex-col sm:flex-row gap-4">
                         <Button variant="primary" onClick={handleSaveAndDownload} disabled={isProcessing} className="flex-1">
                             {isProcessing ? (<><i className="fas fa-spinner fa-spin"></i> Processing...</>) : (<><i className="fas fa-save"></i> Save & Download</>)}
                         </Button>
@@ -3913,14 +3874,14 @@
                     }
                     // Staff don't see this page, so no specific filter needed.
 
-                    // 2. Filter by selected month
-                    if (selectedMonth) {
-                        q = query(q, where("month", "==", selectedMonth));
+                    // 3. Admin's shop filter is also applied on the server
+                    if ((role === 'Admin' || role === 'CEO') && selectedShop) {
+                        q = query(q, where("shop", "==", selectedShop));
                     }
                     
-                    // 3. Admin's shop filter is also applied on the server
-                    if (role === 'Admin' && selectedShop) {
-                        q = query(q, where("shop", "==", selectedShop));
+                    // FIX: Add the month filter to the query
+                    if (selectedMonth) {
+                        q = query(q, where("month", "==", selectedMonth));
                     }
                     
                     try {
@@ -3942,10 +3903,10 @@
             // ... (rest of the component logic remains largely the same, but uses `history` state instead of `useCollection` data)
             
             const isMultiShopManager = userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop) && userProfile.shop.length > 1;
-            const canFilterByShop = userProfile?.role === 'Admin' || isMultiShopManager;
+            const canFilterByShop = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || isMultiShopManager;
 
             const availableShopsForFilter = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
                 if (isMultiShopManager) {
                     // Map shop names to the structure expected by the select dropdown
                     return userProfile.shop.map(name => ({ id: name, name: name }));
@@ -4004,7 +3965,7 @@
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6"><CardTitle>Payroll History</CardTitle><div className="flex flex-wrap gap-4 items-center">
                         {canFilterByShop && (
                             <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
-                                <option value="">{userProfile.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                 {availableShopsForFilter.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                             </select>
                         )}
@@ -4013,7 +3974,7 @@
                     {loading ? (
                          <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
                     ) : (
-                        <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Employee</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Base Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Engagements</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">OT Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loan Deduction</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Other Deductions</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Final Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredHistory.map(rec => (<tr key={rec.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{rec.month}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.baseSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.engagements)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(rec.netSalary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete" /></>)}</div></td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="3" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.baseSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.engagements)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.loanDeduction)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otherDeductions)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.netSalary)}</td><td></td></tr></tfoot></table></div>
+                        <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Employee</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Base Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Engagements</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">OT Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loan Deduction</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Other Deductions</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Final Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredHistory.map(rec => (<tr key={rec.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{rec.month}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td><td className="px-4 py-4 text-sm text-slate-300">{rec.employeeName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.baseSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.engagements)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(rec.netSalary)}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete" /></>)}</div></td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="3" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.baseSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.engagements)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.loanDeduction)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otherDeductions)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.netSalary)}</td><td></td></tr></tfoot></table></div>
                     )}
                     <ConfirmationModal isOpen={!!recordToDelete} onClose={() => setRecordToDelete(null)} onConfirm={handleDelete} title="Delete Payroll Record" message="Are you sure you want to delete this payroll record? This action cannot be undone." />
                 </Card>
@@ -4553,17 +4514,43 @@
         // --- END PAYROLL PAGE ---
 
         // --- START EXPENSE REPORT PAGE ---
-        const ExpenseReportPage = () => {
-            const { data: payrollHistory } = useCollection('payrollHistory');
+        const ExpenseReportPage = ({ userProfile }) => {
+            const { where } = window.firebaseSDK;
+            
+            const payrollQueryConstraints = useMemo(() => {
+                if (!userProfile) return [where("shop", "==", "null")];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return [];
+                if (userProfile.role === 'Shop Manager') {
+                    const shops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    if (shops.length > 0) return [where("shop", "in", shops)];
+                    return [where("shop", "==", "null")];
+                }
+                return [where("shop", "==", "null")];
+            }, [userProfile]);
+
+            const { data: payrollHistory } = useCollection('payrollHistory', payrollQueryConstraints);
             const { data: shops } = useCollection('shops');
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            
+            useEffect(() => {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
+                }
+            }, [userProfile]);
+
+            const availableShops = useMemo(() => {
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
+                if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
+                    return shops.filter(s => userProfile.shop.includes(s.name));
+                }
+                return [];
+            }, [shops, userProfile]);
 
             const { expenseSummary, totals } = useMemo(() => {
                 if (!payrollHistory.length) return { expenseSummary: [], totals: {} };
                 const filteredHistory = payrollHistory.filter(rec => (!selectedShop || rec.shop === selectedShop) && (!selectedMonth || rec.month === selectedMonth));
                 
-                // Group payroll records by shop and month
                 const summary = filteredHistory.reduce((acc, rec) => {
                     if (!rec.shop || !rec.month) return acc;
                     const key = `${rec.shop}_${rec.month}`;
@@ -4589,10 +4576,23 @@
                 
                 return { expenseSummary: summaryArray, totals };
             }, [payrollHistory, selectedShop, selectedMonth]);
+            
+            const canFilterByShop = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop));
 
             return (
                 <Card>
-                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6"><CardTitle>Expense Report Summary</CardTitle><div className="flex flex-wrap gap-4 items-center"><select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto"><option value="">All Shops</option>{shops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select><input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" /></div></div>
+                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
+                        <CardTitle>Expense Report Summary</CardTitle>
+                        <div className="flex flex-wrap gap-4 items-center">
+                            {canFilterByShop && (
+                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
+                                    {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                        </div>
+                    </div>
                     <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Month</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Loan Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Other Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Final Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Account Note</th></tr></thead><tbody className="divide-y divide-slate-700">{expenseSummary.map((item, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{item.month}</td><td className="px-4 py-4 text-sm text-slate-300">{item.shopName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalLoanDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalOtherDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.totalFinalSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.accountNote)}</td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="2" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalLoanDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalOtherDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalFinalSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalAccountNote)}</td></tr></tfoot></table></div>
                 </Card>
             );
@@ -5476,6 +5476,7 @@
             // Filter sidebar links based on user permissions
             const availableLinks = useMemo(() => {
                 if (userProfile?.role === 'Admin') return sidebarLinks; // Admin sees all
+                if (userProfile?.role === 'CEO') return sidebarLinks.filter(link => link.key !== 'sysConfig'); // CEO sees all except Sys Config
                 if (!userProfile?.permissions) {
                     // If no permissions array exists, just show the policy board to be safe.
                     return sidebarLinks.filter(link => link.key === 'policy');
@@ -5657,7 +5658,7 @@
             const totalPending = pendingLeaves.length + pendingOTs.length;
             // Renders the component for the currently active page
             const renderActivePage = useCallback(() => {
-                const hasPermission = userProfile?.role === 'Admin' || userProfile?.permissions?.includes(activePage) || activePage === 'policy';
+                const hasPermission = (userProfile?.role === 'Admin') || (userProfile?.role === 'CEO' && activePage !== 'sysConfig') || userProfile?.permissions?.includes(activePage) || activePage === 'policy';
                 if (!activePage) return null;
                 if (!hasPermission) return <Card><CardTitle>Access Denied</CardTitle><p>You do not have permission to view this page.</p></Card>;
                 
@@ -5667,7 +5668,7 @@
                     case 'attendanceReport': return <AttendanceReportPage userProfile={userProfile} />;
                     case 'loanManager': return <LoanManagerPage userProfile={userProfile} />;
                     case 'payroll': return <PayrollPage userProfile={userProfile} />;
-                    case 'expenseReport': return <ExpenseReportPage />;
+                    case 'expenseReport': return <ExpenseReportPage userProfile={userProfile} />;
                     case 'policy': return <PolicyBoardPage userProfile={userProfile} />;
                     case 'userActivity': return <UserActivityPage />;
                     case 'settings': return <SettingsPage />;
@@ -5754,13 +5755,6 @@
     </script>
 </body>
 </html>
-
-
-
-
-
-
-
 
 
 
