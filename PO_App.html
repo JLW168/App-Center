@@ -2704,86 +2704,57 @@
         };
 
         const handleCompleteTransfer = async () => {
+            setLoading(true);
             const fromShop = shops.find(s => s.id === transferData.fromShopId);
             const toShop = shops.find(s => s.id === transferData.toShopId);
             const newTotalAmount = items.reduce((sum, item) => sum + ((item.quantity || 0) * (item.cost || 0)), 0);
 
-            // Add a guardrail for very large transfers that would exceed transaction limits.
-            // A transaction can have up to 500 writes. Each item can take up to 2 writes (fromShop/toShop).
-            if ((items.length * 2) + 1 > 499) {
-                setModalInfo({
-                    show: true,
-                    title: 'Transfer Too Large',
-                    message: 'This transfer contains too many items to be processed safely in one operation. Please split it into smaller transfers (max 249 items).',
-                    isError: true
-                });
-                return;
-            }
-
             try {
-                // REFACTORED to use a Firestore Transaction for atomic read/write operations.
-                // This is the definitive fix for the race condition that could cause negative stock.
-                await db.runTransaction(async (transaction) => {
-                    const productRefs = items.map(item => db.collection("products").doc(item.productId));
-                    
-                    // The transaction must read all documents before writing.
-                    const productDocs = await Promise.all(productRefs.map(ref => transaction.get(ref)));
+                // Use batched writes to handle large number of stock updates, avoiding transaction limits.
+                const BATCH_SIZE = 245; // Firestore limit is 500 writes per batch. Each item is 2 writes.
+                
+                for (let i = 0; i < items.length; i += BATCH_SIZE) {
+                    const batch = db.batch();
+                    const chunk = items.slice(i, i + BATCH_SIZE);
 
-                    // Step 1: Validate all stock levels within the transaction.
-                    // If any check fails, the transaction automatically aborts before any writes happen.
-                    for (let i = 0; i < items.length; i++) {
-                        const productDoc = productDocs[i];
-                        const originalItem = transferData.items[i];
-                        const receivedQty = items[i].quantity || 0;
+                    chunk.forEach(item => {
+                        const productRef = db.collection("products").doc(item.productId);
+                        const receivedQty = item.quantity || 0;
 
-                        if (!productDoc.exists) {
-                            throw new Error(`Product "${originalItem.name}" could not be found.`);
-                        }
-                        
-                        if (fromShop?.manageStock) {
-                            const currentStock = productDoc.data().stockByShop?.[fromShop.id] || 0;
-                            if (currentStock < receivedQty) {
-                                throw new Error(`Insufficient stock for "${originalItem.name}". Available: ${currentStock}, Requested: ${receivedQty}.`);
-                            }
-                        }
-                    }
-
-                    // Step 2: If all validations passed, proceed with the writes.
-                    for (let i = 0; i < items.length; i++) {
-                        const productRef = productRefs[i];
-                        const receivedQty = items[i].quantity || 0;
-                        
                         if (receivedQty > 0) {
                             if (fromShop?.manageStock) {
-                                transaction.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-receivedQty) });
+                                batch.update(productRef, { [`stockByShop.${fromShop.id}`]: firebase.firestore.FieldValue.increment(-receivedQty) });
                             }
                             if (toShop?.manageStock) {
-                                transaction.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
+                                batch.update(productRef, { [`stockByShop.${toShop.id}`]: firebase.firestore.FieldValue.increment(receivedQty) });
                             }
                         }
-                    }
-                    
-                    // Step 3: Finally, update the transfer document itself.
-                    const transferRef = db.collection("internalTransfers").doc(transferData.id);
-                    transaction.update(transferRef, {
-                        status: 'done',
-                        items: items, // Save the final received quantities
-                        totalAmount: newTotalAmount,
-                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                     });
+                    
+                    await batch.commit();
+                }
+
+                // After all stock updates are committed, update the transfer status.
+                await db.collection("internalTransfers").doc(transferData.id).update({
+                    status: 'done',
+                    items: items, // Save the final received quantities
+                    totalAmount: newTotalAmount,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 });
 
                 setModalInfo({ show: true, title: 'Success', message: 'Transfer completed and stock updated successfully.' });
                 onClose();
 
             } catch (error) {
-                console.error("Transaction failed: ", error);
+                console.error("Transfer completion failed: ", error);
                 setModalInfo({
                     show: true,
                     title: 'Operation Failed',
                     message: `The transfer could not be completed. Reason: ${error.message}`,
                     isError: true
                 });
+            } finally {
+                setLoading(false);
             }
         };
 
@@ -4144,5 +4115,3 @@
         </script>
     </body>
     </html>
-
-
