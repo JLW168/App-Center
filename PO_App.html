@@ -2046,6 +2046,16 @@
             });
         };
 
+        const renderModalForView = () => {
+            if (!viewReqTransfer) return null;
+
+            if (viewReqTransfer.status === 'done') {
+                return <TransferViewModal transferData={viewReqTransfer} onClose={() => setViewReqTransfer(null)} />;
+            } else {
+                return <TransferAuditModal transferData={viewReqTransfer} activeTransfers={activeTransfers} onClose={() => setViewReqTransfer(null)} />;
+            }
+        };
+
         return (
             <div className="space-y-6">
                 <MessageModal {...modal.data} show={modal.type === 'message'} onClose={() => setModal({ type: null })} />
@@ -2067,7 +2077,7 @@
                 {activeTab === 'active-transfer' && <TransferReport title="Active Transfers" transfers={activeTransfers} loading={transfersLoading} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} onDelete={openDeleteModal} />}
                 {activeTab === 'transfer-report' && <TransferReport title="Internal Transfer History" transfers={getTransfersByStatus('done')} loading={transfersLoading} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} />}
                 {activeTab === 'internal-transfer' && <InternalTransfer transferDataToEdit={transferDataToEdit} userProfile={userProfile} setActiveTab={setActiveTab} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} activeTransfers={activeTransfers} />}
-                {viewReqTransfer && <TransferAuditModal transferData={viewReqTransfer} activeTransfers={activeTransfers} onClose={() => setViewReqTransfer(null)} />}
+                {renderModalForView()}
             </div>
         );
     };
@@ -2710,14 +2720,21 @@
             const newTotalAmount = items.reduce((sum, item) => sum + ((item.quantity || 0) * (item.cost || 0)), 0);
 
             try {
-                // Use batched writes to handle large number of stock updates, avoiding transaction limits.
-                const BATCH_SIZE = 245; // Firestore limit is 500 writes per batch. Each item is 2 writes.
-                
-                for (let i = 0; i < items.length; i += BATCH_SIZE) {
+                // Use batched writes to handle large numbers of stock updates.
+                // BATCH_SIZE is set below the 250-item mark for a safer buffer against Firestore's 500-operation limit.
+                const BATCH_SIZE = 240;
+                const totalBatches = Math.ceil(items.length / BATCH_SIZE);
+
+                for (let i = 0; i < totalBatches; i++) {
                     const batch = db.batch();
-                    const chunk = items.slice(i, i + BATCH_SIZE);
+                    const startIndex = i * BATCH_SIZE;
+                    const endIndex = startIndex + BATCH_SIZE;
+                    const chunk = items.slice(startIndex, endIndex);
+                    const isLastBatch = i === totalBatches - 1;
 
                     chunk.forEach(item => {
+                        if (!item.productId) return; // Skip if a product ID is missing
+                        
                         const productRef = db.collection("products").doc(item.productId);
                         const receivedQty = item.quantity || 0;
 
@@ -2730,27 +2747,38 @@
                             }
                         }
                     });
+
+                    // For the final batch, also update the transfer document itself to mark it as 'done'.
+                    // This makes the process more atomic.
+                    if (isLastBatch) {
+                        const transferRef = db.collection("internalTransfers").doc(transferData.id);
+                        batch.update(transferRef, {
+                            status: 'done',
+                            items: items, // Save the final received quantities
+                            totalAmount: newTotalAmount,
+                            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                    }
                     
                     await batch.commit();
                 }
-
-                // After all stock updates are committed, update the transfer status.
-                await db.collection("internalTransfers").doc(transferData.id).update({
-                    status: 'done',
-                    items: items, // Save the final received quantities
-                    totalAmount: newTotalAmount,
-                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                });
 
                 setModalInfo({ show: true, title: 'Success', message: 'Transfer completed and stock updated successfully.' });
                 onClose();
 
             } catch (error) {
                 console.error("Transfer completion failed: ", error);
+                let userMessage = `The transfer could not be completed. Reason: ${error.message}`;
+                if (error.code === 'resource-exhausted' || error.message.includes('Quota')) {
+                    userMessage = "The transfer could not be completed because it contains too many items, and a database quota was exceeded during the update process. Some items may have been partially transferred. Please review stock levels and contact support.";
+                } else if (error.code === 'permission-denied') {
+                    userMessage = "Operation failed. You do not have the required permissions to update product stock. Please contact an administrator.";
+                }
+
                 setModalInfo({
                     show: true,
                     title: 'Operation Failed',
-                    message: `The transfer could not be completed. Reason: ${error.message}`,
+                    message: userMessage,
                     isError: true
                 });
             } finally {
@@ -2869,6 +2897,173 @@
                     </button>
                     <button onClick={handleCompleteTransfer} disabled={!isValidated || loading} type="button" className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 disabled:bg-green-800 disabled:cursor-not-allowed disabled:text-slate-400">
                          {loading ? <div className="loader"></div> : 'Complete Transfer'}
+                    </button>
+                </ModalFooter>
+            </Modal>
+        );
+    };
+
+    const TransferViewModal = ({ transferData, onClose }) => {
+        const { shops, products } = useData();
+        const previewRef = useRef(null);
+        const [loading, setLoading] = useState(false);
+        const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
+
+        const fromShop = shops.find(s => s.id === transferData.fromShopId)?.name || '';
+        const toShop = shops.find(s => s.id === transferData.toShopId)?.name || '';
+        const transferDate = safeToDate(transferData.transferDate)?.toLocaleDateString() || 'N/A';
+        const totalAmount = useMemo(() => transferData.items.reduce((sum, item) => sum + ((item.quantity || 0) * (item.cost || 0)), 0), [transferData.items]);
+
+        const handleExportToExcel = () => {
+            const wb = XLSX.utils.book_new();
+            const ws_data = [];
+            const headerStyle = { font: { bold: true } };
+
+            ws_data.push([{v: 'Internal Transfer Report', s: { font: { sz: 16, bold: true } } }]);
+            ws_data.push([]);
+            ws_data.push([{v: 'From Shop:', s: headerStyle}, fromShop, null, {v: 'Transfer No.:', s: headerStyle}, transferData.transferNo]);
+            ws_data.push([{v: 'To Shop:', s: headerStyle}, toShop, null, {v: 'Date:', s: headerStyle}, transferDate]);
+            ws_data.push([]);
+            
+            const tableHeader = ['No', 'Product Code', 'Barcode', 'Name', 'Received QTY', 'Cost (៛)', 'Sub-Total (៛)', 'Note'];
+            ws_data.push(tableHeader.map(h => ({v: h, s: headerStyle})));
+
+            transferData.items.forEach((item, index) => {
+                const subTotal = (item.quantity || 0) * (item.cost || 0);
+                ws_data.push([
+                    index + 1, item.code, item.barcode || '', item.name, item.quantity || 0,
+                    { t: 'n', v: item.cost || 0, z: '#,##0' },
+                    { t: 'n', v: subTotal, z: '#,##0' },
+                    item.note || ''
+                ]);
+            });
+
+            ws_data.push([]);
+            ws_data.push([null, null, null, null, null, {v: 'Total (៛):', s: headerStyle}, {t: 'n', v: totalAmount, z: '#,##0'}]);
+            const ws = XLSX.utils.aoa_to_sheet(ws_data);
+            ws['!cols'] = [ {wch:5}, {wch:15}, {wch:15}, {wch:40}, {wch:12}, {wch:15}, {wch:15}, {wch:20} ];
+            XLSX.utils.book_append_sheet(wb, ws, 'Transfer Report');
+            XLSX.writeFile(wb, `Transfer-Report-${transferData.transferNo}.xlsx`);
+        };
+
+        const handlePrintPdf = () => {
+            setLoading(true);
+            setTimeout(() => {
+                const input = previewRef.current;
+                if (!input) { setLoading(false); return; }
+                const originalColor = input.style.color;
+                input.style.color = 'black';
+                html2canvas(input, { scale: 2, backgroundColor: '#ffffff', useCORS: true, windowHeight: input.scrollHeight })
+                    .then(canvas => {
+                        const { jsPDF } = window.jspdf;
+                        const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+                        const margin = 10;
+                        const pdfWidth = pdf.internal.pageSize.getWidth();
+                        const usableWidth = pdfWidth - (margin * 2);
+                        const numPages = Math.ceil(canvas.height / (canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth)));
+                        for (let i = 0; i < numPages; i++) {
+                            if (i > 0) pdf.addPage();
+                            const yOffset = i * (canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth));
+                            const pageCanvas = document.createElement('canvas');
+                            pageCanvas.width = canvas.width;
+                            pageCanvas.height = Math.min(canvas.height - yOffset, canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth));
+                            pageCanvas.getContext('2d').drawImage(canvas, 0, yOffset, canvas.width, pageCanvas.height, 0, 0, pageCanvas.width, pageCanvas.height);
+                            pdf.addImage(pageCanvas.toDataURL('image/jpeg', 0.90), 'JPEG', margin, margin, usableWidth, usableWidth * (pageCanvas.height / pageCanvas.width));
+                        }
+                        pdf.save(`Transfer-Report-${transferData.transferNo}.pdf`);
+                    }).catch(err => {
+                        setModalInfo({ show: true, title: 'Error', message: 'Failed to generate PDF.', isError: true });
+                    }).finally(() => {
+                        if (input) input.style.color = originalColor;
+                        setLoading(false);
+                    });
+            }, 150);
+        };
+
+        return (
+            <Modal show={true} maxWidth="max-w-5xl">
+                <MessageModal {...modalInfo} show={modalInfo.show} onClose={() => setModalInfo({ show: false })} />
+                <ModalHeader title={`Transfer Report: ${transferData.transferNo}`} onClose={onClose} />
+                <ModalBody>
+                     <table className="min-w-full divide-y divide-slate-700">
+                        <thead className="bg-slate-900/50">
+                            <tr>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Product Code</th>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
+                                <th className="px-2 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Received QTY</th>
+                                <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Cost (៛)</th>
+                                <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Sub-Total (៛)</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-700">
+                            {transferData.items.map((item, index) => (
+                                <tr key={index}>
+                                    <td className="px-2 py-2 text-sm text-slate-300">{item.code}</td>
+                                    <td className="px-2 py-2 text-sm text-slate-300">{item.name}</td>
+                                    <td className="px-2 py-2 text-sm text-center font-bold text-slate-100">{item.quantity}</td>
+                                    <td className="px-2 py-2 text-sm text-right text-slate-400">{khrFormatter.format(item.cost)}</td>
+                                    <td className="px-2 py-2 text-sm text-right text-slate-300">{khrFormatter.format(item.cost * item.quantity)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                         <tfoot className="bg-slate-900/50">
+                            <tr>
+                                <td colSpan="4" className="px-2 py-3 text-right text-sm font-bold text-slate-300 uppercase">Total</td>
+                                <td className="px-2 py-3 text-right text-sm font-bold text-slate-200">៛{khrFormatter.format(totalAmount)}</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                     {/* Hidden printable layout */}
+                    <div style={{ position: 'absolute', left: '-9999px', top: 'auto' }}>
+                        <div ref={previewRef} className="po-preview-capture" style={{ width: '800px', fontSize: '10px' }}>
+                            <div className="text-center mb-4"><h1 className="text-xl font-bold">Internal Transfer Report</h1></div>
+                            <div className="grid grid-cols-2 gap-x-6 gap-y-1 mb-3 border-y py-2">
+                                <span><strong>From Shop:</strong> {fromShop}</span>
+                                <span><strong>To Shop:</strong> {toShop}</span>
+                                <span><strong>Transfer No.:</strong> {transferData.transferNo}</span>
+                                <span><strong>Date:</strong> {transferDate}</span>
+                            </div>
+                            <table className="w-full text-left border-collapse border border-slate-400">
+                                <thead className="bg-slate-200">
+                                    <tr>
+                                        <th className="border border-slate-300 p-1">No</th>
+                                        <th className="border border-slate-300 p-1">Product Code</th>
+                                        <th className="border border-slate-300 p-1">Name</th>
+                                        <th className="border border-slate-300 p-1 text-center">Received QTY</th>
+                                        <th className="border border-slate-300 p-1 text-right">Cost(៛)</th>
+                                        <th className="border border-slate-300 p-1 text-right">Sub-Total</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {transferData.items.map((item, index) => (
+                                        <tr key={index}>
+                                            <td className="border border-slate-300 p-1">{index + 1}</td>
+                                            <td className="border border-slate-300 p-1">{item.code}</td>
+                                            <td className="border border-slate-300 p-1">{item.name}</td>
+                                            <td className="border border-slate-300 p-1 text-center font-bold">{item.quantity}</td>
+                                            <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost)}</td>
+                                            <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost * item.quantity)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                            <div className="flex justify-end mt-4 text-right"><p className="font-bold">Total: ៛{khrFormatter.format(totalAmount)}</p></div>
+                             <div className="flex justify-between pt-8 mt-auto">
+                                <div><p className="font-bold">Prepared By:</p><p className="mt-8 border-t border-slate-400 pt-1">{transferData.createdBy}</p></div>
+                                <div><p className="font-bold">Approved By:</p><p className="mt-8 border-t border-slate-400 pt-1"></p></div>
+                                <div><p className="font-bold">Received By:</p><p className="mt-8 border-t border-slate-400 pt-1"></p></div>
+                            </div>
+                        </div>
+                    </div>
+                </ModalBody>
+                <ModalFooter>
+                    <button onClick={onClose} type="button" className="bg-slate-600 text-slate-100 font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Close</button>
+                    <button onClick={handlePrintPdf} disabled={loading} type="button" className="bg-red-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-red-700 transition flex items-center gap-2 disabled:bg-red-800">
+                        {loading ? <div className="loader"></div> : <i className="fas fa-file-pdf"></i>}
+                        {loading ? 'Generating...' : 'Print as PDF'}
+                    </button>
+                    <button onClick={handleExportToExcel} type="button" className="bg-indigo-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-indigo-700 flex items-center gap-2">
+                        <i className="fas fa-file-excel"></i> Export to Excel
                     </button>
                 </ModalFooter>
             </Modal>
@@ -4115,3 +4310,4 @@
         </script>
     </body>
     </html>
+
