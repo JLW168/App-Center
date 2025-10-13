@@ -254,12 +254,17 @@
         
         // Custom hook for real-time Firestore collection data
         const useCollection = (collectionName, queryConstraints = []) => {
-            const { db } = useFirebase();
+            const { db, currentUser } = useFirebase(); // Get currentUser
             const [data, setData] = useState([]);
             const [loading, setLoading] = useState(true);
 
             useEffect(() => {
-                if (!db) return;
+                if (!db || !currentUser) { // Add guard for currentUser
+                    // If there's no user yet, we are in a loading state. Don't set loading to false.
+                    setLoading(true);
+                    return;
+                }
+
                 setLoading(true);
                 const { collection, onSnapshot, query } = window.firebaseSDK;
                 const q = query(collection(db, collectionName), ...queryConstraints);
@@ -272,7 +277,7 @@
                     setLoading(false);
                 });
                 return () => unsubscribe();
-            }, [db, collectionName, JSON.stringify(queryConstraints)]); // JSON.stringify to safely memoize the array dependency
+            }, [db, currentUser, collectionName, JSON.stringify(queryConstraints)]); // Add currentUser to dependency array
             return { data, loading };
         };
 
@@ -446,7 +451,13 @@
 
             // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
             let savingsDeduction = 0;
-            if (employee.savingsProgramStatus === 'Active' && parseFloat(employee.savingsPercentage) > 0) {
+            // MODIFIED: Added a check to ensure the payroll month is on or after the employee's effective saving month.
+            if (
+                employee.savingsProgramStatus === 'Active' &&
+                parseFloat(employee.savingsPercentage) > 0 &&
+                employee.savingsEffectiveMonth && 
+                selectedMonth >= employee.savingsEffectiveMonth
+            ) {
                 const percentage = parseFloat(employee.savingsPercentage) / 100;
                 savingsDeduction = grossSalary * percentage;
             }
@@ -475,9 +486,28 @@
         const useAppData = () => useContext(AppDataContext);
 
         const AppDataProvider = ({ children }) => {
+            const { userProfile } = useFirebase();
+            const { where } = window.firebaseSDK;
+            
+            // Create role-based query constraints to prevent permission errors.
+            const employeeQueryConstraints = useMemo(() => {
+                if (!userProfile) {
+                    // While loading or logged out, fetch no employees.
+                    return [where("uid", "==", "null")];
+                }
+                const { role, uid } = userProfile;
+                if (role === 'Admin' || role === 'CEO' || role === 'Shop Manager') {
+                    // Admins, CEOs, and Managers need the full list for dropdowns and management tasks.
+                    // This assumes security rules permit them to read the whole collection.
+                    return [];
+                }
+                // Staff role should only fetch their own document to avoid permission errors.
+                return [where("uid", "==", uid)];
+            }, [userProfile]);
+
             // Use one-time static fetches for data that doesn't change often.
             // This is more efficient than real-time listeners for this type of data.
-            const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
+            const { data: employees, loading: employeesLoading } = useCollection('employees', employeeQueryConstraints);
             const { data: shops, loading: shopsLoading } = useStaticCollection('shops');
             const { data: shifts, loading: shiftsLoading } = useStaticCollection('shifts');
             const { data: positions, loading: positionsLoading } = useStaticCollection('positions');
@@ -999,12 +1029,13 @@
             const availablePages = useMemo(() => [
                 { key: 'employees', label: 'Employees' },
                 { key: 'checkinme', label: 'CheckInMe' },
+                { key: 'savingProgram', label: 'Saving Program' },
                 { key: 'attendanceReport', label: 'Attendance Report' },
                 { key: 'loanManager', label: 'Loan Manager' },
                 { key: 'payroll', label: 'Payroll' },
                 { key: 'expenseReport', label: 'Expense Report' },
                 { key: 'userActivity', label: 'User Activity' },
-                { key: 'policy', label: 'Policy Board' }, // Re-added Policy Board to the list
+                { key: 'policy', label: 'Policy Board' },
                 { key: 'settings', label: 'Settings' },
             ], []);
 
@@ -1483,12 +1514,39 @@
             );
         };
         
+        // NEW: Placeholder component to fix the reference error.
+        const SalaryReviseReportTab = ({ userProfile }) => {
+            return <UnderConstructionPage title="Salary Revise Report" />;
+        };
+        
+        // NEW: Placeholder component to fix the reference error.
+        const FormerEmployeesTab = ({ userProfile }) => {
+            return <UnderConstructionPage title="Resigned/Terminated Employees" />;
+        };
+
+        // Component: Main Employees Page (Tab Container)
+        const EmployeesPage = ({ userProfile }) => {
+            const [activeTab, setActiveTab] = useState('active');
+            return (
+                <TabbedPage tabs={{ active: 'Active Employees', salaryReport: 'Salary Revise Report', former: 'Resigned/Terminated' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                    <div id="active"><ActiveEmployeesTab userProfile={userProfile} /></div>
+                    <div id="salaryReport"><SalaryReviseReportTab userProfile={userProfile} /></div>
+                    <div id="former"><FormerEmployeesTab userProfile={userProfile} /></div>
+                </TabbedPage>
+            );
+        };
+        // --- END EMPLOYEES PAGE COMPONENTS ---
+        
+        // --- START SAVINGS PROGRAM PAGE COMPONENTS (NEW) ---
+        
         // NEW: Modal to Add/Edit Salary Saving Program Participants
         const AddSalarySavingModal = ({ isOpen, onClose, onSave, participant, userProfile, allEmployees }) => {
             const { shops } = useAppData();
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
             const [savingsPercentage, setSavingsPercentage] = useState(0);
+            const [joinDate, setJoinDate] = useState('');
+            const [effectiveMonth, setEffectiveMonth] = useState('');
         
             useEffect(() => {
                 if (participant) {
@@ -1497,11 +1555,17 @@
                     setSelectedShop(participantShop || '');
                     setSelectedEmployeeId(participant.id);
                     setSavingsPercentage(participant.savingsPercentage || 0);
+                    setJoinDate(participant.savingsJoinDate || '');
+                    setEffectiveMonth(participant.savingsEffectiveMonth || '');
                 } else {
                     // ADD MODE - Reset form
                     setSelectedShop('');
                     setSelectedEmployeeId('');
                     setSavingsPercentage(0);
+                    const today = new Date().toISOString().slice(0, 10);
+                    const currentMonth = new Date().toISOString().slice(0, 7);
+                    setJoinDate(today);
+                    setEffectiveMonth(currentMonth);
                 }
             }, [participant, isOpen]);
         
@@ -1525,11 +1589,11 @@
         
             const handleSubmit = (e) => {
                 e.preventDefault();
-                if (!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0) {
-                    alert("Please select an employee and enter a savings percentage greater than 0.");
+                if (!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0 || !joinDate || !effectiveMonth) {
+                    alert("Please fill all required fields, including a savings percentage greater than 0.");
                     return;
                 }
-                onSave(selectedEmployeeId, savingsPercentage || 0);
+                onSave(selectedEmployeeId, savingsPercentage || 0, joinDate, effectiveMonth);
             };
         
             return (
@@ -1562,6 +1626,26 @@
                                         min="0"
                                         max="100"
                                         placeholder="e.g., 10"
+                                        required
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Join Program Date</label>
+                                    <input
+                                        type="date"
+                                        value={joinDate}
+                                        onChange={e => setJoinDate(e.target.value)}
+                                        className="input"
+                                        required
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Effective Month</label>
+                                    <input
+                                        type="month"
+                                        value={effectiveMonth}
+                                        onChange={e => setEffectiveMonth(e.target.value)}
+                                        className="input"
                                         required
                                     />
                                 </div>
@@ -1702,8 +1786,8 @@
             );
         };
 
-        // NEW: Component for Salary Saving Program Report Tab
-        const SalarySavingTab = ({ userProfile }) => {
+        // MOVED & RENAMED: from SalarySavingTab to ParticipantsTab
+        const ParticipantsTab = ({ userProfile }) => {
             const { db } = useFirebase();
             const { doc, updateDoc, where } = window.firebaseSDK;
             const { employees, shops } = useAppData();
@@ -1718,7 +1802,7 @@
             const [participantToRemove, setParticipantToRemove] = useState(null);
             const [paybackParticipant, setPaybackParticipant] = useState(null);
             const [historyParticipant, setHistoryParticipant] = useState(null);
-            const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null); // NEW: State for the confirmation step
+            const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null);
 
             // Fetch transaction history for the selected employee
             const historyQueryConstraints = useMemo(() => {
@@ -1736,13 +1820,15 @@
                 setIsSavingModalOpen(false);
             };
 
-            const handleSaveParticipant = async (employeeId, percentage) => {
+            const handleSaveParticipant = async (employeeId, percentage, joinDate, effectiveMonth) => {
                 if (!employeeId || !db) return;
                 try {
                     const employeeRef = doc(db, 'employees', employeeId);
                     await updateDoc(employeeRef, {
                         savingsProgramStatus: 'Active',
-                        savingsPercentage: percentage
+                        savingsPercentage: percentage,
+                        savingsJoinDate: joinDate,
+                        savingsEffectiveMonth: effectiveMonth
                     });
                     handleCloseSavingModal();
                 } catch (error) {
@@ -1766,11 +1852,10 @@
                 }
             };
             
-            // NEW: This handler is called after the user confirms the payback action.
             const handleStartPaybackProcess = () => {
                 if (!participantForPaybackConfirmation) return;
-                setPaybackParticipant(participantForPaybackConfirmation); // Open the payback modal
-                setParticipantForPaybackConfirmation(null); // Close the confirmation modal
+                setPaybackParticipant(participantForPaybackConfirmation);
+                setParticipantForPaybackConfirmation(null);
             };
             
             const handleProcessPayback = async (employeeId, amount, note) => {
@@ -1798,24 +1883,16 @@
             }, [shops, userProfile]);
 
             const enrolledEmployees = useMemo(() => {
-                // 1. Create a map for quick lookup of savings balances.
                 const savingsMap = new Map(allSavings.map(s => [s.employeeId, s.currentBalance]));
-
-                // 2. Filter employees who are active in the savings program.
                 const enrolled = employees.filter(emp => emp.savingsProgramStatus === 'Active');
-                
-                // 3. Apply shop and search term filters.
                 const filtered = enrolled.filter(emp => 
                     (!selectedShop || (Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop)) &&
                     (emp.name.toLowerCase().includes(searchTerm.toLowerCase()))
                 );
-
-                // 4. Map the final list to include their savings balance.
                 return filtered.map(emp => ({
                     ...emp,
                     savingsBalance: savingsMap.get(emp.id) || 0
                 })).sort((a,b) => a.name.localeCompare(b.name));
-
             }, [employees, allSavings, selectedShop, searchTerm]);
 
             const totalSavings = useMemo(() => {
@@ -1854,7 +1931,7 @@
                                     {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
-                             {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                             {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                 <Button variant="primary" icon="fa-plus" onClick={() => handleOpenSavingModal()}>Add Participant</Button>
                             )}
                             <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
@@ -1866,9 +1943,11 @@
                                 <tr>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Join Date</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Savings Percentage</th>
+                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Effective Month</th>
                                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Accumulated Savings</th>
-                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                         <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
                                     )}
                                 </tr>
@@ -1878,16 +1957,22 @@
                                     <tr key={emp.id} className="hover:bg-slate-700/50">
                                         <td className="px-4 py-4 text-sm text-slate-200">{emp.name}</td>
                                         <td className="px-4 py-4 text-sm text-slate-300">{Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(emp.savingsJoinDate)}</td>
                                         <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsPercentage}%</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsEffectiveMonth}</td>
                                         <td className="px-4 py-4 text-sm text-blue-300 font-semibold text-right">{Utils.formatCurrency(emp.savingsBalance)}</td>
-                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                             <td className="px-4 py-4 text-center">
                                                 <div className="flex items-center justify-center gap-2">
                                                     <Button variant="icon-view" icon="fa-history" onClick={() => setHistoryParticipant(emp)} title="View History"/>
-                                                    {/* MODIFIED: This button now opens the confirmation modal first */}
-                                                    <Button variant="success" icon="fa-hand-holding-usd" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" className="px-3 py-1 text-xs">Payback</Button>
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                                        <Button variant="success" icon="fa-hand-holding-usd" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" className="px-3 py-1 text-xs">Payback</Button>
+                                                    )}
                                                     <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenSavingModal(emp)} title="Edit Percentage"/>
-                                                    <Button variant="icon-delete" icon="fa-user-minus" onClick={() => setParticipantToRemove(emp)} title="Remove from Program"/>
+                                                    {/* MODIFIED: Only Admin and CEO can see the delete button */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                                        <Button variant="icon-delete" icon="fa-user-minus" onClick={() => setParticipantToRemove(emp)} title="Remove from Program"/>
+                                                    )}
                                                 </div>
                                             </td>
                                         )}
@@ -1896,9 +1981,9 @@
                             </tbody>
                             <tfoot className="bg-slate-900/50">
                                 <tr>
-                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 4 : 3} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    <td colSpan="5" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
                                     <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
-                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && <td></td>}
+                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && <td></td>}
                                 </tr>
                             </tfoot>
                         </table>
@@ -1918,7 +2003,6 @@
                         title="Remove from Program"
                         message={`Are you sure you want to remove ${participantToRemove?.name} from the Salary Saving Program? This action will set their status to Inactive.`}
                     />
-                    {/* NEW: Confirmation modal for the payback action */}
                     <ConfirmationModal
                         isOpen={!!participantForPaybackConfirmation}
                         onClose={() => setParticipantForPaybackConfirmation(null)}
@@ -1942,7 +2026,7 @@
             );
         };
 
-        // NEW: Component for Savings History Tab
+        // MOVED: Savings History Tab
         const SavingsHistoryTab = ({ userProfile }) => {
             const { employees, shops } = useAppData();
             const { data: transactions, loading } = useCollection('savingsTransactions');
@@ -2100,31 +2184,18 @@
                 </Card>
             );
         };
-
-        // NEW: Placeholder component to fix the reference error.
-        const SalaryReviseReportTab = ({ userProfile }) => {
-            return <UnderConstructionPage title="Salary Revise Report" />;
-        };
         
-        // NEW: Placeholder component to fix the reference error.
-        const FormerEmployeesTab = ({ userProfile }) => {
-            return <UnderConstructionPage title="Resigned/Terminated Employees" />;
-        };
-
-        // Component: Main Employees Page (Tab Container)
-        const EmployeesPage = ({ userProfile }) => {
-            const [activeTab, setActiveTab] = useState('active');
+        // NEW: Main Savings Program Page (Tab Container)
+        const SavingsProgramPage = ({ userProfile }) => {
+            const [activeTab, setActiveTab] = useState('participants');
             return (
-                <TabbedPage tabs={{ active: 'Active Employees', salaryReport: 'Salary Revise Report', salarySaving: 'Salary Saving Program', savingsHistory: 'Savings History', former: 'Resigned/Terminated' }} activeTab={activeTab} setActiveTab={setActiveTab}>
-                    <div id="active"><ActiveEmployeesTab userProfile={userProfile} /></div>
-                    <div id="salaryReport"><SalaryReviseReportTab userProfile={userProfile} /></div>
-                    <div id="salarySaving"><SalarySavingTab userProfile={userProfile} /></div>
-                    <div id="savingsHistory"><SavingsHistoryTab userProfile={userProfile} /></div>
-                    <div id="former"><FormerEmployeesTab userProfile={userProfile} /></div>
+                <TabbedPage tabs={{ participants: 'Participants', history: 'Savings History' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                    <div id="participants"><ParticipantsTab userProfile={userProfile} /></div>
+                    <div id="history"><SavingsHistoryTab userProfile={userProfile} /></div>
                 </TabbedPage>
             );
         };
-        // --- END EMPLOYEES PAGE COMPONENTS ---
+        // --- END SAVINGS PROGRAM PAGE COMPONENTS ---
 
         // --- START CHECKINME PAGE COMPONENTS ---
 
@@ -2444,6 +2515,12 @@
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">មកយឺតសរុប :</span><span className="font-semibold text-slate-200">{inputs.totalLateDays || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm" title="អវត្តមាន + ភ្លេចចុចចេញ"><span className="text-slate-400">អវត្តមាន :</span><span className="font-semibold text-slate-200">{inputs.noAttendance || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">បំណុលរំលួស :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(inputs.loanDeduction)}</span></div>
+                                {calculations.savingsDeduction > 0 && (
+                                    <div className="flex justify-between items-center text-sm">
+                                        <span className="text-slate-400">ការកាត់សន្សំ :</span>
+                                        <span className="font-semibold text-blue-400">{Utils.formatCurrency(calculations.savingsDeduction)}</span>
+                                    </div>
+                                )}
                                 {calculations.rejectedLeavePenaltyAmount > 0 && (
                                     <div className="flex justify-between items-center text-sm" title="Penalty for absence on a day with a rejected leave request">
                                         <span className="text-slate-400">ច្បាប់សម្រាកបដិសេធ :</span>
@@ -2474,29 +2551,51 @@
         const LeaveRequestModal = ({ isOpen, onClose, onSave, request, userProfile }) => {
             const [formData, setFormData] = useState({});
             
-            // REFACTORED: Get shops from App Data Context
-            const { shops } = useAppData();
-            const canSelectShop = useMemo(() => userProfile?.role === 'Admin' || Array.isArray(userProfile?.shop), [userProfile]);
+            // Get global data from context
+            const { shops, employees } = useAppData();
+
+            const isManagerial = useMemo(() => userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager', [userProfile]);
+
+            // Filter employees for the dropdown based on the selected shop in the modal
+            const employeesInShop = useMemo(() => {
+                if (!formData.shop) return [];
+                return employees.filter(emp => {
+                    const employeeShops = Array.isArray(emp.shop) ? emp.shop : [emp.shop];
+                    return employeeShops.includes(formData.shop) && emp.status === 'Active';
+                });
+            }, [formData.shop, employees]);
             
+            // Determine which shops should be available in the dropdown
+            const availableShopsForModal = useMemo(() => {
+                if (!userProfile) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return shops;
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    return shops.filter(s => managedShops.includes(s.name));
+                }
+                return []; // Staff don't get a shop dropdown
+            }, [userProfile, shops]);
+
             useEffect(() => {
-                const initialData = request 
-                    ? { ...request } 
-                    : (userProfile 
-                        ? { 
-                            leaveDate: new Date().toISOString().substring(0, 10), 
-                            returnDate: new Date().toISOString().substring(0, 10),
-                            shop: canSelectShop ? '' : (userProfile.shop || ''), 
-                            staffId: userProfile.id || '', 
-                            staffName: userProfile.name || '',
-                            supervisor: userProfile.supervisor || '', 
-                            numberOfDays: 1, 
-                            leaveSession: 'Full Day',
-                            leaveType: 'Annual Leave',
-                            reason: '' 
-                          } 
-                        : {});
-                setFormData(initialData);
-            }, [request, userProfile, isOpen, canSelectShop]);
+                if (request) { // EDIT mode: Populate with existing request data
+                    setFormData(request);
+                } else if (userProfile) { // NEW request mode
+                    const initialData = {
+                        leaveDate: new Date().toISOString().substring(0, 10),
+                        returnDate: new Date().toISOString().substring(0, 10),
+                        numberOfDays: 1,
+                        leaveSession: 'Full Day',
+                        leaveType: 'Annual Leave',
+                        reason: '',
+                        // Conditionally pre-fill based on role
+                        shop: isManagerial ? '' : (Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop || ''),
+                        staffId: isManagerial ? '' : (userProfile.id || ''),
+                        staffName: isManagerial ? '' : (userProfile.name || ''),
+                        supervisor: isManagerial ? '' : (userProfile.supervisor || ''),
+                    };
+                    setFormData(initialData);
+                }
+            }, [request, userProfile, isOpen, isManagerial]);
 
             const dateDiffInDays = useMemo(() => {
                 if (formData.leaveDate && formData.returnDate) {
@@ -2513,7 +2612,26 @@
 
             const handleChange = useCallback((e) => {
                 const { name, value } = e.target;
-                const newFormData = { ...formData, [name]: value };
+                let newFormData = { ...formData, [name]: value };
+
+                // When a manager selects a shop, reset the staff selection
+                if (name === 'shop') {
+                    newFormData.staffId = '';
+                    newFormData.staffName = '';
+                    newFormData.supervisor = '';
+                }
+
+                // When a manager selects a staff member, populate their details
+                if (name === 'staffId') {
+                    const selectedEmployee = employees.find(emp => emp.id === value);
+                    if (selectedEmployee) {
+                        newFormData.staffName = selectedEmployee.name;
+                        newFormData.supervisor = selectedEmployee.supervisor || '';
+                    } else {
+                        newFormData.staffName = '';
+                        newFormData.supervisor = '';
+                    }
+                }
 
                 // Recalculate days based on dates and session.
                 const { leaveDate, returnDate, leaveSession } = newFormData;
@@ -2551,25 +2669,22 @@
                 }
                 
                 setFormData(newFormData);
-            }, [formData]);
+            }, [formData, employees]);
             
             const handleSubmit = useCallback((e) => { 
                 e.preventDefault(); 
-                if (canSelectShop && !formData.shop) {
+                if ((isManagerial || Array.isArray(userProfile.shop)) && !formData.shop) {
                     alert("Please select a shop for the leave request.");
                     return;
                 }
                 const dataToSave = { ...formData };
-                // If leave date and return date are the same, it implies a single day of leave.
-                // The attendance report logic requires returnDate to be the day *after* the leave ends.
-                // So, we adjust the returnDate before saving to ensure report accuracy.
                 if (dataToSave.leaveDate && dataToSave.leaveDate === dataToSave.returnDate) {
                     const returnDate = new Date(dataToSave.returnDate);
                     returnDate.setDate(returnDate.getDate() + 1);
                     dataToSave.returnDate = returnDate.toISOString().substring(0, 10);
                 }
                 onSave(dataToSave); 
-            }, [onSave, formData, canSelectShop]);
+            }, [onSave, formData, isManagerial, userProfile]);
             
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-4xl">
@@ -2599,22 +2714,30 @@
                                     />
                                 </div>
                                 
-                                {canSelectShop ? (
+                                {isManagerial ? (
                                     <div>
                                         <label className="text-sm">Shop Name</label>
                                         <select name="shop" value={formData.shop || ''} onChange={handleChange} className="select" required>
                                             <option value="">Select Shop</option>
-                                            {
-                                                userProfile.role === 'Admin' 
-                                                ? (shops || []).map(shop => <option key={shop.id} value={shop.name}>{shop.name}</option>)
-                                                : (Array.isArray(userProfile.shop) ? userProfile.shop : []).map(shopName => <option key={shopName} value={shopName}>{shopName}</option>)
-                                            }
+                                            {availableShopsForModal.map(shop => <option key={shop.id} value={shop.name}>{shop.name}</option>)}
                                         </select>
                                     </div>
                                 ) : (
                                     <div><label className="text-sm">Shop Name</label><input value={formData.shop || ''} className="input" disabled /></div>
                                 )}
-                                <div><label className="text-sm">Staff Name</label><input value={formData.staffName || ''} className="input" disabled /></div>
+                                
+                                {isManagerial && !request ? (
+                                    <div>
+                                        <label className="text-sm">Staff Name</label>
+                                        <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required disabled={!formData.shop}>
+                                            <option value="">Select Staff</option>
+                                            {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                                        </select>
+                                    </div>
+                                ) : (
+                                    <div><label className="text-sm">Staff Name</label><input value={formData.staffName || ''} className="input" disabled /></div>
+                                )}
+                                
                                 <div><label className="text-sm">Supervisor</label><input value={formData.supervisor || ''} className="input" disabled /></div>
 
                                 <div className="lg:col-span-3"><label className="text-sm">Leave Type</label>
@@ -2641,103 +2764,111 @@
         const OTRequestModal = ({ isOpen, onClose, onSave, request, userProfile }) => {
             const [formData, setFormData] = useState({});
             
-            // REFACTORED: Get shops and employees from App Data Context
+            // Get global data from context
             const { shops, employees } = useAppData();
-            const canSelectShop = useMemo(() => userProfile?.role === 'Admin' || Array.isArray(userProfile?.shop), [userProfile]);
+
+            const isManagerial = useMemo(() => userProfile?.role === 'Admin' || userProfile?.role === 'Shop Manager', [userProfile]);
+            
+            // Filter employees for dropdown based on selected shop
+            const employeesInShop = useMemo(() => {
+                if (!formData.shop) return [];
+                return employees.filter(emp => {
+                    const employeeShops = Array.isArray(emp.shop) ? emp.shop : [emp.shop];
+                    return employeeShops.includes(formData.shop) && emp.status === 'Active';
+                });
+            }, [formData.shop, employees]);
+
+            // Determine available shops for dropdown
+            const availableShopsForModal = useMemo(() => {
+                if (!userProfile) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return shops;
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    return shops.filter(s => managedShops.includes(s.name));
+                }
+                return [];
+            }, [userProfile, shops]);
 
             // Initialize form data
             useEffect(() => {
-                const initialData = request 
-                    ? { ...request } 
-                    : (userProfile 
-                        ? { 
-                            reqDate: new Date().toISOString().substring(0, 10), 
-                            shop: canSelectShop ? '' : (userProfile.shop || ''), 
-                            staffId: userProfile.id || '', 
-                            staffName: userProfile.name || '',
-                            supervisor: userProfile.supervisor || '', 
-                            startTime: '', 
-                            endTime: '', 
-                            numberOfOTDays: 0, 
-                            reason: '' 
-                          } 
-                        : {});
-                setFormData(initialData);
-            }, [request, userProfile, isOpen, canSelectShop]);
+                if (request) { // EDIT mode
+                    setFormData(request);
+                } else if (userProfile) { // NEW request mode
+                    const initialData = {
+                        reqDate: new Date().toISOString().substring(0, 10),
+                        startTime: '', endTime: '', numberOfOTDays: 0, reason: '',
+                        shop: isManagerial ? '' : (Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop || ''),
+                        staffId: isManagerial ? '' : (userProfile.id || ''),
+                        staffName: isManagerial ? '' : (userProfile.name || ''),
+                        supervisor: isManagerial ? '' : (userProfile.supervisor || ''),
+                    };
+                    setFormData(initialData);
+                }
+            }, [request, userProfile, isOpen, isManagerial]);
 
             // Calculate OT days from start and end times
             useEffect(() => {
-                // Ensure all required data is available before calculating.
                 if (formData.startTime && formData.endTime && formData.staffId && employees) {
                     const selectedEmployee = employees.find(e => e.id === formData.staffId);
                     const employeeShift = selectedEmployee ? selectedEmployee.shift : null;
 
-                    // New special cases based on shift and time
                     if (employeeShift && (employeeShift === 'AM' || employeeShift === 'PM')) {
-                        if (formData.startTime === '07:30' && formData.endTime === '17:00') { // 7:30 AM to 5:00 PM
-                            setFormData(prev => ({ ...prev, numberOfOTDays: 1 }));
-                            return; // Exit after setting
-                        }
-                        if (formData.startTime === '07:30' && formData.endTime === '21:00') { // 7:30 AM to 9:00 PM
-                            setFormData(prev => ({ ...prev, numberOfOTDays: 1.5 }));
-                            return; // Exit after setting
-                        }
+                        if (formData.startTime === '07:30' && formData.endTime === '17:00') { setFormData(prev => ({ ...prev, numberOfOTDays: 1 })); return; }
+                        if (formData.startTime === '07:30' && formData.endTime === '21:00') { setFormData(prev => ({ ...prev, numberOfOTDays: 1.5 })); return; }
                     }
                     if (employeeShift && employeeShift === 'APM') {
-                         if (formData.startTime === '07:30' && formData.endTime === '21:00') { // 7:30 AM to 9:00 PM for APM
-                            setFormData(prev => ({ ...prev, numberOfOTDays: 1 }));
-                            return; // Exit after setting
-                        }
+                         if (formData.startTime === '07:30' && formData.endTime === '21:00') { setFormData(prev => ({ ...prev, numberOfOTDays: 1 })); return; }
                     }
 
-                    // Fallback to the original duration-based calculation
                     const [startHour, startMinute] = formData.startTime.split(':').map(Number);
                     const [endHour, endMinute] = formData.endTime.split(':').map(Number);
 
                     if (!isNaN(startHour) && !isNaN(startMinute) && !isNaN(endHour) && !isNaN(endMinute)) {
                         const startDate = new Date(0, 0, 0, startHour, startMinute, 0);
                         let endDate = new Date(0, 0, 0, endHour, endMinute, 0);
-
-                        // Handle overnight OT
-                        if (endDate < startDate) {
-                            endDate.setDate(endDate.getDate() + 1);
-                        }
-
+                        if (endDate < startDate) { endDate.setDate(endDate.getDate() + 1); }
                         const diffMillis = endDate - startDate;
                         const diffHours = diffMillis / (1000 * 60 * 60);
-                        
-                        // REVISED LOGIC: Per user request, specific durations are handled differently.
-                        // 4 hours (e.g. 5pm-9pm) and 5 hours (e.g. 7:30am-12:30pm) both count as 0.5 days.
-                        // Durations between 4 and 5 hours are treated as a half day.
-                        // Other durations are calculated against a standard 8-hour OT day.
                         let otDays = 0;
                         const OT_HOURS_PER_DAY = 8;
-
-                        if (diffHours < 4) {
-                            otDays = 0;
-                        } else if (diffHours >= 4 && diffHours <= 5) {
-                            otDays = 0.5;
-                        } else { // diffHours > 5
-                            otDays = diffHours / OT_HOURS_PER_DAY;
-                        }
-                        
+                        if (diffHours < 4) { otDays = 0; } 
+                        else if (diffHours >= 4 && diffHours <= 5) { otDays = 0.5; } 
+                        else { otDays = diffHours / OT_HOURS_PER_DAY; }
                         setFormData(prev => ({ ...prev, numberOfOTDays: otDays > 0 ? otDays.toFixed(2) : 0 }));
                     }
                 }
             }, [formData.startTime, formData.endTime, formData.staffId, employees]);
 
             const handleChange = useCallback((e) => { 
-                setFormData(prev => ({ ...prev, [e.target.name]: e.target.value })); 
-            }, []);
+                const { name, value } = e.target;
+                let newFormData = { ...formData, [name]: value };
+
+                if (name === 'shop') {
+                    newFormData.staffId = '';
+                    newFormData.staffName = '';
+                    newFormData.supervisor = '';
+                }
+                if (name === 'staffId') {
+                    const selectedEmployee = employees.find(emp => emp.id === value);
+                    if (selectedEmployee) {
+                        newFormData.staffName = selectedEmployee.name;
+                        newFormData.supervisor = selectedEmployee.supervisor || '';
+                    } else {
+                        newFormData.staffName = '';
+                        newFormData.supervisor = '';
+                    }
+                }
+                setFormData(newFormData);
+            }, [formData, employees]);
             
             const handleSubmit = useCallback((e) => { 
                 e.preventDefault(); 
-                if (canSelectShop && !formData.shop) {
+                if ((isManagerial || Array.isArray(userProfile.shop)) && !formData.shop) {
                     alert("Please select a shop for the OT request.");
                     return;
                 }
                 onSave(formData); 
-            }, [onSave, formData, canSelectShop]);
+            }, [onSave, formData, isManagerial, userProfile]);
             
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-4xl">
@@ -2749,23 +2880,30 @@
                                 <div><label className="text-sm">Start Hour</label><input type="time" name="startTime" value={formData.startTime || ''} onChange={handleChange} className="input" required /></div>
                                 <div><label className="text-sm">End Hour</label><input type="time" name="endTime" value={formData.endTime || ''} onChange={handleChange} className="input" required /></div>
                                 
-                                {canSelectShop ? (
+                                {isManagerial ? (
                                     <div>
                                         <label className="text-sm">Shop Name</label>
                                         <select name="shop" value={formData.shop || ''} onChange={handleChange} className="select" required>
                                             <option value="">Select Shop</option>
-                                            {
-                                                userProfile.role === 'Admin' 
-                                                ? (shops || []).map(shop => <option key={shop.id} value={shop.name}>{shop.name}</option>)
-                                                : (Array.isArray(userProfile.shop) ? userProfile.shop : []).map(shopName => <option key={shopName} value={shopName}>{shopName}</option>)
-                                            }
+                                            {availableShopsForModal.map(shop => <option key={shop.id} value={shop.name}>{shop.name}</option>)}
                                         </select>
                                     </div>
                                 ) : (
                                     <div><label className="text-sm">Shop Name</label><input value={formData.shop || ''} className="input" disabled /></div>
                                 )}
                                 
-                                <div><label className="text-sm">Staff Name</label><input value={formData.staffName || ''} className="input" disabled /></div>
+                                {isManagerial && !request ? (
+                                    <div>
+                                        <label className="text-sm">Staff Name</label>
+                                        <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required disabled={!formData.shop}>
+                                            <option value="">Select Staff</option>
+                                            {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                                        </select>
+                                    </div>
+                                ) : (
+                                    <div><label className="text-sm">Staff Name</label><input value={formData.staffName || ''} className="input" disabled /></div>
+                                )}
+                                
                                 <div><label className="text-sm">Supervisor</label><input value={formData.supervisor || ''} className="input" disabled /></div>
                                 
                                 <div className="lg:col-span-3"><label className="text-sm">No. OT Day(s)</label><input type="number" name="numberOfOTDays" value={formData.numberOfOTDays || ''} className="input" disabled /></div>
@@ -6372,6 +6510,7 @@
                 { key: 'policy', icon: 'fa-book-open', label: 'Policy Board' },
                 { key: 'employees', icon: 'fa-users', label: 'Employees' }, 
                 { key: 'checkinme', icon: 'fa-user-clock', label: 'CheckInMe' }, 
+                { key: 'savingProgram', icon: 'fa-piggy-bank', label: 'Saving Program' },
                 { key: 'attendanceReport', icon: 'fa-file-alt', label: 'Attendance Report' }, 
                 { key: 'loanManager', icon: 'fa-hand-holding-usd', label: 'Loan Manager' }, 
                 { key: 'payroll', icon: 'fa-money-check-dollar', label: 'Payroll' }, 
@@ -6558,6 +6697,7 @@
                 employees: 'Employees', checkinme: 'CheckInMe', attendanceReport: 'Attendance Report', 
                 loanManager: 'Loan Manager', payroll: 'Payroll', expenseReport: 'Expense Report', 
                 userActivity: 'User Activity', settings: 'Settings', policy: 'Company Policy Board',
+                savingProgram: 'Salary Saving Program',
             }), []);
             
             const totalPending = pendingLeaves.length + pendingOTs.length;
@@ -6570,6 +6710,7 @@
                 switch(activePage) {
                     case 'employees': return <EmployeesPage userProfile={userProfile} />;
                     case 'checkinme': return <CheckInMePage userProfile={userProfile} initialTab={initialCheckInMeTab} />;
+                    case 'savingProgram': return <SavingsProgramPage userProfile={userProfile} />;
                     case 'attendanceReport': return <AttendanceReportPage userProfile={userProfile} />;
                     case 'loanManager': return <LoanManagerPage userProfile={userProfile} />;
                     case 'payroll': return <PayrollPage userProfile={userProfile} />;
@@ -6661,8 +6802,6 @@
     </script>
 </body>
 </html>
-
-
 
 
 
