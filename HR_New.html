@@ -91,7 +91,7 @@
         // Firebase SDK imports
         import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Make Firebase SDK available globally for the Babel script
         window.firebaseSDK = {
@@ -99,7 +99,7 @@
             doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp,
             signInWithEmailAndPassword, onAuthStateChanged, signOut, getDocs, writeBatch,
             enableIndexedDbPersistence, setDoc,
-            orderBy, limit, startAfter, createUserWithEmailAndPassword // Added for new user creation
+            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction // Added for new user creation
         };
     </script>
     
@@ -318,7 +318,7 @@
         const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction) => {
             if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
 
-            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops } = allData;
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts } = allData;
 
             // --- 1. Filter data for the selected employee and month ---
             const monthAttendance = (attendance || []).filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(selectedMonth));
@@ -443,12 +443,21 @@
             const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
             const otSalary = salaryPerDay * (otDays || 0);
             const grossSalary = baseSalaryEarned + otSalary + engagements;
-            // CORRECTED & UPDATED: Added the new penalty to total deductions.
-            const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions + rejectedLeavePenaltyAmount;
+
+            // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
+            let savingsDeduction = 0;
+            if (employee.savingsProgramStatus === 'Active' && parseFloat(employee.savingsPercentage) > 0) {
+                const percentage = parseFloat(employee.savingsPercentage) / 100;
+                savingsDeduction = grossSalary * percentage;
+            }
+            // --- END: Step 3 ---
+            
+            // CORRECTED & UPDATED: Added the new penalty AND savings deduction to total deductions.
+            const totalDeductions = loanDeduction + lateDeductionsAmount + otherDeductions + rejectedLeavePenaltyAmount + savingsDeduction;
             const netSalary = grossSalary - totalDeductions;
 
-            // CORRECTED & UPDATED: Added new penalty amount to the returned calculations object.
-            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount };
+            // CORRECTED & UPDATED: Added new penalty and savings amounts to the returned calculations object.
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
 
             return { inputs: autoInputs, calculations };
         };
@@ -567,7 +576,116 @@
                 const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
                 const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
                 return R * c; // Distance in metres
-            }
+            },
+
+            // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 1) ---
+            // This function transactionally processes a savings contribution to ensure data integrity.
+            // It updates the employee's total balance and creates an audit log entry simultaneously.
+            manageSavingsContribution: async (db, employeeId, employeeName, amount, payrollId) => {
+                const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
+                /* * Data Model for `employeeSavings` collection:
+                 * A single document per employee, identified by their employeeId.
+                 * { 
+                 * employeeId: string, 
+                 * employeeName: string, 
+                 * currentBalance: number, 
+                 * lastUpdated: timestamp 
+                 * }
+                 */
+                const savingsRef = doc(db, 'employeeSavings', employeeId);
+
+                /*
+                 * Data Model for `savingsTransactions` collection:
+                 * A new document is created for every single savings event.
+                 * { 
+                 * employeeId: string, 
+                 * date: timestamp, 
+                 * amountDeducted: number, 
+                 * type: 'contribution' | 'withdrawal', // 'withdrawal' for future use
+                 * payrollId: string // Links back to the specific payroll run
+                 * }
+                 */
+                const transactionRef = doc(collection(db, 'savingsTransactions'));
+
+                try {
+                    // Use a transaction to ensure both writes succeed or neither does.
+                    await runTransaction(db, async (transaction) => {
+                        const savingsDoc = await transaction.get(savingsRef);
+                        let newBalance = amount;
+
+                        // If the employee already has a savings document, add to their balance.
+                        if (savingsDoc.exists()) {
+                            newBalance = savingsDoc.data().currentBalance + amount;
+                        }
+
+                        // Operation 1: Update (or Set) the employee's total savings balance.
+                        transaction.set(savingsRef, { 
+                            currentBalance: newBalance, 
+                            employeeId: employeeId,
+                            employeeName: employeeName,
+                            lastUpdated: serverTimestamp() 
+                        }, { merge: true });
+
+                        // Operation 2: Create a new transaction log for this specific contribution.
+                        transaction.set(transactionRef, {
+                            employeeId: employeeId,
+                            date: serverTimestamp(),
+                            amountDeducted: amount,
+                            type: 'contribution',
+                            payrollId: payrollId
+                        });
+                    });
+                    console.log(`Savings contribution of ${amount} for ${employeeName} processed successfully.`);
+                    return { success: true };
+                } catch (error) {
+                    console.error("Error within manageSavingsContribution transaction: ", error);
+                    return { success: false, error: error };
+                }
+            },
+            // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 2: Payback) ---
+            // This function transactionally processes a savings withdrawal.
+            manageSavingsWithdrawal: async (db, employeeId, amount, note) => {
+                const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
+                const savingsRef = doc(db, 'employeeSavings', employeeId);
+                const transactionRef = doc(collection(db, 'savingsTransactions'));
+        
+                try {
+                    await runTransaction(db, async (transaction) => {
+                        const savingsDoc = await transaction.get(savingsRef);
+        
+                        if (!savingsDoc.exists()) {
+                            throw new Error("Employee has no savings record to withdraw from.");
+                        }
+        
+                        const currentBalance = savingsDoc.data().currentBalance || 0;
+                        if (amount > currentBalance) {
+                            throw new Error("Withdrawal amount cannot exceed the current balance.");
+                        }
+        
+                        const newBalance = currentBalance - amount;
+        
+                        // Operation 1: Update the employee's total savings balance.
+                        transaction.update(savingsRef, { 
+                            currentBalance: newBalance, 
+                            lastUpdated: serverTimestamp() 
+                        });
+        
+                        // Operation 2: Create a new transaction log for this withdrawal.
+                        transaction.set(transactionRef, {
+                            employeeId: employeeId,
+                            date: serverTimestamp(),
+                            amountWithdrawn: amount,
+                            type: 'withdrawal',
+                            note: note || 'Manual payback'
+                        });
+                    });
+                    console.log(`Savings withdrawal of ${amount} for ${employeeId} processed successfully.`);
+                    return { success: true };
+                } catch (error) {
+                    console.error("Error within manageSavingsWithdrawal transaction: ", error);
+                    return { success: false, error: error };
+                }
+            },
         };
         // --- END UTILITY FUNCTIONS ---
 
@@ -886,6 +1004,7 @@
                 { key: 'payroll', label: 'Payroll' },
                 { key: 'expenseReport', label: 'Expense Report' },
                 { key: 'userActivity', label: 'User Activity' },
+                { key: 'policy', label: 'Policy Board' }, // Re-added Policy Board to the list
                 { key: 'settings', label: 'Settings' },
             ], []);
 
@@ -901,7 +1020,7 @@
             useEffect(() => {
                 const initialData = employee 
                     ? { ...employee, permissions: employee.permissions || [] } 
-                    : { name: '', sex: 'M', dob: '', nationId: '', tel: '', shop: '', joinedDate: '', salary: '', position: '', shift: 'AM', supervisor: '', status: 'Active', email: '', uid: '', role: 'Staff', address: '', permissions: [], statusChangeDate: '', reasonForLeaving: '' };
+                    : { name: '', sex: 'M', dob: '', nationId: '', tel: '', shop: '', joinedDate: '', salary: '', position: '', shift: 'AM', supervisor: '', status: 'Active', email: '', uid: '', role: 'Staff', address: '', permissions: [], statusChangeDate: '', reasonForLeaving: '', savingsProgramStatus: 'Inactive', savingsPercentage: 0 }; 
 
                 // When editing, ensure shop is in the right format based on role
                 if (employee) {
@@ -1099,6 +1218,9 @@
                                 
                                 <div><label className="text-sm font-medium text-slate-400">Role</label><select name="role" value={formData.role || 'Staff'} onChange={handleChange} className="select" disabled={isViewOnly || userProfile?.role === 'Shop Manager'}><option>Admin</option><option>CEO</option><option>Shop Manager</option><option>Staff</option></select></div>
                                 <div className="md:col-span-2 lg:col-span-3"><label className="text-sm font-medium text-slate-400">Address</label><textarea name="address" value={formData.address || ''} onChange={handleChange} className="input" rows="3" disabled={isViewOnly}></textarea></div>
+
+                                {/* --- REMOVED: Salary Saving Program Section from this modal --- */}
+
                                 <div className="md:col-span-2 lg:col-span-3">
                                     <label className="text-sm font-medium text-slate-400">Page Permissions</label>
                                     <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 p-4 border border-slate-600 rounded-lg bg-slate-700/50">
@@ -1361,308 +1483,643 @@
             );
         };
         
-        // Component: Former Employees Tab
-        const FormerEmployeesTab = ({ userProfile }) => {
-            const { db, auth } = useFirebase();
-            const [isModalOpen, setModalOpen] = useState(false);
-            const [editingEmployee, setEditingEmployee] = useState(null);
-            const [employeeToDelete, setEmployeeToDelete] = useState(null);
-            const { data: employees } = useCollection('employees');
-
-            const formerEmployees = useMemo(() => employees.filter(e => e.status === 'Resigned' || e.status === 'Terminated'), [employees]);
-
-            const handleOpenModal = useCallback((employee = null) => { setEditingEmployee(employee); setModalOpen(true); }, []);
-            const handleCloseModal = useCallback(() => { setModalOpen(false); setEditingEmployee(null); }, []);
-            
-            const handleSaveEmployee = useCallback(async (employeeData) => {
-                const { doc, updateDoc, addDoc, collection, serverTimestamp } = window.firebaseSDK;
-                const salaryToSave = parseFloat(String(employeeData.salary).replace(/[^0-9.-]/g, '')) || 0;
-                const dataToSave = { ...employeeData, salary: salaryToSave };
-                try {
-                    if (dataToSave.id) {
-                        const { id, ...data } = dataToSave;
-                        const originalData = employees.find(e => e.id === id);
-                        await updateDoc(doc(db, 'employees', id), data);
-                        await addDoc(collection(db, "userLogs"), { 
-                            userId: auth.currentUser.uid, 
-                            action: 'Update Former Employee',
-                            targetId: id,
-                            targetName: data.name,
-                            timestamp: serverTimestamp(), 
-                            originalData, 
-                            updatedData: data 
-                        });
-                    }
-                    handleCloseModal();
-                } catch (e) { console.error("Error saving employee:", e); }
-            }, [db, auth, employees, handleCloseModal]);
-            
-            const handleDeleteConfirm = useCallback(async () => {
-                if (!employeeToDelete) return;
-                try { 
-                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'employees', employeeToDelete.id)); 
-                    const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
-                    await addDoc(collection(db, "userLogs"), { 
-                        userId: auth.currentUser.uid, 
-                        action: 'Delete Employee Record',
-                        targetId: employeeToDelete.id,
-                        targetName: employeeToDelete.name,
-                        timestamp: serverTimestamp(), 
-                        originalData: employeeToDelete, 
-                        updatedData: null 
-                    });
-                } catch (e) { 
-                    console.error(`Error deleting employee:`, e); 
-                } finally {
-                    setEmployeeToDelete(null);
+        // NEW: Modal to Add/Edit Salary Saving Program Participants
+        const AddSalarySavingModal = ({ isOpen, onClose, onSave, participant, userProfile, allEmployees }) => {
+            const { shops } = useAppData();
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+            const [savingsPercentage, setSavingsPercentage] = useState(0);
+        
+            useEffect(() => {
+                if (participant) {
+                    // EDIT MODE
+                    const participantShop = Array.isArray(participant.shop) ? participant.shop[0] : participant.shop;
+                    setSelectedShop(participantShop || '');
+                    setSelectedEmployeeId(participant.id);
+                    setSavingsPercentage(participant.savingsPercentage || 0);
+                } else {
+                    // ADD MODE - Reset form
+                    setSelectedShop('');
+                    setSelectedEmployeeId('');
+                    setSavingsPercentage(0);
                 }
-            }, [db, auth, employeeToDelete]);
+            }, [participant, isOpen]);
+        
+            const availableShops = useMemo(() => {
+                if (!userProfile) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return shops;
+                const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                return shops.filter(s => managedShops.includes(s.name));
+            }, [shops, userProfile]);
+            
+            const availableEmployees = useMemo(() => {
+                if (!selectedShop) return [];
+                // In add mode, show active employees in the selected shop who are NOT already in the program.
+                // In edit mode, it will just be the one employee being edited.
+                return allEmployees.filter(emp => {
+                    const isInShop = Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop;
+                    const isNotEnrolled = emp.savingsProgramStatus !== 'Active';
+                    return emp.status === 'Active' && isInShop && (isNotEnrolled || emp.id === participant?.id);
+                });
+            }, [selectedShop, allEmployees, participant]);
+        
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0) {
+                    alert("Please select an employee and enter a savings percentage greater than 0.");
+                    return;
+                }
+                onSave(selectedEmployeeId, savingsPercentage || 0);
+            };
+        
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-xl">
+                    <form onSubmit={handleSubmit}>
+                        <ModalHeader title={participant ? "Edit Savings Percentage" : "Add to Savings Program"} onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Shop</label>
+                                    <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select" disabled={!!participant}>
+                                        <option value="">Select Shop</option>
+                                        {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Employee</label>
+                                    <select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select" disabled={!selectedShop || !!participant}>
+                                        <option value="">Select Employee</option>
+                                        {availableEmployees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Savings Percentage (%)</label>
+                                    <input
+                                        type="number"
+                                        value={isNaN(savingsPercentage) ? '' : savingsPercentage}
+                                        onChange={e => setSavingsPercentage(parseFloat(e.target.value))}
+                                        className="input"
+                                        min="0"
+                                        max="100"
+                                        placeholder="e.g., 10"
+                                        required
+                                    />
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Save</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // NEW: Modal for processing a savings payback
+        const PaybackModal = ({ isOpen, onClose, onSave, participant }) => {
+            const [amount, setAmount] = useState('');
+            const [note, setNote] = useState('');
+            const [error, setError] = useState('');
+
+            useEffect(() => {
+                if (isOpen) {
+                    setAmount('');
+                    setNote('');
+                    setError('');
+                }
+            }, [isOpen]);
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                const paybackAmount = parseFloat(amount);
+                if (isNaN(paybackAmount) || paybackAmount <= 0) {
+                    setError('Please enter a valid positive amount.');
+                    return;
+                }
+                if (paybackAmount > participant.savingsBalance) {
+                    setError('Payback amount cannot exceed the total savings.');
+                    return;
+                }
+                onSave(participant.id, paybackAmount, note);
+            };
+
+            if (!participant) return null;
 
             return (
-                <Card>
-                    <h3 className="text-xl font-semibold text-slate-100 mb-6">Resigned/Terminated Employees</h3>
-                    {/* Desktop Table */}
-                    <div className="overflow-x-auto hidden md:block"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Worked Dur.</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{formerEmployees.map(emp => (<tr key={emp.id} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.statusChangeDate || 'N/A'}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shop}</td><td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{emp.name}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</td><td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-100 text-red-800'}`}>{emp.status}</span></td><td className="px-4 py-4 text-sm text-slate-300">{emp.reasonForLeaving}</td><td className="px-4 py-4 text-center whitespace-nowrap"><div className="flex items-center justify-center gap-4">{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></td></tr>))}</tbody></table></div>
-                    {/* Mobile Cards */}
-                    <div className="grid grid-cols-1 gap-4 md:hidden">{formerEmployees.map(emp => (<div key={emp.id} className="bg-slate-700/50 rounded-lg p-4 space-y-3"><div className="flex justify-between items-start"><div><p className="font-bold text-lg text-slate-100">{emp.name}</p><p className="text-sm text-slate-300">{emp.shop}</p></div><div className="flex items-center space-x-3"><span className={`px-2 py-1 text-xs font-semibold rounded-full ${emp.status === 'Resigned' ? 'bg-yellow-200 text-yellow-900' : 'bg-red-200 text-red-900'}`}>{emp.status}</span>{(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (<><Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(emp)} title="Edit Record" /><Button variant="icon-delete" icon="fa-trash" onClick={() => setEmployeeToDelete(emp)} title="Delete Record" /></>)}</div></div><div className="text-sm pt-2 border-t border-slate-600"><p><span className="text-slate-400">Date: </span><span className="text-slate-200 font-medium">{emp.statusChangeDate || 'N/A'}</span></p><p><span className="text-slate-400">Worked For: </span><span className="text-slate-200 font-medium">{Utils.calculateWorkedDuration(emp.joinedDate, emp.statusChangeDate)}</span></p><p><span className="text-slate-400">Reason: </span><span className="text-slate-200 font-medium">{emp.reasonForLeaving || 'N/A'}</span></p></div></div>))}</div>
-                    <EmployeeModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveEmployee} employee={editingEmployee} userProfile={userProfile} />
-                    <ConfirmationModal isOpen={!!employeeToDelete} onClose={() => setEmployeeToDelete(null)} onConfirm={handleDeleteConfirm} title="Delete Employee Record" message={`Are you sure you want to permanently delete the record for ${employeeToDelete?.name}? This action cannot be undone.`} />
-                </Card>
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-md">
+                    <form onSubmit={handleSubmit}>
+                        <ModalHeader title="Process Savings Payback" onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Employee</label>
+                                    <input value={participant.name} className="input" disabled />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Total Accumulated Savings</label>
+                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Payback Amount (KHR)</label>
+                                    <input
+                                        type="number"
+                                        value={amount}
+                                        onChange={e => { setAmount(e.target.value); setError(''); }}
+                                        className="input"
+                                        placeholder="Enter amount to pay back"
+                                        required
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                                    <input
+                                        type="text"
+                                        value={note}
+                                        onChange={e => setNote(e.target.value)}
+                                        className="input"
+                                        placeholder="e.g., Cash withdrawal"
+                                    />
+                                </div>
+                                {error && <p className="text-sm text-red-400">{error}</p>}
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Confirm Payback</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
             );
         };
         
-        // Component: Salary Revise Report Tab
-        const SalaryReviseReportTab = ({ userProfile }) => {
-            const { db } = useFirebase();
-            const [isModalOpen, setModalOpen] = useState(false);
-            const [editingRevision, setEditingRevision] = useState(null);
-            const [revisionToDelete, setRevisionToDelete] = useState(null);
-            const { where } = window.firebaseSDK;
-            
-            const queryConstraints = useMemo(() => {
-                if (!userProfile) return [where("shopName", "==", "null")];
-                if (userProfile.role === 'Admin') return [];
-                if (userProfile.role === 'Shop Manager') {
-                    const shops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
-                    if (shops.length > 0) {
-                        return [where("shopName", "in", shops)];
-                    }
-                    return [where("shopName", "==", "null")]; // No shops assigned
-                }
-                return [where("shopName", "==", userProfile.shop || null)];
-            }, [userProfile]);
+        // NEW: Modal to display savings transaction history
+        const SavingsHistoryModal = ({ isOpen, onClose, employeeName, transactions }) => {
+             const sortedTransactions = useMemo(() => {
+                if (!transactions) return [];
+                return [...transactions].sort((a, b) => (b.date?.toDate() || 0) - (a.date?.toDate() || 0));
+            }, [transactions]);
 
-            const { data: revisions } = useCollection('salaryRevisions', queryConstraints);
-            const { data: shops } = useCollection('shops');
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-2xl">
+                    <ModalHeader title={`Savings History for ${employeeName}`} onClose={onClose} />
+                    <ModalBody>
+                        <div className="overflow-x-auto max-h-[60vh]">
+                            <table className="min-w-full divide-y divide-slate-700">
+                                <thead className="bg-slate-900/50 sticky top-0">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Type</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note / Payroll ID</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {sortedTransactions.map(tx => (
+                                        <tr key={tx.id} className="hover:bg-slate-700/50">
+                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
+                                            <td className="px-4 py-4 text-sm font-semibold">
+                                                {tx.type === 'contribution' ? (
+                                                    <span className="text-green-400">Contribution</span>
+                                                ) : (
+                                                    <span className="text-red-400">Withdrawal</span>
+                                                )}
+                                            </td>
+                                            <td className={`px-4 py-4 text-sm text-right font-semibold ${tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'}`}>
+                                                {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
+                                            </td>
+                                            <td className="px-4 py-4 text-sm text-slate-400">{tx.payrollId || tx.note || '-'}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </ModalBody>
+                    <ModalFooter>
+                        <Button variant="secondary" onClick={onClose}>Close</Button>
+                    </ModalFooter>
+                </Modal>
+            );
+        };
+
+        // NEW: Component for Salary Saving Program Report Tab
+        const SalarySavingTab = ({ userProfile }) => {
+            const { db } = useFirebase();
+            const { doc, updateDoc, where } = window.firebaseSDK;
+            const { employees, shops } = useAppData();
+            
+            // Fetch all savings balances. We'll filter them on the client side.
+            const { data: allSavings } = useCollection('employeeSavings');
+            
             const [selectedShop, setSelectedShop] = useState('');
-            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [searchTerm, setSearchTerm] = useState('');
+            const [isSavingModalOpen, setIsSavingModalOpen] = useState(false);
+            const [editingParticipant, setEditingParticipant] = useState(null);
+            const [participantToRemove, setParticipantToRemove] = useState(null);
+            const [paybackParticipant, setPaybackParticipant] = useState(null);
+            const [historyParticipant, setHistoryParticipant] = useState(null);
+            const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null); // NEW: State for the confirmation step
+
+            // Fetch transaction history for the selected employee
+            const historyQueryConstraints = useMemo(() => {
+                return historyParticipant ? [where("employeeId", "==", historyParticipant.id)] : [where("employeeId", "==", "null")];
+            }, [historyParticipant]);
+            const { data: transactionHistory } = useCollection('savingsTransactions', historyQueryConstraints);
+
+            const handleOpenSavingModal = (participant = null) => {
+                setEditingParticipant(participant);
+                setIsSavingModalOpen(true);
+            };
+
+            const handleCloseSavingModal = () => {
+                setEditingParticipant(null);
+                setIsSavingModalOpen(false);
+            };
+
+            const handleSaveParticipant = async (employeeId, percentage) => {
+                if (!employeeId || !db) return;
+                try {
+                    const employeeRef = doc(db, 'employees', employeeId);
+                    await updateDoc(employeeRef, {
+                        savingsProgramStatus: 'Active',
+                        savingsPercentage: percentage
+                    });
+                    handleCloseSavingModal();
+                } catch (error) {
+                    console.error("Error saving participant:", error);
+                    alert("Failed to save participant.");
+                }
+            };
+            
+            const handleConfirmRemove = async () => {
+                if (!participantToRemove || !db) return;
+                try {
+                    const employeeRef = doc(db, 'employees', participantToRemove.id);
+                    await updateDoc(employeeRef, {
+                        savingsProgramStatus: 'Inactive',
+                        savingsPercentage: 0
+                    });
+                    setParticipantToRemove(null);
+                } catch (error) {
+                    console.error("Error removing participant:", error);
+                    alert("Failed to remove participant.");
+                }
+            };
+            
+            // NEW: This handler is called after the user confirms the payback action.
+            const handleStartPaybackProcess = () => {
+                if (!participantForPaybackConfirmation) return;
+                setPaybackParticipant(participantForPaybackConfirmation); // Open the payback modal
+                setParticipantForPaybackConfirmation(null); // Close the confirmation modal
+            };
+            
+            const handleProcessPayback = async (employeeId, amount, note) => {
+                const result = await Utils.manageSavingsWithdrawal(db, employeeId, amount, note);
+                if (result.success) {
+                    alert("Payback processed successfully!");
+                    setPaybackParticipant(null);
+                } else {
+                    alert(`Payback failed: ${result.error?.message || 'An unknown error occurred.'}`);
+                }
+            };
 
             useEffect(() => {
-                if (userProfile && userProfile.role !== 'Admin') {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
                     setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
                 }
             }, [userProfile]);
-
+            
             const availableShops = useMemo(() => {
-                if (userProfile?.role === 'Admin') return shops;
-                if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
-                    return userProfile.shop.map(name => ({ id: name, name: name }));
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) {
+                    return shops.filter(s => userProfile.shop.includes(s.name));
                 }
-                return []; 
+                return [];
             }, [shops, userProfile]);
 
-            const filteredRevisions = useMemo(() => {
-                return revisions.filter(rev => 
-                    (!selectedShop || rev.shopName === selectedShop) && 
-                    (!selectedMonth || rev.date.startsWith(selectedMonth))
+            const enrolledEmployees = useMemo(() => {
+                // 1. Create a map for quick lookup of savings balances.
+                const savingsMap = new Map(allSavings.map(s => [s.employeeId, s.currentBalance]));
+
+                // 2. Filter employees who are active in the savings program.
+                const enrolled = employees.filter(emp => emp.savingsProgramStatus === 'Active');
+                
+                // 3. Apply shop and search term filters.
+                const filtered = enrolled.filter(emp => 
+                    (!selectedShop || (Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop)) &&
+                    (emp.name.toLowerCase().includes(searchTerm.toLowerCase()))
                 );
-            }, [revisions, selectedShop, selectedMonth]);
 
-            const handleOpenModal = useCallback((revision = null) => { setEditingRevision(revision); setModalOpen(true); }, []);
-            const handleCloseModal = useCallback(() => { setEditingRevision(null); setModalOpen(false); }, []);
+                // 4. Map the final list to include their savings balance.
+                return filtered.map(emp => ({
+                    ...emp,
+                    savingsBalance: savingsMap.get(emp.id) || 0
+                })).sort((a,b) => a.name.localeCompare(b.name));
 
-            const handleSaveRevision = useCallback(async (revisionData) => {
-                const { doc, updateDoc, addDoc, collection } = window.firebaseSDK;
-                // Destructure all needed properties from the incoming data
-                const { id, staffId, date, shopName, staffName, reviseAmount, updatedSalary, effectiveDate } = revisionData;
+            }, [employees, allSavings, selectedShop, searchTerm]);
 
-                // Explicitly build the object that will be saved to Firestore.
-                const dataToSave = {
-                    date,
-                    shopName,
-                    staffId,
-                    staffName,
-                    reviseAmount: parseFloat(reviseAmount) || 0,
-                    updatedSalary: updatedSalary || 0, // Ensure the crucial field is saved
-                    effectiveDate: effectiveDate || date // Default effective date to revision date if not set
-                };
+            const totalSavings = useMemo(() => {
+                return enrolledEmployees.reduce((sum, emp) => sum + emp.savingsBalance, 0);
+            }, [enrolledEmployees]);
 
-                try {
-                    if (id) {
-                        // When updating an existing record, always reset its status to 'Pending' for re-approval.
-                        dataToSave.status = 'Pending';
-                        await updateDoc(doc(db, 'salaryRevisions', id), dataToSave);
-                    } else {
-                        // Otherwise, we are adding a new document with 'Pending' status
-                        dataToSave.status = 'Pending';
-                        await addDoc(collection(db, 'salaryRevisions'), dataToSave);
-                    }
-                    
-                    handleCloseModal(); // Close the modal on success
-                } catch (error) { console.error("Error saving salary revision:", error); }
-            }, [db, handleCloseModal]);
-            
-            const handleDeleteRevision = useCallback(async () => {
-                if (!revisionToDelete) return;
-                try {
-                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'salaryRevisions', revisionToDelete.id));
-                } catch (error) { 
-                    console.error("Error deleting revision:", error); 
-                } finally {
-                    setRevisionToDelete(null);
-                }
-            }, [db, revisionToDelete]);
-
-            const handleUpdateStatus = useCallback(async (revisionId, newStatus) => {
-                if (!revisionId || !newStatus) return;
-                try {
-                    await window.firebaseSDK.updateDoc(window.firebaseSDK.doc(db, 'salaryRevisions', revisionId), { status: newStatus });
-                } catch (error) {
-                    console.error(`Error updating revision status:`, error);
-                }
-            }, [db]);
+            const handleExportExcel = useCallback(() => {
+                const dataToExport = enrolledEmployees.map(emp => ({ 
+                    'Name': emp.name,
+                    'Shop': Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop,
+                    'Savings Percentage (%)': emp.savingsPercentage,
+                    'Total Accumulated Savings (KHR)': emp.savingsBalance
+                }));
+                const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+                const workbook = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(workbook, worksheet, "Salary Savings Report");
+                worksheet["!cols"] = [ { wch: 25 }, { wch: 20 }, { wch: 25 }, { wch: 30 } ];
+                XLSX.writeFile(workbook, "Salary_Savings_Report.xlsx");
+            }, [enrolledEmployees]);
 
             return (
                 <Card>
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
-                        <h3 className="text-xl font-semibold text-slate-100">Revise Tracking Report</h3>
+                        <h3 className="text-xl font-semibold text-slate-100">Salary Saving Program Participants</h3>
                         <div className="flex flex-wrap gap-4 items-center">
-                            {(userProfile.role === 'Admin' || (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                            <input 
+                                type="text" 
+                                placeholder="Search by name..." 
+                                value={searchTerm} 
+                                onChange={e => setSearchTerm(e.target.value)} 
+                                className="input w-full sm:w-auto" 
+                            />
+                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                                 <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
-                                    <option value="">{userProfile.role === 'Admin' ? 'All Shops' : 'All My Shops'}</option>
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                     {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
-                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
-                            {(userProfile.role === 'Admin' || userProfile.role === 'Shop Manager') && (
-                                <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add</Button>
+                             {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                <Button variant="primary" icon="fa-plus" onClick={() => handleOpenSavingModal()}>Add Participant</Button>
                             )}
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Effective Date</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount Revised</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Updated Salary</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Status</th><th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th></tr></thead><tbody className="divide-y divide-slate-700">{filteredRevisions.map(rev => {
-                        const isActionable = rev.status !== 'Approved' && rev.status !== 'Rejected';
-                        return (<tr key={rev.id} className="hover:bg-slate-700/50">
-                            <td className="px-4 py-4 text-sm text-slate-200">{rev.date}</td>
-                            <td className="px-4 py-4 text-sm font-semibold text-blue-300">{rev.effectiveDate}</td>
-                            <td className="px-4 py-4 text-sm text-slate-200">{rev.staffName}</td>
-                            <td className="px-4 py-4 text-sm text-slate-300">{rev.shopName}</td>
-                            <td className={`px-4 py-4 text-sm text-right font-semibold ${parseFloat(rev.reviseAmount) < 0 ? 'text-red-400' : 'text-blue-400'}`}>{Utils.formatCurrency(rev.reviseAmount)}</td>
-                            <td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(rev.updatedSalary)}</td>
-                            <td className="px-4 py-4 text-center text-sm"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${ rev.status === 'Approved' ? 'bg-green-100 text-green-800' : rev.status === 'Rejected' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800' }`}>{rev.status || 'Pending'}</span></td>
-                            <td className="px-4 py-4 text-center whitespace-nowrap">
-                                <div className="flex items-center justify-center gap-4">
-                                    {/* Approve/Reject for Admin on actionable items */}
-                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && isActionable && (
-                                        <>
-                                            <Button variant="icon-approve" icon="fa-check-circle" onClick={() => handleUpdateStatus(rev.id, 'Approved')} title="Approve" />
-                                            <Button variant="icon-reject" icon="fa-times-circle" onClick={() => handleUpdateStatus(rev.id, 'Rejected')} title="Reject" />
-                                        </>
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-slate-700">
+                            <thead className="bg-slate-900/50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Savings Percentage</th>
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Accumulated Savings</th>
+                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                        <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
                                     )}
-                                    {/* Edit/Delete buttons with role-based conditions */}
-                                    {(userProfile?.role === 'Admin' || (userProfile?.role === 'Shop Manager' && isActionable)) && (
-                                        <>
-                                            <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(rev)} title="Edit Revision" />
-                                            <Button variant="icon-delete" icon="fa-trash" onClick={() => setRevisionToDelete(rev)} title="Delete Revision" />
-                                        </>
-                                    )}
-                                </div>
-                            </td>
-                        </tr>);
-                    })}</tbody></table></div>
-                    <SalaryReviseModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveRevision} revision={editingRevision} userProfile={userProfile} />
-                    <ConfirmationModal isOpen={!!revisionToDelete} onClose={() => setRevisionToDelete(null)} onConfirm={handleDeleteRevision} title="Delete Salary Revision" message="Are you sure you want to delete this revision record? This action cannot be undone."/>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {enrolledEmployees.map(emp => (
+                                    <tr key={emp.id} className="hover:bg-slate-700/50">
+                                        <td className="px-4 py-4 text-sm text-slate-200">{emp.name}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">{Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsPercentage}%</td>
+                                        <td className="px-4 py-4 text-sm text-blue-300 font-semibold text-right">{Utils.formatCurrency(emp.savingsBalance)}</td>
+                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                            <td className="px-4 py-4 text-center">
+                                                <div className="flex items-center justify-center gap-2">
+                                                    <Button variant="icon-view" icon="fa-history" onClick={() => setHistoryParticipant(emp)} title="View History"/>
+                                                    {/* MODIFIED: This button now opens the confirmation modal first */}
+                                                    <Button variant="success" icon="fa-hand-holding-usd" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" className="px-3 py-1 text-xs">Payback</Button>
+                                                    <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenSavingModal(emp)} title="Edit Percentage"/>
+                                                    <Button variant="icon-delete" icon="fa-user-minus" onClick={() => setParticipantToRemove(emp)} title="Remove from Program"/>
+                                                </div>
+                                            </td>
+                                        )}
+                                    </tr>
+                                ))}
+                            </tbody>
+                            <tfoot className="bg-slate-900/50">
+                                <tr>
+                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 4 : 3} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
+                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && <td></td>}
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                    <AddSalarySavingModal
+                        isOpen={isSavingModalOpen}
+                        onClose={handleCloseSavingModal}
+                        onSave={handleSaveParticipant}
+                        participant={editingParticipant}
+                        userProfile={userProfile}
+                        allEmployees={employees}
+                    />
+                    <ConfirmationModal 
+                        isOpen={!!participantToRemove}
+                        onClose={() => setParticipantToRemove(null)}
+                        onConfirm={handleConfirmRemove}
+                        title="Remove from Program"
+                        message={`Are you sure you want to remove ${participantToRemove?.name} from the Salary Saving Program? This action will set their status to Inactive.`}
+                    />
+                    {/* NEW: Confirmation modal for the payback action */}
+                    <ConfirmationModal
+                        isOpen={!!participantForPaybackConfirmation}
+                        onClose={() => setParticipantForPaybackConfirmation(null)}
+                        onConfirm={handleStartPaybackProcess}
+                        title="Confirm Payback"
+                        message={`Are you sure you want to start the payback process for ${participantForPaybackConfirmation?.name}?`}
+                    />
+                    <PaybackModal
+                        isOpen={!!paybackParticipant}
+                        onClose={() => setPaybackParticipant(null)}
+                        onSave={handleProcessPayback}
+                        participant={paybackParticipant}
+                    />
+                    <SavingsHistoryModal
+                        isOpen={!!historyParticipant}
+                        onClose={() => setHistoryParticipant(null)}
+                        employeeName={historyParticipant?.name}
+                        transactions={transactionHistory}
+                    />
                 </Card>
             );
         };
 
-        // Component: Salary Revise Modal
-        const SalaryReviseModal = ({ isOpen, onClose, onSave, revision, userProfile }) => {
-            const [formData, setFormData] = useState({});
-            // REFACTORED: Get global data from App Data Context instead of making a new collection call.
-            const { shops: allShops, employees } = useAppData();
-            const [selectedShop, setSelectedShop] = useState('');
+        // NEW: Component for Savings History Tab
+        const SavingsHistoryTab = ({ userProfile }) => {
+            const { employees, shops } = useAppData();
+            const { data: transactions, loading } = useCollection('savingsTransactions');
 
-            const availableShops = useMemo(() => {
-                if (!userProfile) return [];
-                if (userProfile.role === 'Admin') return allShops;
-                
-                const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
-                if (managedShops.length > 0) {
-                    return allShops.filter(s => managedShops.includes(s.name));
-                }
-                return [];
-            }, [allShops, userProfile]);
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [searchTerm, setSearchTerm] = useState('');
 
             useEffect(() => {
-                const today = new Date().toISOString().substring(0, 10);
-                const initialData = revision 
-                    ? { ...revision, effectiveDate: revision.effectiveDate || revision.date } 
-                    : { date: today, effectiveDate: today, shopName: '', staffId: '', reviseAmount: '' };
-                setFormData(initialData);
-                setSelectedShop(initialData.shopName);
-            }, [revision, isOpen]);
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
+                }
+            }, [userProfile]);
+            
+            const availableShops = useMemo(() => {
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
+                if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
+                    return shops.filter(s => userProfile.shop.includes(s.name));
+                }
+                return [];
+            }, [shops, userProfile]);
 
-            const employeesInShop = useMemo(() => employees.filter(emp => emp.status === 'Active' && (Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop)), [selectedShop, employees]);
-            const selectedEmployee = useMemo(() => employees.find(emp => emp.id === formData.staffId), [formData.staffId, employees]);
-            const baseSalary = selectedEmployee ? selectedEmployee.salary : 0;
-            
-            // Robust calculation to prevent errors with empty inputs
-            const updatedSalary = useMemo(() => {
-                const base = parseFloat(String(baseSalary).replace(/[^0-9.-]/g, '')) || 0;
-                const revisionAmount = parseFloat(formData.reviseAmount) || 0; // Treat empty/invalid input as 0
-                return base + revisionAmount;
-            }, [baseSalary, formData.reviseAmount]);
-            
-            const handleChange = useCallback((e) => {
-                const { name, value } = e.target;
-                setFormData(prev => ({ ...prev, [name]: value }));
-                if (name === 'shopName') { setSelectedShop(value); setFormData(prev => ({ ...prev, staffId: '' })); }
-            }, []);
-            
-            const handleSubmit = useCallback((e) => {
-                e.preventDefault();
-                const staffName = selectedEmployee?.name || '';
-                onSave({ ...formData, baseSalary, updatedSalary, staffName });
-            }, [onSave, formData, selectedEmployee, baseSalary, updatedSalary]);
+            const { processedTransactions, totals } = useMemo(() => {
+                const employeeMap = new Map(employees.map(emp => [emp.id, { name: emp.name, shop: emp.shop }]));
+                
+                const filtered = transactions.filter(tx => {
+                    const employee = employeeMap.get(tx.employeeId);
+                    if (!employee) return false;
+
+                    const txDate = tx.date?.toDate();
+                    if (!txDate) return false;
+                    
+                    const monthMatch = !selectedMonth || txDate.toISOString().startsWith(selectedMonth);
+                    const employeeShops = Array.isArray(employee.shop) ? employee.shop : [employee.shop];
+                    const shopMatch = !selectedShop || employeeShops.includes(selectedShop);
+                    const searchMatch = !searchTerm || employee.name.toLowerCase().includes(searchTerm.toLowerCase());
+
+                    return monthMatch && shopMatch && searchMatch;
+                });
+                
+                const processed = filtered.map(tx => {
+                    const employee = employeeMap.get(tx.employeeId);
+                    return {
+                        ...tx,
+                        staffName: employee?.name || 'Unknown',
+                        shop: Array.isArray(employee?.shop) ? employee.shop.join(', ') : employee?.shop,
+                    };
+                }).sort((a,b) => (b.date?.toDate() || 0) - (a.date?.toDate() || 0));
+
+                const totals = processed.reduce((acc, tx) => {
+                    if (tx.type === 'contribution') {
+                        acc.totalContributions += tx.amountDeducted || 0;
+                    } else if (tx.type === 'withdrawal') {
+                        acc.totalWithdrawals += tx.amountWithdrawn || 0;
+                    }
+                    return acc;
+                }, { totalContributions: 0, totalWithdrawals: 0 });
+
+                return { processedTransactions: processed, totals };
+            }, [transactions, employees, selectedMonth, selectedShop, searchTerm]);
+
+            const handleExportExcel = useCallback(() => {
+                const dataToExport = processedTransactions.map(tx => ({ 
+                    'Date': Utils.formatRequestDate(tx.date),
+                    'Staff Name': tx.staffName,
+                    'Shop': tx.shop,
+                    'Type': tx.type,
+                    'Amount (KHR)': tx.amountDeducted || tx.amountWithdrawn,
+                    'Note / Payroll ID': tx.payrollId || tx.note || '-'
+                }));
+                const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+                const workbook = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(workbook, worksheet, "Savings History");
+                worksheet["!cols"] = [ { wch: 20 }, { wch: 25 }, { wch: 20 }, { wch: 15 }, { wch: 20 }, { wch: 30 } ];
+                XLSX.writeFile(workbook, `Savings_History_${selectedMonth}.xlsx`);
+            }, [processedTransactions, selectedMonth]);
 
             return (
-                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-2xl">
-                    <form onSubmit={handleSubmit}>
-                        <ModalHeader title={revision ? "Edit Salary Revision" : "New Salary Revision"} onClose={onClose} />
-                        <ModalBody>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                <div><label className="text-sm font-medium text-slate-400">Date</label><input type="date" name="date" value={formData.date || ''} onChange={handleChange} className="input" /></div>
-                                <div><label className="text-sm font-medium text-slate-400">Effective Date</label><input type="date" name="effectiveDate" value={formData.effectiveDate || ''} onChange={handleChange} className="input" /></div>
-                                <div><label className="text-sm font-medium text-slate-400">Shop Name</label><select name="shopName" value={formData.shopName || ''} onChange={handleChange} className="select"><option value="">Select Shop</option>{availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select></div>
-                                <div><label className="text-sm font-medium text-slate-400">Staff Name</label><select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" disabled={!selectedShop}><option value="">Select Staff</option>{employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></div>
-                                <div className="md:col-span-2"><label className="text-sm font-medium text-slate-400">Amount to Revise</label><input type="number" name="reviseAmount" value={formData.reviseAmount || ''} onChange={handleChange} className="input" /></div>
-                                <div className="bg-slate-700/50 p-4 rounded-lg"><label className="text-sm font-medium text-slate-400">Base Salary</label><input value={Utils.formatCurrency(baseSalary)} className="input mt-1" disabled /></div>
-                                <div className="bg-slate-700/50 p-4 rounded-lg"><label className="text-sm font-medium text-slate-400">Updated Salary</label><input value={Utils.formatCurrency(updatedSalary)} className="input mt-1" disabled /></div>
-                            </div>
-                        </ModalBody>
-                        <ModalFooter><Button type="button" variant="secondary" onClick={onClose}>Cancel</Button><Button type="submit" variant="primary" className="px-6">Submit</Button></ModalFooter>
-                    </form>
-                </Modal>
+                <Card>
+                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
+                        <h3 className="text-xl font-semibold text-slate-100">Savings Transaction History</h3>
+                        <div className="flex flex-wrap gap-4 items-center">
+                            <input 
+                                type="text" 
+                                placeholder="Search by name..." 
+                                value={searchTerm} 
+                                onChange={e => setSearchTerm(e.target.value)} 
+                                className="input w-full sm:w-auto" 
+                            />
+                             {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
+                                    {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                            <input 
+                                type="month" 
+                                value={selectedMonth} 
+                                onChange={e => setSelectedMonth(e.target.value)} 
+                                className="input w-full sm:w-auto" 
+                            />
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                        </div>
+                    </div>
+                     {loading ? (
+                        <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
+                    ) : (
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-slate-700">
+                            <thead className="bg-slate-900/50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Type</th>
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note / Payroll ID</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {processedTransactions.map(tx => (
+                                    <tr key={tx.id} className="hover:bg-slate-700/50">
+                                        <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-200">{tx.staffName}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">{tx.shop}</td>
+                                        <td className="px-4 py-4 text-sm font-semibold">
+                                            {tx.type === 'contribution' ? (
+                                                <span className="text-green-400">Contribution</span>
+                                            ) : (
+                                                <span className="text-red-400">Withdrawal</span>
+                                            )}
+                                        </td>
+                                        <td className={`px-4 py-4 text-sm text-right font-semibold ${tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'}`}>
+                                            {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
+                                        </td>
+                                        <td className="px-4 py-4 text-sm text-slate-400">{tx.payrollId || tx.note || '-'}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                            <tfoot className="bg-slate-900/50">
+                                <tr>
+                                    <td colSpan="4" className="px-4 py-3 text-right font-bold text-green-400 uppercase">Total Contributions</td>
+                                    <td className="px-4 py-3 text-right font-bold text-green-400">{Utils.formatCurrency(totals.totalContributions)}</td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td colSpan="4" className="px-4 py-3 text-right font-bold text-red-400 uppercase">Total Withdrawals</td>
+                                    <td className="px-4 py-3 text-right font-bold text-red-400">{Utils.formatCurrency(totals.totalWithdrawals)}</td>
+                                    <td></td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                    )}
+                </Card>
             );
+        };
+
+        // NEW: Placeholder component to fix the reference error.
+        const SalaryReviseReportTab = ({ userProfile }) => {
+            return <UnderConstructionPage title="Salary Revise Report" />;
+        };
+        
+        // NEW: Placeholder component to fix the reference error.
+        const FormerEmployeesTab = ({ userProfile }) => {
+            return <UnderConstructionPage title="Resigned/Terminated Employees" />;
         };
 
         // Component: Main Employees Page (Tab Container)
         const EmployeesPage = ({ userProfile }) => {
             const [activeTab, setActiveTab] = useState('active');
             return (
-                <TabbedPage tabs={{ active: 'Active Employees', salaryReport: 'Salary Revise Report', former: 'Resigned/Terminated' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                <TabbedPage tabs={{ active: 'Active Employees', salaryReport: 'Salary Revise Report', salarySaving: 'Salary Saving Program', savingsHistory: 'Savings History', former: 'Resigned/Terminated' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="active"><ActiveEmployeesTab userProfile={userProfile} /></div>
                     <div id="salaryReport"><SalaryReviseReportTab userProfile={userProfile} /></div>
+                    <div id="salarySaving"><SalarySavingTab userProfile={userProfile} /></div>
+                    <div id="savingsHistory"><SavingsHistoryTab userProfile={userProfile} /></div>
                     <div id="former"><FormerEmployeesTab userProfile={userProfile} /></div>
                 </TabbedPage>
             );
@@ -1682,6 +2139,7 @@
             const [distance, setDistance] = useState(null);
             const [selectedShopForCheckIn, setSelectedShopForCheckIn] = useState('');
             const [alertModal, setAlertModal] = useState({ isOpen: false, message: '' }); // State for the new alert modal
+            const [savingsBalance, setSavingsBalance] = useState(0); // NEW: State for savings balance
             
             // FIX: Set the month filter to default to the current month, respecting the user's local timezone.
             const [selectedMonth, setSelectedMonth] = useState(() => {
@@ -1711,6 +2169,25 @@
                 salaryRevisions: useCollection('salaryRevisions', staffQueryConstraints).data,
                 shifts: shifts, // Use data from context
             };
+            
+            // --- NEW: Step 4/5 - Real-time listener for the employee's savings balance ---
+            useEffect(() => {
+                // This effect runs only for the logged-in user.
+                if (!db || !userProfile?.id) return;
+                
+                const { doc, onSnapshot } = window.firebaseSDK;
+                // The document ID in 'employeeSavings' collection is the employee's ID.
+                const savingsDocRef = doc(db, 'employeeSavings', userProfile.id);
+
+                const unsubscribe = onSnapshot(savingsDocRef, (doc) => {
+                    if (doc.exists()) {
+                        setSavingsBalance(doc.data().currentBalance || 0);
+                    } else {
+                        setSavingsBalance(0); // If no document exists, balance is 0.
+                    }
+                }, (error) => { console.error("Error fetching savings balance:", error); });
+                return () => unsubscribe(); // Clean up the listener on component unmount.
+            }, [db, userProfile?.id]);
             
             const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
 
@@ -1928,7 +2405,19 @@
                         <p className="font-medium text-lg text-slate-100">{status}</p>
                         {accuracy && <p className="text-xs text-slate-400 mt-1">Accuracy: {Math.round(accuracy)}m</p>}
                     </div>
-                    <div className="text-center text-sm text-slate-400"><p>Welcome, <span className="font-bold text-slate-200">{userProfile?.name}</span></p><p>Your selected shop is <span className="font-bold text-slate-200">{selectedShopForCheckIn || 'N/A'}</span></p>{lastAction && (<p className="mt-2">Last action: Checked <span className="font-semibold text-slate-200">{lastAction.type}</span> at <span className="font-semibold text-slate-200">{
+
+                    {/* --- NEW: Step 4/5 - Savings Program Balance Display --- */}
+                    {userProfile?.savingsProgramStatus === 'Active' && (
+                        <div className="w-full max-w-md mt-8 p-4 bg-indigo-900/50 border border-indigo-700 rounded-lg text-center">
+                            <h4 className="text-lg font-semibold text-indigo-200">My Savings Program</h4>
+                            <p className="text-sm text-slate-400">Total Accumulated Savings</p>
+                            <p className="text-4xl font-bold text-white mt-2">
+                                {Utils.formatCurrency(savingsBalance)}
+                            </p>
+                        </div>
+                    )}
+
+                    <div className="text-center text-sm text-slate-400"><p>Welcome, <span className="font-bold text-slate-200">{userProfile?.name}</span></p><p>Your selected shop is <span className="font-bold text-slate-200">{selectedShopForCheckIn || 'N/A'}</span></p>{lastAction && (<p className="mt-2">Last action: Checked <span className="font-semibold text-slate-200">{
                         /* FIX: Format the last action timestamp using the shop's timezone for consistency. */
                         Utils.formatDateInTimezone(lastAction.timestamp, userShop?.timezone).localTime
                     }</span></p>)}</div>
@@ -4018,6 +4507,13 @@
                                         <p>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
                                     </div>
                                 )}
+                                {/* --- NEW: Step 3 - Display Savings Deduction on Payslip --- */}
+                                {calculations.savingsDeduction > 0 && (
+                                    <div className="flex justify-between text-sm text-blue-700 font-semibold" title="Voluntary Savings Program">
+                                        <p>Savings Deduction</p>
+                                        <p>{Utils.formatCurrency(calculations.savingsDeduction)}</p>
+                                    </div>
+                                )}
                                 <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Total Deductions</p><p className="text-red-600">{Utils.formatCurrency(calculations.totalDeductions)}</p></div>
                             </div>
                         </div>
@@ -4183,10 +4679,17 @@
                 const finalInputs = { ...autoInputs, loanDeduction: manualLoanDeduction };
                 const payrollData = { month: selectedMonth, shop: shopName, employeeId: selectedEmployee.id, employeeName: selectedEmployee.name, baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, manualInputs: finalInputs, calculations: calculations };
                 
+                let payrollRecordId;
                 let success = false;
                 try {
-                    if (editingRecord) { await updateDoc(doc(db, 'payrollHistory', editingRecord.id), payrollData); } 
-                    else { await addDoc(collection(db, 'payrollHistory'), { ...payrollData, createdAt: serverTimestamp() }); }
+                    if (editingRecord) { 
+                        await updateDoc(doc(db, 'payrollHistory', editingRecord.id), payrollData); 
+                        payrollRecordId = editingRecord.id;
+                    } 
+                    else { 
+                        const newDocRef = await addDoc(collection(db, 'payrollHistory'), { ...payrollData, createdAt: serverTimestamp() }); 
+                        payrollRecordId = newDocRef.id;
+                    }
                     
                     if (finalInputs.loanDeduction > 0) {
                         const activeLoan = allData.staffLoans.find(loan => loan.staffId === selectedEmployee.id && loan.status === 'Active');
@@ -4198,6 +4701,19 @@
                             await addDoc(collection(db, 'loanPayments'), { paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, staffId: selectedEmployee.id, staffName: selectedEmployee.name, shop: shopName, loanId: activeLoan.id, amountPaid: finalInputs.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll" });
                         }
                     }
+
+                    // --- NEW: Step 3 - Process Savings Contribution ---
+                    if (calculations.savingsDeduction > 0) {
+                        await Utils.manageSavingsContribution(
+                            db,
+                            selectedEmployee.id,
+                            selectedEmployee.name,
+                            calculations.savingsDeduction,
+                            payrollRecordId // Link to the payroll record
+                        );
+                    }
+                    // --- END: Step 3 ---
+
                     alert('Payroll saved successfully!');
                     success = true;
                 } catch (error) {
@@ -5652,8 +6168,22 @@
                         
                         try {
                             await batch.commit();
+
+                            // --- NEW: Step 3 - Process Savings Contribution (after batch commit) ---
+                            if (calculations.savingsDeduction > 0) {
+                                setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Saved for ${employee.name}. Processing savings...`]);
+                                await Utils.manageSavingsContribution(
+                                    db,
+                                    employee.id,
+                                    employee.name,
+                                    calculations.savingsDeduction,
+                                    payrollDocRef.id // Use the ID from the ref created for the batch
+                                );
+                            }
+                            // --- END: Step 3 ---
+
                             successCount++;
-                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully saved for ${employee.name}.`]);
+                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully processed for ${employee.name}.`]);
                         } catch (error) {
                              setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
                         }
@@ -6131,6 +6661,13 @@
     </script>
 </body>
 </html>
+
+
+
+
+
+
+
 
 
 
