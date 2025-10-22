@@ -369,6 +369,7 @@
     // Safely converts Firestore Timestamps or date strings to Date objects
     const safeToDate = (timestamp) => {
         if (!timestamp) return null;
+        if (timestamp instanceof Date) return timestamp; // Handle native Date objects
         if (typeof timestamp.toDate === 'function') return timestamp.toDate();
         if (typeof timestamp === 'string') {
             const date = new Date(timestamp);
@@ -1281,12 +1282,14 @@
                 const originalColor = input.style.color;
                 input.style.color = 'black';
 
-                html2canvas(input, {
+                const canvasOptions = {
                     scale: 2, // OPTIMIZATION: Reduced scale from 3 to 2.
                     backgroundColor: '#ffffff',
                     useCORS: true,
                     windowHeight: input.scrollHeight 
-                }).then(sourceCanvas => {
+                };
+
+                html2canvas(input, canvasOptions).then(sourceCanvas => {
                     const { jsPDF } = window.jspdf;
                     
                     const pdf = new jsPDF({
@@ -1305,48 +1308,84 @@
                     const sourceCanvasWidth = sourceCanvas.width;
                     const sourceCanvasHeight = sourceCanvas.height;
 
-                    const sliceHeightInPixels = sourceCanvasWidth * (usableHeight / usableWidth);
-                    
-                    const numPages = Math.ceil(sourceCanvasHeight / sliceHeightInPixels);
+                    // --- NEW LOGIC TO PREVENT ROW SPLITTING ---
 
-                    for (let i = 0; i < numPages; i++) {
-                        const yOffset = i * sliceHeightInPixels;
-                        
-                        if (i > 0) {
-                            pdf.addPage();
+                    // Calculate the height of one PDF page in the same pixel scale as the canvas
+                    const pageHeightInPixels = sourceCanvasWidth * (usableHeight / usableWidth);
+                    
+                    const table = input.querySelector('table');
+                    const rows = table ? Array.from(table.querySelectorAll('tbody tr')) : [];
+                    
+                    // --- FIX: Use getBoundingClientRect for accurate positioning relative to the captured element ---
+                    const inputTop = input.getBoundingClientRect().top;
+                    const rowBottomsOnCanvas = rows.map(row => (row.getBoundingClientRect().bottom - inputTop) * canvasOptions.scale);
+                    const tableTopOnCanvas = table ? (table.getBoundingClientRect().top - inputTop) * canvasOptions.scale : -1;
+
+                    let yOffset = 0;
+                    const pages = []; // Store page data before rendering to get total page count
+
+                    // Loop through the canvas, creating page slices that respect row boundaries
+                    while (yOffset < sourceCanvasHeight) {
+                        let potentialSliceEnd = yOffset + pageHeightInPixels;
+                        let actualSliceEnd = potentialSliceEnd;
+
+                        // Adjust slice end to avoid cutting table rows if we are within the table area
+                        if (table && potentialSliceEnd > tableTopOnCanvas && potentialSliceEnd < sourceCanvasHeight) {
+                            // Find the last row that fits completely within this potential slice
+                            const lastFittingRowBottom = rowBottomsOnCanvas
+                                .filter(bottom => bottom > yOffset && bottom <= potentialSliceEnd)
+                                .pop();
+                            
+                            if (lastFittingRowBottom) {
+                                // If we found a row to break after, set the slice end to its bottom
+                                actualSliceEnd = lastFittingRowBottom;
+                            }
+                            // If no row fits (i.e., a single row is taller than the page), we must cut it, so we revert to the original calculated slice end.
                         }
 
+                        const sliceHeight = Math.min(actualSliceEnd - yOffset, sourceCanvasHeight - yOffset);
+
+                        if (sliceHeight <= 0) {
+                            break; // Safety break to prevent infinite loops
+                        }
+
+                        // Create a temporary canvas for the current page's slice
                         const tempCanvas = document.createElement('canvas');
                         tempCanvas.width = sourceCanvasWidth;
-                        tempCanvas.height = Math.min(sliceHeightInPixels, sourceCanvasHeight - yOffset);
-                        
+                        tempCanvas.height = sliceHeight;
                         const tempCtx = tempCanvas.getContext('2d');
                         
-                        tempCtx.drawImage(
-                            sourceCanvas,
-                            0, yOffset,                      
-                            sourceCanvasWidth, tempCanvas.height, 
-                            0, 0,                             
-                            tempCanvas.width, tempCanvas.height
-                        );
-
-                        // OPTIMIZATION: Use JPEG format with quality compression for huge file size reduction.
-                        const sliceDataUrl = tempCanvas.toDataURL('image/jpeg', 0.90);
-
-                        const sliceHeightOnPdf = usableWidth / (tempCanvas.width / tempCanvas.height);
+                        tempCtx.drawImage(sourceCanvas, 0, yOffset, sourceCanvasWidth, sliceHeight, 0, 0, sourceCanvasWidth, sliceHeight);
                         
-                        // OPTIMIZATION: Add image as JPEG.
-                        pdf.addImage(sliceDataUrl, 'JPEG', leftMargin, topMargin, usableWidth, sliceHeightOnPdf);
+                        // Store the image data URL and its height for later rendering
+                        pages.push({
+                            dataUrl: tempCanvas.toDataURL('image/jpeg', 0.90),
+                            height: sliceHeight
+                        });
 
+                        yOffset += sliceHeight;
+                    }
+
+                    // Now, render all the calculated pages to the PDF with the correct total page count
+                    pages.forEach((page, index) => {
+                        if (index > 0) {
+                            pdf.addPage();
+                        }
+                        
+                        // Use the stored height for each specific page to calculate its dimensions in the PDF
+                        const sliceHeightOnPdf = usableWidth / (sourceCanvasWidth / page.height);
+                        
+                        pdf.addImage(page.dataUrl, 'JPEG', leftMargin, topMargin, usableWidth, sliceHeightOnPdf);
+                        
                         // Add page number footer to each page
                         pdf.setFontSize(8);
-                        pdf.setTextColor(0); // Set text color to black
-                        const pageNumberText = `Page ${i + 1} of ${numPages}`;
+                        pdf.setTextColor(0);
+                        const pageNumberText = `Page ${index + 1} of ${pages.length}`;
                         const textWidth = pdf.getStringUnitWidth(pageNumberText) * pdf.internal.getFontSize() / pdf.internal.scaleFactor;
                         const textX = (pdfWidth - textWidth) / 2; // Center horizontally
                         const textY = pdfHeight - bottomMargin + 4; // Position it within the bottom margin area
                         pdf.text(pageNumberText, textX, textY);
-                    }
+                    });
 
                     pdf.save(`PO-${po.poNumber}.pdf`);
                 }).catch(err => {
@@ -1567,12 +1606,12 @@
                                                     <td className="border border-slate-300 p-1">{item.code}</td>
                                                     <td className="border border-slate-300 p-1">{item.barcode || ''}</td>
                                                     <td className="border border-slate-300 p-1">{item.name}</td>
-                                                    <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.price || 0)}</td>
-                                                    <td className="border border-slate-300 p-1 text-center font-bold">{auditedQty}</td>
-                                                    <td className="border border-slate-300 p-1 text-right font-bold bg-slate-100">{audTotalKHR}</td>
-                                                    <td className="border border-slate-300 p-1 text-right font-bold bg-slate-100">{audTotalUSD}</td>
-                                                    <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(costPerUnit.toFixed(2))}</td>
-                                                    <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(checkUp.toFixed(2))}</td>
+                                                    <td className="border border-slate-300 p-1 text-right" style={{ textAlign: 'right' }}>{khrFormatter.format(item.price || 0)}</td>
+                                                    <td className="border border-slate-300 p-1 text-center font-bold" style={{ textAlign: 'center' }}>{auditedQty}</td>
+                                                    <td className="border border-slate-300 p-1 text-right font-bold bg-slate-100" style={{ textAlign: 'right' }}>{audTotalKHR}</td>
+                                                    <td className="border border-slate-300 p-1 text-right font-bold bg-slate-100" style={{ textAlign: 'right' }}>{audTotalUSD}</td>
+                                                    <td className="border border-slate-300 p-1 text-right" style={{ textAlign: 'right' }}>{khrFormatter.format(costPerUnit.toFixed(2))}</td>
+                                                    <td className="border border-slate-300 p-1 text-right" style={{ textAlign: 'right' }}>{khrFormatter.format(checkUp.toFixed(2))}</td>
                                                 </tr>
                                             );
                                         })
@@ -1587,9 +1626,9 @@
                                                     <td className="border border-slate-300 p-1">{item.code}</td>
                                                     <td className="border border-slate-300 p-1">{item.barcode || ''}</td>
                                                     <td className="border border-slate-300 p-1">{item.name}</td>
-                                                    <td className="border border-slate-300 p-1 text-center">{qty}</td>
+                                                    <td className="border border-slate-300 p-1 text-center" style={{ textAlign: 'center' }}>{qty}</td>
                                                     <td className="border border-slate-300 p-1 text-right"></td>
-                                                    <td className="border border-slate-300 p-1 text-right">{po.exchangeRate ? usdFormatter.format(costPerUnit / po.exchangeRate) : ''}</td>
+                                                    <td className="border border-slate-300 p-1 text-right"></td>
                                                     <td className="border border-slate-300 p-1 text-right"></td>
                                                     <td className="border border-slate-300 p-1">{item.note || ''}</td>
                                                 </tr>
@@ -3020,7 +3059,6 @@
                 }).then(sourceCanvas => {
                     const { jsPDF } = window.jspdf;
                     
-                    // Use portrait for transfers
                     const pdf = new jsPDF({
                         orientation: 'landscape',
                         unit: 'mm',
@@ -3032,50 +3070,73 @@
                     const pdfHeight = pdf.internal.pageSize.getHeight();
                     
                     const usableWidth = pdfWidth - leftMargin - rightMargin;
+                    const usableHeight = pdfHeight - topMargin - bottomMargin;
                     
                     const sourceCanvasWidth = sourceCanvas.width;
                     const sourceCanvasHeight = sourceCanvas.height;
 
-                    const sliceHeightInPixels = sourceCanvasWidth * (pdfHeight / pdfWidth); // Adjusted for portrait
-                    
-                    const numPages = Math.ceil(sourceCanvasHeight / sliceHeightInPixels);
+                    const pageHeightInPixels = sourceCanvasWidth * (usableHeight / usableWidth);
+                    const table = input.querySelector('table');
+                    const rows = table ? Array.from(table.querySelectorAll('tbody tr')) : [];
 
-                    for (let i = 0; i < numPages; i++) {
-                        const yOffset = i * sliceHeightInPixels;
-                        
-                        if (i > 0) {
-                            pdf.addPage();
+                    // --- FIX: Use getBoundingClientRect for accurate positioning relative to the captured element ---
+                    const inputTop = input.getBoundingClientRect().top;
+                    const rowBottomsOnCanvas = rows.map(row => (row.getBoundingClientRect().bottom - inputTop) * 2); // Scale is 2
+                    const tableTopOnCanvas = table ? (table.getBoundingClientRect().top - inputTop) * 2 : -1; // Scale is 2
+
+                    let yOffset = 0;
+                    const pages = [];
+
+                    while (yOffset < sourceCanvasHeight) {
+                        let potentialSliceEnd = yOffset + pageHeightInPixels;
+                        let actualSliceEnd = potentialSliceEnd;
+
+                        if (table && potentialSliceEnd > tableTopOnCanvas && potentialSliceEnd < sourceCanvasHeight) {
+                            // Find the last row that fits completely within this potential slice
+                            const lastFittingRowBottom = rowBottomsOnCanvas
+                                .filter(bottom => bottom > yOffset && bottom <= potentialSliceEnd)
+                                .pop();
+                            
+                            if (lastFittingRowBottom) {
+                                // If we found a row to break after, set the slice end to its bottom
+                                actualSliceEnd = lastFittingRowBottom;
+                            }
                         }
+
+                        const sliceHeight = Math.min(actualSliceEnd - yOffset, sourceCanvasHeight - yOffset);
+                        if (sliceHeight <= 0) break;
 
                         const tempCanvas = document.createElement('canvas');
                         tempCanvas.width = sourceCanvasWidth;
-                        tempCanvas.height = Math.min(sliceHeightInPixels, sourceCanvasHeight - yOffset);
-                        
+                        tempCanvas.height = sliceHeight;
                         const tempCtx = tempCanvas.getContext('2d');
                         
-                        tempCtx.drawImage(
-                            sourceCanvas,
-                            0, yOffset,                      
-                            sourceCanvasWidth, tempCanvas.height, 
-                            0, 0,                             
-                            tempCanvas.width, tempCanvas.height
-                        );
-
-                        const sliceDataUrl = tempCanvas.toDataURL('image/jpeg', 0.90);
-
-                        const sliceHeightOnPdf = usableWidth / (tempCanvas.width / tempCanvas.height);
+                        tempCtx.drawImage(sourceCanvas, 0, yOffset, sourceCanvasWidth, sliceHeight, 0, 0, sourceCanvasWidth, sliceHeight);
                         
-                        pdf.addImage(sliceDataUrl, 'JPEG', leftMargin, topMargin, usableWidth, sliceHeightOnPdf);
+                        pages.push({
+                            dataUrl: tempCanvas.toDataURL('image/jpeg', 0.90),
+                            height: sliceHeight
+                        });
 
-                        // Add page number footer to each page
+                        yOffset += sliceHeight;
+                    }
+
+                    pages.forEach((page, index) => {
+                        if (index > 0) {
+                            pdf.addPage();
+                        }
+                        
+                        const sliceHeightOnPdf = usableWidth / (sourceCanvasWidth / page.height);
+                        pdf.addImage(page.dataUrl, 'JPEG', leftMargin, topMargin, usableWidth, sliceHeightOnPdf);
+                        
                         pdf.setFontSize(8);
                         pdf.setTextColor(0);
-                        const pageNumberText = `Page ${i + 1} of ${numPages}`;
+                        const pageNumberText = `Page ${index + 1} of ${pages.length}`;
                         const textWidth = pdf.getStringUnitWidth(pageNumberText) * pdf.internal.getFontSize() / pdf.internal.scaleFactor;
                         const textX = (pdfWidth - textWidth) / 2;
                         const textY = pdfHeight - bottomMargin + 4;
                         pdf.text(pageNumberText, textX, textY);
-                    }
+                    });
 
                     pdf.save(`Transfer-Review-${transferData.transferNo}.pdf`);
                 }).catch(err => {
@@ -3140,7 +3201,7 @@
 
                     {/* Hidden printable layout */}
                     <div style={{ position: 'absolute', left: '-9999px', top: 'auto' }}>
-                        <div ref={previewRef} className="po-preview-capture" style={{ width: '800px', fontSize: '12pt' }}>
+                        <div ref={previewRef} className="po-preview-capture">
                             <div className="text-center mb-4">
                                 <h1 className="text-xl font-bold">Internal Transfer Review</h1>
                             </div>
@@ -3155,10 +3216,10 @@
                                     <tr>
                                         <th className="border border-slate-300 p-1">No</th>
                                         <th className="border border-slate-300 p-1">Product Code</th>
+                                        <th className="border border-slate-300 p-1">Barcode</th>
                                         <th className="border border-slate-300 p-1">Name</th>
                                         <th className="border border-slate-300 p-1 text-center">Req. QTY</th>
                                         <th className="border border-slate-300 p-1 text-center">Rec. QTY</th>
-                                        <th className="border border-slate-300 p-1 text-right">Cost(៛)</th>
                                         <th className="border border-slate-300 p-1 text-right">Sub-Total</th>
                                     </tr>
                                 </thead>
@@ -3167,10 +3228,10 @@
                                         <tr key={index}>
                                             <td className="border border-slate-300 p-1">{index + 1}</td>
                                             <td className="border border-slate-300 p-1">{item.code}</td>
+                                            <td className="border border-slate-300 p-1">{item.barcode || ''}</td>
                                             <td className="border border-slate-300 p-1">{item.name}</td>
                                             <td className="border border-slate-300 p-1 text-center">{transferData.items[index].quantity}</td>
                                             <td className="border border-slate-300 p-1 text-center font-bold">{item.quantity}</td>
-                                            <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost)}</td>
                                             <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost * item.quantity)}</td>
                                         </tr>
                                     ))}
@@ -3259,24 +3320,84 @@
                 const originalColor = input.style.color;
                 input.style.color = 'black';
                 html2canvas(input, { scale: 2, backgroundColor: '#ffffff', useCORS: true, windowHeight: input.scrollHeight })
-                    .then(canvas => {
+                    .then(sourceCanvas => {
                         const { jsPDF } = window.jspdf;
                         const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-                        const margin = 10;
+                        
+                        const topMargin = 10, bottomMargin = 10, leftMargin = 10, rightMargin = 10;
                         const pdfWidth = pdf.internal.pageSize.getWidth();
-                        const usableWidth = pdfWidth - (margin * 2);
-                        const numPages = Math.ceil(canvas.height / (canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth)));
-                        for (let i = 0; i < numPages; i++) {
-                            if (i > 0) pdf.addPage();
-                            const yOffset = i * (canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth));
-                            const pageCanvas = document.createElement('canvas');
-                            pageCanvas.width = canvas.width;
-                            pageCanvas.height = Math.min(canvas.height - yOffset, canvas.width * (pdf.internal.pageSize.getHeight() / pdfWidth));
-                            pageCanvas.getContext('2d').drawImage(canvas, 0, yOffset, canvas.width, pageCanvas.height, 0, 0, pageCanvas.width, pageCanvas.height);
-                            pdf.addImage(pageCanvas.toDataURL('image/jpeg', 0.90), 'JPEG', margin, margin, usableWidth, usableWidth * (pageCanvas.height / pageCanvas.width));
+                        const pdfHeight = pdf.internal.pageSize.getHeight();
+                        
+                        const usableWidth = pdfWidth - leftMargin - rightMargin;
+                        const usableHeight = pdfHeight - topMargin - bottomMargin;
+                        
+                        const sourceCanvasWidth = sourceCanvas.width;
+                        const sourceCanvasHeight = sourceCanvas.height;
+
+                        const pageHeightInPixels = sourceCanvasWidth * (usableHeight / usableWidth);
+                        const table = input.querySelector('table');
+                        const rows = table ? Array.from(table.querySelectorAll('tbody tr')) : [];
+                        
+                        // --- FIX: Use getBoundingClientRect for accurate positioning relative to the captured element ---
+                        const inputTop = input.getBoundingClientRect().top;
+                        const rowBottomsOnCanvas = rows.map(row => (row.getBoundingClientRect().bottom - inputTop) * 2); // Scale is 2
+                        const tableTopOnCanvas = table ? (table.getBoundingClientRect().top - inputTop) * 2 : -1; // Scale is 2
+
+                        let yOffset = 0;
+                        const pages = [];
+
+                        while (yOffset < sourceCanvasHeight) {
+                            let potentialSliceEnd = yOffset + pageHeightInPixels;
+                            let actualSliceEnd = potentialSliceEnd;
+
+                            if (table && potentialSliceEnd > tableTopOnCanvas && potentialSliceEnd < sourceCanvasHeight) {
+                                const lastFittingRowBottom = rowBottomsOnCanvas
+                                    .filter(bottom => bottom > yOffset && bottom <= potentialSliceEnd)
+                                    .pop();
+                                
+                                if (lastFittingRowBottom) {
+                                    actualSliceEnd = lastFittingRowBottom;
+                                }
+                            }
+
+                            const sliceHeight = Math.min(actualSliceEnd - yOffset, sourceCanvasHeight - yOffset);
+                            if (sliceHeight <= 0) break;
+
+                            const tempCanvas = document.createElement('canvas');
+                            tempCanvas.width = sourceCanvasWidth;
+                            tempCanvas.height = sliceHeight;
+                            const tempCtx = tempCanvas.getContext('2d');
+                            
+                            tempCtx.drawImage(sourceCanvas, 0, yOffset, sourceCanvasWidth, sliceHeight, 0, 0, sourceCanvasWidth, sliceHeight);
+                            
+                            pages.push({
+                                dataUrl: tempCanvas.toDataURL('image/jpeg', 0.90),
+                                height: sliceHeight
+                            });
+
+                            yOffset += sliceHeight;
                         }
+
+                        pages.forEach((page, index) => {
+                            if (index > 0) {
+                                pdf.addPage();
+                            }
+                            
+                            const sliceHeightOnPdf = usableWidth / (sourceCanvasWidth / page.height);
+                            pdf.addImage(page.dataUrl, 'JPEG', leftMargin, topMargin, usableWidth, sliceHeightOnPdf);
+                            
+                            pdf.setFontSize(8);
+                            pdf.setTextColor(0);
+                            const pageNumberText = `Page ${index + 1} of ${pages.length}`;
+                            const textWidth = pdf.getStringUnitWidth(pageNumberText) * pdf.internal.getFontSize() / pdf.internal.scaleFactor;
+                            const textX = (pdfWidth - textWidth) / 2;
+                            const textY = pdfHeight - bottomMargin + 4;
+                            pdf.text(pageNumberText, textX, textY);
+                        });
+
                         pdf.save(`Transfer-Report-${transferData.transferNo}.pdf`);
                     }).catch(err => {
+                        console.error("Failed to generate PDF:", err);
                         setModalInfo({ show: true, title: 'Error', message: 'Failed to generate PDF.', isError: true });
                     }).finally(() => {
                         if (input) input.style.color = originalColor;
@@ -3322,7 +3443,7 @@
                     </table>
                      {/* Hidden printable layout */}
                     <div style={{ position: 'absolute', left: '-9999px', top: 'auto' }}>
-                        <div ref={previewRef} className="po-preview-capture" style={{ width: '800px', fontSize: '12pt' }}>
+                        <div ref={previewRef} className="po-preview-capture">
                             <div className="text-center mb-4"><h1 className="text-xl font-bold">Internal Transfer Report</h1></div>
                             <div className="grid grid-cols-2 gap-x-6 gap-y-1 mb-3 border-y py-2">
                                 <span><strong>From Shop:</strong> {fromShop}</span>
@@ -3338,7 +3459,6 @@
                                         <th className="border border-slate-300 p-1">Barcode</th>
                                         <th className="border border-slate-300 p-1">Name</th>
                                         <th className="border border-slate-300 p-1 text-center">Received QTY</th>
-                                        <th className="border border-slate-300 p-1 text-right">Cost(៛)</th>
                                         <th className="border border-slate-300 p-1 text-right">Sub-Total</th>
                                     </tr>
                                 </thead>
@@ -3350,7 +3470,6 @@
                                             <td className="border border-slate-300 p-1">{item.barcode || ''}</td>
                                             <td className="border border-slate-300 p-1">{item.name}</td>
                                             <td className="border border-slate-300 p-1 text-center font-bold">{item.quantity}</td>
-                                            <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost)}</td>
                                             <td className="border border-slate-300 p-1 text-right">{khrFormatter.format(item.cost * item.quantity)}</td>
                                         </tr>
                                     ))}
@@ -4883,6 +5002,4 @@
         </script>
     </body>
     </html>
-
-
 
