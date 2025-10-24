@@ -3512,9 +3512,12 @@
 
         const ShopEditModal = ({ shop, onClose }) => {
             const { showNotification } = useNotification();
-            const { doc, updateDoc, addDoc, collection } = window.Firebase;
+            const { doc, updateDoc, addDoc, collection, Timestamp } = window.Firebase; // Added Timestamp
+            const { userData } = useAuth(); // Added useAuth hook
             const [formData, setFormData] = useState({
                 name: '', address: '', phone: '', gca: 0, saleMargin: 0, shareholders: [],
+                adjustmentAmount: '', // New state for adjustment amount
+                adjustmentReason: '', // New state for adjustment reason
                 ...shop
             });
             const [isUpdating, setIsUpdating] = useState(false);
@@ -3522,8 +3525,25 @@
 
             useEffect(() => {
                 isMounted.current = true;
+                // Ensure initial shop data includes empty adjustment fields
+                if (shop) {
+                     setFormData(prev => ({
+                        ...prev, // Keep existing state if any
+                        ...shop, // Overwrite with shop data
+                        adjustmentAmount: '', // Reset adjustment fields when opening
+                        adjustmentReason: '',
+                        gca: shop.gca || 0 // Ensure GCA is initialized
+                     }));
+                } else {
+                     setFormData({ // For new shops
+                        name: '', address: '', phone: '', gca: 0, saleMargin: 0, 
+                        shareholders: [{id: crypto.randomUUID(), name: '', percentage: 100}],
+                        adjustmentAmount: '',
+                        adjustmentReason: ''
+                     });
+                }
                 return () => { isMounted.current = false; };
-            }, []);
+            }, [shop]); // Rerun effect when shop prop changes
             
             const shareholderTotal = useMemo(() => (formData.shareholders || []).reduce((sum, s) => sum + (parseFloat(String(s.percentage)) || 0), 0), [formData.shareholders]);
             const isTotalValid = shareholderTotal === 100;
@@ -3539,25 +3559,89 @@
                     showNotification("Shareholder percentages must total 100%.", "error");
                     return;
                 }
+                if (!isMounted.current) return;
                 setIsUpdating(true);
+
+                let currentGCA = parseFloat(String(shop?.gca || 0)) || 0; // Use GCA from prop for calculation base
+                let finalGCA = currentGCA;
+                const adjustmentAmount = parseFormattedNumber(formData.adjustmentAmount);
+                const adjustmentReason = formData.adjustmentReason.trim();
+                let adjustmentRecordSaved = false;
+
+                // --- GCA Adjustment Logic ---
+                if (adjustmentAmount !== 0 && adjustmentReason) {
+                    const newGCA = currentGCA + adjustmentAmount;
+                    finalGCA = newGCA; // Update the GCA to be saved
+
+                    const adjustmentRecord = {
+                        shopId: shop.id,
+                        shopName: formData.name,
+                        adjustmentAmount: adjustmentAmount,
+                        reason: adjustmentReason,
+                        previousGCA: currentGCA,
+                        newGCA: newGCA,
+                        adjustedAt: Timestamp.now(),
+                        adjustedBy: userData?.uid || 'unknown',
+                        adjustedByName: userData?.name || 'Unknown'
+                    };
+
+                    try {
+                        await addDoc(collection(window.db, "gcaAdjustments"), adjustmentRecord);
+                        adjustmentRecordSaved = true; // Mark as saved
+                        showNotification("GCA adjustment recorded.", "success");
+                    } catch (error) {
+                        console.error("Failed to save GCA adjustment record:", error);
+                        showNotification("Failed to save GCA adjustment history.", "error");
+                        // Decide if you want to stop the whole process if history fails
+                        if (isMounted.current) setIsUpdating(false); 
+                        return; // Stop if saving history failed
+                    }
+                } else if (adjustmentAmount !== 0 && !adjustmentReason) {
+                    showNotification("Please provide a reason for the GCA adjustment.", "error");
+                    if (isMounted.current) setIsUpdating(false);
+                    return; // Stop if reason is missing for adjustment
+                }
+                // --- End GCA Adjustment Logic ---
+
                 const dataToSave = {
-                    ...formData,
-                    gca: parseFloat(String(formData.gca)) || 0,
+                    name: formData.name,
+                    address: formData.address,
+                    phone: formData.phone,
                     saleMargin: parseFloat(String(formData.saleMargin)) || 0,
-                    shareholders: (formData.shareholders || []).map(s => ({...s, percentage: parseFloat(String(s.percentage)) || 0}))
+                    gca: finalGCA, // Save the potentially adjusted GCA
+                    shareholders: (formData.shareholders || []).map(s => ({
+                        // Ensure id is kept if it exists, otherwise it might cause issues if keys change unnecessarily
+                        id: s.id || crypto.randomUUID(), 
+                        name: s.name, 
+                        percentage: parseFloat(String(s.percentage)) || 0
+                    }))
                 };
-                delete dataToSave.id;
+                
+                // Remove id from dataToSave if it's a new shop (shop.id doesn't exist)
+                // This prevents trying to save an 'id' field for a new Firestore document
+                if (!shop.id) {
+                     delete dataToSave.id; 
+                }
+
 
                 try {
                     if (shop.id) {
                         await updateDoc(doc(window.db, "shops", shop.id), dataToSave);
                     } else {
+                        // For adding a new shop, 'gca' will be the initial GCA (potentially 0 if no adjustment was made)
                         await addDoc(collection(window.db, "shops"), dataToSave);
                     }
                     showNotification(`Shop ${shop.id ? 'updated' : 'added'}.`, "success");
-                    if (isMounted.current) onClose();
+                    
+                    if (isMounted.current) {
+                        // Reset adjustment fields specifically after successful save
+                        setFormData(prev => ({ ...prev, adjustmentAmount: '', adjustmentReason: '' }));
+                        onClose(); // Close modal on success
+                    }
                 } catch (error) {
-                    showNotification("Failed to save shop.", "error");
+                    console.error("Failed to save shop:", error);
+                    showNotification("Failed to save shop details.", "error");
+                    // If adjustment was saved but shop update failed, may need manual correction or retry logic
                 } finally {
                     if (isMounted.current) setIsUpdating(false);
                 }
@@ -3566,22 +3650,62 @@
             return (
                 <Modal title={shop.id ? 'Edit Shop' : 'Add Shop'} onClose={onClose} size="2xl">
                     <form onSubmit={handleUpdate} className="space-y-4">
+                        {/* Shop Details */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <FormInput label="Shop Name" name="name" value={formData.name || ''} onChange={handleChange} required />
                             <FormInput label="Sale Margin (%)" name="saleMargin" type="number" value={formData.saleMargin || ''} onChange={handleChange} />
-                            <FormInput label="GCA (៛)" name="gca" type="number" value={formData.gca || ''} onChange={handleChange} />
+                            {/* GCA Display (Read Only) */}
+                            <FormInput 
+                                label="Current GCA (៛)" 
+                                name="gcaDisplay" 
+                                value={(formData.gca || 0).toLocaleString()} 
+                                readOnly 
+                                disabled 
+                                className="bg-slate-600 !text-slate-400"
+                            />
                         </div>
+                        
+                        {/* GCA Adjustment Section - Only show for existing shops */}
+                        {shop.id && (
+                             <div className="pt-4 mt-4 border-t border-slate-700 space-y-4">
+                                <h4 className="text-lg font-semibold text-slate-200">Adjust GCA</h4>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                     <LiveFormatInput 
+                                        label="GCA Adjustment Amount (៛)" 
+                                        name="adjustmentAmount" 
+                                        value={formData.adjustmentAmount} 
+                                        onChange={handleChange} 
+                                        placeholder="Enter +/- amount"
+                                     />
+                                     <FormTextarea 
+                                        label="Reason for Adjustment" 
+                                        name="adjustmentReason" 
+                                        value={formData.adjustmentReason} 
+                                        onChange={handleChange} 
+                                        placeholder="Required if adjusting GCA"
+                                        rows={2}
+                                     />
+                                </div>
+                             </div>
+                        )}
+
+                        {/* Shareholders Section */}
                         <div className="pt-4 border-t border-slate-700">
-                            <div className="flex justify-between items-center mb-2"><h4 className="text-lg font-semibold text-slate-200">Shareholders</h4><Button type="button" onClick={addShareholder} variant="secondary" icon="Plus">Add</Button></div>
+                            <div className="flex justify-between items-center mb-2">
+                                <h4 className="text-lg font-semibold text-slate-200">Shareholders</h4>
+                                <Button type="button" onClick={addShareholder} variant="secondary" icon="Plus">Add</Button>
+                            </div>
                              {(formData.shareholders || []).map((s, i) => (
                                 <div key={s.id} className="grid grid-cols-12 gap-2 items-center mb-2">
                                     <div className="col-span-6"><FormInput label={i === 0 ? "Owner Name" : ""} name={`name-${s.id}`} value={s.name || ''} onChange={e => handleShareholderChange(s.id, 'name', e.target.value)} /></div>
-                                    <div className="col-span-4"><FormInput label={i === 0 ? "%" : ""} name={`p-${s.id}`} type="number" value={s.percentage || ''} onChange={e => handleShareholderChange(s.id, 'percentage', e.target.value)} /></div>
+                                    <div className="col-span-4"><FormInput label={i === 0 ? "%" : ""} name={`p-${s.id}`} type="number" step="0.01" value={s.percentage || ''} onChange={e => handleShareholderChange(s.id, 'percentage', e.target.value)} /></div>
                                     <div className="col-span-2 pt-5"><Button type="button" variant="ghost" onClick={() => removeShareholder(s.id)} className="text-red-400 hover:bg-red-900/50"><Icon name="Trash2"/></Button></div>
                                 </div>
                              ))}
                              <div className={`mt-2 p-2 text-center rounded-md font-bold ${isTotalValid ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'}`}>Total: {shareholderTotal}%</div>
                         </div>
+                        
+                        {/* Action Buttons */}
                         <div className="flex justify-end gap-4 pt-4 border-t border-slate-700">
                             <Button type="button" onClick={onClose} variant="secondary">Cancel</Button>
                             <Button type="submit" disabled={isUpdating || !isTotalValid} className="w-24" icon={isUpdating ? "LoaderCircle" : null}>
@@ -3853,7 +3977,7 @@
                 const shareholderData = {};
                 const allShareholders = [...new Set(data.shops.flatMap(s => (s.shareholders || []).map(sh => sh.name)))];
                 allShareholders.forEach(name => {
-                    shareholderData[name] = { totalGCA: 0, totalNetIncome: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0 };
+                    shareholderData[name] = { totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0 };
                 });
 
                 data.shops.forEach(shop => {
@@ -3876,6 +4000,7 @@
                         if(shareholderData[sh.name]) {
                             shareholderData[sh.name].totalGCA += currentGCA * (sh.percentage / 100);
                             shareholderData[sh.name].totalNetIncome += totalNetIncomeForMonth * (sh.percentage / 100);
+                            shareholderData[sh.name].totalBizExpense += bizExpenseForMonth * (sh.percentage / 100);
                         }
                     });
                 });
@@ -3895,11 +4020,12 @@
                 const totals = Object.values(shareholderData).reduce((acc, d) => {
                     acc.totalGCA += d.totalGCA;
                     acc.totalNetIncome += d.totalNetIncome;
+                    acc.totalBizExpense += d.totalBizExpense;
                     acc.familyExpense += d.familyExpense;
                     acc.finalNetIncome += d.finalNetIncome;
                     acc.totalCOH += d.totalCOH;
                     return acc;
-                }, { totalGCA: 0, totalNetIncome: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0 });
+                }, { totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0 });
 
                 return { shareholderData, totals };
             }, [data]);
@@ -3959,6 +4085,7 @@
                                     <tr>
                                         <th className="p-2 text-left">No.</th><th className="p-2 text-left">Shareholder</th>
                                         <th className="p-2 text-right">Total GCA</th><th className="p-2 text-right">Total Net-Income</th>
+                                        <th className="p-2 text-right">Total Biz Expense</th>
                                         <th className="p-2 text-right">Family Expense</th><th className="p-2 text-right">Final Net-Income</th>
                                         <th className="p-2 text-right">Total COH</th>
                                     </tr>
@@ -3969,6 +4096,7 @@
                                             <td className="p-2">{index + 1}</td><td className="p-2 font-semibold">{name}</td>
                                             <td className="p-2 text-right font-mono">{d.totalGCA.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                             <td className="p-2 text-right font-mono">{d.totalNetIncome.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+                                            <td className="p-2 text-right font-mono text-red-400">{d.totalBizExpense.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                             <td className="p-2 text-right font-mono text-red-400">{d.familyExpense.toLocaleString()}</td>
                                             <td className="p-2 text-right font-mono font-bold">{d.finalNetIncome.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                             <td className="p-2 text-right font-mono font-bold text-blue-400">{d.totalCOH.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
@@ -3980,6 +4108,7 @@
                                         <td colSpan="2" className="p-2 text-right">Sub-Total (KHR)</td>
                                         <td className="p-2 text-right font-mono">{shareholderTotals.totalGCA.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                         <td className="p-2 text-right font-mono">{shareholderTotals.totalNetIncome.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+                                        <td className="p-2 text-right font-mono text-red-400">{shareholderTotals.totalBizExpense.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                         <td className="p-2 text-right font-mono">{shareholderTotals.familyExpense.toLocaleString()}</td>
                                         <td className="p-2 text-right font-mono">{shareholderTotals.finalNetIncome.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
                                         <td className="p-2 text-right font-mono">{shareholderTotals.totalCOH.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
@@ -4211,5 +4340,3 @@
 
 </body>
 </html>
-
-
