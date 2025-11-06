@@ -323,8 +323,12 @@
         };
         
         // NEW: Standalone payroll calculation logic
-        const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction) => {
+        // MODIFIED: Added 'savingsWithdrawals' as a new argument
+        const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals = []) => {
             if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
+
+            // NEW (Plan Step 1): Log the incoming withdrawal data to confirm it's being received.
+            console.log(`[Payroll Calc] Received ${savingsWithdrawals.length} savings withdrawals for ${employee?.name} in ${selectedMonth}`, savingsWithdrawals);
 
             const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts } = allData;
 
@@ -342,9 +346,18 @@
                 .filter(rev => rev.staffId === employee.id && rev.effectiveDate && rev.effectiveDate <= `${selectedMonth}-31` && rev.status === 'Approved')
                 .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate));
             
-            const baseSalary = applicableRevisions.length > 0
-                ? (parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0)
-                : (parseFloat(String(employee.salary).replace(/[^0-9.-]/g, '')) || 0);
+            // --- START FIX: Prevent NaN from employee.salary or updatedSalary ---
+            // The (parseFloat(...) || 0) pattern is flawed, as (NaN || 0) results in NaN.
+            // We must explicitly check for NaN.
+            let parsedBaseSalary;
+            if (applicableRevisions.length > 0) {
+                parsedBaseSalary = parseFloat(String(applicableRevisions[0].updatedSalary).replace(/[^0-9.-]/g, ''));
+            } else {
+                parsedBaseSalary = parseFloat(String(employee.salary).replace(/[^0-9.-]/g, ''));
+            }
+            
+            const baseSalary = isNaN(parsedBaseSalary) ? 0 : parsedBaseSalary;
+            // --- END FIX ---
             
             const salaryPerDay = baseSalary > 0 && daysInMonth > 0 ? baseSalary / daysInMonth : 0;
 
@@ -450,7 +463,15 @@
             const daysToPayFor = (workDays || 0) + (givenOffDays || 0);
             const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
             const otSalary = salaryPerDay * (otDays || 0);
-            const grossSalary = baseSalaryEarned + otSalary + engagements;
+            
+            // --- NEW (Plan Step 2, Part B): Calculate total savings withdrawal ---
+            // Sum up all withdrawal amounts. This will be added to earnings.
+            const totalSavingsWithdrawal = (savingsWithdrawals || []).reduce(
+                (sum, tx) => sum + (parseFloat(tx.amountWithdrawn) || 0), 0
+            );
+            
+            // MODIFIED (Plan Step 2, Part B): Add the savings withdrawal to the gross salary.
+            const grossSalary = baseSalaryEarned + otSalary + engagements + totalSavingsWithdrawal;
 
             // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
             let savingsDeduction = 0;
@@ -459,10 +480,14 @@
                 employee.savingsProgramStatus === 'Active' &&
                 parseFloat(employee.savingsPercentage) > 0 &&
                 employee.savingsEffectiveMonth && 
-                selectedMonth >= employee.savingsEffectiveMonth
+                selectedMonth >= employee.savingsEffectiveMonth &&
+                // --- NEW (Plan Step 2, Part A): Only deduct if there was NO withdrawal this month. ---
+                totalSavingsWithdrawal === 0 
             ) {
                 const percentage = parseFloat(employee.savingsPercentage) / 100;
-                savingsDeduction = grossSalary * percentage;
+                // FIX: Round the savings deduction to the nearest whole number,
+                // consistent with how netSalary is rounded for KHR.
+                savingsDeduction = Math.round(grossSalary * percentage);
             }
             // --- END: Step 3 ---
             
@@ -475,17 +500,20 @@
             const netSalary = Math.round(grossSalary - totalDeductions);
 
             // CORRECTED & UPDATED: Added new penalty and savings amounts to the returned calculations object.
-            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
+            // MODIFIED (Plan Step 2): Add 'totalSavingsWithdrawal' to the calculations object.
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, totalSavingsWithdrawal, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
 
             return { inputs: autoInputs, calculations };
         };
         
         // NEW: Centralized Payroll Calculator Hook
-        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction) => {
+        // MODIFIED: Added 'savingsWithdrawals' as a new argument and to the dependency array
+        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals) => {
             return useMemo(() => {
                 // The complex logic is now in a separate function.
-                return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction);
-            }, [employee, selectedMonth, allData, manualLoanDeduction]);
+                // MODIFIED: Pass 'savingsWithdrawals' to the core function
+                return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals);
+            }, [employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals]);
         };
 
         // NEW: Phase 3 - App Data Context for centralizing common data
@@ -620,6 +648,14 @@
             // It updates the employee's total balance and creates an audit log entry simultaneously.
             manageSavingsContribution: async (db, employeeId, employeeName, amount, payrollId) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
+
+                // --- NEW: Add a guard against NaN values ---
+                if (isNaN(amount) || amount === null) {
+                    console.error(`Skipping savings contribution for ${employeeName}: Invalid amount (${amount}).`);
+                    return { success: false, error: "Invalid amount (NaN)" };
+                }
+                // --- END GUARD ---
+
                 /* * Data Model for `employeeSavings` collection:
                  * A single document per employee, identified by their employeeId.
                  * { 
@@ -649,11 +685,18 @@
                     await runTransaction(db, async (transaction) => {
                         const savingsDoc = await transaction.get(savingsRef);
                         let newBalance = amount;
+                        let currentBalance = 0; // NEW: Default to 0
 
                         // If the employee already has a savings document, add to their balance.
                         if (savingsDoc.exists()) {
-                            newBalance = savingsDoc.data().currentBalance + amount;
+                            // FIX: Safely get the current balance, defaulting to 0 if it's null/undefined/NaN
+                            // AND remove any non-numeric characters just in case (e.g., currency symbols)
+                            const rawBalance = savingsDoc.data().currentBalance;
+                            currentBalance = parseFloat(String(rawBalance).replace(/[^0-9.-]/g, '')) || 0;
                         }
+
+                        // FIX: Calculate new balance based on the safe currentBalance
+                        newBalance = currentBalance + amount;
 
                         // Operation 1: Update (or Set) the employee's total savings balance.
                         transaction.set(savingsRef, { 
@@ -1635,7 +1678,16 @@
                         </ModalBody>
                         <ModalFooter>
                             <Button variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button type="submit" variant="primary">Submit Revision</Button>
+                            <Button 
+                                type="submit" 
+                                variant="primary"
+                                // FIX: Corrected disabled logic to use this component's state
+                                // It should check for staffId and reviseAmount from its own formData.
+                                disabled={!formData.staffId || !formData.reviseAmount}
+                            >
+                                {/* FIX: Corrected button text. */}
+                                Save Revision
+                            </Button>
                         </ModalFooter>
                     </form>
                 </Modal>
@@ -1653,7 +1705,10 @@
             const [editingRevision, setEditingRevision] = useState(null);
             const [revisionToDelete, setRevisionToDelete] = useState(null);
             const [selectedShop, setSelectedShop] = useState('');
-            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            // REVISED: Removed month filter state
+            // const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            // REVISED: Added search term state
+            const [searchTerm, setSearchTerm] = useState('');
 
             // Data fetching
             const queryConstraints = useMemo(() => {
@@ -1672,10 +1727,12 @@
                 return revisions
                     .filter(rev => 
                         (!selectedShop || rev.shopName === selectedShop) &&
-                        (!selectedMonth || (rev.effectiveDate && rev.effectiveDate.startsWith(selectedMonth)))
+                        // REVISED: Replaced month filter with search term filter
+                        (!searchTerm || (rev.staffName && rev.staffName.toLowerCase().includes(searchTerm.toLowerCase())))
                     )
                     .sort((a,b) => (b.reqDate || '').localeCompare(a.reqDate || ''));
-            }, [revisions, selectedShop, selectedMonth]);
+            // REVISED: Updated dependency array
+            }, [revisions, selectedShop, searchTerm]);
 
             // Handlers
             const handleOpenModal = (revision = null) => { setEditingRevision(revision); setIsModalOpen(true); };
@@ -1742,7 +1799,14 @@
                                 <option value="">All Shops</option>
                                 {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                             </select>
-                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                            {/* REVISED: Replaced month input with text search input */}
+                            <input 
+                                type="text"
+                                placeholder="Search by name..."
+                                value={searchTerm}
+                                onChange={e => setSearchTerm(e.target.value)}
+                                className="input w-full sm:w-auto"
+                            />
                             {canManage && <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add Revision</Button>}
                         </div>
                     </div>
@@ -2157,7 +2221,17 @@
                         </ModalBody>
                         <ModalFooter>
                             <Button variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button type="submit" variant="primary">Save</Button>
+                            <Button 
+                                type="submit" 
+                                variant="primary"
+                                // FIX: Corrected disabled logic to use this component's state
+                                // (savingsPercentage, selectedEmployeeId) instead of 'amount'.
+                                // This resolves the "amount is not defined" error.
+                                disabled={!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0 || !joinDate || !effectiveMonth}
+                            >
+                                {/* FIX: Corrected button text. */}
+                                {participant ? "Update" : "Save Participant"}
+                            </Button>
                         </ModalFooter>
                     </form>
                 </Modal>
@@ -2166,27 +2240,40 @@
 
         // NEW: Modal for processing a savings payback
         const PaybackModal = ({ isOpen, onClose, onSave, participant }) => {
-            const [amount, setAmount] = useState('');
+            const [amount, setAmount] = useState(0); // MODIFIED: Initialize to 0
             const [note, setNote] = useState('');
             const [error, setError] = useState('');
+            const [selectedPercentage, setSelectedPercentage] = useState(null); // NEW: State for active button
 
             useEffect(() => {
                 if (isOpen) {
-                    setAmount('');
+                    setAmount(0); // MODIFIED: Reset to 0
                     setNote('');
                     setError('');
+                    setSelectedPercentage(null); // NEW: Reset percentage
                 }
             }, [isOpen]);
+            
+            // NEW: Handler for percentage buttons
+            const handlePercentageClick = (percentage) => {
+                if (!participant) return;
+                const paybackAmount = Math.round((participant.savingsBalance || 0) * (percentage / 100));
+                setAmount(paybackAmount);
+                setSelectedPercentage(percentage);
+                setError('');
+            };
 
             const handleSubmit = (e) => {
                 e.preventDefault();
                 const paybackAmount = parseFloat(amount);
-                if (isNaN(paybackAmount) || paybackAmount <= 0) {
-                    setError('Please enter a valid positive amount.');
+                
+                // MODIFIED: Check for 0 or NaN
+                if (isNaN(paybackAmount) || paybackAmount <= 0) { 
+                    setError('Please select a valid payback percentage.');
                     return;
                 }
                 if (paybackAmount > participant.savingsBalance) {
-                    setError('Payback amount cannot exceed the total savings.');
+                    setError('Payback amount cannot exceed the total savings. This should not happen.');
                     return;
                 }
                 onSave(participant.id, paybackAmount, note);
@@ -2206,21 +2293,46 @@
                                 </div>
                                 <div>
                                     <label className="text-sm font-medium text-slate-400">Total Accumulated Savings</label>
-                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                                <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                            </div>
+                            
+                            {/* --- REVISED: Payback Amount Section --- */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-400 mb-2 block">Select Payback Percentage</label>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {[25, 50, 75, 100].map((perc) => {
+                                        const isActive = selectedPercentage === perc;
+                                        return (
+                                            <button
+                                                key={perc}
+                                                type="button"
+                                                onClick={() => handlePercentageClick(perc)}
+                                                className={`py-2 px-3 rounded-lg font-medium transition-colors ${
+                                                    isActive 
+                                                        ? 'bg-blue-600 text-white ring-2 ring-blue-400' 
+                                                        : 'bg-slate-600 text-slate-200 hover:bg-slate-500'
+                                                }`}
+                                            >
+                                                {perc}%
+                                            </button>
+                                        );
+                                    })}
                                 </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">Payback Amount (KHR)</label>
-                                    <input
-                                        type="number"
-                                        value={amount}
-                                        onChange={e => { setAmount(e.target.value); setError(''); }}
-                                        className="input"
-                                        placeholder="Enter amount to pay back"
-                                        required
-                                    />
-                                </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                            </div>
+
+                            <div>
+                                <label className="text-sm font-medium text-slate-400">Calculated Payback Amount (KHR)</label>
+                                <input
+                                    type="text"
+                                    value={Utils.formatCurrency(amount)}
+                                    className="input"
+                                    disabled
+                                />
+                            </div>
+                            {/* --- END REVISED SECTION --- */}
+
+                            <div>
+                                <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
                                     <input
                                         type="text"
                                         value={note}
@@ -2234,7 +2346,15 @@
                         </ModalBody>
                         <ModalFooter>
                             <Button variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button type="submit" variant="primary">Confirm Payback</Button>
+                            <Button 
+                                type="submit" 
+                                variant="primary"
+                                // FIX: Added disabled logic. Button should be disabled
+                                // until a valid percentage is selected.
+                                disabled={amount <= 0 || selectedPercentage === null}
+                            >
+                                Confirm Payback
+                            </Button>
                         </ModalFooter>
                     </form>
                 </Modal>
@@ -2743,6 +2863,9 @@
             const [alertModal, setAlertModal] = useState({ isOpen: false, message: '' }); // State for the new alert modal
             const [savingsBalance, setSavingsBalance] = useState(0); // NEW: State for savings balance
             
+            // --- NEW: State for savings withdrawals for the preview ---
+            const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
+            
             // FIX: Set the month filter to default to the current month, respecting the user's local timezone.
             const [selectedMonth, setSelectedMonth] = useState(() => {
                 const now = new Date();
@@ -2790,6 +2913,40 @@
                 }, (error) => { console.error("Error fetching savings balance:", error); });
                 return () => unsubscribe(); // Clean up the listener on component unmount.
             }, [db, userProfile?.id]);
+            
+            // --- NEW: Fetch savings withdrawals for the salary preview ---
+            useEffect(() => {
+                if (!db || !userProfile?.id || !selectedMonth) {
+                    setSavingsWithdrawals([]);
+                    return;
+                }
+
+                const fetchWithdrawals = async () => {
+                    try {
+                        const { collection, query, where, getDocs } = window.firebaseSDK;
+                        const [year, month] = selectedMonth.split('-').map(Number);
+                        const startDate = new Date(year, month - 1, 1);
+                        const endDate = new Date(year, month, 0, 23, 59, 59, 999); 
+
+                        const q = query(
+                            collection(db, 'savingsTransactions'),
+                            where("employeeId", "==", userProfile.id),
+                            where("type", "==", "withdrawal"),
+                            where("date", ">=", startDate),
+                            where("date", "<=", endDate)
+                        );
+                        
+                        const querySnapshot = await getDocs(q);
+                        const withdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        setSavingsWithdrawals(withdrawals);
+                    } catch (error) {
+                        console.error("Error fetching savings withdrawals for preview:", error);
+                        setSavingsWithdrawals([]);
+                    }
+                };
+
+                fetchWithdrawals();
+            }, [db, userProfile?.id, selectedMonth]);
             
             const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
 
@@ -2971,7 +3128,8 @@
             const canCheck = distance !== null && userShop && distance <= (parseFloat(userShop.radius) || 500);
 
             // Use the new centralized hook with the selected month
-            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData);
+            // --- MODIFIED: Pass savingsWithdrawals to the hook ---
+            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData, undefined, savingsWithdrawals);
 
             return (
                 <Card className="max-w-2xl mx-auto"><div className="flex flex-col items-center justify-center p-4 sm:p-8 space-y-8">
@@ -3039,6 +3197,15 @@
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ផ្តល់ជូន :</span><span className="font-semibold text-slate-200">{inputs.givenOffDays || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថែមម៉ោង :</span><span className="font-semibold text-slate-200">{inputs.otDays || 0}</span></div>
                                 <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់បន្ថែម :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.engagements)}</span></div>
+                                
+                                {/* --- NEW: Add Savings Payback line --- */}
+                                {calculations.totalSavingsWithdrawal > 0 && (
+                                    <div className="flex justify-between items-center text-sm" title="Savings Program Payback">
+                                        <span className="text-slate-400">ការទូទាត់សងប្រាក់សន្សំ :</span>
+                                        <span className="font-semibold text-indigo-400">{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</span>
+                                    </div>
+                                )}
+                                
                                 <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-green-400">ប្រាក់ចំណូលសរុប :</span><span className="font-bold text-green-400">{Utils.formatCurrency(calculations.grossSalary)}</span></div>
                             </div>
                             {/* Deductions Column */}
@@ -5182,6 +5349,9 @@
             const [activeTab, setActiveTab] = useState('calculator');
             const [editingRecord, setEditingRecord] = useState(null);
             
+            // NEW: Get employee data from the app context.
+            const { employees } = useAppData();
+            
             // Function to switch to calculator tab and load record for editing
             const handleEdit = (record) => { 
                 setEditingRecord(record); 
@@ -5197,7 +5367,8 @@
             return (
                 <TabbedPage tabs={{ calculator: 'Payroll Calculator', history: 'Payroll History' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                    <div id="calculator"><PayrollCalculatorTab userProfile={userProfile} editingRecord={editingRecord} onSaveSuccess={handleSaveSuccess} /></div>
-                    <div id="history"><PayrollHistoryTab onEdit={handleEdit} userProfile={userProfile} /></div>
+                    {/* MODIFIED: Pass the employees list as a prop */}
+                    <div id="history"><PayrollHistoryTab onEdit={handleEdit} userProfile={userProfile} employees={employees} /></div>
                 </TabbedPage>
             );
         };
@@ -5245,6 +5416,17 @@
                                 <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
                                 <div className="flex justify-between text-sm"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
                                 <div className="flex justify-between text-sm"><p>Engagements</p><p className={getChangeIndicatorClass(calculations.engagements, oldCalcs.engagements)}>{Utils.formatCurrency(calculations.engagements)}</p></div>
+                                
+                                {/* --- NEW (Plan Step 3): Display Savings Payback on Payslip --- */}
+                                {/* This line will only appear if there was a withdrawal during the month. */}
+                                {calculations.totalSavingsWithdrawal > 0 && (
+                                    <div className="flex justify-between text-sm text-indigo-700 font-semibold" title="Savings Program Payback">
+                                        <p>Savings Payback</p>
+                                        <p className={getChangeIndicatorClass(calculations.totalSavingsWithdrawal, oldCalcs.totalSavingsWithdrawal)}>{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</p>
+                                    </div>
+                                )}
+                                {/* --- END (Plan Step 3) --- */}
+
                                 <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Gross Salary</p><p className={getChangeIndicatorClass(calculations.grossSalary, oldCalcs.grossSalary)}>{Utils.formatCurrency(calculations.grossSalary)}</p></div>
                             </div>
                             <div className="space-y-2 p-4 border-t-4 border-red-500 bg-red-50 rounded-b-lg">
@@ -5262,7 +5444,8 @@
                                         <p className={getChangeIndicatorClass(calculations.rejectedLeavePenaltyAmount, oldCalcs.rejectedLeavePenaltyAmount)}>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
                                     </div>
                                 )}
-                                {/* --- NEW: Step 3 - Display Savings Deduction on Payslip --- */}
+                                {/* --- MODIFIED: Step 3 - Display Savings Deduction on Payslip --- */}
+                                {/* This will now correctly show $0.00 if a payback occurred, thanks to Step 2's logic. */}
                                 {calculations.savingsDeduction > 0 && (
                                     <div className="flex justify-between text-sm text-blue-700 font-semibold" title="Voluntary Savings Program">
                                         <p>Savings Deduction</p>
@@ -5297,33 +5480,76 @@
 
             // PHASE 2 OPTIMIZATION: Add query constraints for Shop Managers to only load data for their shops.
             const payrollQueryConstraints = useMemo(() => {
-                const { role, shop } = userProfile || {};
+                const { role, shop, id } = userProfile || {};
+                
+                // 1. Logic for Admin/CEO
+                if (role === 'Admin' || role === 'CEO') {
+                    // *** THE CORE FIX ***
+                    // If no shop is selected, return queries that find nothing.
+                    if (!selectedShop) {
+                        return {
+                            attendance: [where("shop", "==", "null")],
+                            leave: [where("shop", "==", "null")],
+                            ot: [where("shop", "==", "null")],
+                            loan: [where("shop", "==", "null")],
+                            state: [where("shop", "==", "null")],
+                            salary: [where("shopName", "==", "null")]
+                        };
+                    }
+                    // A shop IS selected, fetch data ONLY for that shop.
+                    return {
+                        attendance: [where("shop", "==", selectedShop)],
+                        leave: [where("shop", "==", selectedShop)],
+                        ot: [where("shop", "==", selectedShop)],
+                        loan: [where("shop", "==", selectedShop)],
+                        state: [where("shop", "==", selectedShop)],
+                        salary: [where("shopName", "==", selectedShop)]
+                    };
+                }
+
+                // 2. Logic for Shop Manager
                 if (role === 'Shop Manager') {
                     const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
                     if (managedShops.length > 0) {
-                        // Return constraints for different collection structures
                         return {
-                            standard: [where("shop", "in", managedShops)], // For collections with 'shop' field
-                            salary: [where("shopName", "in", managedShops)] // For 'salaryRevisions' with 'shopName' field
+                            attendance: [where("shop", "in", managedShops)],
+                            leave: [where("shop", "in", managedShops)],
+                            ot: [where("shop", "in", managedShops)],
+                            loan: [where("shop", "in", managedShops)],
+                            state: [where("shop", "in", managedShops)],
+                            salary: [where("shopName", "in", managedShops)]
                         };
                     }
-                     // If manager has no shops, return a query that finds nothing.
+                    // No shops assigned
+                    return { attendance: [where("shop", "==", "null")], leave: [where("shop", "==", "null")], ot: [where("shop", "==", "null")], loan: [where("shop", "==", "null")], state: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] };
+                }
+                
+                // 3. Logic for Staff
+                if (role === 'Staff' && id) {
+                    // Staff only fetch their own data.
                     return {
-                        standard: [where("shop", "==", "null")],
-                        salary: [where("shopName", "==", "null")]
+                        attendance: [where("employeeId", "==", id)], // Uses employeeId
+                        leave: [where("staffId", "==", id)],      // Uses staffId
+                        ot: [where("staffId", "==", id)],         // Uses staffId
+                        loan: [where("staffId", "==", id)],       // Uses staffId
+                        state: [where("staffId", "==", id)],      // Uses staffId
+                        salary: [where("staffId", "==", id)]      // Uses staffId
                     };
                 }
-                // Admin and Staff roles will not have server-side constraints here.
-                return { standard: [], salary: [] };
-            }, [userProfile]);
+
+                // Default: return nothing
+                return { attendance: [where("shop", "==", "null")], leave: [where("shop", "==", "null")], ot: [where("shop", "==", "null")], loan: [where("shop", "==", "null")], state: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] };
+
+            }, [userProfile, selectedShop]); // *** ADDED selectedShop to the dependency array ***
             
             // --- START FIX FOR "Maximum update depth exceeded" ---
             // 1. Extract data fetching from the allData object definition to stabilize its reference.
-            const { data: attendanceData } = useCollection('attendance', payrollQueryConstraints.standard);
-            const { data: leaveRequestsData } = useCollection('leaveRequests', payrollQueryConstraints.standard);
-            const { data: otRequestsData } = useCollection('otRequests', payrollQueryConstraints.standard);
-            const { data: staffLoansData } = useCollection('staffLoans', payrollQueryConstraints.standard);
-            const { data: employeeStatesData } = useCollection('employeeStates', payrollQueryConstraints.standard);
+            // REVISED: Use the new specific query constraints
+            const { data: attendanceData } = useCollection('attendance', payrollQueryConstraints.attendance);
+            const { data: leaveRequestsData } = useCollection('leaveRequests', payrollQueryConstraints.leave);
+            const { data: otRequestsData } = useCollection('otRequests', payrollQueryConstraints.ot);
+            const { data: staffLoansData } = useCollection('staffLoans', payrollQueryConstraints.loan);
+            const { data: employeeStatesData } = useCollection('employeeStates', payrollQueryConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', payrollQueryConstraints.salary);
 
             // 2. Memoize the allData object to prevent it from being recreated on every render.
@@ -5357,6 +5583,9 @@
             const [displayInputs, setDisplayInputs] = useState({});
             const [displayCalculations, setDisplayCalculations] = useState({});
 
+            // NEW (Plan Step 1): Add state to hold savings withdrawal data for the selected employee/month.
+            const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
+
             const isMultiShopManager = userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop);
         
             const isShopManager = userProfile?.role === 'Shop Manager';
@@ -5372,7 +5601,8 @@
             const selectedEmployee = useMemo(() => employees.find(emp => emp.id === selectedEmployeeId), [selectedEmployeeId, employees]);
             
             // The hook now calculates LIVE data in the background. We will decide when to use it.
-            const { inputs: liveInputs, calculations: liveCalculations } = usePayrollCalculator(selectedEmployee, selectedMonth, allData, manualLoanDeduction);
+            // MODIFIED: Pass 'savingsWithdrawals' state to the hook
+            const { inputs: liveInputs, calculations: liveCalculations } = usePayrollCalculator(selectedEmployee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals);
 
             // Effect to load a historical record or update display with live data for a new record.
             // FIX (Bug #2): Split this single useEffect into two separate effects below.
@@ -5434,6 +5664,46 @@
             }, [editingRecord, liveInputs, liveCalculations, isRecalculated]); // Depends on live data and recalculate flag
             // --- END BUG #2 FIX ---
 
+            // NEW (Plan Step 1): Fetch savings withdrawals for the selected employee and month.
+            // This runs whenever the employee or month changes.
+            useEffect(() => {
+                if (!db || !selectedEmployeeId || !selectedMonth) {
+                    setSavingsWithdrawals([]);
+                    return;
+                }
+
+                const fetchWithdrawals = async () => {
+                    try {
+                        const { collection, query, where, getDocs } = window.firebaseSDK;
+                        
+                        // Get the start and end of the selected month
+                        const [year, month] = selectedMonth.split('-').map(Number);
+                        const startDate = new Date(year, month - 1, 1);
+                        // Get the last millisecond of the last day of the month
+                        const endDate = new Date(year, month, 0, 23, 59, 59, 999); 
+
+                        const q = query(
+                            collection(db, 'savingsTransactions'),
+                            where("employeeId", "==", selectedEmployeeId),
+                            where("type", "==", "withdrawal"),
+                            where("date", ">=", startDate),
+                            where("date", "<=", endDate)
+                        );
+                        
+                        const querySnapshot = await getDocs(q);
+                        const withdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        setSavingsWithdrawals(withdrawals);
+
+                    } catch (error) {
+                        console.error("Error fetching savings withdrawals:", error);
+                        setSavingsWithdrawals([]);
+                    }
+                };
+
+                fetchWithdrawals();
+
+            }, [db, selectedEmployeeId, selectedMonth]);
+
             // Effect to initialize manual loan deduction ONLY for new payroll runs.
             useEffect(() => {
                 if (!editingRecord && liveInputs.loanDeduction !== undefined && manualLoanDeduction === undefined) {
@@ -5493,7 +5763,7 @@
                 if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') {
                      relevantEmployees = selectedShop 
                         ? employees.filter(e => Array.isArray(e.shop) ? e.shop.includes(selectedShop) : e.shop === selectedShop)
-                        : employees;
+                        : []; // REVISED: No shop = no employees. Forces Admin to select a shop.
                 } else if (isShopManager) {
                     const shopsToFilter = selectedShop ? [selectedShop] : managedShops;
                     relevantEmployees = employees.filter(e => {
@@ -5685,7 +5955,8 @@
             );
         };
 
-        const PayrollHistoryTab = ({ onEdit, userProfile }) => {
+        // MODIFIED: Accept the 'employees' prop
+        const PayrollHistoryTab = ({ onEdit, userProfile, employees }) => {
             const { db } = useFirebase();
             // FIX (Bug #1): Added Firestore functions needed for transactional delete
             const { where, query, collection, getDocs, doc, runTransaction, deleteDoc } = window.firebaseSDK;
@@ -5784,12 +6055,13 @@
                     acc.baseSalary += curr.baseSalary || 0; 
                     acc.engagements += curr.calculations?.engagements || 0;
                     acc.otSalary += curr.calculations?.otSalary || 0;
+                    acc.totalSavingsPayback += curr.calculations?.totalSavingsWithdrawal || 0; // Add this
                     acc.loanDeduction += curr.manualInputs?.loanDeduction || 0; 
                     acc.otherDeductions += curr.calculations?.otherDeductions || 0;
                     acc.savingsDeduction += curr.calculations?.savingsDeduction || 0; // NEW: Add savings to totals
                     acc.netSalary += curr.netSalary || 0; 
                     return acc; 
-                }, { baseSalary: 0, engagements: 0, otSalary: 0, loanDeduction: 0, otherDeductions: 0, savingsDeduction: 0, netSalary: 0 }); // NEW: Initialize savings
+                }, { baseSalary: 0, engagements: 0, otSalary: 0, totalSavingsPayback: 0, loanDeduction: 0, otherDeductions: 0, savingsDeduction: 0, netSalary: 0 }); // NEW: Initialize savings
                 return { filteredHistory: sorted, totals };
             }, [history, selectedShop, userProfile]);
             // --- END RESTORED CODE ---
@@ -5804,17 +6076,30 @@
                 const loanDeductionAmount = recordToDelete.manualInputs?.loanDeduction || 0;
                 const savingsContributionAmount = recordToDelete.calculations?.savingsDeduction || 0;
 
+                // NEW (BUG FIX): Find the employee's current savings program status *before* the transaction.
+                // We must use the 'employees' prop list passed down from the parent.
+                const employee = (employees || []).find(e => e.id === employeeId);
+                const isEmployeeStillInSavingsProgram = employee && employee.savingsProgramStatus === 'Active';
+
                 try {
+                    // --- PRE-TRANSACTION READS (THE FIX) ---
+                    // All queries must be run *before* the transaction starts.
+                    
+                    // 1. Find the loan payment record (if any) linked to this payroll ID.
+                    const loanPaymentQuery = query(collection(db, 'loanPayments'), where("payrollId", "==", payrollId));
+                    const loanPaymentSnap = await getDocs(loanPaymentQuery); // Run query *outside* transaction
+
+                    // 2. Find the savings transaction record (if any) linked to this payroll ID.
+                    const savingsTxQuery = query(collection(db, 'savingsTransactions'), where("payrollId", "==", payrollId), where("type", "==", "contribution"));
+                    const savingsTxSnap = await getDocs(savingsTxQuery); // Run query *outside* transaction
+                    // --- END PRE-TRANSACTION READS ---
+
                     // Use runTransaction for atomic operations
                     await runTransaction(db, async (transaction) => {
                         
                         // --- 1. Loan Reversal Logic ---
                         if (loanDeductionAmount > 0) {
-                            // Find the specific loan payment record linked to this payroll ID.
-                            // Queries must happen *outside* transaction.get, but use the transaction object later for reads/writes.
-                            const loanPaymentQuery = query(collection(db, 'loanPayments'), where("payrollId", "==", payrollId));
-                            const loanPaymentSnap = await getDocs(loanPaymentQuery); // Use getDocs for queries
-
+                            // Use the snapshot result from *outside* the transaction
                             if (!loanPaymentSnap.empty) {
                                 const loanPaymentDoc = loanPaymentSnap.docs[0];
                                 const loanPaymentData = loanPaymentDoc.data();
@@ -5849,11 +6134,11 @@
                         }
 
                         // --- 2. Savings Reversal Logic ---
-                        if (savingsContributionAmount > 0) {
-                            // Find the specific savings transaction linked to this payroll ID.
-                            const savingsTxQuery = query(collection(db, 'savingsTransactions'), where("payrollId", "==", payrollId), where("type", "==", "contribution"));
-                            const savingsTxSnap = await getDocs(savingsTxQuery); // Use getDocs for queries
-
+                        // MODIFIED (BUG FIX): Only reverse the savings if the employee is *still* an active
+                        // member of the savings program. If they are 'Inactive', their balance
+                        // should not be touched, as it may have already been paid out.
+                        if (savingsContributionAmount > 0 && isEmployeeStillInSavingsProgram) {
+                            // Use the snapshot result from *outside* the transaction
                             if (!savingsTxSnap.empty) {
                                 const savingsTxDoc = savingsTxSnap.docs[0];
                                 const amountContributed = savingsTxDoc.data().amountDeducted || 0;
@@ -5880,6 +6165,9 @@
                             } else {
                                 console.warn(`Savings contribution record for payroll ID ${payrollId} not found. Cannot reverse savings contribution.`);
                             }
+                        } else if (savingsContributionAmount > 0 && !isEmployeeStillInSavingsProgram) {
+                            // NEW: Log that we are *intentionally* not reversing the savings.
+                            console.warn(`Payroll ${payrollId} deleted, but savings contribution for ${employeeId} was NOT reversed because the employee is no longer in the savings program. The savings transaction record (if found) will be left intact for historical auditing.`);
                         }
 
                         // --- 3. Payroll History Deletion ---
@@ -5891,7 +6179,13 @@
                     // --- Post-Transaction UI Update ---
                     // Refetch data after successful delete by triggering the useEffect dependency.
                     // This forces the component to re-run the fetchHistory function.
-                    setSelectedMonth(prev => `${prev}`); 
+                    // REVISED: The old method was unreliable.
+                    // setSelectedMonth(prev => `${prev}`); 
+                    
+                    // NEW: Manually filter the deleted record out of the local state
+                    // This provides an immediate UI update without a full refetch.
+                    setHistory(prevHistory => prevHistory.filter(record => record.id !== payrollId));
+                    
                     alert('Payroll record and associated transactions deleted successfully.');
 
                 } catch (error) {
@@ -5933,6 +6227,7 @@
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Base Salary</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Engagements</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">OT Salary</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Savings Payback</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loan Ded.</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Other Ded.</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Savings Ded.</th>
@@ -5950,6 +6245,7 @@
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.baseSalary)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.engagements)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.otSalary)}</td>
+                                            <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.totalSavingsWithdrawal)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.manualInputs?.loanDeduction)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.otherDeductions)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.savingsDeduction)}</td>
@@ -5970,6 +6266,7 @@
                                         <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.baseSalary)}</td>
                                         <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.engagements)}</td>
                                         <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otSalary)}</td>
+                                        <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsPayback)}</td>
                                         <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.loanDeduction)}</td>
                                         <td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.otherDeductions)}</td>
                                         <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totals.savingsDeduction)}</td>
@@ -6573,16 +6870,17 @@
                 const summary = filteredHistory.reduce((acc, rec) => {
                     if (!rec.shop || !rec.month) return acc;
                     const key = `${rec.shop}_${rec.month}`;
-                    if (!acc[key]) { acc[key] = { month: rec.month, shopName: rec.shop, totalLoanDed: 0, totalOtherDed: 0, totalSavingsDed: 0, totalFinalSalary: 0 }; }
+                    if (!acc[key]) { acc[key] = { month: rec.month, shopName: rec.shop, totalLoanDed: 0, totalOtherDed: 0, totalSavingsDed: 0, totalSavingsPayback: 0, totalFinalSalary: 0 }; }
                     acc[key].totalLoanDed += parseFloat(rec.manualInputs?.loanDeduction) || 0;
                     acc[key].totalOtherDed += parseFloat(rec.calculations?.otherDeductions) || 0;
                     acc[key].totalSavingsDed += parseFloat(rec.calculations?.savingsDeduction) || 0;
+                    acc[key].totalSavingsPayback += parseFloat(rec.calculations?.totalSavingsWithdrawal) || 0;
                     acc[key].totalFinalSalary += parseFloat(rec.netSalary) || 0;
                     return acc;
                 }, {});
 
                 const summaryArray = Object.values(summary).map(item => {
-                    const accountNote = (item.totalFinalSalary || 0) + (item.totalLoanDed || 0) + (item.totalOtherDed || 0) + (item.totalSavingsDed || 0);
+                    const accountNote = (item.totalFinalSalary || 0) + (item.totalLoanDed || 0) + (item.totalOtherDed || 0) + (item.totalSavingsDed || 0) + (item.totalSavingsPayback || 0);
                     return { ...item, accountNote };
                 }).sort((a, b) => b.month.localeCompare(a.month) || a.shopName.localeCompare(b.shopName));
 
@@ -6590,10 +6888,11 @@
                     acc.totalLoanDed += curr.totalLoanDed; 
                     acc.totalOtherDed += curr.totalOtherDed; 
                     acc.totalSavingsDed += curr.totalSavingsDed;
+                    acc.totalSavingsPayback += curr.totalSavingsPayback;
                     acc.totalFinalSalary += curr.totalFinalSalary; 
                     acc.totalAccountNote += curr.accountNote;
                     return acc; 
-                }, { totalLoanDed: 0, totalOtherDed: 0, totalSavingsDed: 0, totalFinalSalary: 0, totalAccountNote: 0 });
+                }, { totalLoanDed: 0, totalOtherDed: 0, totalSavingsDed: 0, totalSavingsPayback: 0, totalFinalSalary: 0, totalAccountNote: 0 });
                 
                 return { expenseSummary: summaryArray, totals };
             }, [payrollHistory, selectedShop, selectedMonth]);
@@ -6614,7 +6913,7 @@
                             <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
                         </div>
                     </div>
-                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Month</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Loan Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Other Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Saving Program</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Final Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Account Note</th></tr></thead><tbody className="divide-y divide-slate-700">{expenseSummary.map((item, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{item.month}</td><td className="px-4 py-4 text-sm text-slate-300">{item.shopName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalLoanDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalOtherDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalSavingsDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.totalFinalSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.accountNote)}</td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="2" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalLoanDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalOtherDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalFinalSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalAccountNote)}</td></tr></tfoot></table></div>
+                    <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Month</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Loan Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Other Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Saving Program</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Savings Payback</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Final Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Account Note</th></tr></thead><tbody className="divide-y divide-slate-700">{expenseSummary.map((item, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{item.month}</td><td className="px-4 py-4 text-sm text-slate-300">{item.shopName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalLoanDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalOtherDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalSavingsDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalSavingsPayback)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.totalFinalSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.accountNote)}</td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="2" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalLoanDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalOtherDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsPayback)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalFinalSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalAccountNote)}</td></tr></tfoot></table></div>
                 </Card>
             );
         };
@@ -7018,88 +7317,240 @@
 
         // --- START SETTINGS PAGE ---
         
-        const MemoAlertTab = () => {
-            const { db } = useFirebase();
-            const [memoContent, setMemoContent] = useState('');
-            const [memoStatus, setMemoStatus] = useState('Deactive');
-            const [loading, setLoading] = useState(true);
-            const [saving, setSaving] = useState(false);
+        // NEW: Modal for adding/editing scheduled memos
+        const MemoAlertModal = ({ isOpen, onClose, onSave, memo }) => {
+            const [formData, setFormData] = useState({});
+            // NEW: Get shops from the app context
+            const { shops } = useAppData();
 
             useEffect(() => {
-                if (!db) return;
-                const { doc, onSnapshot } = window.firebaseSDK;
-                const memoRef = doc(db, "settings", "memoAlert");
-                const unsubscribe = onSnapshot(memoRef, (doc) => {
-                    if (doc.exists()) {
-                        const data = doc.data();
-                        setMemoContent(data.content || '');
-                        setMemoStatus(data.status || 'Deactive');
-                    }
-                    setLoading(false);
-                }, (error) => {
-                    console.error("Error fetching memo: ", error);
-                    setLoading(false);
-                });
-                return () => unsubscribe();
-            }, [db]);
+                if (isOpen) {
+                    // Set default values for a new memo
+                    const initialData = memo 
+                        ? { ...memo, targetShops: memo.targetShops || [] } // Ensure targetShops is an array when editing
+                        : { 
+                            title: '', 
+                            content: '', 
+                            startTime: '07:30', 
+                            endTime: '16:00', 
+                            status: 'Active', 
+                            targetShops: [] // REVISED: Replaced targetRole with targetShops array
+                          };
+                    setFormData(initialData);
+                }
+            }, [memo, isOpen]);
 
-            const handleSave = async () => {
-                if (!db) return;
-                setSaving(true);
-                const { doc, setDoc } = window.firebaseSDK;
-                const memoRef = doc(db, "settings", "memoAlert");
-                try {
-                    await setDoc(memoRef, { content: memoContent, status: memoStatus }, { merge: true });
-                } catch (error) {
-                    console.error("Error saving memo: ", error);
-                } finally {
-                    setSaving(false);
+            const handleChange = (e) => {
+                const { name, value, type, checked } = e.target;
+                
+                // REVISED: Handle the new targetShops checkbox array
+                if (name === 'targetShops') {
+                    setFormData(prev => {
+                        const shopArray = Array.isArray(prev.targetShops) ? prev.targetShops : [];
+                        const newShops = checked ? [...shopArray, value] : shopArray.filter(s => s !== value);
+                        return { ...prev, targetShops: newShops };
+                    });
+                } else {
+                    setFormData(prev => ({ ...prev, [name]: value }));
                 }
             };
 
-            if (loading) {
-                return <Card><CardTitle>Memo Alert</CardTitle><div>Loading...</div></Card>;
-            }
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                // REVISED: Updated validation
+                if (!formData.title || !formData.content || !formData.startTime || !formData.endTime) {
+                    alert("Please fill in title, content, start time, and end time.");
+                    return;
+                }
+                if (formData.endTime <= formData.startTime) {
+                    alert("End Time must be after Start Time.");
+                    return;
+                }
+                onSave(formData);
+            };
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-xl">
+                    <form onSubmit={handleSubmit}>
+                        <ModalHeader title={memo ? "Edit Memo" : "Add New Memo"} onClose={onClose} />
+                        <ModalBody>
+                            {/* REVISED: Updated layout for new shop selector */}
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Memo Title</label>
+                                    <input name="title" value={formData.title || ''} onChange={handleChange} className="input" required />
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Start Time</label>
+                                        <input type="time" name="startTime" value={formData.startTime || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">End Time</label>
+                                        <input type="time" name="endTime" value={formData.endTime || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Status</label>
+                                        <select name="status" value={formData.status || 'Active'} onChange={handleChange} className="select" required>
+                                            <option value="Active">Active</option>
+                                            <option value="Inactive">Inactive</option>
+                                        </select>
+                                    </div>
+                                    {/* REVISED: Replaced Role selector with Shop selector */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Target Shops (Select none for "All Shops")</label>
+                                        <div className="mt-1 p-2 border border-slate-600 rounded-lg bg-slate-700/50 max-h-32 overflow-y-auto">
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                                {(shops || []).sort((a,b) => a.name.localeCompare(b.name)).map(shop => (
+                                                    <div key={shop.id} className="flex items-center">
+                                                        <input 
+                                                            id={`shop-memo-${shop.id}`} 
+                                                            name="targetShops" 
+                                                            type="checkbox" 
+                                                            value={shop.name} 
+                                                            checked={(Array.isArray(formData.targetShops) ? formData.targetShops : []).includes(shop.name)} 
+                                                            onChange={handleChange} 
+                                                            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600"
+                                                        />
+                                                        <label htmlFor={`shop-memo-${shop.id}`} className="ml-2 text-sm text-slate-300 truncate" title={shop.name}>{shop.name}</label>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Content</label>
+                                    <textarea
+                                        name="content"
+                                        rows="6"
+                                        className="input"
+                                        value={formData.content || ''}
+                                        onChange={handleChange}
+                                        placeholder="Enter memo content..."
+                                        required
+                                    ></textarea>
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Save Memo</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+        
+        // REVISED: This component is now a full CRUD manager for the `memoAlerts` collection
+        const MemoAlertTab = () => {
+            const { db } = useFirebase();
+            // Use the new `memoAlerts` collection
+            const { data: memos, loading } = useCollection('memoAlerts');
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingMemo, setEditingMemo] = useState(null);
+            const [memoToDelete, setMemoToDelete] = useState(null);
+
+            const handleOpenModal = (memo = null) => {
+                setEditingMemo(memo);
+                setIsModalOpen(true);
+            };
+            const handleCloseModal = () => {
+                setEditingMemo(null);
+                setIsModalOpen(false);
+            };
+
+            const handleSave = async (formData) => {
+                const { addDoc, updateDoc, doc, collection, serverTimestamp } = window.firebaseSDK;
+                const { id, ...dataToSave } = formData;
+                
+                try {
+                    if (id) {
+                        // Update existing memo
+                        await updateDoc(doc(db, 'memoAlerts', id), { ...dataToSave, updatedAt: serverTimestamp() });
+                    } else {
+                        // Add new memo
+                        await addDoc(collection(db, 'memoAlerts'), { ...dataToSave, createdAt: serverTimestamp() });
+                    }
+                    handleCloseModal();
+                } catch (error) {
+                    console.error("Error saving memo:", error);
+                }
+            };
+
+            const handleDeleteConfirm = async () => {
+                if (!memoToDelete) return;
+                try {
+                    // Delete memo
+                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'memoAlerts', memoToDelete.id));
+                } catch (error) {
+                    console.error("Error deleting memo:", error);
+                } finally {
+                    setMemoToDelete(null);
+                }
+            };
+
+            // Sort memos by start time for a logical display
+            const sortedMemos = useMemo(() => {
+                if (!memos) return [];
+                return [...memos].sort((a, b) => (a.startTime || '00:00').localeCompare(b.startTime || '00:00'));
+            }, [memos]);
 
             return (
                 <Card>
-                    <CardTitle>Memo Alert Settings</CardTitle>
-                    <div className="space-y-6">
-                        <div>
-                            <label htmlFor="memoContent" className="block text-sm font-medium text-slate-400">Memo Content (5-6 lines recommended)</label>
-                            <textarea
-                                id="memoContent"
-                                name="memoContent"
-                                rows="6"
-                                className="input mt-1"
-                                value={memoContent}
-                                onChange={(e) => setMemoContent(e.target.value)}
-                                placeholder="Enter your memo alert here..."
-                            ></textarea>
-                        </div>
-                        <div>
-                            <label className="block text-sm font-medium text-slate-400">Popup Status</label>
-                            <div className="mt-2 space-y-2">
-                                <div className="flex items-center">
-                                    <input id="status-all" name="status" type="radio" value="Active All" checked={memoStatus === 'Active All'} onChange={(e) => setMemoStatus(e.target.value)} className="h-4 w-4 text-blue-600 border-gray-300 focus:ring-blue-500 bg-slate-600" />
-                                    <label htmlFor="status-all" className="ml-3 block text-sm font-medium text-slate-300">Active All (Show to everyone)</label>
-                                </div>
-                                <div className="flex items-center">
-                                    <input id="status-manager" name="status" type="radio" value="Active Shop Manager" checked={memoStatus === 'Active Shop Manager'} onChange={(e) => setMemoStatus(e.target.value)} className="h-4 w-4 text-blue-600 border-gray-300 focus:ring-blue-500 bg-slate-600" />
-                                    <label htmlFor="status-manager" className="ml-3 block text-sm font-medium text-slate-300">Active Shop Manager (Only for Shop Managers)</label>
-                                </div>
-                                <div className="flex items-center">
-                                    <input id="status-deactive" name="status" type="radio" value="Deactive" checked={memoStatus === 'Deactive'} onChange={(e) => setMemoStatus(e.target.value)} className="h-4 w-4 text-blue-600 border-gray-300 focus:ring-blue-500 bg-slate-600" />
-                                    <label htmlFor="status-deactive" className="ml-3 block text-sm font-medium text-slate-300">Deactive (Do not show popup)</label>
-                                </div>
-                            </div>
-                        </div>
-                        <div className="flex justify-end">
-                            <Button onClick={handleSave} disabled={saving} variant="primary" icon={saving ? 'fa-spinner fa-spin' : null}>
-                                {saving ? 'Saving...' : 'Save Memo'}
-                            </Button>
-                        </div>
+                    <div className="flex justify-between items-center mb-6">
+                        <CardTitle>Memo Alert Management</CardTitle>
+                        <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add New Memo</Button>
                     </div>
+                    {loading ? (
+                        <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl"></i></div>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-slate-700">
+                                <thead className="bg-slate-900/50">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Title</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Time Window</th>
+                                        {/* REVISED: Changed header from Target Role to Target Shops */}
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Target Shops</th>
+                                        <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Status</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {sortedMemos.map(memo => (
+                                        <tr key={memo.id} className="hover:bg-slate-700/50">
+                                            <td className="px-4 py-4 text-sm text-slate-200">{memo.title}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300">{memo.startTime} to {memo.endTime}</td>
+                                            {/* REVISED: Display the list of shops or "All Shops" */}
+                                            <td className="px-4 py-4 text-sm text-slate-300">
+                                                {(Array.isArray(memo.targetShops) && memo.targetShops.length > 0)
+                                                    ? memo.targetShops.join(', ')
+                                                    : 'All Shops'
+                                                }
+                                            </td>
+                                            <td className="px-4 py-4 text-center text-sm">
+                                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${memo.status === 'Active' ? 'bg-green-100 text-green-800' : 'bg-slate-100 text-slate-800'}`}>
+                                                    {memo.status}
+                                                </span>
+                                            </td>
+                                            <td className="px-4 py-4 text-right">
+                                                <div className="flex items-center justify-end gap-4">
+                                                    <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(memo)} />
+                                                    <Button variant="icon-delete" icon="fa-trash" onClick={() => setMemoToDelete(memo)} />
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {/* The new modal component is used here */}
+                    <MemoAlertModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSave} memo={editingMemo} />
+                    <ConfirmationModal isOpen={!!memoToDelete} onClose={() => setMemoToDelete(null)} onConfirm={handleDeleteConfirm} title="Delete Memo" message={`Are you sure you want to delete the memo "${memoToDelete?.title}"?`} />
                 </Card>
             );
         };
@@ -7182,6 +7633,7 @@
                         </div>
                     </div>
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
+                    {/* REVISED: Use the new memo management component */}
                     <div id="memo"><MemoAlertTab /></div>
                     {/* MODIFIED: Removed the 'triggerSalary' div */}
                 </TabbedPage>
@@ -7245,15 +7697,45 @@
                 }
 
                 setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
+                
+                // --- NEW: Get start/end of month for savings query ---
+                const [year, month] = selectedMonth.split('-').map(Number);
+                const startDate = new Date(year, month - 1, 1);
+                const endDate = new Date(year, month, 0, 23, 59, 59, 999);
+                // --- END NEW ---
 
                 let successCount = 0;
                 for (const employee of employeesToProcess) {
                     await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
                     setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
 
+                    // --- NEW: Fetch savings withdrawals for this specific employee and month ---
+                    let employeeSavingsWithdrawals = [];
+                    try {
+                        const q = query(
+                            collection(db, 'savingsTransactions'),
+                            where("employeeId", "==", employee.id),
+                            where("type", "==", "withdrawal"),
+                            where("date", ">=", startDate),
+                            where("date", "<=", endDate)
+                        );
+                        
+                        const querySnapshot = await getDocs(q);
+                        employeeSavingsWithdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        if (employeeSavingsWithdrawals.length > 0) {
+                             setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}... (Found ${employeeSavingsWithdrawals.length} withdrawals)`]);
+                        }
+                    } catch (error) {
+                        console.error(`Error fetching savings withdrawals for ${employee.name}:`, error);
+                         setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}... (Error fetching withdrawals)`]);
+                    }
+                    // --- END NEW ---
+
                     // Here we call the logic from our hook, but directly.
                     // This is a simplified version; in a real large-scale app, this would be a backend function.
-                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData);
+                    
+                    // --- MODIFIED CALL: Pass the fetched withdrawals to the calculator ---
+                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals);
                     
                     if (calculations.netSalary !== undefined) {
                         const batch = writeBatch(db);
@@ -7589,39 +8071,55 @@
             const [activePage, setActivePage] = useState('');
             const [initialCheckInMeTab, setInitialCheckInMeTab] = useState('checkInOut');
             const [showNotificationModal, setShowNotificationModal] = useState(true);
-            const [memoAlert, setMemoAlert] = useState(null);
+            
+            // REVISED: Renamed state to be more specific
+            const [memoToDisplay, setMemoToDisplay] = useState(null);
             const [isMemoVisible, setMemoVisible] = useState(false);
+            
             const [memoShownThisSession, setMemoShownThisSession] = useState(false);
             const { db } = useFirebase();
+            const { where } = window.firebaseSDK; // Added where for query
 
-            // Fetch memo alert data
-            useEffect(() => {
-                if (!db) return;
-                const { doc, onSnapshot } = window.firebaseSDK;
-                const memoRef = doc(db, "settings", "memoAlert");
-                const unsubscribe = onSnapshot(memoRef, (doc) => {
-                    if (doc.exists()) {
-                        setMemoAlert(doc.data());
-                    } else {
-                        setMemoAlert(null);
-                    }
-                });
-                return () => unsubscribe();
-            }, [db]);
+            // REVISED: Fetches all *active* memos from the new `memoAlerts` collection
+            const { data: activeMemos } = useCollection('memoAlerts', [where("status", "==", "Active")]);
 
             // Logic to show memo modal
             useEffect(() => {
-                if (memoAlert && userProfile && !memoShownThisSession) {
-                    const shouldShow = 
-                        (memoAlert.status === 'Active All') ||
-                        (memoAlert.status === 'Active Shop Manager' && userProfile.role === 'Shop Manager');
+                // REVISED: This logic now finds the correct memo based on time and role
+                // Check if we have active memos, a user profile, and haven't shown a memo this session
+                if (activeMemos && activeMemos.length > 0 && userProfile && !memoShownThisSession) {
+                    
+                    const now = new Date();
+                    // Get current time in "HH:mm" format (24-hour)
+                    const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+                    
+                    // REVISED: Find the first memo that matches the new criteria (shop and time)
+                    const memoToShow = activeMemos.find(memo => {
+                        if (!memo.startTime || !memo.endTime) return false; // Skip memos without time
+                        
+                        // 1. Check if user's shop matches
+                        const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                        const targetShops = Array.isArray(memo.targetShops) ? memo.targetShops : [];
+                        
+                        // Shop match is true if targetShops is empty (All Shops)
+                        // OR if any of the user's shops are in the targetShops list.
+                        const shopMatch = targetShops.length === 0 || 
+                                          userShops.some(shop => targetShops.includes(shop));
 
-                    if (shouldShow) {
+                        // 2. Check if current time is within the [startTime, endTime) range
+                        const timeMatch = currentTime >= memo.startTime && currentTime < memo.endTime;
+                        
+                        return shopMatch && timeMatch;
+                    });
+
+                    // If we found a memo to show, update state to display it
+                    if (memoToShow) {
+                        setMemoToDisplay(memoToShow);
                         setMemoVisible(true);
                         setMemoShownThisSession(true); // Ensure it only shows once per session/reload
                     }
                 }
-            }, [memoAlert, userProfile, memoShownThisSession]);
+            }, [activeMemos, userProfile, memoShownThisSession]); // Re-run when memos or user profile changes
             
             // Set the default page based on user role and permissions
             useEffect(() => {
@@ -7642,7 +8140,7 @@
 
             const toggleSidebar = useCallback(() => setSidebarOpen(prev => !prev), []);
             
-            const { where } = window.firebaseSDK;
+            // const { where } = window.firebaseSDK; // <-- Removed duplicate declaration
             const requestQueryConstraints = useMemo(() => {
                 // This logic determines which pending requests to fetch for notifications.
                 if (userProfile?.role === 'Admin') {
@@ -7728,11 +8226,12 @@
                                 <Button variant="primary" onClick={() => handleNotificationClick('leaveRequest')}>View Requests</Button>
                             </ModalFooter>
                         </Modal>
-                        {memoAlert && (
+                        {/* REVISED: This modal now reads from the new `memoToDisplay` state */}
+                        {memoToDisplay && (
                             <Modal isOpen={isMemoVisible} onClose={() => setMemoVisible(false)} maxWidth="max-w-lg">
-                                <ModalHeader title="ដំណឹងប្រាប់ពត៏មាន" onClose={() => setMemoVisible(false)} />
+                                <ModalHeader title={memoToDisplay.title || "ដំណឹងប្រាប់ពត៏មាន"} onClose={() => setMemoVisible(false)} />
                                 <ModalBody>
-                                    <pre className="text-slate-300 whitespace-pre-wrap font-sans">{memoAlert.content}</pre>
+                                    <pre className="text-slate-300 whitespace-pre-wrap font-sans">{memoToDisplay.content}</pre>
                                 </ModalBody>
                                 <ModalFooter>
                                     <Button variant="primary" onClick={() => setMemoVisible(false)}>ទទួលបាន</Button>
@@ -7779,8 +8278,3 @@
     </script>
 </body>
 </html>
-
-
-
-
-
