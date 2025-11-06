@@ -2417,6 +2417,15 @@
             const { employees, shops } = useAppData();
             
             // Fetch all savings balances. We'll filter them on the client side.
+            // MODIFIED: Switched from useCollection (real-time) to useStaticCollection (one-time fetch on load)
+            // This fixes a bug where the listener was showing stale data from the cache after a payroll save.
+            // Now, it will fetch the fresh, correct data every time the tab is loaded.
+            
+            // --- REVERTING PREVIOUS FIX ---
+            // The above assumption was incorrect and *caused* the bug.
+            // We MUST use the real-time `useCollection` listener so that the component
+            // receives the updated balance when the user navigates back to this tab
+            // after saving payroll on another page.
             const { data: allSavings } = useCollection('employeeSavings');
             
             const [selectedShop, setSelectedShop] = useState('');
@@ -2632,7 +2641,7 @@
                             </tbody>
                             <tfoot className="bg-slate-900/50">
                                 <tr>
-                                    <td colSpan="5" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    <td colSpan="6" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
                                     <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
                                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && <td></td>}
                                 </tr>
@@ -5985,19 +5994,30 @@
                     if (role === 'Shop Manager') {
                         const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
                         if (managedShops.length > 0) {
-                            q = query(q, where("shop", "in", managedShops));
+                            // REVISED: If a specific shop is selected, query for just that one.
+                            if (selectedShop) {
+                                q = query(q, where("shop", "==", selectedShop));
+                            } 
+                            // Otherwise, query for all their managed shops.
+                            else {
+                                q = query(q, where("shop", "in", managedShops));
+                            }
                         } else {
                             q = query(q, where("shop", "==", "null")); // No shops, no data
                         }
+                    // REVISED: Apply on-demand logic for Admin/CEO
+                    } else if (role === 'Admin' || role === 'CEO') {
+                        if (selectedShop) {
+                            q = query(q, where("shop", "==", selectedShop));
+                        } else {
+                            // *** THE FIX ***
+                            // If no shop is selected, fetch nothing.
+                            q = query(q, where("shop", "==", "null"));
+                        }
                     }
                     // Staff don't see this page, so no specific filter needed.
-
-                    // 3. Admin's shop filter is also applied on the server
-                    if ((role === 'Admin' || role === 'CEO') && selectedShop) {
-                        q = query(q, where("shop", "==", selectedShop));
-                    }
                     
-                    // FIX: Add the month filter to the query
+                    // 2. Add the month filter to the query
                     if (selectedMonth) {
                         q = query(q, where("month", "==", selectedMonth));
                     }
@@ -6044,10 +6064,10 @@
             const { filteredHistory, totals } = useMemo(() => {
                 // Client-side filtering is now simpler as server does most of the work
                 const filtered = history.filter(rec => {
-                    // For managers with multiple shops, they can further filter down from their total set of shops
-                    if (userProfile?.role === 'Shop Manager' && selectedShop) {
-                        return rec.shop === selectedShop;
-                    }
+                    // REVISED: This client-side filter is no longer needed, as the server query handles it.
+                    // if (userProfile?.role === 'Shop Manager' && selectedShop) {
+                    //     return rec.shop === selectedShop;
+                    // }
                     return true;
                 });
                     const sorted = [...filtered].sort((a,b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
@@ -6137,7 +6157,13 @@
                         // MODIFIED (BUG FIX): Only reverse the savings if the employee is *still* an active
                         // member of the savings program. If they are 'Inactive', their balance
                         // should not be touched, as it may have already been paid out.
-                        if (savingsContributionAmount > 0 && isEmployeeStillInSavingsProgram) {
+                        
+                        // --- BUG FIX ---
+                        // The logic above was incorrect. The savings contribution MUST be reversed
+                        // regardless of the employee's current program status to maintain
+                        // database integrity. The check for 'isEmployeeStillInSavingsProgram'
+                        // has been removed.
+                        if (savingsContributionAmount > 0) {
                             // Use the snapshot result from *outside* the transaction
                             if (!savingsTxSnap.empty) {
                                 const savingsTxDoc = savingsTxSnap.docs[0];
@@ -6165,10 +6191,17 @@
                             } else {
                                 console.warn(`Savings contribution record for payroll ID ${payrollId} not found. Cannot reverse savings contribution.`);
                             }
+                        }
+                        
+                        // --- END REPLACEMENT LOGIC ---
+                        
+                        // The old 'else if' block below is now removed as it contained the faulty logic.
+                        /*
                         } else if (savingsContributionAmount > 0 && !isEmployeeStillInSavingsProgram) {
                             // NEW: Log that we are *intentionally* not reversing the savings.
                             console.warn(`Payroll ${payrollId} deleted, but savings contribution for ${employeeId} was NOT reversed because the employee is no longer in the savings program. The savings transaction record (if found) will be left intact for historical auditing.`);
                         }
+                        */
 
                         // --- 3. Payroll History Deletion ---
                         // Delete the main payroll history document *within the transaction*.
@@ -7642,7 +7675,7 @@
 
         // NEW: Component for manually triggering payroll for a whole shop
         const TriggerSalaryTab = () => {
-            const { db, userProfile } = useFirebase();
+            const { db, userProfile } = useFirebase(); // MODIFIED: Added useFirebase hook to get db
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
             const [triggerConfirmed, setTriggerConfirmed] = useState(false);
@@ -7651,19 +7684,24 @@
             const [processComplete, setProcessComplete] = useState(false);
 
             // Fetch all data needed for calculations in one go, using one-time fetches for efficiency
+            // REMOVED: All useStaticCollection hooks have been removed from here to prevent
+            // the 87,000+ reads on page load. Data will now be fetched *inside* handleTriggerPayroll.
+            /*
             const { data: allShops, loading: shopsLoading } = useStaticCollection('shops');
             const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
             const { data: attendance, loading: attendanceLoading } = useStaticCollection('attendance');
-            const { data: leaveRequests, loading: leaveLoading } = useStaticCollection('leaveRequests');
-            const { data: otRequests, loading: otLoading } = useStaticCollection('otRequests');
-            const { data: staffLoans, loading: loansLoading } = useStaticCollection('staffLoans');
-            const { data: employeeStates, loading: statesLoading } = useStaticCollection('employeeStates');
-            const { data: salaryRevisions, loading: revisionsLoading } = useStaticCollection('salaryRevisions');
+            ... (and so on) ...
+            */
 
-            const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
+            // MODIFIED: This check is no longer needed here, as data is fetched on-demand.
+            // const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
+            // NEW: We still need a static list of shops for the dropdown.
+            const { data: allShops } = useStaticCollection('shops');
+
 
             const handleTriggerPayroll = async () => {
-                if (!triggerConfirmed || !selectedShop || !selectedMonth || !allDataReady) {
+                // MODIFIED: Removed the 'allDataReady' check which was causing a ReferenceError
+                if (!triggerConfirmed || !selectedShop || !selectedMonth) {
                     alert("Please select a shop, month, and confirm the action.");
                     return;
                 }
@@ -7672,9 +7710,55 @@
                 setProcessLog([]);
                 setProcessComplete(false);
 
-                const { writeBatch, collection, doc, serverTimestamp, getDocs, query, where } = window.firebaseSDK;
+                // --- START MODIFICATION: Fetch all data on-demand ---
+                setProcessLog(prev => [...prev, 'Fetching all required data... This may take a moment.']);
 
-                const allData = { shops: allShops, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
+                const { collection, getDocs, query, where } = window.firebaseSDK;
+
+                let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, savingsWithdrawals;
+
+                try {
+                    const [
+                        shopsSnap,
+                        empSnap,
+                        attSnap,
+                        leaveSnap,
+                        otSnap,
+                        loanSnap,
+                        stateSnap,
+                        revSnap
+                    ] = await Promise.all([
+                        getDocs(collection(db, 'shops')),
+                        getDocs(collection(db, 'employees')),
+                        getDocs(collection(db, 'attendance')),
+                        getDocs(collection(db, 'leaveRequests')),
+                        getDocs(collection(db, 'otRequests')),
+                        getDocs(collection(db, 'staffLoans')),
+                        getDocs(collection(db, 'employeeStates')),
+                        getDocs(collection(db, 'salaryRevisions'))
+                    ]);
+
+                    allShopsData = shopsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    employees = empSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    attendance = attSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    leaveRequests = leaveSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    otRequests = otSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    staffLoans = loanSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    employeeStates = stateSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    salaryRevisions = revSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+                    setProcessLog(prev => [...prev, 'All data fetched successfully.']);
+
+                } catch (fetchError) {
+                    console.error("Critical error fetching bulk data:", fetchError);
+                    setProcessLog(prev => [...prev, `FATAL ERROR: Could not fetch data. ${fetchError.message}`]);
+                    setIsProcessing(false);
+                    return;
+                }
+                // --- END MODIFICATION ---
+
+                // MODIFIED: Use the locally fetched data
+                const allData = { shops: allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
 
                 let employeesToProcess = [];
                 if (selectedShop === 'ALL_SHOPS') {
@@ -7825,7 +7909,8 @@
 
                         <Button 
                             onClick={handleTriggerPayroll} 
-                            disabled={!triggerConfirmed || isProcessing || !selectedShop || !allDataReady}
+                            // MODIFIED: Removed !allDataReady check
+                            disabled={!triggerConfirmed || isProcessing || !selectedShop}
                             variant="danger"
                             className="w-full py-3 text-base"
                         >
