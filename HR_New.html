@@ -94,7 +94,7 @@
         // Firebase SDK imports
         import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction, deleteField } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Make Firebase SDK available globally for the Babel script
         window.firebaseSDK = {
@@ -102,7 +102,7 @@
             doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp,
             signInWithEmailAndPassword, onAuthStateChanged, signOut, getDocs, writeBatch,
             enableIndexedDbPersistence, setDoc,
-            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction // Added for new user creation
+            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction, deleteField // Added deleteField
         };
     </script>
     
@@ -324,7 +324,8 @@
         
         // NEW: Standalone payroll calculation logic
         // MODIFIED: Added 'savingsWithdrawals' as a new argument
-        const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals = []) => {
+        // MODIFIED (STEP 5): Added 'savingsData' as a new argument
+        const calculatePayrollForEmployee = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals = [], savingsData = null) => {
             if (!employee || !selectedMonth) return { inputs: {}, calculations: {} };
 
             // NEW (Plan Step 1): Log the incoming withdrawal data to confirm it's being received.
@@ -475,18 +476,18 @@
 
             // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
             let savingsDeduction = 0;
-            // MODIFIED: Added a check to ensure the payroll month is on or after the employee's effective saving month.
+            // MODIFIED (STEP 5): This logic is now refactored to use the new 'savingsData' object
+            // instead of the deprecated fields on the 'employee' object.
             if (
-                employee.savingsProgramStatus === 'Active' &&
-                parseFloat(employee.savingsPercentage) > 0 &&
-                employee.savingsEffectiveMonth && 
-                selectedMonth >= employee.savingsEffectiveMonth &&
-                // --- NEW (Plan Step 2, Part A): Only deduct if there was NO withdrawal this month. ---
-                totalSavingsWithdrawal === 0 
+                savingsData && // Check if savingsData object exists
+                savingsData.savingsProgramStatus === 'Active' &&
+                parseFloat(savingsData.savingsPercentage) > 0 &&
+                savingsData.savingsEffectiveMonth && 
+                selectedMonth >= savingsData.savingsEffectiveMonth &&
+                totalSavingsWithdrawal === 0 // Only deduct if no withdrawal
             ) {
-                const percentage = parseFloat(employee.savingsPercentage) / 100;
-                // FIX: Round the savings deduction to the nearest whole number,
-                // consistent with how netSalary is rounded for KHR.
+                const percentage = parseFloat(savingsData.savingsPercentage) / 100;
+                // Round the savings deduction
                 savingsDeduction = Math.round(grossSalary * percentage);
             }
             // --- END: Step 3 ---
@@ -508,12 +509,14 @@
         
         // NEW: Centralized Payroll Calculator Hook
         // MODIFIED: Added 'savingsWithdrawals' as a new argument and to the dependency array
-        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals) => {
+        // MODIFIED (STEP 5): Added 'savingsData' as a new argument
+        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData) => {
             return useMemo(() => {
                 // The complex logic is now in a separate function.
                 // MODIFIED: Pass 'savingsWithdrawals' to the core function
-                return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals);
-            }, [employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals]);
+                // MODIFIED (STEP 5): Pass 'savingsData' to the core function
+                return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData);
+            }, [employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData]); // MODIFIED (STEP 5): Added 'savingsData'
         };
 
         // NEW: Phase 3 - App Data Context for centralizing common data
@@ -646,7 +649,8 @@
             // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 1) ---
             // This function transactionally processes a savings contribution to ensure data integrity.
             // It updates the employee's total balance and creates an audit log entry simultaneously.
-            manageSavingsContribution: async (db, employeeId, employeeName, amount, payrollId) => {
+            // MODIFIED (STEP 3): Added 'shop' parameter for denormalization.
+            manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
 
                 // --- NEW: Add a guard against NaN values ---
@@ -665,7 +669,8 @@
                  * lastUpdated: timestamp 
                  * }
                  */
-                const savingsRef = doc(db, 'employeeSavings', employeeId);
+                // MODIFIED (STEP 3): Path changed to new '/savingprogram' collection.
+                const savingsRef = doc(db, 'savingprogram', employeeId);
 
                 /*
                  * Data Model for `savingsTransactions` collection:
@@ -678,7 +683,8 @@
                  * payrollId: string // Links back to the specific payroll run
                  * }
                  */
-                const transactionRef = doc(collection(db, 'savingsTransactions'));
+                // MODIFIED (STEP 3): Path changed to new '/savingprogram/{id}/transactions' subcollection.
+                const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
 
                 try {
                     // Use a transaction to ensure both writes succeed or neither does.
@@ -703,12 +709,17 @@
                             currentBalance: newBalance, 
                             employeeId: employeeId,
                             employeeName: employeeName,
+                            // MODIFIED (STEP 3): Add shop to the main savings doc for easier reference.
+                            shop: shop, 
                             lastUpdated: serverTimestamp() 
                         }, { merge: true });
 
                         // Operation 2: Create a new transaction log for this specific contribution.
+                        // MODIFIED (STEP 3): Added 'staffName' and 'shop' for denormalization (for Collection Group Query).
                         transaction.set(transactionRef, {
                             employeeId: employeeId,
+                            staffName: employeeName, // Denormalized field
+                            shop: shop, // Denormalized field
                             date: serverTimestamp(),
                             amountDeducted: amount,
                             type: 'contribution',
@@ -724,10 +735,13 @@
             },
             // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 2: Payback) ---
             // This function transactionally processes a savings withdrawal.
-            manageSavingsWithdrawal: async (db, employeeId, amount, note) => {
+            // MODIFIED (STEP 3): Added 'employeeName' and 'shop' parameters for denormalization.
+            manageSavingsWithdrawal: async (db, employeeId, employeeName, shop, amount, note) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
-                const savingsRef = doc(db, 'employeeSavings', employeeId);
-                const transactionRef = doc(collection(db, 'savingsTransactions'));
+                // MODIFIED (STEP 3): Path changed to new '/savingprogram' collection.
+                const savingsRef = doc(db, 'savingprogram', employeeId);
+                // MODIFIED (STEP 3): Path changed to new '/savingprogram/{id}/transactions' subcollection.
+                const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
         
                 try {
                     await runTransaction(db, async (transaction) => {
@@ -751,8 +765,11 @@
                         });
         
                         // Operation 2: Create a new transaction log for this withdrawal.
+                        // MODIFIED (STEP 3): Added 'staffName' and 'shop' for denormalization.
                         transaction.set(transactionRef, {
                             employeeId: employeeId,
+                            staffName: employeeName, // Denormalized field
+                            shop: shop, // Denormalized field
                             date: serverTimestamp(),
                             amountWithdrawn: amount,
                             type: 'withdrawal',
@@ -2108,7 +2125,8 @@
         // --- START SAVINGS PROGRAM PAGE COMPONENTS (NEW) ---
         
         // NEW: Modal to Add/Edit Salary Saving Program Participants
-        const AddSalarySavingModal = ({ isOpen, onClose, onSave, participant, userProfile, allEmployees }) => {
+        // MODIFIED (STEP 4): Added 'allSavings' prop
+        const AddSalarySavingModal = ({ isOpen, onClose, onSave, participant, userProfile, allEmployees, allSavings }) => {
             const { shops } = useAppData();
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
@@ -2146,14 +2164,18 @@
             
             const availableEmployees = useMemo(() => {
                 if (!selectedShop) return [];
-                // In add mode, show active employees in the selected shop who are NOT already in the program.
-                // In edit mode, it will just be the one employee being edited.
+                // MODIFIED (STEP 4): Check against the new 'allSavings' prop (from /savingprogram)
+                // to see if an employee is already enrolled, instead of checking the deprecated
+                // 'savingsProgramStatus' field on the employee document.
+                const enrolledIds = new Set((allSavings || []).map(s => s.id));
+                
                 return allEmployees.filter(emp => {
                     const isInShop = Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop;
-                    const isNotEnrolled = emp.savingsProgramStatus !== 'Active';
+                    // Use the new Set to check for enrollment
+                    const isNotEnrolled = !enrolledIds.has(emp.id);
                     return emp.status === 'Active' && isInShop && (isNotEnrolled || emp.id === participant?.id);
                 });
-            }, [selectedShop, allEmployees, participant]);
+            }, [selectedShop, allEmployees, participant, allSavings]); // Added 'allSavings'
         
             const handleSubmit = (e) => {
                 e.preventDefault();
@@ -2411,22 +2433,15 @@
         };
 
         // MOVED & RENAMED: from SalarySavingTab to ParticipantsTab
+        // MODIFIED (STEP 4): This component is heavily refactored to use the new '/savingprogram' collection.
         const ParticipantsTab = ({ userProfile }) => {
             const { db } = useFirebase();
-            const { doc, updateDoc, where } = window.firebaseSDK;
+            // MODIFIED (STEP 4): Added setDoc and deleteField
+            const { doc, updateDoc, where, setDoc, deleteField } = window.firebaseSDK;
             const { employees, shops } = useAppData();
             
-            // Fetch all savings balances. We'll filter them on the client side.
-            // MODIFIED: Switched from useCollection (real-time) to useStaticCollection (one-time fetch on load)
-            // This fixes a bug where the listener was showing stale data from the cache after a payroll save.
-            // Now, it will fetch the fresh, correct data every time the tab is loaded.
-            
-            // --- REVERTING PREVIOUS FIX ---
-            // The above assumption was incorrect and *caused* the bug.
-            // We MUST use the real-time `useCollection` listener so that the component
-            // receives the updated balance when the user navigates back to this tab
-            // after saving payroll on another page.
-            const { data: allSavings } = useCollection('employeeSavings');
+            // MODIFIED (STEP 4): Data source is now 'savingprogram' collection
+            const { data: allSavings } = useCollection('savingprogram');
             
             const [selectedShop, setSelectedShop] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
@@ -2437,10 +2452,12 @@
             const [historyParticipant, setHistoryParticipant] = useState(null);
             const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null);
 
-            // Fetch transaction history for the selected employee
+            // MODIFIED (STEP 4): This query is now for the new subcollection path.
+            // It will be updated again in Step 6, but this prepares it.
             const historyQueryConstraints = useMemo(() => {
                 return historyParticipant ? [where("employeeId", "==", historyParticipant.id)] : [where("employeeId", "==", "null")];
             }, [historyParticipant]);
+            // MODIFIED (STEP 4): This collection name will be changed in Step 6.
             const { data: transactionHistory } = useCollection('savingsTransactions', historyQueryConstraints);
 
             const handleOpenSavingModal = (participant = null) => {
@@ -2453,16 +2470,42 @@
                 setIsSavingModalOpen(false);
             };
 
+            // MODIFIED (STEP 4): This function now writes to '/savingprogram' and cleans up '/employees'.
             const handleSaveParticipant = async (employeeId, percentage, joinDate, effectiveMonth) => {
                 if (!employeeId || !db) return;
+                
+                // Find the employee to get their name and shop for denormalization
+                const employee = employees.find(e => e.id === employeeId);
+                if (!employee) {
+                    alert("Could not find employee data.");
+                    return;
+                }
+                
                 try {
-                    const employeeRef = doc(db, 'employees', employeeId);
-                    await updateDoc(employeeRef, {
+                    // 1. Set (or update) the document in the new '/savingprogram' collection
+                    const savingsDocRef = doc(db, 'savingprogram', employeeId);
+                    const newData = {
+                        employeeId: employeeId,
+                        employeeName: employee.name,
+                        shop: Array.isArray(employee.shop) ? employee.shop[0] : employee.shop,
                         savingsProgramStatus: 'Active',
                         savingsPercentage: percentage,
                         savingsJoinDate: joinDate,
-                        savingsEffectiveMonth: effectiveMonth
+                        savingsEffectiveMonth: effectiveMonth,
+                        // Do not overwrite currentBalance if it's just an edit
+                    };
+                    // Use { merge: true } to create or update without overwriting the balance
+                    await setDoc(savingsDocRef, newData, { merge: true }); 
+
+                    // 2. Remove the deprecated fields from the '/employees' document
+                    const employeeRef = doc(db, 'employees', employeeId);
+                    await updateDoc(employeeRef, {
+                        savingsProgramStatus: deleteField(),
+                        savingsPercentage: deleteField(),
+                        savingsJoinDate: deleteField(),
+                        savingsEffectiveMonth: deleteField()
                     });
+                    
                     handleCloseSavingModal();
                 } catch (error) {
                     console.error("Error saving participant:", error);
@@ -2470,11 +2513,13 @@
                 }
             };
             
+            // MODIFIED (STEP 4): This function now updates the '/savingprogram' collection.
             const handleConfirmRemove = async () => {
                 if (!participantToRemove || !db) return;
                 try {
-                    const employeeRef = doc(db, 'employees', participantToRemove.id);
-                    await updateDoc(employeeRef, {
+                    // Update the '/savingprogram' doc instead of the '/employees' doc
+                    const savingsDocRef = doc(db, 'savingprogram', participantToRemove.id);
+                    await updateDoc(savingsDocRef, {
                         savingsProgramStatus: 'Inactive',
                         savingsPercentage: 0
                     });
@@ -2491,8 +2536,25 @@
                 setParticipantForPaybackConfirmation(null);
             };
             
+            // MODIFIED (STEP 4): This function now passes the required 'employeeName' and 'shop'
+            // to match the new signature of Utils.manageSavingsWithdrawal.
             const handleProcessPayback = async (employeeId, amount, note) => {
-                const result = await Utils.manageSavingsWithdrawal(db, employeeId, amount, note);
+                if (!paybackParticipant) {
+                    alert("Error: No participant selected for payback.");
+                    return;
+                }
+                
+                const participantShop = Array.isArray(paybackParticipant.shop) ? paybackParticipant.shop[0] : paybackParticipant.shop;
+                
+                const result = await Utils.manageSavingsWithdrawal(
+                    db, 
+                    employeeId, 
+                    paybackParticipant.name, // Pass Employee Name
+                    participantShop, // Pass Shop
+                    amount, 
+                    note
+                );
+                
                 if (result.success) {
                     alert("Payback processed successfully!");
                     setPaybackParticipant(null);
@@ -2519,22 +2581,39 @@
                 return [];
             }, [shops, userProfile]);
 
+            // MODIFIED (STEP 4): This logic is completely rebuilt to use '/savingprogram'
+            // as the source of truth for participants.
             const enrolledEmployees = useMemo(() => {
-                const savingsMap = new Map(allSavings.map(s => [s.employeeId, s.currentBalance]));
-                
-                // 1. Get all employees who are in the savings program
-                const enrolled = employees.filter(emp => emp.savingsProgramStatus === 'Active');
+                // 1. Create a map of all employees from context for quick lookup
+                const employeeMap = new Map((employees || []).map(e => [e.id, e]));
 
-                // 2. Apply role-based filtering (THE BUG FIX)
+                // 2. Map over 'allSavings' (from /savingprogram) and merge with employee data
+                const enrolled = (allSavings || []).map(savingDoc => {
+                    const employeeData = employeeMap.get(savingDoc.id);
+                    // Use employeeData if available, but fallback to denormalized data
+                    // in savingDoc just in case (e.g., for a resigned employee).
+                    return {
+                        ...employeeData, // Full employee record (includes 'status', 'position', etc.)
+                        ...savingDoc,   // Full savings record (overwrites with fresher savings data)
+                        id: savingDoc.id, // Ensure savingDoc.id is primary
+                        name: employeeData?.name || savingDoc.employeeName,
+                        shop: employeeData?.shop || savingDoc.shop, // Use employee's current shop
+                        savingsBalance: savingDoc.currentBalance || 0
+                    };
+                });
+
+                // 3. Apply role-based filtering
                 const roleFiltered = enrolled.filter(emp => {
                     if (!userProfile) return false;
+                    // Only show 'Active' status participants in this list
+                    if (emp.savingsProgramStatus !== 'Active') return false; 
+                    
                     if (userProfile.role === 'Admin' || userProfile.role === 'CEO') {
                         return true; // Admins/CEOs see everyone
                     }
                     if (userProfile.role === 'Shop Manager') {
                         const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
                         const employeeShops = Array.isArray(emp.shop) ? emp.shop : (emp.shop ? [emp.shop] : []);
-                        // Check if there is any overlap between manager's shops and employee's shops
                         return employeeShops.some(s => managedShops.includes(s));
                     }
                     if (userProfile.role === 'Staff') {
@@ -2543,16 +2622,13 @@
                     return false; // Default deny
                 });
 
-                // 3. Apply the UI filters (selectedShop dropdown and search term)
+                // 4. Apply the UI filters (selectedShop dropdown and search term)
                 const filtered = roleFiltered.filter(emp => 
                     (!selectedShop || (Array.isArray(emp.shop) ? emp.shop.includes(selectedShop) : emp.shop === selectedShop)) &&
                     (emp.name.toLowerCase().includes(searchTerm.toLowerCase()))
                 );
                 
-                return filtered.map(emp => ({
-                    ...emp,
-                    savingsBalance: savingsMap.get(emp.id) || 0
-                })).sort((a,b) => a.name.localeCompare(b.name));
+                return filtered.sort((a,b) => a.name.localeCompare(b.name));
             }, [employees, allSavings, selectedShop, searchTerm, userProfile]); // Added userProfile
 
             const totalSavings = useMemo(() => {
@@ -2655,6 +2731,7 @@
                         participant={editingParticipant}
                         userProfile={userProfile}
                         allEmployees={employees}
+                        allSavings={allSavings} // MODIFIED (STEP 4): Pass 'allSavings' data
                     />
                     <ConfirmationModal 
                         isOpen={!!participantToRemove}
@@ -2871,7 +2948,9 @@
             const [distance, setDistance] = useState(null);
             const [selectedShopForCheckIn, setSelectedShopForCheckIn] = useState('');
             const [alertModal, setAlertModal] = useState({ isOpen: false, message: '' }); // State for the new alert modal
-            const [savingsBalance, setSavingsBalance] = useState(0); // NEW: State for savings balance
+            // MODIFIED (STEP 5): Replaced 'savingsBalance' state with 'savingsData' state
+            // const [savingsBalance, setSavingsBalance] = useState(0); // OLD
+            const [savingsData, setSavingsData] = useState(null); // NEW: State for savings data object
             
             // --- NEW: State for savings withdrawals for the preview ---
             const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
@@ -2911,16 +2990,21 @@
                 if (!db || !userProfile?.id) return;
                 
                 const { doc, onSnapshot } = window.firebaseSDK;
-                // The document ID in 'employeeSavings' collection is the employee's ID.
-                const savingsDocRef = doc(db, 'employeeSavings', userProfile.id);
+                // MODIFIED (STEP 5): Path changed from 'employeeSavings' to 'savingprogram'
+                const savingsDocRef = doc(db, 'savingprogram', userProfile.id);
 
                 const unsubscribe = onSnapshot(savingsDocRef, (doc) => {
                     if (doc.exists()) {
-                        setSavingsBalance(doc.data().currentBalance || 0);
+                        // setSavingsBalance(doc.data().currentBalance || 0); // OLD
+                        setSavingsData(doc.data()); // NEW: Store the whole object
                     } else {
-                        setSavingsBalance(0); // If no document exists, balance is 0.
+                        // setSavingsBalance(0); // OLD
+                        setSavingsData(null); // NEW: Store null
                     }
-                }, (error) => { console.error("Error fetching savings balance:", error); });
+                }, (error) => { 
+                    console.error("Error fetching savings balance:", error); 
+                    setSavingsData(null); // NEW
+                });
                 return () => unsubscribe(); // Clean up the listener on component unmount.
             }, [db, userProfile?.id]);
             
@@ -3139,7 +3223,8 @@
 
             // Use the new centralized hook with the selected month
             // --- MODIFIED: Pass savingsWithdrawals to the hook ---
-            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData, undefined, savingsWithdrawals);
+            // MODIFIED (STEP 5): Pass 'savingsData' to the hook
+            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData, undefined, savingsWithdrawals, savingsData);
 
             return (
                 <Card className="max-w-2xl mx-auto"><div className="flex flex-col items-center justify-center p-4 sm:p-8 space-y-8">
@@ -3177,14 +3262,15 @@
                     </div>
 
                     {/* --- NEW: Step 4/5 - Savings Program Balance Display --- */}
-                    {userProfile?.savingsProgramStatus === 'Active' && (
+                    {/* MODIFIED (STEP 5): Logic updated to use 'savingsData' object */}
+                    {savingsData && savingsData.savingsProgramStatus === 'Active' && (
                         <div className="w-full max-w-md mt-8 p-4 bg-indigo-900/50 border border-indigo-700 rounded-lg text-center">
                             {/* TRANSLATED: "My Savings Program" to Khmer */}
                             <h4 className="text-lg font-semibold text-indigo-200">កម្មវិធីសន្សំរបស់ខ្ញុំ</h4>
                             {/* TRANSLATED: "Total Accumulated Savings" to Khmer */}
                             <p className="text-sm text-slate-400">សមតុល្យសរុប</p>
                             <p className="text-4xl font-bold text-white mt-2">
-                                {Utils.formatCurrency(savingsBalance)}
+                                {Utils.formatCurrency(savingsData?.currentBalance || 0)}
                             </p>
                         </div>
                     )}
@@ -5617,6 +5703,9 @@
             const [displayInputs, setDisplayInputs] = useState({});
             const [displayCalculations, setDisplayCalculations] = useState({});
 
+            // MODIFIED (STEP 5): Added 'savingsData' state
+            const [savingsData, setSavingsData] = useState(null);
+
             // NEW (Plan Step 1): Add state to hold savings withdrawal data for the selected employee/month.
             const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
 
@@ -5636,7 +5725,8 @@
             
             // The hook now calculates LIVE data in the background. We will decide when to use it.
             // MODIFIED: Pass 'savingsWithdrawals' state to the hook
-            const { inputs: liveInputs, calculations: liveCalculations } = usePayrollCalculator(selectedEmployee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals);
+            // MODIFIED (STEP 5): Pass 'savingsData' state to the hook
+            const { inputs: liveInputs, calculations: liveCalculations } = usePayrollCalculator(selectedEmployee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData);
 
             // Effect to load a historical record or update display with live data for a new record.
             // FIX (Bug #2): Split this single useEffect into two separate effects below.
@@ -5697,6 +5787,27 @@
                 }
             }, [editingRecord, liveInputs, liveCalculations, isRecalculated]); // Depends on live data and recalculate flag
             // --- END BUG #2 FIX ---
+
+            // MODIFIED (STEP 5): Add effect to fetch 'savingsData' for the selected employee
+            useEffect(() => {
+                if (!db || !selectedEmployeeId) {
+                    setSavingsData(null);
+                    return;
+                }
+                const { doc, onSnapshot } = window.firebaseSDK;
+                const savingsDocRef = doc(db, 'savingprogram', selectedEmployeeId);
+                const unsubscribe = onSnapshot(savingsDocRef, (doc) => {
+                    if (doc.exists()) {
+                        setSavingsData(doc.data());
+                    } else {
+                        setSavingsData(null); // No savings record for this employee
+                    }
+                }, (error) => {
+                    console.error("Error fetching savings data for payroll:", error);
+                    setSavingsData(null);
+                });
+                return () => unsubscribe();
+            }, [db, selectedEmployeeId]);
 
             // NEW (Plan Step 1): Fetch savings withdrawals for the selected employee and month.
             // This runs whenever the employee or month changes.
@@ -5872,10 +5983,12 @@
 
                     // --- NEW: Step 3 - Process Savings Contribution ---
                     if (displayCalculations.savingsDeduction > 0) {
+                        // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
                         await Utils.manageSavingsContribution(
                             db,
                             selectedEmployee.id,
                             selectedEmployee.name,
+                            shopName, // Pass the shopName
                             displayCalculations.savingsDeduction,
                             payrollRecordId // Link to the payroll record
                         );
@@ -7375,6 +7488,161 @@
 
         // --- START SETTINGS PAGE ---
         
+        // --- START DATA MIGRATION TAB (TEMP) ---
+        // This component is for Step 2 of the refactor plan. It should be removed after use.
+        const DataMigrationTab = () => {
+            const { db } = useFirebase();
+            const { serverTimestamp } = window.firebaseSDK;
+            const [log, setLog] = useState([]);
+            const [isLoading, setIsLoading] = useState(false);
+            const [isConfirmed, setIsConfirmed] = useState(false);
+            
+            const handleRunMigration = async () => {
+                if (!isConfirmed) {
+                    alert("Please check the confirmation box to run the migration.");
+                    return;
+                }
+                
+                setIsLoading(true);
+                setLog(['Starting migration...']);
+
+                const { getDocs, collection, query, where, writeBatch, doc, deleteField } = window.firebaseSDK;
+                if (!deleteField) {
+                     setLog(prev => [...prev, 'FATAL ERROR: deleteField is not loaded in firebaseSDK. Please refresh.']);
+                     setIsLoading(false);
+                     return;
+                }
+                
+                const batch = writeBatch(db);
+                
+                try {
+                    // 1. Fetch active participants from /employees
+                    setLog(prev => [...prev, 'Fetching active participants from /employees...']);
+                    const employeesQuery = query(collection(db, "employees"), where("savingsProgramStatus", "==", "Active"));
+                    const employeesSnap = await getDocs(employeesQuery);
+                    const participants = employeesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    
+                    if (participants.length === 0) {
+                        setLog(prev => [...prev, 'No active participants found in /employees. Migration might have already run or there are no participants.']);
+                        setIsLoading(false);
+                        return;
+                    }
+                    setLog(prev => [...prev, `Found ${participants.length} active participants.`]);
+
+                    // 2. Fetch all savings balances from /employeeSavings
+                    setLog(prev => [...prev, 'Fetching current balances from /employeeSavings...']);
+                    const savingsSnap = await getDocs(collection(db, "employeeSavings"));
+                    const savingsMap = new Map(savingsSnap.docs.map(d => [d.id, d.data().currentBalance || 0]));
+                    setLog(prev => [...prev, `Found ${savingsMap.size} savings balance records.`]);
+
+                    let processedCount = 0;
+                    
+                    // 3. Loop through participants and build the batch
+                    for (const emp of participants) {
+                        const employeeId = emp.id;
+                        const currentBalance = savingsMap.get(employeeId) || 0;
+                        
+                        setLog(prev => [...prev, `[${processedCount + 1}/${participants.length}] Processing ${emp.name} (Balance: ${currentBalance})...`]);
+
+                        // 3a. Batch SET: Create new doc in /savingprogram
+                        const newSavingRef = doc(db, 'savingprogram', employeeId);
+                        const newData = {
+                            // Data from employee doc
+                            employeeId: employeeId,
+                            employeeName: emp.name,
+                            shop: Array.isArray(emp.shop) ? emp.shop[0] : emp.shop, // Denormalize primary shop
+                            savingsProgramStatus: emp.savingsProgramStatus,
+                            savingsPercentage: emp.savingsPercentage,
+                            savingsJoinDate: emp.savingsJoinDate,
+                            savingsEffectiveMonth: emp.savingsEffectiveMonth,
+                            // Data from employeeSavings doc
+                            currentBalance: currentBalance,
+                            lastUpdated: serverTimestamp() // Set a fresh timestamp
+                        };
+                        batch.set(newSavingRef, newData, { merge: true });
+
+                        // 3b. Batch UPDATE: Remove deprecated fields from /employees
+                        const employeeRef = doc(db, 'employees', employeeId);
+                        batch.update(employeeRef, {
+                            savingsProgramStatus: deleteField(),
+                            savingsPercentage: deleteField(),
+                            savingsJoinDate: deleteField(),
+                            savingsEffectiveMonth: deleteField()
+                        });
+
+                        // 3c. Batch DELETE: Delete old /employeeSavings doc
+                        if (savingsMap.has(employeeId)) {
+                            const oldSavingRef = doc(db, 'employeeSavings', employeeId);
+                            batch.delete(oldSavingRef);
+                        }
+                        
+                        processedCount++;
+                    }
+
+                    // 4. Commit batch
+                    setLog(prev => [...prev, `Batch built for ${processedCount} participants. Committing...`]);
+                    await batch.commit();
+                    
+                    setLog(prev => [...prev, '--- MIGRATION COMPLETE! ---']);
+                    setLog(prev => [...prev, 'All data has been moved to /savingprogram.']);
+                    setLog(prev => [...prev, 'Old fields removed from /employees.']);
+                    setLog(prev => [...prev, 'Old /employeeSavings collection has been cleared.']);
+                    
+                } catch (error) {
+                    console.error("Migration Error: ", error);
+                    setLog(prev => [...prev, `--- ERROR: ${error.message} ---`]);
+                    setLog(prev => [...prev, 'Migration failed. Please check the console and data.']);
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            return (
+                <Card>
+                    <CardTitle>Data Migration: Salary Saving Program</CardTitle>
+                    <div className="max-w-xl space-y-4">
+                        <p className="text-slate-400">This is a one-time operation to move data from `/employees` and `/employeeSavings` to the new `/savingprogram` collection as per Step 2 of the refactor plan.</p>
+                        <p className="text-yellow-400 font-semibold">Warning: Do not run this more than once. This action is irreversible.</p>
+                        
+                        <div className="p-4 border border-yellow-600 bg-yellow-900/20 rounded-lg">
+                            <div className="flex items-start">
+                                <input 
+                                    id="confirm-migration" 
+                                    type="checkbox" 
+                                    checked={isConfirmed} 
+                                    onChange={e => setIsConfirmed(e.target.checked)} 
+                                    className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 mt-1" 
+                                    disabled={isLoading} 
+                                />
+                                <label htmlFor="confirm-migration" className="ml-3 text-sm text-slate-300">
+                                    I confirm that I want to run this data migration.
+                                </label>
+                            </div>
+                        </div>
+
+                        <Button 
+                            onClick={handleRunMigration}
+                            disabled={isLoading || !isConfirmed}
+                            variant="danger"
+                            className="w-full py-3 text-base"
+                        >
+                            {isLoading ? <><i className="fas fa-spinner fa-spin"></i> Running Migration...</> : <><i className="fas fa-exclamation-triangle"></i> Run Data Migration</>}
+                        </Button>
+                        
+                        {log.length > 0 && (
+                            <div className="mt-6">
+                                <h4 className="font-semibold text-slate-200">Migration Log:</h4>
+                                <pre className="mt-2 bg-slate-900/70 p-4 rounded-lg text-sm text-slate-300 h-64 overflow-y-auto font-mono">
+                                    {log.join('\n')}
+                                </pre>
+                            </div>
+                        )}
+                    </div>
+                </Card>
+            );
+        };
+        // --- END DATA MIGRATION TAB (TEMP) ---
+
         // NEW: Modal for adding/editing scheduled memos
         const MemoAlertModal = ({ isOpen, onClose, onSave, memo }) => {
             const [formData, setFormData] = useState({});
@@ -7617,6 +7885,8 @@
             const { data: positions } = useCollection('positions');
             const { data: shifts } = useCollection('shifts');
             const [activeTab, setActiveTab] = useState(initialTab);
+            // NEW: Get userProfile to conditionally show migration tab
+            const { userProfile } = useFirebase(); 
 
             // NEW: Effect to update the active tab if the initialTab prop changes
             // This allows the Dashboard to control which tab is shown.
@@ -7624,6 +7894,19 @@
                 setActiveTab(initialTab);
             }, [initialTab]);
             
+            // NEW: Add migration tab only for Admins
+            const tabs = useMemo(() => {
+                const baseTabs = { 
+                    shop: 'Shop & Shift Management', 
+                    position: 'Position Management', 
+                    memo: 'Memo Alert' 
+                };
+                if (userProfile?.role === 'Admin') {
+                    baseTabs.migration = 'Data Migration';
+                }
+                return baseTabs;
+            }, [userProfile]);
+
             // NEW: Timezone options for shop settings
             const timezoneOptions = [
                 'Asia/Phnom_Penh',
@@ -7682,8 +7965,8 @@
             // END FIX
 
             return (
-                // MODIFIED: Removed 'triggerSalary' from the tabs object
-                <TabbedPage tabs={{ shop: 'Shop & Shift Management', position: 'Position Management', memo: 'Memo Alert' }} activeTab={activeTab} setActiveTab={setActiveTab}>
+                // MODIFIED: Use the new dynamic tabs object
+                <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop">
                         <SettingsCRUD title="Shop" collectionName="shops" items={shops} formFields={shopFormFields} listColumns={shopListColumns} />
                         <div className="mt-8">
@@ -7693,7 +7976,10 @@
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
                     {/* REVISED: Use the new memo management component */}
                     <div id="memo"><MemoAlertTab /></div>
-                    {/* MODIFIED: Removed the 'triggerSalary' div */}
+                    {/* NEW: Add the migration tab content, also guarded */}
+                    {userProfile?.role === 'Admin' && (
+                        <div id="migration"><DataMigrationTab /></div>
+                    )}
                 </TabbedPage>
             );
         }
@@ -7741,6 +8027,8 @@
                 const { collection, getDocs, query, where } = window.firebaseSDK;
 
                 let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, savingsWithdrawals;
+                // MODIFIED (STEP 5): Add 'savingsData'
+                let savingsData;
 
                 try {
                     const [
@@ -7751,7 +8039,9 @@
                         otSnap,
                         loanSnap,
                         stateSnap,
-                        revSnap
+                        revSnap,
+                        // MODIFIED (STEP 5): Add 'savingsSnap'
+                        savingsSnap
                     ] = await Promise.all([
                         getDocs(collection(db, 'shops')),
                         getDocs(collection(db, 'employees')),
@@ -7760,7 +8050,9 @@
                         getDocs(collection(db, 'otRequests')),
                         getDocs(collection(db, 'staffLoans')),
                         getDocs(collection(db, 'employeeStates')),
-                        getDocs(collection(db, 'salaryRevisions'))
+                        getDocs(collection(db, 'salaryRevisions')),
+                        // MODIFIED (STEP 5): Add query for 'savingprogram'
+                        getDocs(collection(db, 'savingprogram'))
                     ]);
 
                     allShopsData = shopsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -7771,6 +8063,8 @@
                     staffLoans = loanSnap.docs.map(d => ({ id: d.id, ...d.data() }));
                     employeeStates = stateSnap.docs.map(d => ({ id: d.id, ...d.data() }));
                     salaryRevisions = revSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    // MODIFIED (STEP 5): Process 'savingsData'
+                    savingsData = savingsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
                     setProcessLog(prev => [...prev, 'All data fetched successfully.']);
 
@@ -7784,6 +8078,8 @@
 
                 // MODIFIED: Use the locally fetched data
                 const allData = { shops: allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
+                // MODIFIED (STEP 5): Create a Map for savings data
+                const savingsDataMap = new Map(savingsData.map(d => [d.id, d]));
 
                 let employeesToProcess = [];
                 if (selectedShop === 'ALL_SHOPS') {
@@ -7822,8 +8118,8 @@
                     let employeeSavingsWithdrawals = [];
                     try {
                         const q = query(
-                            collection(db, 'savingsTransactions'),
-                            where("employeeId", "==", employee.id),
+                            // MODIFIED (STEP 5): Path changed from 'savingsTransactions' to subcollection
+                            collection(db, 'savingprogram', employee.id, 'transactions'),
                             where("type", "==", "withdrawal"),
                             where("date", ">=", startDate),
                             where("date", "<=", endDate)
@@ -7843,8 +8139,11 @@
                     // Here we call the logic from our hook, but directly.
                     // This is a simplified version; in a real large-scale app, this would be a backend function.
                     
-                    // --- MODIFIED CALL: Pass the fetched withdrawals to the calculator ---
-                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals);
+                    // MODIFIED (STEP 5): Get this employee's savingsData from the Map
+                    const employeeSavingsData = savingsDataMap.get(employee.id) || null;
+                    
+                    // --- MODIFIED CALL: Pass the fetched withdrawals and savingsData to the calculator ---
+                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals, employeeSavingsData);
                     
                     if (calculations.netSalary !== undefined) {
                         const batch = writeBatch(db);
@@ -7878,10 +8177,12 @@
                             // --- NEW: Step 3 - Process Savings Contribution (after batch commit) ---
                             if (calculations.savingsDeduction > 0) {
                                 setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Saved for ${employee.name}. Processing savings...`]);
+                                // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
                                 await Utils.manageSavingsContribution(
                                     db,
                                     employee.id,
                                     employee.name,
+                                    shopName, // Pass the shopName
                                     calculations.savingsDeduction,
                                     payrollDocRef.id // Use the ID from the ref created for the batch
                                 );
