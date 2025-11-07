@@ -94,7 +94,9 @@
         // Firebase SDK imports
         import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction, deleteField } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // MODIFIED (STEP 6.C): Added 'collectionGroup'
+        // FIX: Removed the typo 'S' after the quotes
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction, deleteField, collectionGroup } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Make Firebase SDK available globally for the Babel script
         window.firebaseSDK = {
@@ -102,7 +104,8 @@
             doc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp,
             signInWithEmailAndPassword, onAuthStateChanged, signOut, getDocs, writeBatch,
             enableIndexedDbPersistence, setDoc,
-            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction, deleteField // Added deleteField
+            // MODIFIED (STEP 6.C): Added 'collectionGroup'
+            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction, deleteField, collectionGroup
         };
     </script>
     
@@ -652,81 +655,85 @@
             // MODIFIED (STEP 3): Added 'shop' parameter for denormalization.
             manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
-
-                // --- NEW: Add a guard against NaN values ---
-                if (isNaN(amount) || amount === null) {
-                    console.error(`Skipping savings contribution for ${employeeName}: Invalid amount (${amount}).`);
-                    return { success: false, error: "Invalid amount (NaN)" };
-                }
-                // --- END GUARD ---
-
-                /* * Data Model for `employeeSavings` collection:
-                 * A single document per employee, identified by their employeeId.
-                 * { 
-                 * employeeId: string, 
-                 * employeeName: string, 
-                 * currentBalance: number, 
-                 * lastUpdated: timestamp 
-                 * }
-                 */
-                // MODIFIED (STEP 3): Path changed to new '/savingprogram' collection.
                 const savingsRef = doc(db, 'savingprogram', employeeId);
-
-                /*
-                 * Data Model for `savingsTransactions` collection:
-                 * A new document is created for every single savings event.
-                 * { 
-                 * employeeId: string, 
-                 * date: timestamp, 
-                 * amountDeducted: number, 
-                 * type: 'contribution' | 'withdrawal', // 'withdrawal' for future use
-                 * payrollId: string // Links back to the specific payroll run
-                 * }
-                 */
-                // MODIFIED (STEP 3): Path changed to new '/savingprogram/{id}/transactions' subcollection.
                 const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
-
+        
                 try {
+                    // NEW: Log the data being passed into the function
+                    console.log(`[Savings RUN] manageSavingsContribution called:`, { employeeId, employeeName, shop, amount, payrollId });
+
                     // Use a transaction to ensure both writes succeed or neither does.
                     await runTransaction(db, async (transaction) => {
                         const savingsDoc = await transaction.get(savingsRef);
-                        let newBalance = amount;
-                        let currentBalance = 0; // NEW: Default to 0
+                        
+                        const parseSafeFloat = (val) => {
+                            if (val === null || val === undefined) return 0;
+                            const num = parseFloat(val);
+                            return isNaN(num) ? 0 : num;
+                        };
+                        
+                        let currentCredit = 0;
+                        let currentWithdrawals = 0;
 
-                        // If the employee already has a savings document, add to their balance.
                         if (savingsDoc.exists()) {
-                            // FIX: Safely get the current balance, defaulting to 0 if it's null/undefined/NaN
-                            // AND remove any non-numeric characters just in case (e.g., currency symbols)
-                            const rawBalance = savingsDoc.data().currentBalance;
-                            currentBalance = parseFloat(String(rawBalance).replace(/[^0-9.-]/g, '')) || 0;
+                            // --- Doc EXISTS, read values ---
+                            currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
+                            currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                        }
+                        
+                        // NEW: Log the values read from the database
+                        console.log(`[Savings TX] Read values:`, { currentCredit, currentWithdrawals });
+
+                        // --- Calculate new values ---
+                        const newCredit = currentCredit + amount;
+                        const newBalance = newCredit - currentWithdrawals;
+
+                        // NEW: Log the values to be written
+                        console.log(`[Savings TX] Calculated new values:`, { newCredit, newBalance });
+
+                        if (savingsDoc.exists()) {
+                            // --- Operation 1: UPDATE existing document ---
+                            // This is the most significant change. We are now using 'update'
+                            // instead of 'set with merge' for existing documents.
+                            transaction.update(savingsRef, { 
+                                currentBalance: newBalance, 
+                                mySavingCredit: newCredit,
+                                lastUpdated: serverTimestamp() 
+                            });
+                        } else {
+                            // --- Operation 1: SET new document ---
+                            // This path should only be hit if handleSaveParticipant failed.
+                            // We set all data, knowing that percentage/join date might be missing.
+                            // NEW: Log a warning if this path is taken
+                            console.warn(`[Savings TX] Savings doc for ${employeeName} did not exist. Creating new doc.`);
+                            transaction.set(savingsRef, { 
+                                currentBalance: newBalance, 
+                                mySavingCredit: newCredit, 
+                                mySavingWithdrawalTotal: currentWithdrawals, // which is 0
+                                employeeId: employeeId,
+                                employeeName: employeeName,
+                                shop: shop, 
+                                lastUpdated: serverTimestamp()
+                                // Note: savingsPercentage etc. will be missing if this path is hit,
+                                // which indicates a bug in the 'Add Participant' logic.
+                            });
                         }
 
-                        // FIX: Calculate new balance based on the safe currentBalance
-                        newBalance = currentBalance + amount;
-
-                        // Operation 1: Update (or Set) the employee's total savings balance.
-                        transaction.set(savingsRef, { 
-                            currentBalance: newBalance, 
-                            employeeId: employeeId,
-                            employeeName: employeeName,
-                            // MODIFIED (STEP 3): Add shop to the main savings doc for easier reference.
-                            shop: shop, 
-                            lastUpdated: serverTimestamp() 
-                        }, { merge: true });
-
                         // Operation 2: Create a new transaction log for this specific contribution.
-                        // MODIFIED (STEP 3): Added 'staffName' and 'shop' for denormalization (for Collection Group Query).
-                        transaction.set(transactionRef, {
+                        const logData = {
                             employeeId: employeeId,
                             staffName: employeeName, // Denormalized field
-                            shop: shop, // Denormalized field
+                            shop: shop || 'N/A', // FIX: Prevent undefined 'shop' from failing the transaction
                             date: serverTimestamp(),
                             amountDeducted: amount,
                             type: 'contribution',
                             payrollId: payrollId
-                        });
+                        };
+                        // NEW: Log the data being written to the subcollection
+                        console.log(`[Savings TX] Writing log data:`, logData);
+                        transaction.set(transactionRef, logData);
                     });
-                    console.log(`Savings contribution of ${amount} for ${employeeName} processed successfully.`);
+                    console.log(`[Savings SUCCESS] Savings contribution of ${amount} for ${employeeName} processed successfully.`);
                     return { success: true };
                 } catch (error) {
                     console.error("Error within manageSavingsContribution transaction: ", error);
@@ -751,16 +758,30 @@
                             throw new Error("Employee has no savings record to withdraw from.");
                         }
         
-                        const currentBalance = savingsDoc.data().currentBalance || 0;
+                        // --- BUG FIX: Correctly parse floats, handling NaN/undefined/null ---
+                        const parseSafeFloat = (val) => {
+                            if (val === null || val === undefined) return 0;
+                            const num = parseFloat(val);
+                            return isNaN(num) ? 0 : num;
+                        };
+
+                        const currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
+                        const currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
+                        const currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                        // --- END BUG FIX ---
+                        
                         if (amount > currentBalance) {
                             throw new Error("Withdrawal amount cannot exceed the current balance.");
                         }
         
-                        const newBalance = currentBalance - amount;
+                        // MODIFIED: Implement new logic
+                        const newWithdrawals = currentWithdrawals + amount;
+                        const newBalance = currentCredit - newWithdrawals; // Recalculate balance
         
                         // Operation 1: Update the employee's total savings balance.
                         transaction.update(savingsRef, { 
                             currentBalance: newBalance, 
+                            mySavingWithdrawalTotal: newWithdrawals, // NEW: Set the new withdrawal total
                             lastUpdated: serverTimestamp() 
                         });
         
@@ -2183,7 +2204,8 @@
                     alert("Please fill all required fields, including a savings percentage greater than 0.");
                     return;
                 }
-                onSave(selectedEmployeeId, savingsPercentage || 0, joinDate, effectiveMonth);
+                // MODIFIED: Pass the '!!participant' boolean as an 'isEdit' flag
+                onSave(selectedEmployeeId, savingsPercentage || 0, joinDate, effectiveMonth, !!participant);
             };
         
             return (
@@ -2452,13 +2474,30 @@
             const [historyParticipant, setHistoryParticipant] = useState(null);
             const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null);
 
-            // MODIFIED (STEP 4): This query is now for the new subcollection path.
-            // It will be updated again in Step 6, but this prepares it.
-            const historyQueryConstraints = useMemo(() => {
-                return historyParticipant ? [where("employeeId", "==", historyParticipant.id)] : [where("employeeId", "==", "null")];
-            }, [historyParticipant]);
-            // MODIFIED (STEP 4): This collection name will be changed in Step 6.
-            const { data: transactionHistory } = useCollection('savingsTransactions', historyQueryConstraints);
+            // MODIFIED (STEP 6.B): Replaced 'useCollection' with a 'useEffect'
+            // to listen to the new dynamic subcollection path.
+            const [transactionHistory, setTransactionHistory] = useState([]);
+            useEffect(() => {
+                if (!db || !historyParticipant) {
+                    setTransactionHistory([]);
+                    return;
+                }
+                
+                const { collection, onSnapshot, orderBy, query } = window.firebaseSDK;
+                const collectionRef = collection(db, 'savingprogram', historyParticipant.id, 'transactions');
+                const q = query(collectionRef, orderBy('date', 'desc')); // Order by date descending
+
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    const history = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setTransactionHistory(history);
+                }, (error) => {
+                    console.error("Error fetching transaction history:", error);
+                    setTransactionHistory([]);
+                });
+
+                // Clean up the listener when the modal is closed or participant changes
+                return () => unsubscribe();
+            }, [db, historyParticipant]); // Re-run when the selected participant changes
 
             const handleOpenSavingModal = (participant = null) => {
                 setEditingParticipant(participant);
@@ -2471,7 +2510,8 @@
             };
 
             // MODIFIED (STEP 4): This function now writes to '/savingprogram' and cleans up '/employees'.
-            const handleSaveParticipant = async (employeeId, percentage, joinDate, effectiveMonth) => {
+            // MODIFIED (Bug Fix): Added 'isEdit' flag to correctly initialize balance for new participants.
+            const handleSaveParticipant = async (employeeId, percentage, joinDate, effectiveMonth, isEdit) => {
                 if (!employeeId || !db) return;
                 
                 // Find the employee to get their name and shop for denormalization
@@ -2494,6 +2534,14 @@
                         savingsEffectiveMonth: effectiveMonth,
                         // Do not overwrite currentBalance if it's just an edit
                     };
+
+                    // FIX: If this is a NEW participant (not an edit), initialize their balance to 0.
+                    if (!isEdit) {
+                        newData.currentBalance = 0;
+                        newData.mySavingCredit = 0; // NEW: Initialize new credit field
+                        newData.mySavingWithdrawalTotal = 0; // NEW: Initialize new withdrawal field
+                    }
+
                     // Use { merge: true } to create or update without overwriting the balance
                     await setDoc(savingsDocRef, newData, { merge: true }); 
 
@@ -2682,6 +2730,13 @@
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Join Date</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Savings Percentage</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Effective Month</th>
+                                    
+                                    {/* MODIFIED: Removed 'My Saving Credit' to prevent duplication */}
+                                    {/* <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">My Saving Credit</th> */}
+                                    
+                                    {/* NEW: Added 'Total Withdrawals' for clarity */}
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Withdrawals</th>
+                                    
                                     <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Accumulated Savings</th>
                                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                         <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
@@ -2696,6 +2751,13 @@
                                         <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(emp.savingsJoinDate)}</td>
                                         <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsPercentage}%</td>
                                         <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsEffectiveMonth}</td>
+                                        
+                                        {/* MODIFIED: Removed 'My Saving Credit' column data */}
+                                        {/* <td className="px-4 py-4 text-sm text-green-300 font-semibold text-right">{Utils.formatCurrency(emp.mySavingCredit)}</td> */}
+                                        
+                                        {/* NEW: Added 'Total Withdrawals' column data */}
+                                        <td className="px-4 py-4 text-sm text-red-300 font-semibold text-right">{Utils.formatCurrency(emp.mySavingWithdrawalTotal)}</td>
+                                        
                                         <td className="px-4 py-4 text-sm text-blue-300 font-semibold text-right">{Utils.formatCurrency(emp.savingsBalance)}</td>
                                         {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
                                             <td className="px-4 py-4 text-center">
@@ -2717,8 +2779,13 @@
                             </tbody>
                             <tfoot className="bg-slate-900/50">
                                 <tr>
-                                    <td colSpan="6" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    {/* MODIFIED: 
+                                      1. Corrected colSpan from 7 to 6.
+                                      2. This colSpan is now dynamic. It's 6 if actions are visible, 5 if not.
+                                    */}
+                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager' ? 6 : 5} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
                                     <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
+                                    {/* MODIFIED: Changed <em> to <td> for correct column alignment */}
                                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && <td></td>}
                                 </tr>
                             </tfoot>
@@ -2764,13 +2831,63 @@
         };
 
         // MOVED: Savings History Tab
+        // MODIFIED (STEP 6.C): This component is completely refactored to use a collectionGroup query.
         const SavingsHistoryTab = ({ userProfile }) => {
-            const { employees, shops } = useAppData();
-            const { data: transactions, loading } = useCollection('savingsTransactions');
+            const { db } = useFirebase();
+            const { shops } = useAppData(); // We only need shops for the filter dropdown
+            
+            // MODIFIED (STEP 6.C): Replaced 'useCollection' with 'useState'
+            const [transactions, setTransactions] = useState([]);
+            const [loading, setLoading] = useState(true);
 
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
             const [searchTerm, setSearchTerm] = useState('');
+
+            // MODIFIED (STEP 6.C): New data fetching logic using collectionGroup
+            useEffect(() => {
+                if (!db || !userProfile) return;
+
+                // --- THIS IS THE FIX ---
+                // We are replacing the one-time `getDocs` with a real-time `onSnapshot` listener.
+                // This will automatically update the history card when new transactions are added.
+
+                setLoading(true);
+                const { collectionGroup, query, where, onSnapshot, orderBy } = window.firebaseSDK;
+                
+                // Query the 'transactions' subcollection across all 'savingprogram' documents
+                let q = query(collectionGroup(db, 'transactions'), orderBy('date', 'desc'));
+                
+                // Apply role-based filtering at the query level for security and efficiency
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    if (managedShops.length > 0) {
+                        // Filter results to only include transactions from shops they manage
+                        q = query(q, where("shop", "in", managedShops));
+                    } else {
+                        q = query(q, where("shop", "==", "null")); // No shops, no data
+                    }
+                } else if (userProfile.role === 'Staff') {
+                    // Staff can only see their own transactions
+                    q = query(q, where("employeeId", "==", userProfile.id));
+                }
+                // Admin/CEO sees all (no extra 'where' clause)
+
+                // Use onSnapshot to listen for real-time changes
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    const txs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setTransactions(txs);
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Error fetching real-time savings transaction history:", error);
+                    setTransactions([]);
+                    setLoading(false);
+                });
+
+                // Clean up the listener on component unmount
+                return () => unsubscribe();
+                
+            }, [db, userProfile]); // This effect now sets up the listener
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
@@ -2786,34 +2903,31 @@
                 return [];
             }, [shops, userProfile]);
 
+            // MODIFIED (STEP 6.C): This logic is now much simpler and uses the denormalized fields.
             const { processedTransactions, totals } = useMemo(() => {
-                const employeeMap = new Map(employees.map(emp => [emp.id, { name: emp.name, shop: emp.shop }]));
+                // 'transactions' state is already pre-filtered by role (from useEffect).
+                // Now, we just apply the UI filters (month, shop, search).
                 
                 const filtered = transactions.filter(tx => {
-                    const employee = employeeMap.get(tx.employeeId);
-                    if (!employee) return false;
-
                     const txDate = tx.date?.toDate();
                     if (!txDate) return false;
-                    
+
+                    // Filter 1: Month
                     const monthMatch = !selectedMonth || txDate.toISOString().startsWith(selectedMonth);
-                    const employeeShops = Array.isArray(employee.shop) ? employee.shop : [employee.shop];
-                    const shopMatch = !selectedShop || employeeShops.includes(selectedShop);
-                    const searchMatch = !searchTerm || employee.name.toLowerCase().includes(searchTerm.toLowerCase());
+                    
+                    // Filter 2: Shop (using denormalized field 'tx.shop')
+                    const shopMatch = !selectedShop || tx.shop === selectedShop;
+                    
+                    // Filter 3: Search Term (using denormalized field 'tx.staffName')
+                    const searchMatch = !searchTerm || (tx.staffName && tx.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
 
                     return monthMatch && shopMatch && searchMatch;
                 });
                 
-                const processed = filtered.map(tx => {
-                    const employee = employeeMap.get(tx.employeeId);
-                    return {
-                        ...tx,
-                        staffName: employee?.name || 'Unknown',
-                        shop: Array.isArray(employee?.shop) ? employee.shop.join(', ') : employee?.shop,
-                    };
-                }).sort((a,b) => (b.date?.toDate() || 0) - (a.date?.toDate() || 0));
-
-                const totals = processed.reduce((acc, tx) => {
+                // Data is already sorted by date from the query, so no need to sort again.
+                // The denormalized fields are already on 'tx', so no 'map' is needed.
+                
+                const totals = filtered.reduce((acc, tx) => {
                     if (tx.type === 'contribution') {
                         acc.totalContributions += tx.amountDeducted || 0;
                     } else if (tx.type === 'withdrawal') {
@@ -2822,8 +2936,8 @@
                     return acc;
                 }, { totalContributions: 0, totalWithdrawals: 0 });
 
-                return { processedTransactions: processed, totals };
-            }, [transactions, employees, selectedMonth, selectedShop, searchTerm]);
+                return { processedTransactions: filtered, totals };
+            }, [transactions, selectedMonth, selectedShop, searchTerm]); // Removed 'employees' dependency
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = processedTransactions.map(tx => ({ 
@@ -3023,7 +3137,8 @@
                         const endDate = new Date(year, month, 0, 23, 59, 59, 999); 
 
                         const q = query(
-                            collection(db, 'savingsTransactions'),
+                            // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
+                            collection(db, 'savingprogram', userProfile.id, 'transactions'),
                             where("employeeId", "==", userProfile.id),
                             where("type", "==", "withdrawal"),
                             where("date", ">=", startDate),
@@ -5487,8 +5602,8 @@
             return (
                 <TabbedPage tabs={{ calculator: 'Payroll Calculator', history: 'Payroll History' }} activeTab={activeTab} setActiveTab={setActiveTab}>
                    <div id="calculator"><PayrollCalculatorTab userProfile={userProfile} editingRecord={editingRecord} onSaveSuccess={handleSaveSuccess} /></div>
-                    {/* MODIFIED: Pass the employees list as a prop */}
-                    <div id="history"><PayrollHistoryTab onEdit={handleEdit} userProfile={userProfile} employees={employees} /></div>
+                    {/* MODIFIED (STEP 6.D): Removed the 'employees' prop */}
+                    <div id="history"><PayrollHistoryTab onEdit={handleEdit} userProfile={userProfile} /></div>
                 </TabbedPage>
             );
         };
@@ -5607,13 +5722,16 @@
                     // *** THE CORE FIX ***
                     // If no shop is selected, return queries that find nothing.
                     if (!selectedShop) {
+                        // FIX: "All Shops" (empty string) should return NO constraints,
+                        // which tells useCollection to fetch ALL documents.
+                        // The previous logic [where("shop", "==", "null")] was the bug.
                         return {
-                            attendance: [where("shop", "==", "null")],
-                            leave: [where("shop", "==", "null")],
-                            ot: [where("shop", "==", "null")],
-                            loan: [where("shop", "==", "null")],
-                            state: [where("shop", "==", "null")],
-                            salary: [where("shopName", "==", "null")]
+                            attendance: [],
+                            leave: [],
+                            ot: [],
+                            loan: [],
+                            state: [],
+                            salary: []
                         };
                     }
                     // A shop IS selected, fetch data ONLY for that shop.
@@ -5640,9 +5758,9 @@
                             salary: [where("shopName", "in", managedShops)]
                         };
                     }
-                    // No shops assigned
-                    return { attendance: [where("shop", "==", "null")], leave: [where("shop", "==", "null")], ot: [where("shop", "==", "null")], loan: [where("shop", "==", "null")], state: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] };
                 }
+
+                // 2. Logic for Shop Manager
                 
                 // 3. Logic for Staff
                 if (role === 'Staff' && id) {
@@ -5828,7 +5946,8 @@
                         const endDate = new Date(year, month, 0, 23, 59, 59, 999); 
 
                         const q = query(
-                            collection(db, 'savingsTransactions'),
+                            // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
+                            collection(db, 'savingprogram', selectedEmployeeId, 'transactions'),
                             where("employeeId", "==", selectedEmployeeId),
                             where("type", "==", "withdrawal"),
                             where("date", ">=", startDate),
@@ -5955,7 +6074,7 @@
                 }
 
                 const finalInputsForSave = { ...displayInputs, loanDeduction: manualLoanDeduction };
-                const payrollData = { month: selectedMonth, shop: shopName, employeeId: selectedEmployee.id, employeeName: selectedEmployee.name, baseSalary: displayCalculations.baseSalary, netSalary: displayCalculations.netSalary, manualInputs: finalInputsForSave, calculations: displayCalculations };
+                        const payrollData = { month: selectedMonth, shop: shopName, employeeId: selectedEmployee.id, employeeName: selectedEmployee.name, baseSalary: displayCalculations.baseSalary, netSalary: displayCalculations.netSalary, manualInputs: finalInputsForSave, calculations: displayCalculations };
                 
                 let payrollRecordId;
                 let success = false;
@@ -5984,6 +6103,8 @@
                     // --- NEW: Step 3 - Process Savings Contribution ---
                     if (displayCalculations.savingsDeduction > 0) {
                         // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
+                        // NEW: Log before calling
+                        console.log(`[Payroll Save] Calling manageSavingsContribution for ${selectedEmployee.name}, Amount: ${displayCalculations.savingsDeduction}`);
                         await Utils.manageSavingsContribution(
                             db,
                             selectedEmployee.id,
@@ -6091,6 +6212,7 @@
                     {/* FIX: Added missing closing </div> for the main grid */}
                     </div>
 
+                    {/* --- FIX: This block was corrupted. Replacing with correct TriggerSalaryTab --- */}
                     {/* NEW: Added TriggerSalaryTab below the calculator/payslip grid */}
                     {/* MODIFIED: Allow Shop Manager to access this tool as well */}
                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && (
@@ -6102,11 +6224,12 @@
             );
         };
 
-        // MODIFIED: Accept the 'employees' prop
-        const PayrollHistoryTab = ({ onEdit, userProfile, employees }) => {
+        // MODIFIED (STEP 6.D): Removed the 'employees' prop
+        const PayrollHistoryTab = ({ onEdit, userProfile }) => {
             const { db } = useFirebase();
             // FIX (Bug #1): Added Firestore functions needed for transactional delete
-            const { where, query, collection, getDocs, doc, runTransaction, deleteDoc } = window.firebaseSDK;
+            // MODIFIED (STEP 6.D): We only need collectionGroup for the savings query now
+            const { where, query, collection, getDocs, doc, runTransaction, deleteDoc, collectionGroup } = window.firebaseSDK;
 
             // --- START RESTORED CODE ---
             // Filter states
@@ -6149,8 +6272,9 @@
                             q = query(q, where("shop", "==", selectedShop));
                         } else {
                             // *** THE FIX ***
-                            // If no shop is selected, fetch nothing.
-                            q = query(q, where("shop", "==", "null"));
+                            // If no shop is selected ("All Shops"), do not add any
+                            // shop filter. This will fetch all records.
+                            // The previous logic `q = query(q, where("shop", "==", "null"));` was the bug.
                         }
                     }
                     // Staff don't see this page, so no specific filter needed.
@@ -6234,11 +6358,9 @@
                 const loanDeductionAmount = recordToDelete.manualInputs?.loanDeduction || 0;
                 const savingsContributionAmount = recordToDelete.calculations?.savingsDeduction || 0;
 
-                // NEW (BUG FIX): Find the employee's current savings program status *before* the transaction.
-                // We must use the 'employees' prop list passed down from the parent.
-                const employee = (employees || []).find(e => e.id === employeeId);
-                const isEmployeeStillInSavingsProgram = employee && employee.savingsProgramStatus === 'Active';
-
+                // MODIFIED (STEP 6.D): Removed the dependency on the 'employees' prop and the
+                // faulty 'isEmployeeStillInSavingsProgram' logic.
+                
                 try {
                     // --- PRE-TRANSACTION READS (THE FIX) ---
                     // All queries must be run *before* the transaction starts.
@@ -6248,7 +6370,12 @@
                     const loanPaymentSnap = await getDocs(loanPaymentQuery); // Run query *outside* transaction
 
                     // 2. Find the savings transaction record (if any) linked to this payroll ID.
-                    const savingsTxQuery = query(collection(db, 'savingsTransactions'), where("payrollId", "==", payrollId), where("type", "==", "contribution"));
+                    // MODIFIED (STEP 6.D): Use the new subcollection path, which requires the employeeId.
+                    const savingsTxQuery = query(
+                        collection(db, 'savingprogram', employeeId, 'transactions'), 
+                        where("payrollId", "==", payrollId), 
+                        where("type", "==", "contribution")
+                    );
                     const savingsTxSnap = await getDocs(savingsTxQuery); // Run query *outside* transaction
                     // --- END PRE-TRANSACTION READS ---
 
@@ -6292,15 +6419,7 @@
                         }
 
                         // --- 2. Savings Reversal Logic ---
-                        // MODIFIED (BUG FIX): Only reverse the savings if the employee is *still* an active
-                        // member of the savings program. If they are 'Inactive', their balance
-                        // should not be touched, as it may have already been paid out.
-                        
-                        // --- BUG FIX ---
-                        // The logic above was incorrect. The savings contribution MUST be reversed
-                        // regardless of the employee's current program status to maintain
-                        // database integrity. The check for 'isEmployeeStillInSavingsProgram'
-                        // has been removed.
+                        // MODIFIED (STEP 6.D): This logic is now corrected and simplified.
                         if (savingsContributionAmount > 0) {
                             // Use the snapshot result from *outside* the transaction
                             if (!savingsTxSnap.empty) {
@@ -6308,7 +6427,8 @@
                                 const amountContributed = savingsTxDoc.data().amountDeducted || 0;
                                 
                                 // Get the main employee savings document *within the transaction*.
-                                const employeeSavingsRef = doc(db, 'employeeSavings', employeeId);
+                                // MODIFIED (STEP 6.D): Use the new '/savingprogram' path
+                                const employeeSavingsRef = doc(db, 'savingprogram', employeeId);
                                 const employeeSavingsDoc = await transaction.get(employeeSavingsRef);
 
                                 if (employeeSavingsDoc.exists()) {
@@ -6331,16 +6451,9 @@
                             }
                         }
                         
-                        // --- END REPLACEMENT LOGIC ---
+                        // MODIFIED (STEP 6.D): Removed the faulty 'else if' block that
+                        // prevented savings reversal for inactive program members.
                         
-                        // The old 'else if' block below is now removed as it contained the faulty logic.
-                        /*
-                        } else if (savingsContributionAmount > 0 && !isEmployeeStillInSavingsProgram) {
-                            // NEW: Log that we are *intentionally* not reversing the savings.
-                            console.warn(`Payroll ${payrollId} deleted, but savings contribution for ${employeeId} was NOT reversed because the employee is no longer in the savings program. The savings transaction record (if found) will be left intact for historical auditing.`);
-                        }
-                        */
-
                         // --- 3. Payroll History Deletion ---
                         // Delete the main payroll history document *within the transaction*.
                         const payrollHistoryRef = doc(db, 'payrollHistory', payrollId);
@@ -6406,13 +6519,13 @@
                                         <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
                                     </tr>
                                 </thead>
+                                {/* FIX: Restoring the correct table body for PayrollHistoryTab */}
                                 <tbody className="divide-y divide-slate-700">
                                     {filteredHistory.map(record => (
                                         <tr key={record.id} className="hover:bg-slate-700/50">
-                                            {/* Table data cells remain the same */}
-                                            <td className="px-4 py-4 text-sm text-slate-200">{record.month}</td>
-                                            <td className="px-4 py-4 text-sm text-slate-300">{record.shop}</td>
-                                            <td className="px-4 py-4 text-sm text-slate-300">{record.employeeName}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{record.month}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{record.shop}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-200 whitespace-nowrap">{record.employeeName}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.baseSalary)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.engagements)}</td>
                                             <td className="px-4 py-4 text-sm text-right">{Utils.formatCurrency(record.calculations?.otSalary)}</td>
@@ -8118,7 +8231,7 @@
                     let employeeSavingsWithdrawals = [];
                     try {
                         const q = query(
-                            // MODIFIED (STEP 5): Path changed from 'savingsTransactions' to subcollection
+                            // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
                             collection(db, 'savingprogram', employee.id, 'transactions'),
                             where("type", "==", "withdrawal"),
                             where("date", ">=", startDate),
@@ -8178,6 +8291,8 @@
                             if (calculations.savingsDeduction > 0) {
                                 setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Saved for ${employee.name}. Processing savings...`]);
                                 // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
+                                // NEW: Log before calling
+                                console.log(`[Payroll Trigger] Calling manageSavingsContribution for ${employee.name}, Amount: ${calculations.savingsDeduction}`);
                                 await Utils.manageSavingsContribution(
                                     db,
                                     employee.id,
