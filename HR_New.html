@@ -674,12 +674,27 @@
                         
                         let currentCredit = 0;
                         let currentWithdrawals = 0;
+                        // --- NEW: Add currentBalance for the patch ---
+                        let currentBalance = 0;
 
                         if (savingsDoc.exists()) {
                             // --- Doc EXISTS, read values ---
                             currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
                             currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                            // --- NEW: Read currentBalance ---
+                            currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
                         }
+
+                        // --- NEW: Data-Integrity Patch (as requested) ---
+                        // This patch detects and fixes legacy data where mySavingCredit was 0
+                        // (or null) but currentBalance was correct.
+                        if ((currentCredit === 0 || currentCredit === null) && currentBalance > 0) {
+                            console.warn(`[Savings Patch: Contribution] Fixing inconsistent data for ${employeeId}.`);
+                            // Back-calculate the correct total credit.
+                            // This new 'currentCredit' value will be used in the calculation below.
+                            currentCredit = currentBalance + currentWithdrawals;
+                        }
+                        // --- END: Data-Integrity Patch ---
                         
                         // NEW: Log the values read from the database
                         console.log(`[Savings TX] Read values:`, { currentCredit, currentWithdrawals });
@@ -766,9 +781,23 @@
                         };
 
                         const currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
-                        const currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
+                        let currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
                         const currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
                         // --- END BUG FIX ---
+
+                        // --- NEW: Data-Integrity Patch (as requested) ---
+                        // This patch detects and fixes legacy data where mySavingCredit was 0
+                        // (or null) but currentBalance was correct.
+                        if ((currentCredit === 0 || currentCredit === null) && currentBalance > 0) {
+                            console.warn(`[Savings Patch: Withdrawal] Fixing inconsistent data for ${employeeId}.`);
+                            // Back-calculate the correct total credit.
+                            currentCredit = currentBalance + currentWithdrawals;
+                            
+                            // We also update the database field immediately to fix it permanently.
+                            // This is safe because we are already in a transaction.
+                            transaction.update(savingsRef, { mySavingCredit: currentCredit });
+                        }
+                        // --- END: Data-Integrity Patch ---
                         
                         if (amount > currentBalance) {
                             throw new Error("Withdrawal amount cannot exceed the current balance.");
@@ -776,7 +805,11 @@
         
                         // MODIFIED: Implement new logic
                         const newWithdrawals = currentWithdrawals + amount;
-                        const newBalance = currentCredit - newWithdrawals; // Recalculate balance
+                        
+                        // --- REVERTING PREVIOUS FIX ---
+                        // Now that 'currentCredit' is patched and correct, we can
+                        // safely use the original "source of truth" formula.
+                        const newBalance = currentCredit - newWithdrawals;
         
                         // Operation 1: Update the employee's total savings balance.
                         transaction.update(savingsRef, { 
@@ -3139,14 +3172,17 @@
                         const q = query(
                             // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
                             collection(db, 'savingprogram', userProfile.id, 'transactions'),
-                            where("employeeId", "==", userProfile.id),
-                            where("type", "==", "withdrawal"),
+                            // --- BUG FIX: Removed 'employeeId' and 'type' filters to avoid needing
+                            // a complex composite index. We will filter in Javascript.
                             where("date", ">=", startDate),
                             where("date", "<=", endDate)
                         );
                         
                         const querySnapshot = await getDocs(q);
-                        const withdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        // Filter for 'withdrawal' in Javascript
+                        const withdrawals = querySnapshot.docs
+                            .map(doc => ({ id: doc.id, ...doc.data() }))
+                            .filter(tx => tx.type === 'withdrawal');
                         setSavingsWithdrawals(withdrawals);
                     } catch (error) {
                         console.error("Error fetching savings withdrawals for preview:", error);
@@ -5928,7 +5964,7 @@
             }, [db, selectedEmployeeId]);
 
             // NEW (Plan Step 1): Fetch savings withdrawals for the selected employee and month.
-            // This runs whenever the employee or month changes.
+            // NEW (Plan Step 1): Add effect to fetch savings withdrawal data
             useEffect(() => {
                 if (!db || !selectedEmployeeId || !selectedMonth) {
                     setSavingsWithdrawals([]);
@@ -5948,14 +5984,18 @@
                         const q = query(
                             // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
                             collection(db, 'savingprogram', selectedEmployeeId, 'transactions'),
-                            where("employeeId", "==", selectedEmployeeId),
-                            where("type", "==", "withdrawal"),
+                            // --- BUG FIX: Removed 'type' filter to avoid needing a composite index
+                            // on (type, date). We will filter for 'type' in Javascript.
+                            // The redundant 'where("employeeId", ...)' was already correctly removed.
                             where("date", ">=", startDate),
                             where("date", "<=", endDate)
                         );
                         
                         const querySnapshot = await getDocs(q);
-                        const withdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        // Filter for 'withdrawal' in Javascript
+                        const withdrawals = querySnapshot.docs
+                            .map(doc => ({ id: doc.id, ...doc.data() }))
+                            .filter(tx => tx.type === 'withdrawal');
                         setSavingsWithdrawals(withdrawals);
 
                     } catch (error) {
