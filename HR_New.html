@@ -837,6 +837,72 @@
                     return { success: false, error: error };
                 }
             },
+            
+            // --- NEW: Function to REVERSE a savings withdrawal transactionally ---
+            reverseSavingsWithdrawal: async (db, txToReverse) => {
+                const { doc, serverTimestamp, runTransaction } = window.firebaseSDK;
+                
+                // Ensure we have the necessary IDs to build document references
+                if (!txToReverse || !txToReverse.employeeId || !txToReverse.id) {
+                    return { success: false, error: new Error("Invalid transaction data provided.") };
+                }
+
+                const savingsRef = doc(db, 'savingprogram', txToReverse.employeeId);
+                const transactionRef = doc(db, 'savingprogram', txToReverse.employeeId, 'transactions', txToReverse.id);
+
+                try {
+                    await runTransaction(db, async (transaction) => {
+                        const savingsDoc = await transaction.get(savingsRef);
+
+                        if (!savingsDoc.exists()) {
+                            throw new Error("Employee has no savings record. Cannot reverse.");
+                        }
+
+                        // Helper to safely parse floats
+                        const parseSafeFloat = (val) => {
+                            if (val === null || val === undefined) return 0;
+                            const num = parseFloat(val);
+                            return isNaN(num) ? 0 : num;
+                        };
+
+                        const currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
+                        let currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
+                        const currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                        const amountToReverse = parseSafeFloat(txToReverse.amountWithdrawn);
+
+                        // --- Data-Integrity Patch (same as in other functions) ---
+                        if ((currentCredit === 0 || currentCredit === null) && (currentBalance > 0 || currentWithdrawals > 0)) {
+                            console.warn(`[Savings Patch: Reversal] Fixing inconsistent data for ${txToReverse.employeeId}.`);
+                            currentCredit = currentBalance + currentWithdrawals;
+                            // Update the main doc immediately since we're in a transaction
+                            transaction.update(savingsRef, { mySavingCredit: currentCredit });
+                        }
+                        // --- END: Data-Integrity Patch ---
+                        
+                        // Calculate new totals
+                        const newWithdrawalTotal = currentWithdrawals - amountToReverse;
+                        
+                        // Use the "source of truth" formula to recalculate the balance
+                        const newBalance = currentCredit - newWithdrawalTotal;
+
+                        // Operation 1: Update the main savings document
+                        transaction.update(savingsRef, {
+                            currentBalance: newBalance,
+                            mySavingWithdrawalTotal: newWithdrawalTotal,
+                            lastUpdated: serverTimestamp()
+                        });
+                        
+                        // Operation 2: Delete the withdrawal transaction log
+                        transaction.delete(transactionRef);
+                    });
+                    
+                    console.log(`Savings withdrawal ${txToReverse.id} of ${amountToReverse} for ${txToReverse.employeeId} reversed successfully.`);
+                    return { success: true };
+                } catch (error) {
+                    console.error("Error within reverseSavingsWithdrawal transaction: ", error);
+                    return { success: false, error: error };
+                }
+            },
         };
         // --- END UTILITY FUNCTIONS ---
 
@@ -4272,8 +4338,8 @@
 
         // NEW: Phase 1 Refactoring - Daily Report Filters Component
         const DailyReportFilters = memo(({
-            userProfile, selectedShop, setSelectedShop, selectedEmployeeId, setSelectedEmployeeId, availableShops,
-            employeesInShop, filterType, setFilterType, customMonth, setCustomMonth,
+            userProfile, selectedShop, setSelectedShop, searchTerm, setSearchTerm, availableShops, // MODIFIED: Replaced employeeId props with searchTerm
+            filterType, setFilterType, customMonth, setCustomMonth, // MODIFIED: Removed employeesInShop
             selectedShift, setSelectedShift, uniqueShiftNames, onExportExcel
         }) => {
             return (
@@ -4281,16 +4347,20 @@
                     <CardTitle>Daily Attendance Report</CardTitle>
                     <div className="flex flex-wrap gap-4 items-center">
                         {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
-                            <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
+                            <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSearchTerm(''); }} className="select w-full sm:w-auto">
                                 <option value="">{userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                 {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                             </select>
                         )}
-                        {userProfile?.role !== 'Staff' && selectedShop && (
-                            <select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select w-full sm:w-auto">
-                                <option value="">All Staff</option>
-                                {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-                            </select>
+                        {/* MODIFIED: Removed '&& selectedShop' condition to make search always visible */}
+                        {userProfile?.role !== 'Staff' && (
+                            <input 
+                                type="text"
+                                placeholder="Search by name..."
+                                value={searchTerm}
+                                onChange={e => setSearchTerm(e.target.value)}
+                                className="input w-full sm:w-auto"
+                            />
                         )}
                         <select value={filterType} onChange={e => setFilterType(e.target.value)} className="select w-full sm:w-auto">
                             <option value="today">Today</option>
@@ -4361,8 +4431,8 @@
 
         // NEW: Phase 1 Refactoring - Work Day Report Filters Component
         const WorkDayReportFilters = memo(({
-            userProfile, selectedShop, setSelectedShop, selectedEmployeeId, setSelectedEmployeeId, availableShops,
-            employeesInShop, filterType, setFilterType, selectedMonth, setSelectedMonth,
+            userProfile, selectedShop, setSelectedShop, searchTerm, setSearchTerm, availableShops, // MODIFIED: Replaced employeeId props with searchTerm
+            filterType, setFilterType, selectedMonth, setSelectedMonth, // MODIFIED: Removed employeesInShop
             selectedShift, setSelectedShift, uniqueShiftNames, onExportExcel
         }) => {
             return (
@@ -4370,16 +4440,20 @@
                     <CardTitle>Monthly Work Day Report</CardTitle>
                     <div className="flex flex-wrap gap-4 items-center">
                         {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
-                            <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSelectedEmployeeId(''); }} className="select w-full sm:w-auto">
+                            <select value={selectedShop} onChange={e => { setSelectedShop(e.target.value); setSearchTerm(''); }} className="select w-full sm:w-auto">
                                 <option value="">{userProfile?.role === 'Admin' || userProfile?.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                 {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                             </select>
                         )}
-                         {userProfile?.role !== 'Staff' && selectedShop && (
-                            <select value={selectedEmployeeId} onChange={e => setSelectedEmployeeId(e.target.value)} className="select w-full sm:w-auto">
-                                <option value="">All Staff</option>
-                                {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-                            </select>
+                         {/* MODIFIED: Removed '&& selectedShop' condition to make search always visible */}
+                         {userProfile?.role !== 'Staff' && (
+                            <input 
+                                type="text"
+                                placeholder="Search by name..."
+                                value={searchTerm}
+                                onChange={e => setSearchTerm(e.target.value)}
+                                className="input w-full sm:w-auto"
+                            />
                         )}
                         <select value={filterType} onChange={e => setFilterType(e.target.value)} className="select w-full sm:w-auto">
                             <option value="thisMonth">This Month</option>
@@ -4555,7 +4629,8 @@
             const [selectedShop, setSelectedShop] = useState('');
             const [filterType, setFilterType] = useState('today');
             const [customMonth, setCustomMonth] = useState(new Date().toISOString().slice(0, 7));
-            const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+            // MODIFIED: Renamed state from selectedEmployeeId to searchTerm
+            const [searchTerm, setSearchTerm] = useState('');
             const [selectedShift, setSelectedShift] = useState('');
 
             // Data State
@@ -4632,7 +4707,8 @@
                         const attendanceData = attSnap.docs.map(d => ({id: d.id, ...d.data()}))
                             .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || rec.employeeId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (rec.employeeName && rec.employeeName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 return shopMatch && empMatch;
                             });
                         setAdminAttendance(attendanceData);
@@ -4640,15 +4716,17 @@
                         const leaveData = leaveSnap.docs.map(d => ({ id: d.id, ...d.data() }))
                             .filter(lr => {
                                 const shopMatch = !selectedShop || lr.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || lr.staffId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (lr.staffName && lr.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 const dateMatch = lr.returnDate >= startDate.toISOString().slice(0, 10);
                                 return shopMatch && empMatch && dateMatch;
                             });
 
                         const otData = otSnap.docs.map(d => ({id: d.id, ...d.data()}))
-                            .filter(rec => {
+                             .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || rec.staffId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (rec.staffName && rec.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 return shopMatch && empMatch;
                             });
                         
@@ -4666,7 +4744,7 @@
                 
                 fetchAdminData();
 
-            }, [userProfile, filterType, customMonth, selectedShop, selectedEmployeeId, db, setLoadingAdminReport, setAdminReportData]);
+            }, [userProfile, filterType, customMonth, selectedShop, searchTerm, db, setLoadingAdminReport, setAdminReportData]);
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin') {
@@ -4720,7 +4798,9 @@
 
                     const shopMatch = !selectedShop || employeeShops.includes(selectedShop);
                     const shiftMatch = !selectedShift || emp.shift === selectedShift;
-                    return emp.status === 'Active' && roleMatch && shopMatch && (!selectedEmployeeId || emp.id === selectedEmployeeId) && shiftMatch && emp.role !== 'Admin' && emp.role !== 'CEO';
+                    // MODIFIED: Use searchTerm for name matching and remove selectedEmployeeId
+                    const searchMatch = !searchTerm || emp.name.toLowerCase().includes(searchTerm.toLowerCase());
+                    return emp.status === 'Active' && roleMatch && shopMatch && searchMatch && shiftMatch && emp.role !== 'Admin' && emp.role !== 'CEO';
                 });
                 
                 // --- START BUG FIX ---
@@ -4868,10 +4948,10 @@
                     };
                 }).filter(Boolean);
                 
-                // 6. Sort and return.
+                    // 6. Sort and return.
                 return reportArray.sort((a, b) => (a.shop || '').localeCompare(b.shop || '') || b.date.localeCompare(a.date) || a.employeeName.localeCompare(b.employeeName));
                 // --- END PERFORMANCE FIX ---
-            }, [attendance, selectedShop, filterType, customMonth, selectedEmployeeId, employees, leaveRequests, otRequests, selectedShift, shops, shifts, userProfile, isReportLoading]);
+            }, [attendance, selectedShop, filterType, customMonth, searchTerm, employees, leaveRequests, otRequests, selectedShift, shops, shifts, userProfile, isReportLoading]); // MODIFIED: selectedEmployeeId -> searchTerm
 
             const handleDelete = async () => {
                 if (!recordToDelete?.docIds) return;
@@ -4985,10 +5065,11 @@
                         userProfile={userProfile}
                         selectedShop={selectedShop}
                         setSelectedShop={setSelectedShop}
-                        selectedEmployeeId={selectedEmployeeId}
-                        setSelectedEmployeeId={setSelectedEmployeeId}
+                        // MODIFIED: Pass searchTerm and setSearchTerm
+                        searchTerm={searchTerm}
+                        setSearchTerm={setSearchTerm}
                         availableShops={availableShops}
-                        employeesInShop={employeesInShop}
+                        // employeesInShop={employeesInShop} // MODIFIED: Removed unused prop
                         filterType={filterType}
                         setFilterType={setFilterType}
                         customMonth={customMonth}
@@ -5018,7 +5099,8 @@
             const [selectedShop, setSelectedShop] = useState('');
             const [filterType, setFilterType] = useState('thisMonth');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
-            const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
+            // MODIFIED: Renamed state from selectedEmployeeId to searchTerm
+            const [searchTerm, setSearchTerm] = useState('');
             const [selectedShift, setSelectedShift] = useState(''); // NEW: State for shift filter
 
             // Data States
@@ -5100,7 +5182,8 @@
                         const attendanceData = attSnap.docs.map(d => ({id: d.id, ...d.data()}))
                             .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || rec.employeeId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (rec.employeeName && rec.employeeName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 return shopMatch && empMatch;
                             });
                         setAdminAttendance(attendanceData);
@@ -5108,7 +5191,8 @@
                         const statesData = statesSnap.docs.map(d => ({id: d.id, ...d.data()}))
                             .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || rec.staffId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (rec.staffName && rec.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 return shopMatch && empMatch;
                             });
                         setAdminEmployeeStates(statesData);
@@ -5116,7 +5200,8 @@
                         const leaveData = leaveSnap.docs.map(d => ({ id: d.id, ...d.data() }))
                             .filter(lr => {
                                 const shopMatch = !selectedShop || lr.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || lr.staffId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (lr.staffName && lr.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 const dateMatch = lr.returnDate >= startDate;
                                 return shopMatch && empMatch && dateMatch;
                             });
@@ -5124,7 +5209,8 @@
                         const otData = otSnap.docs.map(d => ({id: d.id, ...d.data()}))
                              .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
-                                const empMatch = !selectedEmployeeId || rec.staffId === selectedEmployeeId;
+                                // MODIFIED: Changed from selectedEmployeeId to searchTerm for name matching
+                                const empMatch = !searchTerm || (rec.staffName && rec.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                                 return shopMatch && empMatch;
                             });
 
@@ -5142,7 +5228,7 @@
                 
                 fetchAdminData();
 
-            }, [userProfile, filterType, selectedMonth, selectedShop, selectedEmployeeId, db, setLoadingAdminReport, setAdminReportData]);
+            }, [userProfile, filterType, selectedMonth, selectedShop, searchTerm, db, setLoadingAdminReport, setAdminReportData]);
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin') {
@@ -5202,7 +5288,8 @@
                     else roleMatch = emp.id === userProfile.id; // Staff see only themselves
                     
                     const shopFilterMatch = !selectedShop || employeeShops.includes(selectedShop);
-                    const employeeFilterMatch = !selectedEmployeeId || emp.id === selectedEmployeeId;
+                    // MODIFIED: Use searchTerm for name matching
+                    const employeeFilterMatch = !searchTerm || emp.name.toLowerCase().includes(searchTerm.toLowerCase());
                     const shiftFilterMatch = !selectedShift || emp.shift === selectedShift; // NEW: Add shift filter condition
 
                     return roleMatch && shopFilterMatch && employeeFilterMatch && shiftFilterMatch && emp.role !== 'Admin' && emp.role !== 'CEO'; // NEW: Apply shift filter
@@ -5288,7 +5375,7 @@
                 
                 return report.sort((a, b) => (a.shopName || '').localeCompare(b.shopName || '') || (a.staffName || '').localeCompare(b.staffName || ''));
 
-            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, selectedEmployeeId, userProfile, selectedShift]); // NEW: Add selectedShift to dependencies
+            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, searchTerm, userProfile, selectedShift]); // MODIFIED: selectedEmployeeId -> searchTerm
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = workDayReport.map(rec => ({
@@ -5339,9 +5426,11 @@
                         userProfile={userProfile}
                         selectedShop={selectedShop}
                         setSelectedShop={setSelectedShop}
-                        setSelectedEmployeeId={setSelectedEmployeeId}
+                        // MODIFIED: Pass searchTerm and setSearchTerm
+                        searchTerm={searchTerm}
+                        setSearchTerm={setSearchTerm}
                         availableShops={availableShops}
-                        employeesInShop={employeesInShop}
+                        // employeesInShop={employeesInShop} // MODIFIED: Removed unused prop
                         filterType={filterType}
                         setFilterType={setFilterType}
                         selectedMonth={selectedMonth}
@@ -7657,157 +7746,9 @@
         
         // --- START DATA MIGRATION TAB (TEMP) ---
         // This component is for Step 2 of the refactor plan. It should be removed after use.
-        const DataMigrationTab = () => {
-            const { db } = useFirebase();
-            const { serverTimestamp } = window.firebaseSDK;
-            const [log, setLog] = useState([]);
-            const [isLoading, setIsLoading] = useState(false);
-            const [isConfirmed, setIsConfirmed] = useState(false);
-            
-            const handleRunMigration = async () => {
-                if (!isConfirmed) {
-                    alert("Please check the confirmation box to run the migration.");
-                    return;
-                }
-                
-                setIsLoading(true);
-                setLog(['Starting migration...']);
-
-                const { getDocs, collection, query, where, writeBatch, doc, deleteField } = window.firebaseSDK;
-                if (!deleteField) {
-                     setLog(prev => [...prev, 'FATAL ERROR: deleteField is not loaded in firebaseSDK. Please refresh.']);
-                     setIsLoading(false);
-                     return;
-                }
-                
-                const batch = writeBatch(db);
-                
-                try {
-                    // 1. Fetch active participants from /employees
-                    setLog(prev => [...prev, 'Fetching active participants from /employees...']);
-                    const employeesQuery = query(collection(db, "employees"), where("savingsProgramStatus", "==", "Active"));
-                    const employeesSnap = await getDocs(employeesQuery);
-                    const participants = employeesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    
-                    if (participants.length === 0) {
-                        setLog(prev => [...prev, 'No active participants found in /employees. Migration might have already run or there are no participants.']);
-                        setIsLoading(false);
-                        return;
-                    }
-                    setLog(prev => [...prev, `Found ${participants.length} active participants.`]);
-
-                    // 2. Fetch all savings balances from /employeeSavings
-                    setLog(prev => [...prev, 'Fetching current balances from /employeeSavings...']);
-                    const savingsSnap = await getDocs(collection(db, "employeeSavings"));
-                    const savingsMap = new Map(savingsSnap.docs.map(d => [d.id, d.data().currentBalance || 0]));
-                    setLog(prev => [...prev, `Found ${savingsMap.size} savings balance records.`]);
-
-                    let processedCount = 0;
-                    
-                    // 3. Loop through participants and build the batch
-                    for (const emp of participants) {
-                        const employeeId = emp.id;
-                        const currentBalance = savingsMap.get(employeeId) || 0;
-                        
-                        setLog(prev => [...prev, `[${processedCount + 1}/${participants.length}] Processing ${emp.name} (Balance: ${currentBalance})...`]);
-
-                        // 3a. Batch SET: Create new doc in /savingprogram
-                        const newSavingRef = doc(db, 'savingprogram', employeeId);
-                        const newData = {
-                            // Data from employee doc
-                            employeeId: employeeId,
-                            employeeName: emp.name,
-                            shop: Array.isArray(emp.shop) ? emp.shop[0] : emp.shop, // Denormalize primary shop
-                            savingsProgramStatus: emp.savingsProgramStatus,
-                            savingsPercentage: emp.savingsPercentage,
-                            savingsJoinDate: emp.savingsJoinDate,
-                            savingsEffectiveMonth: emp.savingsEffectiveMonth,
-                            // Data from employeeSavings doc
-                            currentBalance: currentBalance,
-                            lastUpdated: serverTimestamp() // Set a fresh timestamp
-                        };
-                        batch.set(newSavingRef, newData, { merge: true });
-
-                        // 3b. Batch UPDATE: Remove deprecated fields from /employees
-                        const employeeRef = doc(db, 'employees', employeeId);
-                        batch.update(employeeRef, {
-                            savingsProgramStatus: deleteField(),
-                            savingsPercentage: deleteField(),
-                            savingsJoinDate: deleteField(),
-                            savingsEffectiveMonth: deleteField()
-                        });
-
-                        // 3c. Batch DELETE: Delete old /employeeSavings doc
-                        if (savingsMap.has(employeeId)) {
-                            const oldSavingRef = doc(db, 'employeeSavings', employeeId);
-                            batch.delete(oldSavingRef);
-                        }
-                        
-                        processedCount++;
-                    }
-
-                    // 4. Commit batch
-                    setLog(prev => [...prev, `Batch built for ${processedCount} participants. Committing...`]);
-                    await batch.commit();
-                    
-                    setLog(prev => [...prev, '--- MIGRATION COMPLETE! ---']);
-                    setLog(prev => [...prev, 'All data has been moved to /savingprogram.']);
-                    setLog(prev => [...prev, 'Old fields removed from /employees.']);
-                    setLog(prev => [...prev, 'Old /employeeSavings collection has been cleared.']);
-                    
-                } catch (error) {
-                    console.error("Migration Error: ", error);
-                    setLog(prev => [...prev, `--- ERROR: ${error.message} ---`]);
-                    setLog(prev => [...prev, 'Migration failed. Please check the console and data.']);
-                } finally {
-                    setIsLoading(false);
-                }
-            };
-
-            return (
-                <Card>
-                    <CardTitle>Data Migration: Salary Saving Program</CardTitle>
-                    <div className="max-w-xl space-y-4">
-                        <p className="text-slate-400">This is a one-time operation to move data from `/employees` and `/employeeSavings` to the new `/savingprogram` collection as per Step 2 of the refactor plan.</p>
-                        <p className="text-yellow-400 font-semibold">Warning: Do not run this more than once. This action is irreversible.</p>
-                        
-                        <div className="p-4 border border-yellow-600 bg-yellow-900/20 rounded-lg">
-                            <div className="flex items-start">
-                                <input 
-                                    id="confirm-migration" 
-                                    type="checkbox" 
-                                    checked={isConfirmed} 
-                                    onChange={e => setIsConfirmed(e.target.checked)} 
-                                    className="h-5 w-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 mt-1" 
-                                    disabled={isLoading} 
-                                />
-                                <label htmlFor="confirm-migration" className="ml-3 text-sm text-slate-300">
-                                    I confirm that I want to run this data migration.
-                                </label>
-                            </div>
-                        </div>
-
-                        <Button 
-                            onClick={handleRunMigration}
-                            disabled={isLoading || !isConfirmed}
-                            variant="danger"
-                            className="w-full py-3 text-base"
-                        >
-                            {isLoading ? <><i className="fas fa-spinner fa-spin"></i> Running Migration...</> : <><i className="fas fa-exclamation-triangle"></i> Run Data Migration</>}
-                        </Button>
-                        
-                        {log.length > 0 && (
-                            <div className="mt-6">
-                                <h4 className="font-semibold text-slate-200">Migration Log:</h4>
-                                <pre className="mt-2 bg-slate-900/70 p-4 rounded-lg text-sm text-slate-300 h-64 overflow-y-auto font-mono">
-                                    {log.join('\n')}
-                                </pre>
-                            </div>
-                        )}
-                    </div>
-                </Card>
-            );
-        };
+        /* REMOVED: The entire 'DataMigrationTab' component (approximately 110 lines) 
+            was here. It has been deleted as requested.
+        */
         // --- END DATA MIGRATION TAB (TEMP) ---
 
         // NEW: Modal for adding/editing scheduled memos
@@ -8068,9 +8009,7 @@
                     position: 'Position Management', 
                     memo: 'Memo Alert' 
                 };
-                if (userProfile?.role === 'Admin') {
-                    baseTabs.migration = 'Data Migration';
-                }
+                // REMOVED: The logic adding the 'migration' tab has been deleted.
                 return baseTabs;
             }, [userProfile]);
 
@@ -8143,10 +8082,7 @@
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
                     {/* REVISED: Use the new memo management component */}
                     <div id="memo"><MemoAlertTab /></div>
-                    {/* NEW: Add the migration tab content, also guarded */}
-                    {userProfile?.role === 'Admin' && (
-                        <div id="migration"><DataMigrationTab /></div>
-                    )}
+                    {/* REMOVED: The div for the 'migration' tab has been deleted. */}
                 </TabbedPage>
             );
         }
