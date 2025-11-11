@@ -1,4 +1,4 @@
-    <!DOCTYPE html>
+<!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
@@ -235,9 +235,18 @@
                         const query = db.collection('products').where('vendorId', 'in', chunk);
                         
                         const unsub = query.onSnapshot(snapshot => {
-                            snapshot.docs.forEach(doc => {
-                                allProductsForPriority.set(doc.id, { id: doc.id, ...doc.data() });
+                            // --- FIX START ---
+                            // Use docChanges() to correctly handle additions, modifications, AND removals.
+                            snapshot.docChanges().forEach((change) => {
+                                if (change.type === "added" || change.type === "modified") {
+                                    allProductsForPriority.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
+                                }
+                                if (change.type === "removed") {
+                                    allProductsForPriority.delete(change.doc.id);
+                                }
                             });
+                            // --- FIX END ---
+
                             // Update state with the combined results from all chunks for this priority level.
                             setDataCallback(Array.from(allProductsForPriority.values()));
                             if(setLoadedCallback) setLoadedCallback(true); // Signal that at least one chunk has loaded.
@@ -4317,16 +4326,61 @@
         const vendorFuse = useMemo(() => new Fuse(vendors, { keys: ['name'], threshold: 0.4 }), [vendors]);
         const debouncedVendorSearch = useDebounce(vendorSearch, 300);
 
+        // --- New state for barcode validation ---
+        const [barcodeValidation, setBarcodeValidation] = useState({ status: 'idle', message: '' }); // idle, validating, valid, invalid
+        const debouncedBarcode = useDebounce(formData.barcode, 500); // Debounce barcode input
+        const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
+
         useEffect(() => {
             if (productToEdit) {
                 const initialVendor = vendors.find(v => v.id === productToEdit.vendorId);
                 setVendorSearch(initialVendor ? initialVendor.name : '');
                 setFormData({ ...initialFormState, ...productToEdit });
+                // When editing, the initial barcode is considered valid.
+                setBarcodeValidation({ status: 'idle', message: '' }); 
             } else {
                 setFormData(initialFormState);
                 setVendorSearch('');
+                setBarcodeValidation({ status: 'idle', message: '' });
             }
         }, [productToEdit, show, vendors]);
+
+        // --- New effect for barcode validation ---
+        useEffect(() => {
+            const validateBarcode = async () => {
+                const barcode = debouncedBarcode?.trim();
+
+                if (!barcode) {
+                    setBarcodeValidation({ status: 'idle', message: '' }); // No barcode, so it's fine (or use 'idle')
+                    return;
+                }
+
+                // If we are editing and the barcode hasn't changed, it's valid.
+                if (productToEdit && productToEdit.barcode === barcode) {
+                    setBarcodeValidation({ status: 'valid', message: '' });
+                    return;
+                }
+
+                setBarcodeValidation({ status: 'validating', message: '' });
+
+                try {
+                    const snapshot = await db.collection("products").where("barcode", "==", barcode).limit(1).get();
+                    if (!snapshot.empty) {
+                        const doc = snapshot.docs[0].data();
+                        setBarcodeValidation({ status: 'invalid', message: `Barcode already in use by: ${doc.name}` });
+                    } else {
+                        setBarcodeValidation({ status: 'valid', message: '' });
+                    }
+                } catch (error) {
+                    console.error("Barcode validation error:", error);
+                    // Don't block saving if validation fails, but log it.
+                    setBarcodeValidation({ status: 'idle', message: 'Could not validate barcode.' }); 
+                }
+            };
+
+            validateBarcode();
+        }, [debouncedBarcode, productToEdit]);
+
 
         useEffect(() => {
             if (debouncedVendorSearch && !formData.vendorId) {
@@ -4337,8 +4391,27 @@
             }
         }, [debouncedVendorSearch, vendorFuse, formData.vendorId]);
         
-        const handleInputChange = (e) => setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
-        const handleSubmit = (e) => { e.preventDefault(); onSave(formData, productToEdit?.id); };
+        const handleInputChange = (e) => {
+            setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
+            if (e.target.name === 'barcode') {
+                 // Reset validation on key press, let debouncer handle it
+                setBarcodeValidation({ status: 'validating', message: '' });
+            }
+        };
+
+        const handleSubmit = (e) => { 
+            e.preventDefault(); 
+            // --- Check validation before saving ---
+            if (barcodeValidation.status === 'invalid') {
+                setModalInfo({ show: true, title: "Validation Error", message: "Cannot save: The barcode is already in use by another product.", isError: true });
+                return;
+            }
+            if (barcodeValidation.status === 'validating') {
+                setModalInfo({ show: true, title: "Validation Error", message: "Please wait, barcode is currently being validated.", isError: true });
+                return;
+            }
+            onSave(formData, productToEdit?.id); 
+        };
 
         const handleInputKeyDown = (e) => {
             if (e.key === 'Enter') {
@@ -4362,6 +4435,7 @@
 
         return (
             <Modal show={show} onClose={onClose} maxWidth="max-w-4xl">
+                <MessageModal {...modalInfo} show={modalInfo.show} onClose={() => setModalInfo({ show: false })} />
                 <form onSubmit={handleSubmit}>
                     <ModalHeader title={productToEdit?.id ? "Edit Product" : "Add New Product"} onClose={onClose} />
                     <ModalBody>
@@ -4373,6 +4447,21 @@
                             <div>
                                 <label className="block text-sm font-medium text-slate-300 mb-1">Barcode</label>
                                 <input type="text" name="barcode" value={formData.barcode || ''} onChange={handleInputChange} onKeyDown={handleInputKeyDown} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md" />
+                                {/* --- New Validation Feedback --- */}
+                                <div className="h-4 mt-1 text-xs">
+                                    {barcodeValidation.status === 'validating' && (
+                                        <div className="flex items-center text-blue-400">
+                                            <div className="loader w-3 h-3 mr-2 border-2"></div>
+                                            Checking...
+                                        </div>
+                                    )}
+                                    {barcodeValidation.status === 'invalid' && (
+                                        <p className="text-red-400">{barcodeValidation.message}</p>
+                                    )}
+                                    {barcodeValidation.status === 'valid' && formData.barcode && (
+                                        <p className="text-green-400">Barcode is unique.</p>
+                                    )}
+                                </div>
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-slate-300 mb-1">Product Name</label>
@@ -4421,7 +4510,11 @@
                     </ModalBody>
                     <ModalFooter>
                         <button type="button" onClick={onClose} className="bg-slate-600 text-slate-100 font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Cancel</button>
-                        <button type="submit" className={`${productToEdit?.id ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'} text-white font-bold py-2 px-6 rounded-lg`}>
+                        <button 
+                            type="submit" 
+                            disabled={barcodeValidation.status === 'invalid' || barcodeValidation.status === 'validating'}
+                            className={`${productToEdit?.id ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'} text-white font-bold py-2 px-6 rounded-lg disabled:bg-slate-700 disabled:cursor-not-allowed`}
+                        >
                             {productToEdit?.id ? 'Update Product' : 'Add Product'}
                         </button>
                     </ModalFooter>
@@ -5019,4 +5112,3 @@
         </script>
     </body>
     </html>
-
