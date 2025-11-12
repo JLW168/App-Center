@@ -336,12 +336,50 @@
 
             const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts } = allData;
 
+            // --- FIX: MOVED TIMEZONE LOGIC UP ---
+            // We must get the employee's timezone *first* to correctly filter attendance by the local month.
+            // 1. Determine the correct "home shop" name. Prioritize the new 'primaryShop' field.
+            const employeeShopName = employee.primaryShop 
+                ? employee.primaryShop // Use the new field if it exists
+                : (Array.isArray(employee.shop) ? employee.shop[0] : employee.shop); // Fallback to old logic
+            
+            // 2. Find the shop details from the allData.shops list
+            const employeeShop = (shops || []).find(s => s.name === employeeShopName);
+            
+            // 3. Get the timezone. This will now be the timezone of the primary shop.
+            const employeeShopTimezone = employeeShop?.timezone; // e.g., 'Asia/Phnom_Penh'
+
             // --- 1. Filter data for the selected employee and month ---
-            const monthAttendance = (attendance || []).filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(selectedMonth));
+            
+            // FIX: The original filter used .toISOString().startsWith(selectedMonth), which is timezone-unaware
+            // and caused the bug. This new filter uses the employee's shop timezone to get the correct
+            // set of attendance records for their local month.
+            const monthAttendance = (attendance || []).filter(r => {
+                if (r.employeeId !== employee.id) return false;
+                if (!r.timestamp || !r.timestamp.toDate) return false;
+                // Get the record's local date (e.g., '2025-11-12') using the employee's primary shop timezone
+                const { localDate } = Utils.formatDateInTimezone(r.timestamp, employeeShopTimezone);
+                // Check if that local date's month (e.g., '2025-11') matches the selected month
+                return localDate.startsWith(selectedMonth);
+            });
             const monthLeave = (leaveRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.leaveDate.startsWith(selectedMonth));
             const monthOT = (otRequests || []).filter(r => r.staffId === employee.id && r.status === 'Approved' && r.reqDate.startsWith(selectedMonth));
             const monthStates = (employeeStates || []).filter(r => r.staffId === employee.id && r.date.startsWith(selectedMonth));
-            const activeLoan = (staffLoans || []).find(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth));
+            
+            // --- FIX: Corrected loan-finding logic ---
+            // The previous .find() logic was not deterministic and could grab the wrong loan
+            // if an employee had multiple active loans.
+            // This new logic finds ALL applicable loans and sorts them to get the one
+            // with the most recent effectiveDate that is on or before the selected month.
+            const applicableLoans = (staffLoans || [])
+                .filter(l => l.staffId === employee.id && 
+                             l.status === 'Active' && 
+                             (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth)
+                )
+                .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
+            
+            const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
+            // --- END FIX ---
 
             // --- MOVED UP: Calculate Base Salary & Salary Per Day first, as it's needed for penalty calculation ---
             const [year, month] = selectedMonth.split('-').map(Number);
@@ -369,13 +407,30 @@
             // --- 2. Calculate inputs automatically ---
             const leaveDays = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
             const otDays = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
-            const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : (activeLoan ? parseFloat(activeLoan.agreedMonthlyDeduction) || 0 : 0);
+            
+            // --- FIX: Separate auto-calculation from manual override ---
+            // 1. Calculate the "pure" automatic loan deduction first.
+            const autoLoanDeduction = (activeLoan ? parseFloat(activeLoan.agreedMonthlyDeduction) || 0 : 0);
+            // 2. Use the manual override if it exists, otherwise use the auto-value.
+            const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : autoLoanDeduction;
+            // --- END FIX ---
+            
             const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
 
-            // NEW: Get the employee's primary shop and their assigned timezone. This is crucial for all date calculations.
-            const employeeShopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
+            // --- NEW (STEP 2): Get the employee's primary shop and their assigned timezone. This is crucial for all date calculations. ---
+            // 1. Determine the correct "home shop" name. Prioritize the new 'primaryShop' field.
+            // --- THIS BLOCK (lines 2198-2207) IS NOW MOVED to line 2158 ---
+            /*
+            const employeeShopName = employee.primaryShop 
+                ? employee.primaryShop // Use the new field if it exists
+                : (Array.isArray(employee.shop) ? employee.shop[0] : employee.shop); // Fallback to old logic
+
+            // 2. Find the shop details from the allData.shops list
             const employeeShop = (shops || []).find(s => s.name === employeeShopName);
+            
+            // 3. Get the timezone. This will now be the timezone of the primary shop.
             const employeeShopTimezone = employeeShop?.timezone; // e.g., 'Asia/Phnom_Penh'
+            */
 
             const dailyRecords = {};
             monthAttendance.forEach(rec => {
@@ -450,7 +505,8 @@
             const givenOffDays = Math.floor(workDays / 6.5);
 
             // FIX: Create the autoInputs object to be returned, now including noAttendance.
-            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance };
+            // --- MODIFIED: Also add the new autoLoanDeduction field ---
+            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance, autoLoanDeduction: autoLoanDeduction };
 
             // --- 3. Perform Final Salary Calculations ---
             const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
@@ -903,6 +959,30 @@
                     return { success: false, error: error };
                 }
             },
+            
+            // --- NEW: Function to log user activity ---
+            logUserActivity: async (db, auth, action, targetInfo = {}) => {
+                const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
+                const userId = auth?.currentUser?.uid;
+                if (!db || !userId) {
+                    console.warn("User activity logging failed: DB or User not available.");
+                    return;
+                }
+
+                try {
+                    await addDoc(collection(db, 'userLogs'), {
+                        userId: userId,
+                        action: action, // e.g., "Add Employee"
+                        targetId: targetInfo.id || null, // e.g., the employee's ID
+                        targetName: targetInfo.name || null, // e.g., the employee's name
+                        originalData: targetInfo.originalData || null, // Data *before* the change
+                        updatedData: targetInfo.updatedData || null,   // Data *after* the change
+                        timestamp: serverTimestamp()
+                    });
+                } catch (error) {
+                    console.error("Failed to write user activity log:", error);
+                }
+            },
         };
         // --- END UTILITY FUNCTIONS ---
 
@@ -1238,7 +1318,7 @@
             useEffect(() => {
                 const initialData = employee 
                     ? { ...employee, permissions: employee.permissions || [] } 
-                    : { name: '', sex: 'M', dob: '', nationId: '', tel: '', shop: '', joinedDate: '', salary: '', position: '', shift: 'AM', supervisor: '', status: 'Active', email: '', uid: '', role: 'Staff', address: '', permissions: [], statusChangeDate: '', reasonForLeaving: '', savingsProgramStatus: 'Inactive', savingsPercentage: 0 }; 
+                    : { name: '', sex: 'M', dob: '', nationId: '', tel: '', shop: '', joinedDate: '', salary: '', position: '', shift: 'AM', supervisor: '', status: 'Active', email: '', uid: '', role: 'Staff', address: '', permissions: [], statusChangeDate: '', reasonForLeaving: '', savingsProgramStatus: 'Inactive', savingsPercentage: 0, primaryShop: '' }; // Add primaryShop
 
                 // When editing, ensure shop is in the right format based on role
                 if (employee) {
@@ -1247,9 +1327,22 @@
                     } else {
                         initialData.shop = Array.isArray(employee.shop) ? employee.shop[0] || '' : employee.shop || '';
                     }
+
+                    // NEW: Set initial primaryShop
+                    let defaultPrimary = '';
+                    if (employee.primaryShop) {
+                        defaultPrimary = employee.primaryShop;
+                    } else if (Array.isArray(initialData.shop)) {
+                        defaultPrimary = initialData.shop[0] || ''; // Default to first shop in array
+                    } else {
+                        defaultPrimary = initialData.shop; // Default to the single shop string
+                    }
+                    initialData.primaryShop = defaultPrimary;
+
                 } else {
                     // For new employee, default based on Staff role
                     initialData.shop = '';
+                    initialData.primaryShop = ''; // NEW
                 }
 
                 setFormData(initialData);
@@ -1273,31 +1366,49 @@
                         const newRole = value;
                         let newShopValue = prev.shop;
                         let newPermissions = prev.permissions || []; // Get current permissions
-
+                        let newPrimaryShop = prev.primaryShop; // NEW
+                        
                         if (newRole === 'Shop Manager' || newRole === 'Admin' || newRole === 'CEO') {
                             // convert to array if it's a string
                             newShopValue = Array.isArray(prev.shop) ? prev.shop : (prev.shop ? [prev.shop] : []);
                         } else {
                             // convert to string (first element) if it's an array
                             newShopValue = Array.isArray(prev.shop) ? prev.shop[0] || '' : prev.shop;
+                            // NEW: If changing to single-shop, primaryShop MUST be that shop
+                            newPrimaryShop = newShopValue;
                         }
 
                         // If role is changed to something other than Admin, remove the sysConfig permission.
                         
-                        return { ...prev, role: newRole, shop: newShopValue, permissions: newPermissions };
+                        return { ...prev, role: newRole, shop: newShopValue, permissions: newPermissions, primaryShop: newPrimaryShop }; // NEW: return with newPrimaryShop
                     });
                 } else if (type === 'checkbox') {
                     if (name === 'shop') { // Handling shop multi-select
                         setFormData(prev => {
                             const shopArray = Array.isArray(prev.shop) ? prev.shop : [];
                             const newShops = checked ? [...shopArray, value] : shopArray.filter(s => s !== value);
-                            return { ...prev, shop: newShops };
+                            
+                            // NEW: Check if primaryShop is still valid
+                            let newPrimaryShop = prev.primaryShop;
+                            if (!newShops.includes(newPrimaryShop)) {
+                                newPrimaryShop = newShops[0] || ''; // Reset to first available, or empty
+                            }
+                            
+                            return { ...prev, shop: newShops, primaryShop: newPrimaryShop }; // NEW: update primaryShop
                         });
                     } else { // Handling permissions
                         setFormData(prev => ({ ...prev, permissions: checked ? [...(prev.permissions || []), value] : (prev.permissions || []).filter(p => p !== value) }));
+                        setFormData(prev => ({ ...prev, permissions: checked ? [...(prev.permissions || []), value] : (prev.permissions || []).filter(p => p !== value) }));
                     }
                 } else {
-                    setFormData(prev => ({ ...prev, [name]: value }));
+                    // NEW: Handle single-shop change
+                    if (name === 'shop') { 
+                        // This is for single-shop roles
+                        setFormData(prev => ({ ...prev, [name]: value, primaryShop: value })); // Also update primaryShop
+                    } else {
+                        // This handles 'primaryShop' dropdown change and all others
+                        setFormData(prev => ({ ...prev, [name]: value }));
+                    }
                 }
             }, []);
 
@@ -1392,6 +1503,33 @@
                                     </div>
                                 )}
 
+                                {/* --- NEW: Primary Shop Dropdown --- */}
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Primary Shop (for Timezone)</label>
+                                    <select 
+                                        name="primaryShop" 
+                                        value={formData.primaryShop || ''} 
+                                        onChange={handleChange} 
+                                        className="select"
+                                        // Disable if not a multi-shop role OR if no shops are assigned
+                                        disabled={isViewOnly || !(formData.role === 'Shop Manager' || formData.role === 'Admin' || formData.role === 'CEO') || !formData.shop || formData.shop.length === 0}
+                                    >
+                                        <option value="">Select Primary Shop</option>
+                                        {/* Populate options based on whether shop is an array (multi-shop) 
+                                          or a string (single-shop, in which case it will be disabled anyway
+                                          but this makes it robust).
+                                        */}
+                                        {Array.isArray(formData.shop) ? (
+                                            formData.shop.map(shopName => (
+                                                <option key={shopName} value={shopName}>{shopName}</option>
+                                            ))
+                                        ) : (
+                                            formData.shop && <option value={formData.shop}>{formData.shop}</option>
+                                        )}
+                                    </select>
+                                </div>
+                                {/* --- END: Primary Shop Dropdown --- */}
+
                                 <div><label className="text-sm font-medium text-slate-400">Joined Date</label><input type="date" name="joinedDate" value={formData.joinedDate || ''} onChange={handleChange} className="input" disabled={isViewOnly} /></div>
                                 <div><label className="text-sm font-medium text-slate-400">Salary</label><input name="salary" value={formData.salary || ''} onChange={handleSalaryChange} onBlur={handleSalaryBlur} className="input" disabled={isViewOnly || (userProfile?.role === 'Shop Manager' && employee)} /></div>
                                 <div><label className="text-sm font-medium text-slate-400">Position</label><select name="position" value={formData.position || ''} onChange={handleChange} className="select" disabled={isViewOnly}><option value="">Select Position</option>{(positions || []).map(p => <option key={p.id} value={p.position}>{p.position}</option>)}</select></div>
@@ -1484,7 +1622,8 @@
         
         // NEW: ActiveEmployeesTab component to fix the reference error.
         const ActiveEmployeesTab = ({ userProfile }) => {
-            const { db } = useFirebase();
+            // MODIFIED: Added 'auth'
+            const { db, auth } = useFirebase();
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [isViewOnly, setIsViewOnly] = useState(false);
             const [editingEmployee, setEditingEmployee] = useState(null);
@@ -1587,12 +1726,34 @@
                 const { addDoc, updateDoc, doc, collection } = window.firebaseSDK;
                 const { id, ...dataToSave } = formData;
                 
+                // --- NEW LOGGING ---
+                let action = '';
+                let originalData = null;
+                let savedEmployeeId = id; // Store the ID for logging
+
                 try {
                     if (id) {
+                        action = 'Edit Employee';
+                        // Find original data *before* update
+                        const originalEmployee = employees.find(e => e.id === id);
+                        if (originalEmployee) originalData = originalEmployee;
+
                         await updateDoc(doc(db, 'employees', id), dataToSave);
                     } else {
-                        await addDoc(collection(db, 'employees'), dataToSave);
+                        action = 'Add Employee';
+                        const newDocRef = await addDoc(collection(db, 'employees'), dataToSave);
+                        savedEmployeeId = newDocRef.id; // Get the new ID
                     }
+
+                    // --- NEW: Log the activity ---
+                    Utils.logUserActivity(db, auth, action, {
+                        id: savedEmployeeId,
+                        name: dataToSave.name,
+                        originalData: originalData,
+                        updatedData: dataToSave
+                    });
+                    // --- END LOGGING ---
+
                     handleCloseModal();
                 } catch (error) {
                     console.error("Error saving employee:", error);
@@ -1833,7 +1994,8 @@
 
         // Component: Salary Revise Report Tab
         const SalaryReviseReportTab = ({ userProfile }) => {
-            const { db } = useFirebase();
+            // MODIFIED: Added 'auth'
+            const { db, auth } = useFirebase();
             const { where } = window.firebaseSDK;
             const { shops } = useAppData();
             
@@ -1894,6 +2056,16 @@
                 try {
                     const revisionRef = doc(db, 'salaryRevisions', revision.id);
                     await updateDoc(revisionRef, { status: newStatus });
+                    
+                    // --- NEW: Log the approval/rejection ---
+                    const action = newStatus === 'Approved' ? 'Approve Salary Revision' : 'Reject Salary Revision';
+                    Utils.logUserActivity(db, auth, action, {
+                        id: revision.id,
+                        name: revision.staffName,
+                        originalData: { ...revision, status: 'Pending' },
+                        updatedData: { ...revision, status: newStatus }
+                    });
+                    // --- END LOGGING ---
                     
                     // CRITICAL STEP: If approved, update the employee's main salary record.
                     // REMOVED: This line is removed to ensure historical payroll accuracy.
@@ -2383,10 +2555,16 @@
                                             name="status"
                                             value={savingsProgramStatus}
                                             onChange={e => setSavingsProgramStatus(e.target.value)}
-                                            className={`select ${savingsProgramStatus === 'Active' ? 'text-green-400' : 'text-red-400'}`}
+                                            className={`select ${
+                                                savingsProgramStatus === 'Active' ? 'text-green-400' :
+                                                savingsProgramStatus === 'Paused' ? 'text-yellow-400' :
+                                                'text-red-400'
+                                            }`}
                                             required
                                         >
                                             <option value="Active">Active</option>
+                                            {/* NEW: Added Paused option */}
+                                            <option value="Paused">Paused</option>
                                             <option value="Inactive">Inactive</option>
                                         </select>
                                     </div>
@@ -2587,7 +2765,8 @@
         // MOVED & RENAMED: from SalarySavingTab to ParticipantsTab
         // MODIFIED (STEP 4): This component is heavily refactored to use the new '/savingprogram' collection.
         const ParticipantsTab = ({ userProfile }) => {
-            const { db } = useFirebase();
+            // MODIFIED: Added 'auth'
+            const { db, auth } = useFirebase();
             // MODIFIED (STEP 4): Added setDoc and deleteField
             const { doc, updateDoc, where, setDoc, deleteField } = window.firebaseSDK;
             const { employees, shops } = useAppData();
@@ -2686,6 +2865,16 @@
                         savingsEffectiveMonth: deleteField()
                     });
                     
+                    // --- NEW: Log the activity ---
+                    const action = isEdit ? 'Edit Savings Participant' : 'Add Savings Participant';
+                    // We don't have easy access to original data here, so we'll just log the new data.
+                    Utils.logUserActivity(db, auth, action, {
+                        id: employeeId,
+                        name: employee.name,
+                        updatedData: newData
+                    });
+                    // --- END LOGGING ---
+                    
                     handleCloseSavingModal();
                 } catch (error) {
                     console.error("Error saving participant:", error);
@@ -2703,6 +2892,16 @@
                         savingsProgramStatus: 'Inactive',
                         savingsPercentage: 0
                     });
+
+                    // --- NEW: Log the activity ---
+                    Utils.logUserActivity(db, auth, 'Remove Savings Participant', {
+                        id: participantToRemove.id,
+                        name: participantToRemove.name,
+                        originalData: participantToRemove,
+                        updatedData: { ...participantToRemove, savingsProgramStatus: 'Inactive', savingsPercentage: 0 }
+                    });
+                    // --- END LOGGING ---
+
                     setParticipantToRemove(null);
                 } catch (error) {
                     console.error("Error removing participant:", error);
@@ -2785,8 +2984,11 @@
                 // 3. Apply role-based filtering
                 const roleFiltered = enrolled.filter(emp => {
                     if (!userProfile) return false;
-                    // Only show 'Active' status participants in this list
-                    if (emp.savingsProgramStatus !== 'Active') return false; 
+                    
+                    // MODIFICATION: Removed this filter. We now want to show *all*
+                    // participants (Active and Inactive) and let the new Status
+                    // column show their state.
+                    // if (emp.savingsProgramStatus !== 'Active') return false; 
                     
                     if (userProfile.role === 'Admin' || userProfile.role === 'CEO') {
                         return true; // Admins/CEOs see everyone
@@ -2863,6 +3065,9 @@
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Savings Percentage</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Effective Month</th>
                                     
+                                    {/* NEW: Added Status column header */}
+                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Status</th>
+
                                     {/* MODIFIED: Removed 'My Saving Credit' to prevent duplication */}
                                     {/* <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">My Saving Credit</th> */}
                                     
@@ -2883,6 +3088,17 @@
                                         <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(emp.savingsJoinDate)}</td>
                                         <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsPercentage}%</td>
                                         <td className="px-4 py-4 text-sm text-slate-300 text-center">{emp.savingsEffectiveMonth}</td>
+                                        
+                                        {/* NEW: Added Status column data cell */}
+                                        <td className="px-4 py-4 text-center text-sm">
+                                            <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                                                emp.savingsProgramStatus === 'Active' ? 'bg-green-100 text-green-800' :
+                                                emp.savingsProgramStatus === 'Paused' ? 'bg-yellow-100 text-yellow-800' :
+                                                'bg-slate-100 text-slate-800'
+                                            }`}>
+                                                {emp.savingsProgramStatus || 'N/A'}
+                                            </span>
+                                        </td>
                                         
                                         {/* MODIFIED: Removed 'My Saving Credit' column data */}
                                         {/* <td className="px-4 py-4 text-sm text-green-300 font-semibold text-right">{Utils.formatCurrency(emp.mySavingCredit)}</td> */}
@@ -2914,8 +3130,9 @@
                                     {/* MODIFIED: 
                                       1. Corrected colSpan from 7 to 6.
                                       2. This colSpan is now dynamic. It's 6 if actions are visible, 5 if not.
+                                      3. MODIFIED AGAIN: Increased colSpan by 1 (to 7 or 6) for the new Status column.
                                     */}
-                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager' ? 6 : 5} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager' ? 7 : 6} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
                                     <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
                                     {/* MODIFIED: Changed <em> to <td> for correct column alignment */}
                                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && <td></td>}
@@ -3525,7 +3742,8 @@
 
                     {/* --- NEW: Step 4/5 - Savings Program Balance Display --- */}
                     {/* MODIFIED (STEP 5): Logic updated to use 'savingsData' object */}
-                    {savingsData && savingsData.savingsProgramStatus === 'Active' && (
+                    {/* MODIFIED: Show card if status is 'Active' OR 'Paused' */}
+                    {savingsData && (savingsData.savingsProgramStatus === 'Active' || savingsData.savingsProgramStatus === 'Paused') && (
                         <div className="w-full max-w-md mt-8 p-4 bg-indigo-900/50 border border-indigo-700 rounded-lg text-center">
                             {/* TRANSLATED: "My Savings Program" to Khmer */}
                             <h4 className="text-lg font-semibold text-indigo-200">កម្មវិធីសន្សំរបស់ខ្ញុំ</h4>
@@ -5330,11 +5548,28 @@
                 
                 // 2. Generate a report row for each of those employees
                 const report = employeesToReportOn.map(employee => {
-                    const employeeShopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
-                    const employeeShop = shops.find(s => s.name === employeeShopName);
-                    const employeeShopTimezone = employeeShop?.timezone;
+                    // --- NEW (STEP 3): Use primaryShop for timezone. Logic must match Payroll Calculator. ---
+                    // 1. Determine the correct "home shop" name. Prioritize the new 'primaryShop' field.
+                    const employeeShopName = employee.primaryShop 
+                        ? employee.primaryShop // Use the new field if it exists
+                        : (Array.isArray(employee.shop) ? employee.shop[0] : employee.shop); // Fallback to old logic
 
-                    const monthAttendance = attendance.filter(r => r.employeeId === employee.id && r.timestamp?.toDate().toISOString().startsWith(targetMonth));
+                    // 2. Find the shop details from the 'shops' data
+                    const employeeShop = shops.find(s => s.name === employeeShopName);
+                    
+                    // 3. Get the timezone. This will now be the timezone of the primary shop.
+                    const employeeShopTimezone = employeeShop?.timezone; // e.g., 'Asia/Phnom_Penh'
+
+                    // FIX: Replaced the old timezone-unaware filter with the correct timezone-aware filter
+                    // from the Payroll Calculator to ensure consistency.
+                    const monthAttendance = (attendance || []).filter(r => {
+                        if (r.employeeId !== employee.id) return false;
+                        if (!r.timestamp || !r.timestamp.toDate) return false;
+                        // Get the record's local date (e.g., '2025-11-12') using the employee's primary shop timezone
+                        const { localDate } = Utils.formatDateInTimezone(r.timestamp, employeeShopTimezone);
+                        // Check if that local date's month (e.g., '2025-11') matches the targetMonth
+                        return localDate.startsWith(targetMonth);
+                    });
                     const monthLeave = leaveRequests.filter(r => r.staffId === employee.id && r.status === 'Approved' && r.leaveDate.startsWith(targetMonth));
                     const monthOT = otRequests.filter(r => r.staffId === employee.id && r.status === 'Approved' && r.reqDate.startsWith(targetMonth));
                     const monthStates = employeeStates.filter(r => r.staffId === employee.id && r.date.startsWith(targetMonth));
@@ -5992,6 +6227,34 @@
             // MODIFIED (STEP 5): Added 'savingsData' state
             const [savingsData, setSavingsData] = useState(null);
 
+            {/* --- NEW FIX: Fetch savings data for the selected employee --- */}
+            useEffect(() => {
+                // This effect runs when the selected employee changes.
+                if (!db || !selectedEmployeeId) {
+                    setSavingsData(null); // Clear data if no employee is selected
+                    return;
+                }
+                
+                const { doc, onSnapshot } = window.firebaseSDK;
+                // Listen to the document in the '/savingprogram' collection
+                const savingsDocRef = doc(db, 'savingprogram', selectedEmployeeId);
+
+                const unsubscribe = onSnapshot(savingsDocRef, (doc) => {
+                    if (doc.exists()) {
+                        setSavingsData(doc.data()); // Store the whole savings object
+                    } else {
+                        setSavingsData(null); // No savings record for this employee
+                    }
+                }, (error) => { 
+                    console.error("Error fetching savings data for payroll:", error); 
+                    setSavingsData(null);
+                });
+                
+                // Clean up the listener on component unmount or when employee changes
+                return () => unsubscribe();
+            }, [db, selectedEmployeeId]); // Dependency array is key
+            {/* --- END NEW FIX --- */}
+
             // NEW (Plan Step 1): Add state to hold savings withdrawal data for the selected employee/month.
             const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
 
@@ -6074,82 +6337,46 @@
             }, [editingRecord, liveInputs, liveCalculations, isRecalculated]); // Depends on live data and recalculate flag
             // --- END BUG #2 FIX ---
 
-            // MODIFIED (STEP 5): Add effect to fetch 'savingsData' for the selected employee
-            useEffect(() => {
-                if (!db || !selectedEmployeeId) {
-                    setSavingsData(null);
-                    return;
-                }
-                const { doc, onSnapshot } = window.firebaseSDK;
-                const savingsDocRef = doc(db, 'savingprogram', selectedEmployeeId);
-                const unsubscribe = onSnapshot(savingsDocRef, (doc) => {
-                    if (doc.exists()) {
-                        setSavingsData(doc.data());
-                    } else {
-                        setSavingsData(null); // No savings record for this employee
-                    }
-                }, (error) => {
-                    console.error("Error fetching savings data for payroll:", error);
-                    setSavingsData(null);
-                });
-                return () => unsubscribe();
-            }, [db, selectedEmployeeId]);
-
-            // NEW (Plan Step 1): Fetch savings withdrawals for the selected employee and month.
-            // NEW (Plan Step 1): Add effect to fetch savings withdrawal data
-            useEffect(() => {
-                if (!db || !selectedEmployeeId || !selectedMonth) {
-                    setSavingsWithdrawals([]);
-                    return;
-                }
-
-                const fetchWithdrawals = async () => {
-                    try {
-                        const { collection, query, where, getDocs } = window.firebaseSDK;
-                        
-                        // Get the start and end of the selected month
-                        const [year, month] = selectedMonth.split('-').map(Number);
-                        const startDate = new Date(year, month - 1, 1);
-                        // Get the last millisecond of the last day of the month
-                        const endDate = new Date(year, month, 0, 23, 59, 59, 999); 
-
-                        const q = query(
-                            // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
-                            collection(db, 'savingprogram', selectedEmployeeId, 'transactions'),
-                            // --- BUG FIX: Removed 'type' filter to avoid needing a composite index
-                            // on (type, date). We will filter for 'type' in Javascript.
-                            // The redundant 'where("employeeId", ...)' was already correctly removed.
-                            where("date", ">=", startDate),
-                            where("date", "<=", endDate)
-                        );
-                        
-                        const querySnapshot = await getDocs(q);
-                        // Filter for 'withdrawal' in Javascript
-                        const withdrawals = querySnapshot.docs
-                            .map(doc => ({ id: doc.id, ...doc.data() }))
-                            .filter(tx => tx.type === 'withdrawal');
-                        setSavingsWithdrawals(withdrawals);
-
-                    } catch (error) {
-                        console.error("Error fetching savings withdrawals:", error);
-                        setSavingsWithdrawals([]);
-                    }
-                };
-
-                fetchWithdrawals();
-
-            }, [db, selectedEmployeeId, selectedMonth]);
-
-            // Effect to initialize manual loan deduction ONLY for new payroll runs.
-            useEffect(() => {
-                if (!editingRecord && liveInputs.loanDeduction !== undefined && manualLoanDeduction === undefined) {
-                    setManualLoanDeduction(liveInputs.loanDeduction);
-                } else if (!editingRecord) {
-                    // If a user deselects an employee, reset the loan field to the auto-calculated one
-                    setManualLoanDeduction(liveInputs.loanDeduction);
-                }
-            }, [liveInputs.loanDeduction, editingRecord]);
+            // --- START NEW LOAN DEDUCTION BUG FIX ---
             
+            // REMOVED: The two conflicting useEffect hooks that managed
+            // manualLoanDeduction have been removed. They were:
+            
+            // --- REMOVED HOOK 1 (The "Resetter") ---
+            // useEffect(() => {
+            //     if (!editingRecord) {
+            //         setManualLoanDeduction(undefined);
+            //     }
+            // }, [selectedEmployeeId, selectedMonth, editingRecord]); // <-- FIX: Removed `allData`
+            
+            // --- REMOVED HOOK 2 (The "Populator") ---
+            // useEffect(() => {
+            //     // Use the "pure" automatic value, ignoring any manual override
+            //     if (!editingRecord && liveInputs.autoLoanDeduction !== undefined && manualLoanDeduction === undefined) {
+            //         setManualLoanDeduction(liveInputs.autoLoanDeduction);
+            //     }
+            // }, [liveInputs.autoLoanDeduction, editingRecord]); // <-- FIX: Removed `manualLoanDeduction`
+            
+
+            // NEW: This single hook now replaces the two above.
+            // It is the single source of truth for the manualLoanDeduction state
+            // when in "new payroll" mode or "recalculate" mode.
+            useEffect(() => {
+                if (!editingRecord || isRecalculated) {
+                    // We are in "new payroll" mode OR "edit and recalculated" mode.
+                    // *always* set the manual loan input to the latest auto-calculated value.
+                    // This populates "0" for no loan, "5000" for a loan, or
+                    // "undefined" if it's still loading. This fixes the stuck "0" bug.
+                    setManualLoanDeduction(liveInputs.autoLoanDeduction);
+                }
+                // If 'editingRecord' exists and 'isRecalculated' is false,
+                // the "REPLACEMENT EFFECT 2" (at line 5437) is responsible for setting
+                // the manualLoanDeduction from the saved record. This hook does nothing.
+                
+            }, [liveInputs.autoLoanDeduction, editingRecord, isRecalculated]);
+            
+            // --- END NEW LOAN DEDUCTION BUG FIX ---
+
             // Reset state when editingRecord is cleared (e.g., after a save) or on initial load
             useEffect(() => {
                 if (!editingRecord && userProfile) {
@@ -6261,7 +6488,19 @@
                     }
                     
                     if (finalInputsForSave.loanDeduction > 0) {
-                        const activeLoan = allData.staffLoans.find(loan => loan.staffId === selectedEmployee.id && loan.status === 'Active');
+                        // --- BUG FIX: Use deterministic logic to find the correct loan ---
+                        // This ensures the deduction is applied to the *correct* loan,
+                        // by finding the one with the latest effectiveDate.
+                        const applicableLoans = (allData.staffLoans || [])
+                            .filter(l => l.staffId === selectedEmployee.id && 
+                                         l.status === 'Active' &&
+                                         (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth)
+                            )
+                            .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
+
+                        const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
+                        // --- END FIX ---
+
                         if (activeLoan) {
                             const newTotalPaid = (activeLoan.totalPaid || 0) + finalInputsForSave.loanDeduction;
                             const newBalance = activeLoan.loanAmount - newTotalPaid;
@@ -8160,10 +8399,10 @@
                 // --- START MODIFICATION: Fetch all data on-demand ---
                 setProcessLog(prev => [...prev, 'Fetching all required data... This may take a moment.']);
 
-                const { collection, getDocs, query, where } = window.firebaseSDK;
+                // FIX 1: Added 'writeBatch', 'doc', and 'serverTimestamp' which are needed inside the processing loop.
+                const { collection, getDocs, query, where, writeBatch, doc, serverTimestamp } = window.firebaseSDK;
 
-                let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, savingsWithdrawals;
-                // MODIFIED (STEP 5): Add 'savingsData'
+                let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions;
                 let savingsData;
 
                 try {
@@ -8231,11 +8470,15 @@
                 }
                 
                 // Check if payroll for this shop/month already exists to prevent duplicates
+                // --- BUG FIX: This check is flawed. It checks for the whole shop, not per-employee. ---
+                // --- This logic will be removed and moved inside the loop. ---
+                /*
                 const payrollCheckQuery = query(collection(db, "payrollHistory"), where("month", "==", selectedMonth), where("shop", "==", selectedShop));
                 const existingPayrollSnap = await getDocs(payrollCheckQuery);
                 if (!existingPayrollSnap.empty) {
                      setProcessLog(prev => [...prev, `Warning: Payroll for ${selectedShop} for ${selectedMonth} may already exist. Please check history.`]);
                 }
+                */
 
                 setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
                 
@@ -8248,6 +8491,28 @@
                 let successCount = 0;
                 for (const employee of employeesToProcess) {
                     await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
+                    
+                    // --- NEW DUPLICATE CHECK (BUG FIX) ---
+                    // Check if a payroll record already exists for this specific employee and month.
+                    try {
+                        const payrollCheckQuery = query(
+                            collection(db, "payrollHistory"), 
+                            where("employeeId", "==", employee.id), 
+                            where("month", "==", selectedMonth)
+                        );
+                        const existingPayrollSnap = await getDocs(payrollCheckQuery);
+                        
+                        if (!existingPayrollSnap.empty) {
+                            // A record already exists. Log it and skip this employee.
+                            setProcessLog(prev => [...prev, `[Skipped] ${employee.name}: Payroll record already exists for ${selectedMonth}.`]);
+                            continue; // Move to the next employee
+                        }
+                    } catch (checkError) {
+                        setProcessLog(prev => [...prev, `[Error] Failed to check duplicates for ${employee.name}: ${checkError.message}`]);
+                        continue; // Skip this employee due to the check error
+                    }
+                    // --- END DUPLICATE CHECK ---
+
                     setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
 
                     // --- NEW: Fetch savings withdrawals for this specific employee and month ---
@@ -8256,13 +8521,18 @@
                         const q = query(
                             // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
                             collection(db, 'savingprogram', employee.id, 'transactions'),
-                            where("type", "==", "withdrawal"),
+                            // FIX 2 (Index Error): Removed the 'type' filter from the query. We will filter in JS.
+                            // where("type", "==", "withdrawal"), 
                             where("date", ">=", startDate),
                             where("date", "<=", endDate)
                         );
                         
                         const querySnapshot = await getDocs(q);
-                        employeeSavingsWithdrawals = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        // FIX 2 (Index Error): Apply the 'type' filter here in JavaScript
+                        employeeSavingsWithdrawals = querySnapshot.docs
+                            .map(doc => ({ id: doc.id, ...doc.data() }))
+                            .filter(tx => tx.type === 'withdrawal');
+                            
                         if (employeeSavingsWithdrawals.length > 0) {
                              setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}... (Found ${employeeSavingsWithdrawals.length} withdrawals)`]);
                         }
@@ -8292,27 +8562,46 @@
                         
                         // Handle loan deduction logic
                         if (inputs.loanDeduction > 0) {
-                            const activeLoan = staffLoans.find(loan => loan.staffId === employee.id && loan.status === 'Active');
+                            // --- BUG FIX: Use deterministic logic to find the correct loan ---
+                            // This ensures the deduction is applied to the *correct* loan,
+                            // by finding the one with the latest effectiveDate.
+                            const applicableLoans = (staffLoans || [])
+                                .filter(l => l.staffId === employee.id && 
+                                             l.status === 'Active' &&
+                                             (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth)
+                                )
+                                .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
+                            
+                            const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
+                            // --- END FIX ---
+
                             if (activeLoan) {
                                 const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
                                 const newBalance = activeLoan.loanAmount - newTotalPaid;
                                 const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
                                 
-                                const loanDocRef = doc(db, 'staffLoans', activeLoan.id);
-                                batch.update(loanDocRef, { totalPaid: newTotalPaid, status: newStatus });
+                                batch.update(doc(db, 'staffLoans', activeLoan.id), { totalPaid: newTotalPaid, status: newStatus });
                                 
-                                const paymentDocRef = doc(collection(db, 'loanPayments'));
-                                // FIX: Add the payrollDocRef.id to the loan payment for reversal tracking.
-                                batch.set(paymentDocRef, { paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, staffId: employee.id, staffName: employee.name, shop: shopName, loanId: activeLoan.id, amountPaid: inputs.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll trigger", payrollId: payrollDocRef.id });
+                                batch.set(doc(collection(db, 'loanPayments')), { 
+                                    paymentDate: `${selectedMonth}-${new Date(year, month, 0).getDate()}`, // Use year/month from above
+                                    staffId: employee.id, 
+                                    staffName: employee.name, 
+                                    shop: shopName, 
+                                    loanId: activeLoan.id, 
+                                    amountPaid: inputs.loanDeduction, 
+                                    remainingBalance: newBalance, 
+                                    note: "Paid via payroll",
+                                    payrollId: payrollDocRef.id // Link to the payroll doc
+                                });
                             }
                         }
-                        
+
+                        // --- Batch commit and Savings Contribution ---
                         try {
                             await batch.commit();
 
                             // --- NEW: Step 3 - Process Savings Contribution (after batch commit) ---
                             if (calculations.savingsDeduction > 0) {
-                                setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Saved for ${employee.name}. Processing savings...`]);
                                 // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
                                 // NEW: Log before calling
                                 console.log(`[Payroll Trigger] Calling manageSavingsContribution for ${employee.name}, Amount: ${calculations.savingsDeduction}`);
@@ -8329,6 +8618,7 @@
 
                             successCount++;
                             setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully processed for ${employee.name}.`]);
+                        
                         } catch (error) {
                              setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
                         }
