@@ -561,7 +561,6 @@
                         {canViewDashboard && (
                             <>
                                 <TabButton tabName="dashboard" label="Dashboard" isActive={activeTab === 'dashboard'} onClick={setActiveTab} />
-                                <TabButton tabName="miniSale" label="Mini Sale Report" isActive={activeTab === 'miniSale'} onClick={setActiveTab} />
                             </>
                         )}
                     </div>
@@ -574,9 +573,6 @@
                         <>
                             <div className={activeTab === 'dashboard' ? '' : 'hidden'}>
                                 <ReportsDashboard />
-                            </div>
-                            <div className={activeTab === 'miniSale' ? '' : 'hidden'}>
-                                <MiniSaleReportPage /> {/* This component is defined later, but should be in scope */}
                             </div>
                         </>
                     )}
@@ -787,9 +783,17 @@
             const { showNotification } = useNotification();
             const { doc, deleteDoc, updateDoc } = window.Firebase;
 
-            const [filters, setFilters] = useState({ shop: '', dueTime: 'Today', startDate: '', endDate: '' });
+            const [filters, setFilters] = useState({ 
+                shop: '', 
+                dueTime: 'Today', 
+                startDate: '', 
+                endDate: '',
+                month: new Date().toISOString().slice(0, 7), // Added month
+                week: '1' // Added week
+            });
             const [isSubmitting, setIsSubmitting] = useState(false);
             const [modalState, setModalState] = useState({ edit: null, delete: null, note: null, customDate: false });
+            const [isAggregated, setIsAggregated] = useState(false); // <-- NEW: State for the toggle
 
             const handleModalOpen = useCallback((type, data) => setModalState(prev => ({ ...prev, [type]: data })), []);
             const handleModalClose = useCallback((type) => setModalState(prev => ({ ...prev, [type]: null })), []);
@@ -863,55 +867,118 @@
                 
                 let filtered = userFilteredReports;
                 const { dueTime, startDate, endDate, shop } = filters;
-                const now = new Date();
+                
+                // --- START: Timezone-Correct Date Logic ---
+                // All date calculations must be relative to Cambodia's timezone (GMT+7)
+                const timeZone = 'Asia/Phnom_Penh';
+                const cambodiaOffset = 7 * 60 * 60 * 1000; // +07:00 in milliseconds
+                const now = new Date(); // The current moment in time
+
+                // Get the current Y/M/D parts *as they are in Cambodia*
+                const parts = new Intl.DateTimeFormat('en-US', {
+                    timeZone: timeZone,
+                    year: 'numeric',
+                    month: 'numeric', // 1-indexed
+                    day: 'numeric'
+                }).formatToParts(now).reduce((acc, part) => {
+                    if (part.type !== 'literal') acc[part.type] = parseInt(part.value, 10);
+                    return acc;
+                }, {});
+                // parts = { year: 2025, month: 11, day: 14 } (example)
 
                 if (dueTime === 'Today') {
-                    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-                    startOfToday.setHours(0, 0, 0, 0);
-                    filtered = userFilteredReports.filter(r => r.createdAt?.toDate() >= startOfToday);
+                    // 00:00:00 in Cambodia
+                    const startOfToday = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0) - cambodiaOffset);
+                    // 23:59:59.999 in Cambodia
+                    const endOfToday = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 23, 59, 59, 999) - cambodiaOffset);
+                    
+                    filtered = userFilteredReports.filter(r => {
+                        const reportDate = r.createdAt?.toDate();
+                        return reportDate >= startOfToday && reportDate <= endOfToday;
+                    });
                 } else if (dueTime === 'Yesterday') {
-                    const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-                    startOfYesterday.setHours(0, 0, 0, 0);
-                    const endOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-                    endOfYesterday.setHours(23, 59, 59, 999);
+                    // Get parts for yesterday in Cambodia
+                    const yesterday = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+                    const yParts = new Intl.DateTimeFormat('en-US', {
+                        timeZone: timeZone,
+                        year: 'numeric', month: 'numeric', day: 'numeric'
+                    }).formatToParts(yesterday).reduce((acc, part) => {
+                        if (part.type !== 'literal') acc[part.type] = parseInt(part.value, 10);
+                        return acc;
+                    }, {});
+                    
+                    const startOfYesterday = new Date(Date.UTC(yParts.year, yParts.month - 1, yParts.day, 0, 0, 0) - cambodiaOffset);
+                    const endOfYesterday = new Date(Date.UTC(yParts.year, yParts.month - 1, yParts.day, 23, 59, 59, 999) - cambodiaOffset);
+                    
                     filtered = userFilteredReports.filter(r => {
                         const reportDate = r.createdAt?.toDate();
                         return reportDate >= startOfYesterday && reportDate <= endOfYesterday;
                     });
+                } else if (dueTime === 'Weekly') {
+                    const [year, monthVal] = filters.month.split('-').map(Number);
+                    const monthIndex = monthVal - 1; // 0-indexed month
+                    let startDay, endDay;
+
+                    if (filters.week === '1') { startDay = 1; endDay = 7; }
+                    else if (filters.week === '2') { startDay = 8; endDay = 14; }
+                    else if (filters.week === '3') { startDay = 15; endDay = 21; }
+                    else if (filters.week === '4') { startDay = 22; endDay = 31; } // Will be capped by end of month logic
+
+                    const start = new Date(Date.UTC(year, monthIndex, startDay, 0, 0, 0) - cambodiaOffset);
+                    
+                    // Get last day of the month (e.g., day 0 of *next* month)
+                    const lastDayDate = new Date(Date.UTC(year, monthIndex + 1, 0));
+                    // Get the numeric date (e.g., 30, 31, 28)
+                    const lastDayOfMonth = lastDayDate.getUTCDate(); 
+                    
+                    const actualEndDay = (filters.week === '4') ? lastDayOfMonth : endDay;
+
+                    const end = new Date(Date.UTC(year, monthIndex, actualEndDay, 23, 59, 59, 999) - cambodiaOffset);
+
+                    filtered = userFilteredReports.filter(r => {
+                        const reportDate = r.createdAt?.toDate();
+                        return reportDate >= start && reportDate <= end;
+                    });
                 } else if (dueTime === 'This Month') {
-                    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-                    startOfMonth.setHours(0, 0, 0, 0);
-                    filtered = userFilteredReports.filter(r => r.createdAt?.toDate() >= startOfMonth);
+                    const startOfMonth = new Date(Date.UTC(parts.year, parts.month - 1, 1, 0, 0, 0) - cambodiaOffset);
+                    // Get end of this month (day 0 of next month)
+                    const endOfMonth = new Date(Date.UTC(parts.year, parts.month, 0, 23, 59, 59, 999) - cambodiaOffset);
+                    
+                    filtered = userFilteredReports.filter(r => {
+                        const reportDate = r.createdAt?.toDate();
+                        return reportDate >= startOfMonth && reportDate <= endOfMonth;
+                    });
                 } else if (dueTime === 'Last Month') {
-                    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                    startOfLastMonth.setHours(0, 0, 0, 0);
-                    const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
-                    endOfLastMonth.setHours(23, 59, 59, 999);
+                    const startOfLastMonth = new Date(Date.UTC(parts.year, parts.month - 2, 1, 0, 0, 0) - cambodiaOffset);
+                    const endOfLastMonth = new Date(Date.UTC(parts.year, parts.month - 1, 0, 23, 59, 59, 999) - cambodiaOffset);
                     filtered = userFilteredReports.filter(r => {
                         const reportDate = r.createdAt?.toDate();
                         return reportDate >= startOfLastMonth && reportDate <= endOfLastMonth;
                     });
                 } else if (dueTime === 'This Year') {
-                    const startOfYear = new Date(now.getFullYear(), 0, 1);
-                    startOfYear.setHours(0, 0, 0, 0);
-                    filtered = userFilteredReports.filter(r => r.createdAt?.toDate() >= startOfYear);
+                    const startOfYear = new Date(Date.UTC(parts.year, 0, 1, 0, 0, 0) - cambodiaOffset);
+                    // Get end of this year
+                    const endOfYear = new Date(Date.UTC(parts.year, 11, 31, 23, 59, 59, 999) - cambodiaOffset);
+
+                    filtered = userFilteredReports.filter(r => {
+                        const reportDate = r.createdAt?.toDate();
+                        return reportDate >= startOfYear && reportDate <= endOfYear;
+                    });
                 } else if (dueTime === 'Last Year') {
-                    const startOfLastYear = new Date(now.getFullYear() - 1, 0, 1);
-                    startOfLastYear.setHours(0, 0, 0, 0);
-                    const endOfLastYear = new Date(now.getFullYear() - 1, 11, 31);
-                    endOfLastYear.setHours(23, 59, 59, 999);
+                    const startOfLastYear = new Date(Date.UTC(parts.year - 1, 0, 1, 0, 0, 0) - cambodiaOffset);
+                    const endOfLastYear = new Date(Date.UTC(parts.year - 1, 11, 31, 23, 59, 59, 999) - cambodiaOffset);
                     filtered = userFilteredReports.filter(r => {
                         const reportDate = r.createdAt?.toDate();
                         return reportDate >= startOfLastYear && reportDate <= endOfLastYear;
                     });
                 } else if (dueTime === 'Custom') {
                     if (startDate && endDate) {
-                        // Parse date strings manually to create dates in local timezone
+                        // Parse date strings manually as UTC and apply offset
                         const [sy, sm, sd] = startDate.split('-').map(Number);
-                        const start = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+                        const start = new Date(Date.UTC(sy, sm - 1, sd, 0, 0, 0) - cambodiaOffset);
                         
                         const [ey, em, ed] = endDate.split('-').map(Number);
-                        const end = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+                        const end = new Date(Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - cambodiaOffset);
                         
                         filtered = userFilteredReports.filter(r => r.createdAt?.toDate() >= start && r.createdAt?.toDate() <= end);
                     } else {
@@ -919,16 +986,42 @@
                         filtered = [];
                     }
                 }
+                // --- END: Timezone-Correct Date Logic ---
                 
                 if (shop) filtered = filtered.filter(r => r.shop === shop);
                 
-                if (['Today', 'Yesterday', 'Custom'].includes(dueTime)) return { type: 'detailed', data: filtered.sort((a,b) => (b.createdAt?.toDate()?.getTime() || 0) - (a.createdAt?.toDate()?.getTime() || 0)) };
+                if (['Today', 'Yesterday', 'Custom'].includes(dueTime)) {
+                    if (isAggregated) { // <-- CHECK: If user wants to aggregate the detailed view
+                        const aggregated = filtered.reduce((acc, report) => {
+                            const key = report.shop;
+                            if (!acc[key]) acc[key] = { 
+                                period: dueTime, 
+                                shop: report.shop, 
+                                cashUsd: 0, cashKhr: 0, bankUsd: 0, bankKhr: 0, grandTotalKhr: 0 
+                            };
+                            acc[key].cashUsd += report.cashUsd || 0; acc[key].cashKhr += report.cashKhr || 0;
+                            acc[key].bankUsd += report.bankUsd || 0; acc[key].bankKhr += report.bankKhr || 0;
+                            acc[key].grandTotalKhr += report.grandTotalKhr || 0;
+                            return acc;
+                        }, {});
+                        const aggregatedData = Object.values(aggregated).sort((a,b) => (b.grandTotalKhr || 0) - (a.grandTotalKhr || 0));
+                        return { type: 'aggregated', data: aggregatedData };
+                    } else {
+                        // Original detailed view
+                        return { type: 'detailed', data: filtered.sort((a,b) => (b.createdAt?.toDate()?.getTime() || 0) - (a.createdAt?.toDate()?.getTime() || 0)) };
+                    }
+                }
                 
                 const aggregated = filtered.reduce((acc, report) => {
                     const date = report.createdAt.toDate();
-                    const period = ['This Month', 'Last Month'].includes(dueTime)
-                        ? date.toLocaleString('default', { month: 'short', year: 'numeric' })
-                        : date.getFullYear().toString();
+                    let period;
+                    if (['This Month', 'Last Month'].includes(dueTime)) {
+                        period = date.toLocaleString('default', { month: 'short', year: 'numeric' });
+                    } else if (dueTime === 'Weekly') {
+                        period = filters.month; // Changed from including week number
+                    } else { // This Year, Last Year
+                        period = date.getFullYear().toString();
+                    }
                     const key = `${period}|${report.shop}`;
                     if (!acc[key]) acc[key] = { period, shop: report.shop, cashUsd: 0, cashKhr: 0, bankUsd: 0, bankKhr: 0, grandTotalKhr: 0 };
                     acc[key].cashUsd += report.cashUsd || 0; acc[key].cashKhr += report.cashKhr || 0;
@@ -936,8 +1029,15 @@
                     acc[key].grandTotalKhr += report.grandTotalKhr || 0;
                     return acc;
                 }, {});
-                return { type: 'aggregated', data: Object.values(aggregated) };
-            }, [reports, filters, userData, availableShops]);
+                
+                const aggregatedData = Object.values(aggregated);
+
+                // Sort aggregated views (Weekly, Monthly, Yearly) by Net Sale descending
+                // This addresses the user request to show top-selling shops first for "Weekly" reports.
+                aggregatedData.sort((a, b) => (b.grandTotalKhr || 0) - (a.grandTotalKhr || 0));
+
+                return { type: 'aggregated', data: aggregatedData };
+            }, [reports, filters, userData, availableShops, isAggregated]); // <-- ADDED: isAggregated dependency
 
             const totals = useMemo(() => {
                 if (!filteredAndAggregatedData?.data) return { cashUsd: 0, cashKhr: 0, bankUsd: 0, bankKhr: 0, cashExchange: 0, netSale: 0 };
@@ -978,13 +1078,30 @@
                     }
                 };
                 return (
-                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4 p-4 bg-slate-900/50 rounded-lg items-center">
+                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4 p-4 bg-slate-900/50 rounded-lg items-end">
                         <FormSelect label="Shop" name="shop" value={filters.shop} onChange={handleFilterChange} options={[{value:'',label:'All Shops'}, ...shops.map(s=>({value:s.name, label:s.name}))]} />
-                        <FormSelect label="Due Time" name="dueTime" value={filters.dueTime} onChange={handleFilterChange} options={[
-                            {value:'Today',label:'Today'}, {value:'Yesterday',label:'Yesterday'}, {value:'This Month',label:'This Month'}, 
-                            {value:'Last Month',label:'Last Month'}, {value:'This Year',label:'This Year'}, {value:'Last Year',label:'Last Year'},
-                            {value:'Custom', label:'Custom'}
+                        <FormSelect label="Report Type" name="dueTime" value={filters.dueTime} onChange={handleFilterChange} options={[
+                            {value:'Today',label:'Today'}, {value:'Yesterday',label:'Yesterday'}, {value: 'Weekly', label: 'Weekly'},
+                            {value:'This Month',label:'This Month'}, {value:'Last Month',label:'Last Month'}, {value:'This Year',label:'This Year'},
+                            {value:'Last Year',label:'Last Year'}, {value:'Custom', label:'Custom'}
                         ]} />
+                        {filters.dueTime === 'Weekly' && (
+                            <>
+                                <FormInput label="Month" type="month" name="month" value={filters.month} onChange={handleFilterChange} />
+                                <FormSelect 
+                                    label="WCDR (Week)" 
+                                    name="week" 
+                                    value={filters.week} 
+                                    onChange={handleFilterChange} 
+                                    options={[ 
+                                        { value: '1', label: '1st Week (1-7)' }, 
+                                        { value: '2', label: '2nd Week (8-14)' }, 
+                                        { value: '3', label: '3rd Week (15-21)' }, 
+                                        { value: '4', label: '4th Week (22-End)' } 
+                                    ]} 
+                                />
+                            </>
+                        )}
                     </div>
                 );
             });
@@ -1000,7 +1117,7 @@
                                     <tr>
                                         <th className="p-3">Date & Time</th><th className="p-3">Shop</th>
                                         <th className="p-3">Staff</th>
-                                        {['Today', 'Yesterday'].includes(viewType) && <th className="p-3">Shift</th>}
+                                        {['Today', 'Yesterday', 'Custom'].includes(viewType) && <th className="p-3">Shift</th>}
                                         <th className="p-3 text-right">Net Sale (៛)</th><th className="p-3 text-right">Cash USD</th><th className="p-3 text-right">Cash KHR</th>
                                         <th className="p-3 text-right">Bank USD</th><th className="p-3 text-right">Bank KHR</th>
                                         <th className="p-3 text-right">Cash Exchange</th>
@@ -1013,7 +1130,7 @@
                                             <td className="p-3 whitespace-nowrap text-slate-400">{formatInCambodiaTime(r.createdAt)}</td>
                                             <td className="p-3 text-slate-300">{r.shop}</td>
                                             <td className="p-3 text-slate-300">{r.staff}</td>
-                                            {['Today', 'Yesterday'].includes(viewType) && <td className="p-3 text-slate-300">{r.shift}</td>}
+                                            {['Today', 'Yesterday', 'Custom'].includes(viewType) && <td className="p-3 text-slate-300">{r.shift}</td>}
                                             <td className="p-3 text-right font-bold text-blue-400">{formatCurrency(r.grandTotalKhr, 'KHR')}</td>
                                             <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashKhr, 'KHR')}</td>
                                             <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankKhr, 'KHR')}</td>
@@ -1027,7 +1144,7 @@
                                     ))}
                                 </tbody>
                                 <tfoot className="bg-slate-800 font-bold"><tr>
-                                    <td colSpan={['Today', 'Yesterday'].includes(viewType) ? 4 : 3} className="p-3 text-right text-slate-300">Sub-Total</td>
+                                    <td colSpan={['Today', 'Yesterday', 'Custom'].includes(viewType) ? 4 : 3} className="p-3 text-right text-slate-300">Sub-Total</td>
                                     <td className="p-3 text-right font-mono text-blue-400">{formatCurrency(totals.netSale, 'KHR')}</td>
                                     <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(totals.cashUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(totals.cashKhr, 'KHR')}</td>
                                     <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(totals.bankUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(totals.bankKhr, 'KHR')}</td>
@@ -1083,6 +1200,23 @@
                     </div>
                     
                     <ReportFilters filters={filters} setFilters={setFilters} shops={availableShops} onCustomClick={() => handleModalOpen('customDate', true)} />
+                    
+                    {/* --- Aggregate Toggle Checkbox (Renamed to "Total" per user request) --- */}
+                    {['Today', 'Yesterday', 'Custom'].includes(filters.dueTime) && (
+                        <div className="flex items-center gap-2 my-4 px-1">
+                            <input
+                                type="checkbox"
+                                id="aggregate-toggle"
+                                className="h-4 w-4 rounded bg-slate-700 border-slate-600 text-blue-500 focus:ring-blue-500"
+                                checked={isAggregated}
+                                onChange={(e) => setIsAggregated(e.target.checked)}
+                            />
+                            <label htmlFor="aggregate-toggle" className="text-sm font-medium text-slate-300">
+                                Total {/* Original label: "Total by Shop (Aggregate)" */}
+                            </label>
+                        </div>
+                    )}
+                    {/* --- END: Aggregate Toggle Checkbox --- */}
                     
                     {!filteredAndAggregatedData ? <div className="py-16 flex justify-center items-center"><Icon name="LoaderCircle" className="w-8 h-8 text-slate-400" /></div> :
                         (filteredAndAggregatedData.type === 'detailed') ? 
@@ -1387,173 +1521,6 @@
         };
         // --- END: Sale Report Page ---
         
-        // --- START: Mini Sale Report Page ---
-        const MiniSaleReportPage = () => {
-            const { reports, shops } = useData(); // 'reports' is alias for 'cashDrops'
-            const { userData } = useAuth(); // Get userData
-            const { showNotification } = useNotification();
-            
-            // Create availableShops based on user role
-            const availableShops = useMemo(() => {
-                if (!userData) return [];
-                return (userData.role === 'Admin' || userData.role === 'Management') 
-                    ? shops 
-                    : shops.filter(s => userData.shopIds?.includes(s.id));
-            }, [shops, userData]);
-
-            const [filters, setFilters] = useState({
-                shop: 'all',
-                month: new Date().toISOString().slice(0, 7),
-                week: '1'
-            });
-
-            const handleFilterChange = (e) => {
-                const { name, value } = e.target;
-                setFilters(prev => ({ ...prev, [name]: value }));
-            };
-
-            const dateRange = useMemo(() => {
-                let start, end;
-                const [year, month] = filters.month.split('-').map(Number);
-                const monthIndex = month - 1;
-                
-                if (filters.week === '1') {
-                    start = new Date(year, monthIndex, 1);
-                    end = new Date(year, monthIndex, 7);
-                } else if (filters.week === '2') {
-                    start = new Date(year, monthIndex, 8);
-                    end = new Date(year, monthIndex, 14);
-                } else if (filters.week === '3') {
-                    start = new Date(year, monthIndex, 15);
-                    end = new Date(year, monthIndex, 21);
-                } else if (filters.week === '4') {
-                    start = new Date(year, monthIndex, 22);
-                    end = new Date(year, monthIndex + 1, 0); // Last day of the month
-                }
-                
-                start.setHours(0, 0, 0, 0);
-                end.setHours(23, 59, 59, 999);
-                return { start, end };
-            }, [filters.month, filters.week]);
-
-            const aggregatedData = useMemo(() => {
-                // Filter reports by user's available shops first
-                const userFilteredReports = (userData.role !== 'Admin' && userData.role !== 'Management')
-                    ? reports.filter(report => availableShops.map(s => s.name).includes(report.shop))
-                    : reports;
-            
-                const filtered = userFilteredReports.filter(report => { // Use userFilteredReports
-                    if (!report.createdAt) return false;
-                    const reportDate = report.createdAt.toDate();
-                    const shopMatch = filters.shop === 'all' || report.shop === filters.shop;
-                    const dateMatch = reportDate >= dateRange.start && reportDate <= dateRange.end;
-                    return shopMatch && dateMatch;
-                });
-
-                const totals = filtered.reduce((acc, report) => {
-                    const key = report.shop;
-                    
-                    if (!acc[key]) {
-                        acc[key] = { shop: report.shop, cashKhr: 0, cashUsd: 0, bankKhr: 0, bankUsd: 0 };
-                    }
-                    acc[key].cashKhr += report.cashKhr || 0;
-                    acc[key].cashUsd += report.cashUsd || 0;
-                    acc[key].bankKhr += report.bankKhr || 0;
-                    acc[key].bankUsd += report.bankUsd || 0;
-                    return acc;
-                }, {});
-
-                // Sort by Shop Name
-                return Object.values(totals).sort((a, b) => a.shop.localeCompare(b.shop));
-
-            }, [reports, filters.shop, dateRange, userData, availableShops]); // Added dependencies
-
-            const footerTotals = useMemo(() => {
-                return aggregatedData.reduce((acc, report) => {
-                    acc.cashKhr += report.cashKhr || 0;
-                    acc.cashUsd += report.cashUsd || 0;
-                    acc.bankKhr += report.bankKhr || 0;
-                    acc.bankUsd += report.bankUsd || 0;
-                    return acc;
-                }, { cashKhr: 0, cashUsd: 0, bankKhr: 0, bankUsd: 0 });
-            }, [aggregatedData]);
-
-            const handleExport = useCallback(() => {
-                const dataToExport = aggregatedData.map((item, index) => ({
-                    'No.': index + 1,
-                    'Shop': item.shop,
-                    'Cash KHR': item.cashKhr,
-                    'Cash USD': item.cashUsd,
-                    'Bank KHR': item.bankKhr,
-                    'Bank USD': item.bankUsd,
-                }));
-                exportToExcel(dataToExport, `Mini_Sale_Report_${filters.month}_Week${filters.week}.xlsx`);
-                showNotification("Exported successfully!", "success");
-            }, [aggregatedData, filters.month, filters.week, showNotification]);
-
-            return (
-                <div className="space-y-6">
-                    <PageHeader title="Mini Sale Report" subtitle="Weekly summary of cash and bank deposits." />
-                    <Card>
-                        <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-4">
-                            <h2 className="text-xl font-bold text-slate-100">Report Filters</h2>
-                            <Button onClick={handleExport} variant="secondary" icon="Download">Export to Excel</Button>
-                        </div>
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {/* Update FormSelect options to use availableShops */}
-                            <FormSelect label="Shop" name="shop" value={filters.shop} onChange={handleFilterChange} options={[{ value: 'all', label: 'All Shops' }, ...availableShops.map(s => ({ value: s.name, label: s.name }))]} />
-                            <FormInput label="Month" type="month" name="month" value={filters.month} onChange={handleFilterChange} />
-                            <FormSelect label="WCDR (Week)" name="week" value={filters.week} onChange={handleFilterChange} options={[ { value: '1', label: '1st Week (1-7)' }, { value: '2', label: '2nd Week (8-14)' }, { value: '3', label: '3rd Week (15-21)' }, { value: '4', label: '4th Week (22-End)' } ]} />
-                        </div>
-                    </Card>
-
-                    <Card>
-                        <h2 className="text-xl font-bold mb-4 text-slate-100 border-b border-slate-700 pb-4">Report Details</h2>
-                        <div className="overflow-x-auto">
-                            <table className="w-full text-sm text-left text-slate-300">
-                                <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
-                                    <tr>
-                                        <th className="p-3">No.</th>
-                                        <th className="p-3">Shop Name</th>
-                                        <th className="p-3 text-right">Cash KHR</th>
-                                        <th className="p-3 text-right">Cash USD</th>
-                                        <th className="p-3 text-right">Bank KHR</th>
-                                        <th className="p-3 text-right">Bank USD</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-700">
-                                    {aggregatedData.length > 0 ? aggregatedData.map((item, index) => (
-                                        <tr key={item.shop} className="hover:bg-slate-700/50">
-                                            <td className="p-3">{index + 1}</td>
-                                            <td className="p-3 font-semibold text-slate-200">{item.shop}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(item.cashKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(item.cashUsd, 'USD')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(item.bankKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(item.bankUsd, 'USD')}</td>
-                                        </tr>
-                                    )) : (
-                                        <tr><td colSpan="6" className="text-center p-8 text-slate-400">No sales data for the selected period.</td></tr>
-                                    )}
-                                </tbody>
-                                {aggregatedData.length > 0 && (
-                                    <tfoot className="bg-slate-900/50 font-bold text-slate-200">
-                                        <tr>
-                                            <td colSpan="2" className="p-3 text-right">Sub Total</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(footerTotals.cashKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(footerTotals.cashUsd, 'USD')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(footerTotals.bankKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono">{formatCurrency(footerTotals.bankUsd, 'USD')}</td>
-                                        </tr>
-                                    </tfoot>
-                                )}
-                            </table>
-                        </div>
-                    </Card>
-                </div>
-            );
-        };
-        // --- END: Mini Sale Report Page ---
-
         // --- START: Purchase Order Page ---
         const useMonthlyData = (filters) => {
             const { reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings } = useData();
