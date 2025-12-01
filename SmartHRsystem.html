@@ -710,14 +710,15 @@
             // It updates the employee's total balance and creates an audit log entry simultaneously.
             // MODIFIED (STEP 3): Added 'shop' parameter for denormalization.
             // MODIFIED (Feature: Cash Deposit): Added 'note' parameter.
-            manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId, note) => {
+            // MODIFIED (Feature: Custom Date): Added 'customDate' parameter.
+            manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId, note, customDate) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
                 const savingsRef = doc(db, 'savingprogram', employeeId);
                 const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
         
                 try {
                     // NEW: Log the data being passed into the function
-                    console.log(`[Savings RUN] manageSavingsContribution called:`, { employeeId, employeeName, shop, amount, payrollId, note });
+                    console.log(`[Savings RUN] manageSavingsContribution called:`, { employeeId, employeeName, shop, amount, payrollId, note, customDate });
 
                     // Use a transaction to ensure both writes succeed or neither does.
                     await runTransaction(db, async (transaction) => {
@@ -774,11 +775,16 @@
                         }
 
                         // Operation 2: Create a new transaction log for this specific contribution.
+                        // MODIFIED: Use customDate if provided. 
+                        // FIX: Append 'T12:00:00' to customDate to force it to Local Noon. 
+                        // This prevents '2025-12-01' being treated as UTC Midnight (which could be prev day in US timezones).
+                        const transactionDate = customDate ? new Date(`${customDate}T12:00:00`) : serverTimestamp();
+
                         const logData = {
                             employeeId: employeeId,
                             staffName: employeeName, // Denormalized field
                             shop: shop || 'N/A', // FIX: Prevent undefined 'shop' from failing the transaction
-                            date: serverTimestamp(),
+                            date: transactionDate,
                             amountDeducted: amount,
                             type: 'contribution',
                             payrollId: payrollId || null,
@@ -793,6 +799,10 @@
                     return { success: true };
                 } catch (error) {
                     console.error("Error within manageSavingsContribution transaction: ", error);
+                    // NEW: Better error handling for Quota Exceeded
+                    if (error.code === 'resource-exhausted') {
+                        return { success: false, error: { message: "Daily Quota Exceeded. Please try again tomorrow or upgrade your Firebase plan." } };
+                    }
                     return { success: false, error: error };
                 }
             },
@@ -2845,6 +2855,7 @@
         const DepositModal = ({ isOpen, onClose, onSave, participant }) => {
             const [amount, setAmount] = useState('');
             const [note, setNote] = useState('');
+            const [date, setDate] = useState(''); // NEW: Date state
             const [error, setError] = useState('');
             const [isSubmitting, setIsSubmitting] = useState(false); // NEW: Loading state
 
@@ -2852,10 +2863,16 @@
                 if (isOpen) {
                     setAmount('');
                     setNote('Cash Deposit');
+                    setDate(new Date().toISOString().slice(0, 10)); // Default to today
                     setError('');
                     setIsSubmitting(false); // Reset loading state
                 }
             }, [isOpen]);
+
+            // NEW: Calculate projected total
+            const currentBalance = participant?.savingsBalance || 0;
+            const depositAmountValue = parseFloat(amount) || 0;
+            const projectedTotal = currentBalance + depositAmountValue;
 
             const handleSubmit = async (e) => { // Made async
                 e.preventDefault();
@@ -2869,7 +2886,8 @@
                 setIsSubmitting(true); // Start loading
                 
                 // Await the result to know if we should reset loading or if modal will close
-                const success = await onSave(participant.id, depositAmount, note);
+                // MODIFIED: Pass date to onSave
+                const success = await onSave(participant.id, depositAmount, note, date);
                 
                 if (!success) {
                     setIsSubmitting(false); // Only reset if failed (modal stays open)
@@ -2889,9 +2907,23 @@
                                     <label className="text-sm font-medium text-slate-400">Employee</label>
                                     <input value={participant.name} className="input" disabled />
                                 </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">Current Balance</label>
-                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Current Balance</label>
+                                        <input value={Utils.formatCurrency(currentBalance)} className="input" disabled />
+                                    </div>
+                                    {/* NEW: Date Input */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Date</label>
+                                        <input 
+                                            type="date" 
+                                            value={date} 
+                                            onChange={(e) => setDate(e.target.value)} 
+                                            className="input" 
+                                            required 
+                                            disabled={isSubmitting}
+                                        />
+                                    </div>
                                 </div>
                                 
                                 <div>
@@ -2900,11 +2932,21 @@
                                         type="number"
                                         value={amount}
                                         onChange={(e) => setAmount(e.target.value)}
-                                        className="input"
+                                        className="input font-bold text-green-400"
                                         placeholder="Enter amount"
                                         required
                                         min="100"
                                         disabled={isSubmitting} // Disable while submitting
+                                    />
+                                </div>
+
+                                {/* NEW: Total Calculation Display */}
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Total (Current + Deposit)</label>
+                                    <input 
+                                        value={Utils.formatCurrency(projectedTotal)} 
+                                        className="input font-bold text-blue-400 bg-slate-800" 
+                                        disabled 
                                     />
                                 </div>
 
@@ -2927,7 +2969,7 @@
                             <Button 
                                 type="submit" 
                                 variant="success" 
-                                disabled={!amount || parseFloat(amount) <= 0 || isSubmitting}
+                                disabled={!amount || parseFloat(amount) <= 0 || !date || isSubmitting}
                             >
                                 {isSubmitting ? <><i className="fas fa-spinner fa-spin"></i> Processing...</> : 'Confirm Deposit'}
                             </Button>
@@ -2998,15 +3040,27 @@
             const { doc, updateDoc, where, setDoc, deleteField } = window.firebaseSDK;
             const { employees, shops } = useAppData();
             
-            // MODIFIED (STEP 4): Data source is now 'savingprogram' collection
-            const { data: allSavings } = useCollection('savingprogram');
-            
             const [selectedShop, setSelectedShop] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
             
             // --- NEW: State for the sub-tabs (Active vs Inactive) ---
             const [listTab, setListTab] = useState('active');
 
+            // --- OPTIMIZATION: Only fetch the data needed for the current tab ---
+            // If tab is 'active', fetch 'Active' and 'Paused'. 
+            // If tab is 'inactive', fetch 'Inactive'.
+            // This prevents downloading hundreds of old inactive records on page load.
+            const savingsQueryConstraints = useMemo(() => {
+                if (listTab === 'active') {
+                    return [where('savingsProgramStatus', 'in', ['Active', 'Paused'])];
+                } else {
+                    return [where('savingsProgramStatus', '==', 'Inactive')];
+                }
+            }, [listTab]);
+
+            // MODIFIED: Pass constraints to useCollection
+            const { data: savingsList } = useCollection('savingprogram', savingsQueryConstraints);
+            
             const [isSavingModalOpen, setIsSavingModalOpen] = useState(false);
             const [editingParticipant, setEditingParticipant] = useState(null);
             const [participantToRemove, setParticipantToRemove] = useState(null);
@@ -3175,7 +3229,8 @@
             };
 
             // --- NEW: Handler for processing cash deposits ---
-            const handleProcessDeposit = async (employeeId, amount, note) => {
+            // MODIFIED: Accepts 'date' parameter
+            const handleProcessDeposit = async (employeeId, amount, note, date) => {
                 // SECURITY CHECK: Ensure only Admin or CEO can perform this action
                 if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
                     alert("Permission Denied: Only Administrators and CEOs can process cash deposits.");
@@ -3190,6 +3245,7 @@
                 const participantShop = Array.isArray(depositParticipant.shop) ? depositParticipant.shop[0] : depositParticipant.shop;
                 
                 // Reuse the existing contribution utility, passing the note and null for payrollId
+                // MODIFIED: Pass 'date'
                 const result = await Utils.manageSavingsContribution(
                     db,
                     employeeId,
@@ -3197,7 +3253,8 @@
                     participantShop,
                     amount,
                     null, // No payrollId for manual deposit
-                    note  // Pass the note
+                    note,  // Pass the note
+                    date   // Pass the custom date
                 );
                 
                 if (result.success) {
@@ -3234,8 +3291,8 @@
                 // 1. Create a map of all employees from context for quick lookup
                 const employeeMap = new Map((employees || []).map(e => [e.id, e]));
 
-                // 2. Map over 'allSavings' (from /savingprogram) and merge with employee data
-                const enrolled = (allSavings || []).map(savingDoc => {
+                // 2. Map over 'savingsList' (fetched based on active tab) and merge with employee data
+                const enrolled = (savingsList || []).map(savingDoc => {
                     const employeeData = employeeMap.get(savingDoc.id);
                     // Use employeeData if available, but fallback to denormalized data
                     // in savingDoc just in case (e.g., for a resigned employee).
@@ -3274,9 +3331,11 @@
                 );
                 
                 return filtered.sort((a,b) => a.name.localeCompare(b.name));
-            }, [employees, allSavings, selectedShop, searchTerm, userProfile]); 
+            }, [employees, savingsList, selectedShop, searchTerm, userProfile]); 
 
             // --- NEW: Filter by Active/Inactive Tab ---
+            // NOTE: The 'savingsList' is ALREADY filtered by the database query based on 'listTab'.
+            // However, we keep this secondary check for robust filtering in case of latency.
             const displayEmployees = useMemo(() => {
                 return enrolledEmployees.filter(emp => {
                     const status = emp.savingsProgramStatus || 'Active'; // Default to Active if undefined
@@ -3415,13 +3474,13 @@
                                                 <div className="flex items-center justify-center gap-2">
                                                     <Button variant="icon-view" icon="fa-history" onClick={() => setHistoryParticipant(emp)} title="View History"/>
                                                     
-                                                    {/* NEW: Add Deposit Button for Cash on Hand - RESTRICTED TO ADMIN/CEO */}
-                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                                    {/* NEW: Add Deposit Button for Cash on Hand - RESTRICTED TO ADMIN/CEO AND ACTIVE/PAUSED STATUS ONLY */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && emp.savingsProgramStatus !== 'Inactive' && (
                                                         <Button variant="icon-approve" icon="fa-circle-plus" onClick={() => setDepositParticipant(emp)} title="Deposit Cash" />
                                                     )}
 
-                                                    {/* MODIFIED: Allow Payback for Active/Paused users, or allow Admins to process it for Inactive too if needed. Currently keeping for all. */}
-                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                                    {/* MODIFIED: Allow Payback for Active/Paused users ONLY. Hidden for Inactive/Removed. */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && emp.savingsProgramStatus !== 'Inactive' && (
                                                         <Button variant="icon-edit-alt" icon="fa-hand-holding-dollar" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" />
                                                     )}
                                                     
@@ -3461,7 +3520,7 @@
                         participant={editingParticipant}
                         userProfile={userProfile}
                         allEmployees={employees}
-                        allSavings={allSavings} // MODIFIED (STEP 4): Pass 'allSavings' data
+                        allSavings={savingsList} // MODIFIED (STEP 4): Pass 'savingsList' data
                     />
                     <ConfirmationModal 
                         isOpen={!!participantToRemove}
@@ -3526,11 +3585,19 @@
                 const { collectionGroup, query, where, onSnapshot, orderBy } = window.firebaseSDK;
                 
                 // Query the 'transactions' subcollection across all 'savingprogram' documents
-                // FIX: Removed the orderBy('date', 'desc') from the query.
-                // This was causing a composite index error when combined with the 'where'
-                // filters below. We will sort in JavaScript instead.
                 let q = query(collectionGroup(db, 'transactions'));
                 
+                // --- QUOTA FIX: Filter by Date Range at the Database Level ---
+                // Instead of downloading EVERYTHING and filtering in JS, we only ask Firebase
+                // for the records in the selected month. This drastically reduces read usage.
+                if (selectedMonth) {
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    q = query(q, where('date', '>=', startOfMonth), where('date', '<=', endOfMonth));
+                }
+                // --- END QUOTA FIX ---
+
                 // Apply role-based filtering at the query level for security and efficiency
                 if (userProfile.role === 'Shop Manager') {
                     const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
@@ -3558,6 +3625,10 @@
                     setLoading(false);
                 }, (error) => {
                     console.error("Error fetching real-time savings transaction history:", error);
+                    // If error is due to missing index, we don't clear data, just stop loading
+                    if (error.code === 'failed-precondition') {
+                        console.warn("Index missing for this query. Create it in Firebase Console.");
+                    }
                     setTransactions([]);
                     setLoading(false);
                 });
@@ -3565,7 +3636,7 @@
                 // Clean up the listener on component unmount
                 return () => unsubscribe();
                 
-            }, [db, userProfile]); // This effect now sets up the listener
+            }, [db, userProfile, selectedMonth]); // Added selectedMonth as dependency
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
@@ -3583,31 +3654,18 @@
 
             // MODIFIED (STEP 6.C): This logic is now much simpler and uses the denormalized fields.
             const { processedTransactions, totals } = useMemo(() => {
-                // 'transactions' state is already pre-filtered by role (from useEffect).
-                // Now, we just apply the UI filters (month, shop, search).
+                // 'transactions' state is already pre-filtered by role and DATE (from useEffect).
+                // Now, we just apply the UI filters (shop, search).
                 
                 const filtered = transactions.filter(tx => {
-                    const txDate = tx.date?.toDate();
-                    if (!txDate) return false;
-
-                    // Filter 1: Month
-                    const monthMatch = !selectedMonth || txDate.toISOString().startsWith(selectedMonth);
-                    
-                    // Filter 2: Shop (using denormalized field 'tx.shop')
+                    // Filter 1: Shop (using denormalized field 'tx.shop')
                     const shopMatch = !selectedShop || tx.shop === selectedShop;
                     
-                    // Filter 3: Search Term (using denormalized field 'tx.staffName')
+                    // Filter 2: Search Term (using denormalized field 'tx.staffName')
                     const searchMatch = !searchTerm || (tx.staffName && tx.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
 
-                    return monthMatch && shopMatch && searchMatch;
+                    return shopMatch && searchMatch;
                 });
-                
-                // Data is already sorted by date from the query, so no need to sort again.
-                // MODIFIED: This comment is no longer true, but the sort is now
-                // handled in the onSnapshot callback, so the data is sorted
-                // before it even gets to this useMemo.
-                
-                // The denormalized fields are already on 'tx', so no 'map' is needed.
                 
                 const totals = filtered.reduce((acc, tx) => {
                     if (tx.type === 'contribution') {
@@ -3619,7 +3677,7 @@
                 }, { totalContributions: 0, totalWithdrawals: 0 });
 
                 return { processedTransactions: filtered, totals };
-            }, [transactions, selectedMonth, selectedShop, searchTerm]); // Removed 'employees' dependency
+            }, [transactions, selectedShop, searchTerm]); // Removed selectedMonth as it's handled in query
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = processedTransactions.map(tx => ({ 
@@ -3739,6 +3797,15 @@
                 
                 let q = query(collectionGroup(db, 'transactions'));
                 
+                // --- QUOTA FIX: Filter by Date Range at the Database Level ---
+                if (selectedMonth) {
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    q = query(q, where('date', '>=', startOfMonth), where('date', '<=', endOfMonth));
+                }
+                // --- END QUOTA FIX ---
+
                 // Security Filters
                 if (userProfile.role === 'Shop Manager') {
                     const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
@@ -3763,7 +3830,7 @@
                 });
 
                 return () => unsubscribe();
-            }, [db, userProfile]);
+            }, [db, userProfile, selectedMonth]); // Added selectedMonth
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
@@ -3782,11 +3849,12 @@
             // Filter logic specific for Cash Deposits
             const { depositTransactions, totalDeposits } = useMemo(() => {
                 const filtered = transactions.filter(tx => {
-                    const txDate = tx.date?.toDate();
-                    if (!txDate) return false;
-
-                    const monthMatch = !selectedMonth || txDate.toISOString().startsWith(selectedMonth);
+                    // Date filtering is now done at the query level, but we keep this for safety
+                    
+                    // Filter 1: Shop
                     const shopMatch = !selectedShop || tx.shop === selectedShop;
+                    
+                    // Filter 2: Search
                     const searchMatch = !searchTerm || (tx.staffName && tx.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
                     
                     // --- CRITICAL FILTER FOR CASH DEPOSITS ---
@@ -3794,13 +3862,13 @@
                     // 2. Must NOT have a payrollId (payroll deductions have IDs)
                     const isCashDeposit = tx.type === 'contribution' && !tx.payrollId;
 
-                    return monthMatch && shopMatch && searchMatch && isCashDeposit;
+                    return shopMatch && searchMatch && isCashDeposit;
                 });
                 
                 const total = filtered.reduce((sum, tx) => sum + (tx.amountDeducted || 0), 0);
 
                 return { depositTransactions: filtered, totalDeposits: total };
-            }, [transactions, selectedMonth, selectedShop, searchTerm]);
+            }, [transactions, selectedShop, searchTerm]); // Removed selectedMonth
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = depositTransactions.map(tx => ({ 
@@ -4453,6 +4521,14 @@
                     alert("Please select a shop for the leave request.");
                     return;
                 }
+
+                // --- BUG FIX: Validation to prevent 0 days or negative dates ---
+                if (formData.numberOfDays <= 0) {
+                    alert("Invalid date range. The Return Date cannot be before the Leave Date.");
+                    return;
+                }
+                // --- END FIX ---
+
                 const dataToSave = { ...formData };
                 if (dataToSave.leaveDate && dataToSave.leaveDate === dataToSave.returnDate) {
                     const returnDate = new Date(dataToSave.returnDate);
