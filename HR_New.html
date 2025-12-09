@@ -74,7 +74,17 @@
         .policy-content u { text-decoration: underline; }
         .policy-content pre { background-color: #1e293b; padding: 1rem; border-radius: 0.5rem; white-space: pre-wrap; }
         .policy-content blockquote { border-left: 4px solid #475569; padding-left: 1rem; margin-left: 0; color: #94a3b8; }
-        /* NEW: Animation for success message */
+        
+        /* NEW: Correct Animation for Dashboard (Stays Visible) */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.6s ease-out forwards;
+        }
+
+        /* OLD: Animation for temporary toasts (Fades Out) */
         @keyframes fadeInOut {
             0% { opacity: 0; transform: translateY(-20px); }
             10% { opacity: 1; transform: translateY(0); }
@@ -589,37 +599,35 @@
             // Create role-based query constraints to prevent permission errors.
             const employeeQueryConstraints = useMemo(() => {
                 if (!userProfile) {
-                    // While loading or logged out, fetch no employees.
                     return [where("uid", "==", "null")];
                 }
                 const { role, uid } = userProfile;
                 if (role === 'Admin' || role === 'CEO' || role === 'Shop Manager') {
-                    // Admins, CEOs, and Managers need the full list for dropdowns and management tasks.
-                    // This assumes security rules permit them to read the whole collection.
                     return [];
                 }
-                // Staff role should only fetch their own document to avoid permission errors.
                 return [where("uid", "==", uid)];
             }, [userProfile]);
 
             // Use one-time static fetches for data that doesn't change often.
-            // This is more efficient than real-time listeners for this type of data.
             const { data: employees, loading: employeesLoading } = useCollection('employees', employeeQueryConstraints);
             const { data: shops, loading: shopsLoading } = useStaticCollection('shops');
             const { data: shifts, loading: shiftsLoading } = useStaticCollection('shifts');
             const { data: positions, loading: positionsLoading } = useStaticCollection('positions');
+            
+            // NEW: Fetch Expense Categories in real-time so updates in Settings reflect immediately in the Expense Report
+            const { data: expenseCategories, loading: categoriesLoading } = useCollection('expenseCategories');
 
             // Combine all loading states into a single flag.
-            const isLoading = employeesLoading || shopsLoading || shiftsLoading || positionsLoading;
+            const isLoading = employeesLoading || shopsLoading || shiftsLoading || positionsLoading || categoriesLoading;
 
-            // Memoize the context value to prevent unnecessary re-renders of consumers.
             const value = useMemo(() => ({
                 employees,
                 shops,
                 shifts,
                 positions,
+                expenseCategories, // Expose categories to the app
                 isLoading
-            }), [employees, shops, shifts, positions, isLoading]);
+            }), [employees, shops, shifts, positions, expenseCategories, isLoading]);
 
             return (
                 <AppDataContext.Provider value={value}>
@@ -709,14 +717,16 @@
             // This function transactionally processes a savings contribution to ensure data integrity.
             // It updates the employee's total balance and creates an audit log entry simultaneously.
             // MODIFIED (STEP 3): Added 'shop' parameter for denormalization.
-            manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId) => {
+            // MODIFIED (Feature: Cash Deposit): Added 'note' parameter.
+            // MODIFIED (Feature: Custom Date): Added 'customDate' parameter.
+            manageSavingsContribution: async (db, employeeId, employeeName, shop, amount, payrollId, note, customDate) => {
                 const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
                 const savingsRef = doc(db, 'savingprogram', employeeId);
                 const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
         
                 try {
                     // NEW: Log the data being passed into the function
-                    console.log(`[Savings RUN] manageSavingsContribution called:`, { employeeId, employeeName, shop, amount, payrollId });
+                    console.log(`[Savings RUN] manageSavingsContribution called:`, { employeeId, employeeName, shop, amount, payrollId, note, customDate });
 
                     // Use a transaction to ensure both writes succeed or neither does.
                     await runTransaction(db, async (transaction) => {
@@ -728,44 +738,29 @@
                             return isNaN(num) ? 0 : num;
                         };
                         
-                        let currentCredit = 0;
-                        let currentWithdrawals = 0;
-                        // --- NEW: Add currentBalance for the patch ---
                         let currentBalance = 0;
+                        let currentWithdrawals = 0;
 
                         if (savingsDoc.exists()) {
                             // --- Doc EXISTS, read values ---
-                            currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
-                            currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
-                            // --- NEW: Read currentBalance ---
                             currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
+                            currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
                         }
 
-                        // --- NEW: Data-Integrity Patch (as requested) ---
-                        // This patch detects and fixes legacy data where mySavingCredit was 0
-                        // (or null) but currentBalance was correct.
-                        if ((currentCredit === 0 || currentCredit === null) && currentBalance > 0) {
-                            console.warn(`[Savings Patch: Contribution] Fixing inconsistent data for ${employeeId}.`);
-                            // Back-calculate the correct total credit.
-                            // This new 'currentCredit' value will be used in the calculation below.
-                            currentCredit = currentBalance + currentWithdrawals;
-                        }
-                        // --- END: Data-Integrity Patch ---
+                        // --- NEW LOGIC: DIRECT SUMMATION (User Request) ---
+                        // We prioritize the "Total Accumulated Savings" (currentBalance) as the source of truth.
+                        // New Balance = Current Balance + Deposit Amount
+                        const newBalance = currentBalance + amount;
                         
-                        // NEW: Log the values read from the database
-                        console.log(`[Savings TX] Read values:`, { currentCredit, currentWithdrawals });
-
-                        // --- Calculate new values ---
-                        const newCredit = currentCredit + amount;
-                        const newBalance = newCredit - currentWithdrawals;
+                        // We assume Credit = Balance + Withdrawals. We recalculate Credit to ensure consistency.
+                        // This fixes any legacy data issues where Credit might be 0 or out of sync.
+                        const newCredit = newBalance + currentWithdrawals;
 
                         // NEW: Log the values to be written
-                        console.log(`[Savings TX] Calculated new values:`, { newCredit, newBalance });
+                        console.log(`[Savings TX] Updating Balance: ${currentBalance} -> ${newBalance} (Credit set to ${newCredit})`);
 
                         if (savingsDoc.exists()) {
                             // --- Operation 1: UPDATE existing document ---
-                            // This is the most significant change. We are now using 'update'
-                            // instead of 'set with merge' for existing documents.
                             transaction.update(savingsRef, { 
                                 currentBalance: newBalance, 
                                 mySavingCredit: newCredit,
@@ -773,32 +768,36 @@
                             });
                         } else {
                             // --- Operation 1: SET new document ---
-                            // This path should only be hit if handleSaveParticipant failed.
-                            // We set all data, knowing that percentage/join date might be missing.
-                            // NEW: Log a warning if this path is taken
                             console.warn(`[Savings TX] Savings doc for ${employeeName} did not exist. Creating new doc.`);
                             transaction.set(savingsRef, { 
                                 currentBalance: newBalance, 
                                 mySavingCredit: newCredit, 
-                                mySavingWithdrawalTotal: currentWithdrawals, // which is 0
+                                mySavingWithdrawalTotal: currentWithdrawals, // 0
                                 employeeId: employeeId,
                                 employeeName: employeeName,
                                 shop: shop, 
-                                lastUpdated: serverTimestamp()
-                                // Note: savingsPercentage etc. will be missing if this path is hit,
-                                // which indicates a bug in the 'Add Participant' logic.
+                                lastUpdated: serverTimestamp(),
+                                savingsProgramStatus: 'Active', // Default
+                                savingsPercentage: 0 // Default
                             });
                         }
 
                         // Operation 2: Create a new transaction log for this specific contribution.
+                        // MODIFIED: Use customDate if provided. 
+                        // FIX: Append 'T12:00:00' to customDate to force it to Local Noon. 
+                        // This prevents '2025-12-01' being treated as UTC Midnight (which could be prev day in US timezones).
+                        const transactionDate = customDate ? new Date(`${customDate}T12:00:00`) : serverTimestamp();
+
                         const logData = {
                             employeeId: employeeId,
                             staffName: employeeName, // Denormalized field
                             shop: shop || 'N/A', // FIX: Prevent undefined 'shop' from failing the transaction
-                            date: serverTimestamp(),
+                            date: transactionDate,
                             amountDeducted: amount,
                             type: 'contribution',
-                            payrollId: payrollId
+                            payrollId: payrollId || null,
+                            // MODIFIED (Feature: Cash Deposit): Smart default for the note
+                            note: note || (payrollId ? 'Payroll Deduction' : 'Manual Cash Deposit') 
                         };
                         // NEW: Log the data being written to the subcollection
                         console.log(`[Savings TX] Writing log data:`, logData);
@@ -808,6 +807,10 @@
                     return { success: true };
                 } catch (error) {
                     console.error("Error within manageSavingsContribution transaction: ", error);
+                    // NEW: Better error handling for Quota Exceeded
+                    if (error.code === 'resource-exhausted') {
+                        return { success: false, error: { message: "Daily Quota Exceeded. Please try again tomorrow or upgrade your Firebase plan." } };
+                    }
                     return { success: false, error: error };
                 }
             },
@@ -1092,23 +1095,50 @@
             const [loading, setLoading] = useState(false);
             const [showPassword, setShowPassword] = useState(false);
 
+            // --- NEW: State for System Initialization ---
+            const [showInitUI, setShowInitUI] = useState(false);
+            const [initCode, setInitCode] = useState('');
+            const [pendingUser, setPendingUser] = useState(null); // Stores the authenticated user while waiting for the code
+
+            // *** SECURITY CONFIGURATION ***
+            // Change this code to something secret before deploying!
+            const SYSTEM_INIT_CODE = "HR2025"; 
+
             const handleLogin = useCallback(async (e) => {
                 e.preventDefault();
                 if (!auth || !db) { setError("System not ready. Please try again."); return; }
                 setLoading(true);
                 setError('');
                 try {
-                    const { signInWithEmailAndPassword, signOut, collection, query, where, getDocs, doc, updateDoc } = window.firebaseSDK;
+                    const { signInWithEmailAndPassword, signOut, collection, query, where, getDocs, doc, updateDoc, addDoc, limit } = window.firebaseSDK;
+                    
+                    // 1. Authenticate with Firebase Auth
                     const userCredential = await signInWithEmailAndPassword(auth, email, password);
                     const user = userCredential.user;
                     
-                    // Verify user has an active employee profile by email
+                    // 2. Check if this user has an employee profile
                     const q = query(collection(db, "employees"), where("email", "==", user.email));
                     const querySnapshot = await getDocs(q);
 
                     if (querySnapshot.empty) {
-                        await signOut(auth);
-                        setError("No employee record found for this user.");
+                        // --- NEW: SYSTEM BOOTSTRAP LOGIC WITH SECURITY CHECK ---
+                        // If no profile found, check if the ENTIRE system is empty (fresh install)
+                        const allEmployeesQuery = query(collection(db, "employees"), limit(1));
+                        const allEmployeesSnap = await getDocs(allEmployeesQuery);
+
+                        if (allEmployeesSnap.empty) {
+                            // SYSTEM IS EMPTY: Do NOT create admin yet.
+                            // Instead, store the user and show the Initialization Code UI.
+                            console.log("Fresh system detected. Requesting Initialization Code...");
+                            setPendingUser(user);
+                            setShowInitUI(true);
+                            setLoading(false); 
+                            return; // Stop here and wait for the code
+                        } else {
+                            // System has users, but THIS user is not one of them.
+                            await signOut(auth);
+                            setError("No employee record found for this user.");
+                        }
                     } else {
                         const employeeDoc = querySnapshot.docs[0];
                         const employeeData = employeeDoc.data();
@@ -1126,12 +1156,108 @@
                         }
                     }
                 } catch (err) {
-                    setError('Failed to login. Please check your credentials.');
-                    console.error(err);
+                    if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
+                        setError('Invalid email or password.');
+                    } else {
+                        setError('Failed to login. Please check connection.');
+                        console.error(err);
+                    }
+                } finally {
+                    // Only stop loading if we didn't trigger the Init UI
+                    if (!showInitUI) setLoading(false);
+                }
+            }, [auth, db, email, password, showInitUI]); // Added showInitUI dependency
+
+            // --- NEW: Handler for the Initialization Code Submit ---
+            const handleInitSubmit = async (e) => {
+                e.preventDefault();
+                setError('');
+                setLoading(true);
+
+                if (initCode !== SYSTEM_INIT_CODE) {
+                    setError("Incorrect Initialization Code.");
+                    setLoading(false);
+                    return;
+                }
+
+                try {
+                    const { addDoc, collection } = window.firebaseSDK;
+                    
+                    // Code is correct! Create the Super Admin profile.
+                    console.log("Code verified. Creating Super Admin profile...");
+                    
+                    await addDoc(collection(db, "employees"), {
+                        uid: pendingUser.uid,
+                        email: pendingUser.email,
+                        name: "System Admin", 
+                        role: "Admin",        
+                        status: "Active",
+                        joinedDate: new Date().toISOString().slice(0, 10),
+                        position: "Administrator",
+                        shop: "Head Office",
+                        salary: 0,
+                        permissions: ['policy', 'employees', 'checkinme', 'attendanceReport', 'payroll', 'hrBanking', 'salaryReport', 'expenseReport', 'userActivity', 'settings']
+                    });
+
+                    alert("System Initialized Successfully! You are now the Super Admin.");
+                    // No need to reload; the onAuthStateChanged listener in AppContent will detect the new profile.
+                    // Just reset the UI state to let the Dashboard render.
+                    setShowInitUI(false); 
+                    
+                } catch (err) {
+                    console.error("Error creating admin:", err);
+                    setError("Failed to create admin profile. Check console.");
                 } finally {
                     setLoading(false);
                 }
-            }, [auth, db, email, password]);
+            };
+
+            // --- NEW: Render the Initialization Code Form if triggered ---
+            if (showInitUI) {
+                return (
+                    <div className="flex items-center justify-center min-h-screen bg-slate-900">
+                        <div className="w-full max-w-md p-8 space-y-8 bg-slate-800 rounded-2xl shadow-lg border border-yellow-600">
+                            <div className="text-center">
+                                <i className="fas fa-shield-halved text-5xl text-yellow-500"></i>
+                                <h2 className="mt-6 text-3xl font-bold text-white">System Initialization</h2>
+                                <p className="mt-2 text-sm text-slate-400">
+                                    This database is empty. To claim the <strong>Admin</strong> role, please enter the system initialization code.
+                                </p>
+                            </div>
+                            <form className="mt-8 space-y-6" onSubmit={handleInitSubmit}>
+                                <div>
+                                    <label htmlFor="init-code" className="sr-only">Initialization Code</label>
+                                    <input 
+                                        id="init-code" 
+                                        name="code" 
+                                        type="password" 
+                                        required 
+                                        className="appearance-none rounded relative block w-full px-3 py-3 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 focus:outline-none focus:ring-yellow-500 focus:border-yellow-500 sm:text-sm text-center tracking-widest" 
+                                        placeholder="ENTER CODE" 
+                                        value={initCode} 
+                                        onChange={(e) => setInitCode(e.target.value)} 
+                                    />
+                                </div>
+                                {error && <p className="text-red-500 text-sm text-center font-bold animate-pulse">{error}</p>}
+                                <div>
+                                    <Button type="submit" variant="primary" disabled={loading} className="w-full py-3 bg-yellow-600 hover:bg-yellow-700 focus:ring-yellow-500">
+                                        {loading ? <i className="fas fa-spinner fa-spin"></i> : 'Verify & Initialize'}
+                                    </Button>
+                                </div>
+                                <div className="text-center">
+                                    <button 
+                                        type="button" 
+                                        onClick={() => { setShowInitUI(false); setPendingUser(null); window.firebaseSDK.signOut(auth); }}
+                                        className="text-sm text-slate-500 hover:text-slate-300 underline"
+                                    >
+                                        Cancel
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            }
 
             return (
                 <div className="flex items-center justify-center min-h-screen bg-slate-900">
@@ -1291,7 +1417,24 @@
                 return [];
             }, [userProfile, shops]);
             
-            const supervisors = useMemo(() => (allEmployees || []).filter(e => e.role === 'Shop Manager' && e.status === 'Active'), [allEmployees]);
+            // MODIFIED: Filter supervisors to only show Shop Managers assigned to the selected shop(s)
+            const supervisors = useMemo(() => {
+                // Ensure we always work with an array of selected shops
+                const selectedShops = Array.isArray(formData.shop) ? formData.shop : (formData.shop ? [formData.shop] : []);
+
+                // If no shop is selected, return empty list
+                if (selectedShops.length === 0) return [];
+
+                return (allEmployees || []).filter(e => {
+                    if (e.role !== 'Shop Manager' || e.status !== 'Active') return false;
+                    
+                    // Get the manager's assigned shops
+                    const managerShops = Array.isArray(e.shop) ? e.shop : (e.shop ? [e.shop] : []);
+                    
+                    // Check if the manager covers ANY of the selected shops
+                    return managerShops.some(s => selectedShops.includes(s));
+                });
+            }, [allEmployees, formData.shop]);
 
             const availablePages = useMemo(() => [
                 { key: 'employees', label: 'Employees' },
@@ -1394,7 +1537,8 @@
                                 newPrimaryShop = newShops[0] || ''; // Reset to first available, or empty
                             }
                             
-                            return { ...prev, shop: newShops, primaryShop: newPrimaryShop }; // NEW: update primaryShop
+                            // MODIFIED: Reset supervisor if shop selection changes
+                            return { ...prev, shop: newShops, primaryShop: newPrimaryShop, supervisor: '' }; 
                         });
                     } else { // Handling permissions
                         setFormData(prev => ({ ...prev, permissions: checked ? [...(prev.permissions || []), value] : (prev.permissions || []).filter(p => p !== value) }));
@@ -1404,7 +1548,8 @@
                     // NEW: Handle single-shop change
                     if (name === 'shop') { 
                         // This is for single-shop roles
-                        setFormData(prev => ({ ...prev, [name]: value, primaryShop: value })); // Also update primaryShop
+                        // MODIFIED: Reset supervisor if shop selection changes
+                        setFormData(prev => ({ ...prev, [name]: value, primaryShop: value, supervisor: '' })); 
                     } else {
                         // This handles 'primaryShop' dropdown change and all others
                         setFormData(prev => ({ ...prev, [name]: value }));
@@ -1723,7 +1868,8 @@
 
             // Handler for saving a new or edited employee.
             const handleSaveEmployee = async (formData) => {
-                const { addDoc, updateDoc, doc, collection } = window.firebaseSDK;
+                // MODIFIED: Added setDoc and serverTimestamp for the auto-savings feature
+                const { addDoc, updateDoc, doc, collection, setDoc, serverTimestamp } = window.firebaseSDK;
                 const { id, ...dataToSave } = formData;
                 
                 // --- NEW LOGGING ---
@@ -1743,6 +1889,33 @@
                         action = 'Add Employee';
                         const newDocRef = await addDoc(collection(db, 'employees'), dataToSave);
                         savedEmployeeId = newDocRef.id; // Get the new ID
+
+                        // --- NEW FEATURE: Auto-Add to Savings Program (Default 5%) ---
+                        try {
+                            const today = new Date();
+                            const savingsDefaults = {
+                                employeeId: savedEmployeeId,
+                                employeeName: dataToSave.name,
+                                // Ensure shop is a string. If array (multi-shop manager), take the first one.
+                                shop: Array.isArray(dataToSave.shop) ? (dataToSave.shop[0] || '') : (dataToSave.shop || ''),
+                                savingsProgramStatus: 'Active',
+                                savingsPercentage: 5, // Request: Default to 5%
+                                savingsJoinDate: today.toISOString().slice(0, 10), // Request: Current Date
+                                savingsEffectiveMonth: today.toISOString().slice(0, 7), // Request: Current Month
+                                currentBalance: 0,
+                                mySavingCredit: 0,
+                                mySavingWithdrawalTotal: 0,
+                                lastUpdated: serverTimestamp()
+                            };
+
+                            // Create the savings record immediately
+                            await setDoc(doc(db, 'savingprogram', savedEmployeeId), savingsDefaults);
+                            console.log(`Auto-enrolled ${dataToSave.name} in Savings Program with 5%.`);
+                        } catch (savingsError) {
+                            console.error("Failed to auto-enroll new employee in savings program:", savingsError);
+                            // We don't block the main employee creation if this fails, but we log it.
+                        }
+                        // --- END NEW FEATURE ---
                     }
 
                     // --- NEW: Log the activity ---
@@ -2592,17 +2765,17 @@
 
         // NEW: Modal for processing a savings payback
         const PaybackModal = ({ isOpen, onClose, onSave, participant }) => {
-            const [amount, setAmount] = useState(0); // MODIFIED: Initialize to 0
+            const [amount, setAmount] = useState(0); 
             const [note, setNote] = useState('');
             const [error, setError] = useState('');
-            const [selectedPercentage, setSelectedPercentage] = useState(null); // NEW: State for active button
+            const [selectedPercentage, setSelectedPercentage] = useState(null); 
 
             useEffect(() => {
                 if (isOpen) {
-                    setAmount(0); // MODIFIED: Reset to 0
+                    setAmount(0);
                     setNote('');
                     setError('');
-                    setSelectedPercentage(null); // NEW: Reset percentage
+                    setSelectedPercentage(null); 
                 }
             }, [isOpen]);
             
@@ -2619,13 +2792,12 @@
                 e.preventDefault();
                 const paybackAmount = parseFloat(amount);
                 
-                // MODIFIED: Check for 0 or NaN
                 if (isNaN(paybackAmount) || paybackAmount <= 0) { 
                     setError('Please select a valid payback percentage.');
                     return;
                 }
                 if (paybackAmount > participant.savingsBalance) {
-                    setError('Payback amount cannot exceed the total savings. This should not happen.');
+                    setError('Payback amount cannot exceed the total savings.');
                     return;
                 }
                 onSave(participant.id, paybackAmount, note);
@@ -2644,53 +2816,48 @@
                                     <input value={participant.name} className="input" disabled />
                                 </div>
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400">Total Accumulated Savings</label>
-                                <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
-                            </div>
-                            
-                            {/* --- REVISED: Payback Amount Section --- */}
-                            <div>
-                                <label className="text-sm font-medium text-slate-400 mb-2 block">Select Payback Percentage</label>
-                                <div className="grid grid-cols-4 gap-2">
-                                    {[25, 50, 75, 100].map((perc) => {
-                                        const isActive = selectedPercentage === perc;
-                                        return (
+                                    <label className="text-sm font-medium text-slate-400">Current Balance</label>
+                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                                </div>
+                                
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Payback Percentage</label>
+                                    <div className="grid grid-cols-4 gap-2 mt-1">
+                                        {[25, 50, 75, 100].map(pct => (
                                             <button
-                                                key={perc}
+                                                key={pct}
                                                 type="button"
-                                                onClick={() => handlePercentageClick(perc)}
-                                                className={`py-2 px-3 rounded-lg font-medium transition-colors ${
-                                                    isActive 
-                                                        ? 'bg-blue-600 text-white ring-2 ring-blue-400' 
-                                                        : 'bg-slate-600 text-slate-200 hover:bg-slate-500'
+                                                onClick={() => handlePercentageClick(pct)}
+                                                className={`py-2 text-sm font-medium rounded border transition-colors ${
+                                                    selectedPercentage === pct
+                                                        ? 'bg-blue-600 border-blue-600 text-white'
+                                                        : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
                                                 }`}
                                             >
-                                                {perc}%
+                                                {pct}%
                                             </button>
-                                        );
-                                    })}
+                                        ))}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div>
-                                <label className="text-sm font-medium text-slate-400">Calculated Payback Amount (KHR)</label>
-                                <input
-                                    type="text"
-                                    value={Utils.formatCurrency(amount)}
-                                    className="input"
-                                    disabled
-                                />
-                            </div>
-                            {/* --- END REVISED SECTION --- */}
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Calculated Amount (KHR)</label>
+                                    <input
+                                        type="text"
+                                        value={Utils.formatCurrency(amount)}
+                                        className="input"
+                                        disabled
+                                    />
+                                </div>
 
-                            <div>
-                                <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
                                     <input
                                         type="text"
                                         value={note}
-                                        onChange={e => setNote(e.target.value)}
+                                        onChange={(e) => setNote(e.target.value)}
                                         className="input"
-                                        placeholder="e.g., Cash withdrawal"
+                                        placeholder="e.g., Resignation payout"
                                     />
                                 </div>
                                 {error && <p className="text-sm text-red-400">{error}</p>}
@@ -2701,9 +2868,7 @@
                             <Button 
                                 type="submit" 
                                 variant="primary"
-                                // FIX: Added disabled logic. Button should be disabled
-                                // until a valid percentage is selected.
-                                disabled={amount <= 0 || selectedPercentage === null}
+                                disabled={!amount || parseFloat(amount) <= 0}
                             >
                                 Confirm Payback
                             </Button>
@@ -2712,48 +2877,179 @@
                 </Modal>
             );
         };
-        
-        // NEW: Modal to display savings transaction history
+
+        // NEW: Modal for processing a savings deposit (Cash on Hand)
+        const DepositModal = ({ isOpen, onClose, onSave, participant }) => {
+            const [amount, setAmount] = useState('');
+            const [note, setNote] = useState('');
+            const [date, setDate] = useState(''); // NEW: Date state
+            const [error, setError] = useState('');
+            const [isSubmitting, setIsSubmitting] = useState(false); // NEW: Loading state
+
+            useEffect(() => {
+                if (isOpen) {
+                    setAmount('');
+                    setNote('Cash Deposit');
+                    setDate(new Date().toISOString().slice(0, 10)); // Default to today
+                    setError('');
+                    setIsSubmitting(false); // Reset loading state
+                }
+            }, [isOpen]);
+
+            // NEW: Calculate projected total
+            const currentBalance = participant?.savingsBalance || 0;
+            const depositAmountValue = parseFloat(amount) || 0;
+            const projectedTotal = currentBalance + depositAmountValue;
+
+            const handleSubmit = async (e) => { // Made async
+                e.preventDefault();
+                const depositAmount = parseFloat(amount);
+                
+                if (isNaN(depositAmount) || depositAmount <= 0) { 
+                    setError('Please enter a valid positive amount.');
+                    return;
+                }
+
+                setIsSubmitting(true); // Start loading
+                
+                // Await the result to know if we should reset loading or if modal will close
+                // MODIFIED: Pass date to onSave
+                const success = await onSave(participant.id, depositAmount, note, date);
+                
+                if (!success) {
+                    setIsSubmitting(false); // Only reset if failed (modal stays open)
+                }
+                // If success, parent component will close the modal, so we don't need to do anything.
+            };
+
+            if (!participant) return null;
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-md">
+                    <form onSubmit={handleSubmit}>
+                        <ModalHeader title="Deposit Cash to Savings" onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Employee</label>
+                                    <input value={participant.name} className="input" disabled />
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Current Balance</label>
+                                        <input value={Utils.formatCurrency(currentBalance)} className="input" disabled />
+                                    </div>
+                                    {/* NEW: Date Input */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Date</label>
+                                        <input 
+                                            type="date" 
+                                            value={date} 
+                                            onChange={(e) => setDate(e.target.value)} 
+                                            className="input" 
+                                            required 
+                                            disabled={isSubmitting}
+                                        />
+                                    </div>
+                                </div>
+                                
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Deposit Amount (KHR)</label>
+                                    <input
+                                        type="number"
+                                        value={amount}
+                                        onChange={(e) => setAmount(e.target.value)}
+                                        className="input font-bold text-green-400"
+                                        placeholder="Enter amount"
+                                        required
+                                        min="100"
+                                        disabled={isSubmitting} // Disable while submitting
+                                    />
+                                </div>
+
+                                {/* NEW: Total Calculation Display */}
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Total (Current + Deposit)</label>
+                                    <input 
+                                        value={Utils.formatCurrency(projectedTotal)} 
+                                        className="input font-bold text-blue-400 bg-slate-800" 
+                                        disabled 
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                                    <input
+                                        type="text"
+                                        value={note}
+                                        onChange={(e) => setNote(e.target.value)}
+                                        className="input"
+                                        placeholder="e.g., Cash from employee"
+                                        disabled={isSubmitting}
+                                    />
+                                </div>
+                                {error && <p className="text-sm text-red-400">{error}</p>}
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose} disabled={isSubmitting}>Cancel</Button>
+                            <Button 
+                                type="submit" 
+                                variant="success" 
+                                disabled={!amount || parseFloat(amount) <= 0 || !date || isSubmitting}
+                            >
+                                {isSubmitting ? <><i className="fas fa-spinner fa-spin"></i> Processing...</> : 'Confirm Deposit'}
+                            </Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // --- FIX: ADDED MISSING SavingsHistoryModal COMPONENT ---
         const SavingsHistoryModal = ({ isOpen, onClose, employeeName, transactions }) => {
-             const sortedTransactions = useMemo(() => {
-                if (!transactions) return [];
-                return [...transactions].sort((a, b) => (b.date?.toDate() || 0) - (a.date?.toDate() || 0));
-            }, [transactions]);
+            if (!isOpen) return null;
 
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-2xl">
-                    <ModalHeader title={`Savings History for ${employeeName}`} onClose={onClose} />
+                    <ModalHeader title={`Savings History: ${employeeName}`} onClose={onClose} />
                     <ModalBody>
-                        <div className="overflow-x-auto max-h-[60vh]">
-                            <table className="min-w-full divide-y divide-slate-700">
-                                <thead className="bg-slate-900/50 sticky top-0">
-                                    <tr>
-                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
-                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Type</th>
-                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
-                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note / Payroll ID</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-700">
-                                    {sortedTransactions.map(tx => (
-                                        <tr key={tx.id} className="hover:bg-slate-700/50">
-                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
-                                            <td className="px-4 py-4 text-sm font-semibold">
-                                                {tx.type === 'contribution' ? (
-                                                    <span className="text-green-400">Contribution</span>
-                                                ) : (
-                                                    <span className="text-red-400">Withdrawal</span>
-                                                )}
-                                            </td>
-                                            <td className={`px-4 py-4 text-sm text-right font-semibold ${tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'}`}>
-                                                {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
-                                            </td>
-                                            <td className="px-4 py-4 text-sm text-slate-400">{tx.payrollId || tx.note || '-'}</td>
+                        {(!transactions || transactions.length === 0) ? (
+                            <p className="text-center text-slate-400 py-4">No transactions found.</p>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <table className="min-w-full divide-y divide-slate-700">
+                                    <thead className="bg-slate-900/50">
+                                        <tr>
+                                            <th className="px-4 py-2 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                            <th className="px-4 py-2 text-left text-xs font-semibold text-slate-400 uppercase">Type</th>
+                                            <th className="px-4 py-2 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                            <th className="px-4 py-2 text-left text-xs font-semibold text-slate-400 uppercase">Note</th>
                                         </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-700">
+                                        {transactions.map((tx) => (
+                                            <tr key={tx.id} className="hover:bg-slate-700/30">
+                                                <td className="px-4 py-2 text-sm text-slate-300">{Utils.formatRequestDate(tx.date)}</td>
+                                                <td className="px-4 py-2 text-sm">
+                                                    <span className={`px-2 py-0.5 text-xs rounded-full ${
+                                                        tx.type === 'contribution' ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'
+                                                    }`}>
+                                                        {tx.type === 'contribution' ? 'Deposit' : 'Withdrawal'}
+                                                    </span>
+                                                </td>
+                                                <td className={`px-4 py-2 text-sm text-right font-medium ${
+                                                    tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'
+                                                }`}>
+                                                    {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
+                                                </td>
+                                                <td className="px-4 py-2 text-sm text-slate-400">{tx.note || tx.payrollId || '-'}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
                     </ModalBody>
                     <ModalFooter>
                         <Button variant="secondary" onClick={onClose}>Close</Button>
@@ -2771,15 +3067,32 @@
             const { doc, updateDoc, where, setDoc, deleteField } = window.firebaseSDK;
             const { employees, shops } = useAppData();
             
-            // MODIFIED (STEP 4): Data source is now 'savingprogram' collection
-            const { data: allSavings } = useCollection('savingprogram');
-            
             const [selectedShop, setSelectedShop] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
+            
+            // --- NEW: State for the sub-tabs (Active vs Inactive) ---
+            const [listTab, setListTab] = useState('active');
+
+            // --- OPTIMIZATION: Only fetch the data needed for the current tab ---
+            // If tab is 'active', fetch 'Active' and 'Paused'. 
+            // If tab is 'inactive', fetch 'Inactive'.
+            // This prevents downloading hundreds of old inactive records on page load.
+            const savingsQueryConstraints = useMemo(() => {
+                if (listTab === 'active') {
+                    return [where('savingsProgramStatus', 'in', ['Active', 'Paused'])];
+                } else {
+                    return [where('savingsProgramStatus', '==', 'Inactive')];
+                }
+            }, [listTab]);
+
+            // MODIFIED: Pass constraints to useCollection
+            const { data: savingsList } = useCollection('savingprogram', savingsQueryConstraints);
+            
             const [isSavingModalOpen, setIsSavingModalOpen] = useState(false);
             const [editingParticipant, setEditingParticipant] = useState(null);
             const [participantToRemove, setParticipantToRemove] = useState(null);
             const [paybackParticipant, setPaybackParticipant] = useState(null);
+            const [depositParticipant, setDepositParticipant] = useState(null); // NEW: State for deposit modal
             const [historyParticipant, setHistoryParticipant] = useState(null);
             const [participantForPaybackConfirmation, setParticipantForPaybackConfirmation] = useState(null);
 
@@ -2942,6 +3255,45 @@
                 }
             };
 
+            // --- NEW: Handler for processing cash deposits ---
+            // MODIFIED: Accepts 'date' parameter
+            const handleProcessDeposit = async (employeeId, amount, note, date) => {
+                // SECURITY CHECK: Ensure only Admin or CEO can perform this action
+                if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    alert("Permission Denied: Only Administrators and CEOs can process cash deposits.");
+                    return false; // Return failure
+                }
+
+                if (!depositParticipant) {
+                    alert("Error: No participant selected for deposit.");
+                    return false; // Return failure
+                }
+                
+                const participantShop = Array.isArray(depositParticipant.shop) ? depositParticipant.shop[0] : depositParticipant.shop;
+                
+                // Reuse the existing contribution utility, passing the note and null for payrollId
+                // MODIFIED: Pass 'date'
+                const result = await Utils.manageSavingsContribution(
+                    db,
+                    employeeId,
+                    depositParticipant.name,
+                    participantShop,
+                    amount,
+                    null, // No payrollId for manual deposit
+                    note,  // Pass the note
+                    date   // Pass the custom date
+                );
+                
+                if (result.success) {
+                    alert("Cash deposit processed successfully!");
+                    setDepositParticipant(null);
+                    return true; // Return success
+                } else {
+                    alert(`Deposit failed: ${result.error?.message || 'An unknown error occurred.'}`);
+                    return false; // Return failure
+                }
+            };
+
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
                     setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
@@ -2966,8 +3318,8 @@
                 // 1. Create a map of all employees from context for quick lookup
                 const employeeMap = new Map((employees || []).map(e => [e.id, e]));
 
-                // 2. Map over 'allSavings' (from /savingprogram) and merge with employee data
-                const enrolled = (allSavings || []).map(savingDoc => {
+                // 2. Map over 'savingsList' (fetched based on active tab) and merge with employee data
+                const enrolled = (savingsList || []).map(savingDoc => {
                     const employeeData = employeeMap.get(savingDoc.id);
                     // Use employeeData if available, but fallback to denormalized data
                     // in savingDoc just in case (e.g., for a resigned employee).
@@ -2984,11 +3336,6 @@
                 // 3. Apply role-based filtering
                 const roleFiltered = enrolled.filter(emp => {
                     if (!userProfile) return false;
-                    
-                    // MODIFICATION: Removed this filter. We now want to show *all*
-                    // participants (Active and Inactive) and let the new Status
-                    // column show their state.
-                    // if (emp.savingsProgramStatus !== 'Active') return false; 
                     
                     if (userProfile.role === 'Admin' || userProfile.role === 'CEO') {
                         return true; // Admins/CEOs see everyone
@@ -3011,28 +3358,72 @@
                 );
                 
                 return filtered.sort((a,b) => a.name.localeCompare(b.name));
-            }, [employees, allSavings, selectedShop, searchTerm, userProfile]); // Added userProfile
+            }, [employees, savingsList, selectedShop, searchTerm, userProfile]); 
 
+            // --- NEW: Filter by Active/Inactive Tab ---
+            // NOTE: The 'savingsList' is ALREADY filtered by the database query based on 'listTab'.
+            // However, we keep this secondary check for robust filtering in case of latency.
+            const displayEmployees = useMemo(() => {
+                return enrolledEmployees.filter(emp => {
+                    const status = emp.savingsProgramStatus || 'Active'; // Default to Active if undefined
+                    if (listTab === 'active') {
+                        // Show Active and Paused in the first tab
+                        return status === 'Active' || status === 'Paused';
+                    } else {
+                        // Show Inactive in the second tab
+                        return status === 'Inactive';
+                    }
+                });
+            }, [enrolledEmployees, listTab]);
+
+            // MODIFIED: Calculate total savings based on the DISPLAYED list, not the full list.
             const totalSavings = useMemo(() => {
-                return enrolledEmployees.reduce((sum, emp) => sum + emp.savingsBalance, 0);
-            }, [enrolledEmployees]);
+                return displayEmployees.reduce((sum, emp) => sum + emp.savingsBalance, 0);
+            }, [displayEmployees]);
 
             const handleExportExcel = useCallback(() => {
-                const dataToExport = enrolledEmployees.map(emp => ({ 
+                // MODIFIED: Export only displayed employees
+                const dataToExport = displayEmployees.map(emp => ({ 
                     'Name': emp.name,
                     'Shop': Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop,
+                    'Status': emp.savingsProgramStatus,
                     'Savings Percentage (%)': emp.savingsPercentage,
                     'Total Accumulated Savings (KHR)': emp.savingsBalance
                 }));
                 const worksheet = XLSX.utils.json_to_sheet(dataToExport);
                 const workbook = XLSX.utils.book_new();
-                XLSX.utils.book_append_sheet(workbook, worksheet, "Salary Savings Report");
-                worksheet["!cols"] = [ { wch: 25 }, { wch: 20 }, { wch: 25 }, { wch: 30 } ];
-                XLSX.writeFile(workbook, "Salary_Savings_Report.xlsx");
-            }, [enrolledEmployees]);
+                const sheetName = listTab === 'active' ? "Active Savings" : "Inactive Savings";
+                XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+                worksheet["!cols"] = [ { wch: 25 }, { wch: 20 }, { wch: 10 }, { wch: 25 }, { wch: 30 } ];
+                XLSX.writeFile(workbook, `Salary_Savings_Report_${listTab}.xlsx`);
+            }, [displayEmployees, listTab]);
 
             return (
                 <Card>
+                    {/* --- NEW: Tab Navigation for Active / Inactive Lists --- */}
+                    <div className="flex space-x-6 border-b border-slate-700 mb-6">
+                        <button
+                            className={`pb-3 text-sm font-medium transition-colors border-b-2 ${
+                                listTab === 'active' 
+                                    ? 'border-blue-500 text-blue-400' 
+                                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                            }`}
+                            onClick={() => setListTab('active')}
+                        >
+                            Active Participants
+                        </button>
+                        <button
+                            className={`pb-3 text-sm font-medium transition-colors border-b-2 ${
+                                listTab === 'inactive' 
+                                    ? 'border-blue-500 text-blue-400' 
+                                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                            }`}
+                            onClick={() => setListTab('inactive')}
+                        >
+                            Inactive / Removed
+                        </button>
+                    </div>
+
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <h3 className="text-xl font-semibold text-slate-100">Salary Saving Program Participants</h3>
                         <div className="flex flex-wrap gap-4 items-center">
@@ -3081,7 +3472,8 @@
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-700">
-                                {enrolledEmployees.map(emp => (
+                                {/* MODIFIED: Map over displayEmployees instead of enrolledEmployees */}
+                                {displayEmployees.map(emp => (
                                     <tr key={emp.id} className="hover:bg-slate-700/50">
                                         <td className="px-4 py-4 text-sm text-slate-200">{emp.name}</td>
                                         <td className="px-4 py-4 text-sm text-slate-300">{Array.isArray(emp.shop) ? emp.shop.join(', ') : emp.shop}</td>
@@ -3100,9 +3492,6 @@
                                             </span>
                                         </td>
                                         
-                                        {/* MODIFIED: Removed 'My Saving Credit' column data */}
-                                        {/* <td className="px-4 py-4 text-sm text-green-300 font-semibold text-right">{Utils.formatCurrency(emp.mySavingCredit)}</td> */}
-                                        
                                         {/* NEW: Added 'Total Withdrawals' column data */}
                                         <td className="px-4 py-4 text-sm text-red-300 font-semibold text-right">{Utils.formatCurrency(emp.mySavingWithdrawalTotal)}</td>
                                         
@@ -3111,12 +3500,21 @@
                                             <td className="px-4 py-4 text-center">
                                                 <div className="flex items-center justify-center gap-2">
                                                     <Button variant="icon-view" icon="fa-history" onClick={() => setHistoryParticipant(emp)} title="View History"/>
-                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
-                                                        <Button variant="success" icon="fa-hand-holding-usd" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" className="px-3 py-1 text-xs">Payback</Button>
+                                                    
+                                                    {/* NEW: Add Deposit Button for Cash on Hand - RESTRICTED TO ADMIN/CEO AND ACTIVE/PAUSED STATUS ONLY */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && emp.savingsProgramStatus !== 'Inactive' && (
+                                                        <Button variant="icon-approve" icon="fa-circle-plus" onClick={() => setDepositParticipant(emp)} title="Deposit Cash" />
                                                     )}
+
+                                                    {/* MODIFIED: Allow Payback for Active/Paused users ONLY. Hidden for Inactive/Removed. */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && emp.savingsProgramStatus !== 'Inactive' && (
+                                                        <Button variant="icon-edit-alt" icon="fa-hand-holding-dollar" onClick={() => setParticipantForPaybackConfirmation(emp)} title="Process Payback" />
+                                                    )}
+                                                    
                                                     <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenSavingModal(emp)} title="Edit Percentage"/>
-                                                    {/* MODIFIED: Only Admin and CEO can see the delete button */}
-                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
+                                                    
+                                                    {/* MODIFIED: Show 'Remove' button only if status is NOT 'Inactive' */}
+                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && emp.savingsProgramStatus !== 'Inactive' && (
                                                         <Button variant="icon-delete" icon="fa-user-minus" onClick={() => setParticipantToRemove(emp)} title="Remove from Program"/>
                                                     )}
                                                 </div>
@@ -3124,17 +3522,19 @@
                                         )}
                                     </tr>
                                 ))}
+                                {displayEmployees.length === 0 && (
+                                    <tr>
+                                        <td colSpan="9" className="px-4 py-8 text-center text-slate-500">
+                                            No {listTab} participants found.
+                                        </td>
+                                    </tr>
+                                )}
                             </tbody>
                             <tfoot className="bg-slate-900/50">
                                 <tr>
-                                    {/* MODIFIED: 
-                                      1. Corrected colSpan from 7 to 6.
-                                      2. This colSpan is now dynamic. It's 6 if actions are visible, 5 if not.
-                                      3. MODIFIED AGAIN: Increased colSpan by 1 (to 7 or 6) for the new Status column.
-                                    */}
-                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager' ? 7 : 6} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings of Filtered Employees</td>
+                                    {/* MODIFIED: Dynamic ColSpan based on visible columns */}
+                                    <td colSpan={userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager' ? 7 : 6} className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Savings ({listTab === 'active' ? 'Active' : 'Inactive'})</td>
                                     <td className="px-4 py-3 text-right font-bold text-blue-300">{Utils.formatCurrency(totalSavings)}</td>
-                                    {/* MODIFIED: Changed <em> to <td> for correct column alignment */}
                                     {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && <td></td>}
                                 </tr>
                             </tfoot>
@@ -3147,7 +3547,7 @@
                         participant={editingParticipant}
                         userProfile={userProfile}
                         allEmployees={employees}
-                        allSavings={allSavings} // MODIFIED (STEP 4): Pass 'allSavings' data
+                        allSavings={savingsList} // MODIFIED (STEP 4): Pass 'savingsList' data
                     />
                     <ConfirmationModal 
                         isOpen={!!participantToRemove}
@@ -3169,6 +3569,13 @@
                         onSave={handleProcessPayback}
                         participant={paybackParticipant}
                     />
+                    {/* NEW: Render the Deposit Modal */}
+                    <DepositModal
+                        isOpen={!!depositParticipant}
+                        onClose={() => setDepositParticipant(null)}
+                        onSave={handleProcessDeposit}
+                        participant={depositParticipant}
+                    />
                     <SavingsHistoryModal
                         isOpen={!!historyParticipant}
                         onClose={() => setHistoryParticipant(null)}
@@ -3180,71 +3587,73 @@
         };
 
         // MOVED: Savings History Tab
-        // MODIFIED (STEP 6.C): This component is completely refactored to use a collectionGroup query.
+        // MODIFIED (STEP 6.C): Refactored to extract and display the Index Creation Link automatically.
         const SavingsHistoryTab = ({ userProfile }) => {
             const { db } = useFirebase();
-            const { shops } = useAppData(); // We only need shops for the filter dropdown
+            const { shops } = useAppData(); 
             
-            // MODIFIED (STEP 6.C): Replaced 'useCollection' with 'useState'
             const [transactions, setTransactions] = useState([]);
             const [loading, setLoading] = useState(true);
+            const [errorMsg, setErrorMsg] = useState('');
+            const [indexLink, setIndexLink] = useState(null); // NEW: State to hold the creation link
+            const [retryTrigger, setRetryTrigger] = useState(0);
 
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
             const [searchTerm, setSearchTerm] = useState('');
 
-            // MODIFIED (STEP 6.C): New data fetching logic using collectionGroup
             useEffect(() => {
                 if (!db || !userProfile) return;
 
-                // --- THIS IS THE FIX ---
-                // We are replacing the one-time `getDocs` with a real-time `onSnapshot` listener.
-                // This will automatically update the history card when new transactions are added.
-
                 setLoading(true);
+                setErrorMsg('');
+                setIndexLink(null); // Reset link
+
                 const { collectionGroup, query, where, onSnapshot, orderBy } = window.firebaseSDK;
                 
-                // Query the 'transactions' subcollection across all 'savingprogram' documents
-                // FIX: Removed the orderBy('date', 'desc') from the query.
-                // This was causing a composite index error when combined with the 'where'
-                // filters below. We will sort in JavaScript instead.
-                let q = query(collectionGroup(db, 'transactions'));
+                let q = query(collectionGroup(db, 'transactions'), orderBy('date', 'desc'));
                 
-                // Apply role-based filtering at the query level for security and efficiency
+                if (selectedMonth) {
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    q = query(q, where('date', '>=', startOfMonth), where('date', '<=', endOfMonth));
+                }
+
                 if (userProfile.role === 'Shop Manager') {
                     const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
                     if (managedShops.length > 0) {
-                        // Filter results to only include transactions from shops they manage
                         q = query(q, where("shop", "in", managedShops));
                     } else {
-                        q = query(q, where("shop", "==", "null")); // No shops, no data
+                        q = query(q, where("shop", "==", "null"));
                     }
                 } else if (userProfile.role === 'Staff') {
-                    // Staff can only see their own transactions
                     q = query(q, where("employeeId", "==", userProfile.id));
                 }
-                // Admin/CEO sees all (no extra 'where' clause)
 
-                // Use onSnapshot to listen for real-time changes
                 const unsubscribe = onSnapshot(q, (snapshot) => {
                     const txs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    
-                    // NEW: Sort the transactions in JavaScript (client-side)
-                    // since we removed it from the query.
-                    txs.sort((a, b) => (b.date?.toDate() || 0) - (a.date?.toDate() || 0));
-                    
                     setTransactions(txs);
                     setLoading(false);
                 }, (error) => {
-                    console.error("Error fetching real-time savings transaction history:", error);
+                    console.error("Savings History Error:", error);
+                    if (error.code === 'failed-precondition') {
+                        setErrorMsg("Database Index Required");
+                        // NEW: Extract the URL from the error message
+                        const match = error.message.match(/https:\/\/console\.firebase\.google\.com[^\s]+/);
+                        if (match) {
+                            setIndexLink(match[0]);
+                        }
+                    } else {
+                        setErrorMsg(error.message);
+                    }
                     setTransactions([]);
                     setLoading(false);
                 });
 
-                // Clean up the listener on component unmount
                 return () => unsubscribe();
                 
-            }, [db, userProfile]); // This effect now sets up the listener
+            }, [db, userProfile, selectedMonth, retryTrigger]);
 
             useEffect(() => {
                 if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
@@ -3260,33 +3669,12 @@
                 return [];
             }, [shops, userProfile]);
 
-            // MODIFIED (STEP 6.C): This logic is now much simpler and uses the denormalized fields.
             const { processedTransactions, totals } = useMemo(() => {
-                // 'transactions' state is already pre-filtered by role (from useEffect).
-                // Now, we just apply the UI filters (month, shop, search).
-                
                 const filtered = transactions.filter(tx => {
-                    const txDate = tx.date?.toDate();
-                    if (!txDate) return false;
-
-                    // Filter 1: Month
-                    const monthMatch = !selectedMonth || txDate.toISOString().startsWith(selectedMonth);
-                    
-                    // Filter 2: Shop (using denormalized field 'tx.shop')
                     const shopMatch = !selectedShop || tx.shop === selectedShop;
-                    
-                    // Filter 3: Search Term (using denormalized field 'tx.staffName')
                     const searchMatch = !searchTerm || (tx.staffName && tx.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
-
-                    return monthMatch && shopMatch && searchMatch;
+                    return shopMatch && searchMatch;
                 });
-                
-                // Data is already sorted by date from the query, so no need to sort again.
-                // MODIFIED: This comment is no longer true, but the sort is now
-                // handled in the onSnapshot callback, so the data is sorted
-                // before it even gets to this useMemo.
-                
-                // The denormalized fields are already on 'tx', so no 'map' is needed.
                 
                 const totals = filtered.reduce((acc, tx) => {
                     if (tx.type === 'contribution') {
@@ -3298,7 +3686,7 @@
                 }, { totalContributions: 0, totalWithdrawals: 0 });
 
                 return { processedTransactions: filtered, totals };
-            }, [transactions, selectedMonth, selectedShop, searchTerm]); // Removed 'employees' dependency
+            }, [transactions, selectedShop, searchTerm]); 
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = processedTransactions.map(tx => ({ 
@@ -3321,28 +3709,50 @@
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
                         <h3 className="text-xl font-semibold text-slate-100">Savings Transaction History</h3>
                         <div className="flex flex-wrap gap-4 items-center">
-                            <input 
-                                type="text" 
-                                placeholder="Search by name..." 
-                                value={searchTerm} 
-                                onChange={e => setSearchTerm(e.target.value)} 
-                                className="input w-full sm:w-auto" 
-                            />
+                            <input type="text" placeholder="Search by name..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="input w-full sm:w-auto" />
                              {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
                                 <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
                                     <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
                                     {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                 </select>
                             )}
-                            <input 
-                                type="month" 
-                                value={selectedMonth} 
-                                onChange={e => setSelectedMonth(e.target.value)} 
-                                className="input w-full sm:w-auto" 
-                            />
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
                             <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
                         </div>
                     </div>
+                    
+                    {/* NEW: Smart Error Message with Direct Action Button */}
+                    {errorMsg && (
+                        <div className="mb-6 p-4 bg-red-900/30 border border-red-500/50 rounded-lg text-red-200 flex flex-col items-center justify-center gap-4 text-center">
+                            <div>
+                                <p className="font-bold text-lg flex items-center justify-center"><i className="fas fa-database mr-2 text-yellow-400"></i> {errorMsg}</p>
+                                {indexLink ? (
+                                    <p className="text-sm mt-2 opacity-90 max-w-lg">
+                                        Firebase requires a specialized index to search across all employee folders. 
+                                        Click the button below to create it instantly.
+                                    </p>
+                                ) : (
+                                    <p className="text-sm mt-2 opacity-90">Open console (F12) to see details.</p>
+                                )}
+                            </div>
+                            <div className="flex gap-4">
+                                {indexLink && (
+                                    <a 
+                                        href={indexLink} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer" 
+                                        className="bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-2 px-6 rounded-lg shadow-lg flex items-center transition-transform transform hover:scale-105"
+                                    >
+                                        <i className="fas fa-hammer mr-2"></i> Create Missing Index
+                                    </a>
+                                )}
+                                <Button variant="secondary" onClick={() => setRetryTrigger(prev => prev + 1)} icon="fa-sync">
+                                    Retry Connection
+                                </Button>
+                            </div>
+                        </div>
+                    )}
+
                      {loading ? (
                         <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
                     ) : (
@@ -3359,24 +3769,28 @@
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-700">
-                                {processedTransactions.map(tx => (
-                                    <tr key={tx.id} className="hover:bg-slate-700/50">
-                                        <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
-                                        <td className="px-4 py-4 text-sm text-slate-200">{tx.staffName}</td>
-                                        <td className="px-4 py-4 text-sm text-slate-300">{tx.shop}</td>
-                                        <td className="px-4 py-4 text-sm font-semibold">
-                                            {tx.type === 'contribution' ? (
-                                                <span className="text-green-400">Contribution</span>
-                                            ) : (
-                                                <span className="text-red-400">Withdrawal</span>
-                                            )}
-                                        </td>
-                                        <td className={`px-4 py-4 text-sm text-right font-semibold ${tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'}`}>
-                                            {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
-                                        </td>
-                                        <td className="px-4 py-4 text-sm text-slate-400">{tx.payrollId || tx.note || '-'}</td>
-                                    </tr>
-                                ))}
+                                {processedTransactions.length === 0 ? (
+                                    <tr><td colSpan="6" className="px-4 py-8 text-center text-slate-500">No transactions found for this month.</td></tr>
+                                ) : (
+                                    processedTransactions.map(tx => (
+                                        <tr key={tx.id} className="hover:bg-slate-700/50">
+                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-200">{tx.staffName}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300">{tx.shop}</td>
+                                            <td className="px-4 py-4 text-sm font-semibold">
+                                                {tx.type === 'contribution' ? (
+                                                    <span className="text-green-400">Contribution</span>
+                                                ) : (
+                                                    <span className="text-red-400">Withdrawal</span>
+                                                )}
+                                            </td>
+                                            <td className={`px-4 py-4 text-sm text-right font-semibold ${tx.type === 'contribution' ? 'text-green-400' : 'text-red-400'}`}>
+                                                {Utils.formatCurrency(tx.amountDeducted || tx.amountWithdrawn)}
+                                            </td>
+                                            <td className="px-4 py-4 text-sm text-slate-400">{tx.payrollId || tx.note || '-'}</td>
+                                        </tr>
+                                    ))
+                                )}
                             </tbody>
                             <tfoot className="bg-slate-900/50">
                                 <tr>
@@ -3396,16 +3810,222 @@
                 </Card>
             );
         };
+
+        // --- NEW: Deposit Cash Report Tab (Updated with Index Link Logic) ---
+        const DepositCashReportTab = ({ userProfile }) => {
+            const { db } = useFirebase();
+            const { shops } = useAppData();
+            
+            const [transactions, setTransactions] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [errorMsg, setErrorMsg] = useState('');
+            const [indexLink, setIndexLink] = useState(null); // NEW
+            const [retryTrigger, setRetryTrigger] = useState(0);
+
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [searchTerm, setSearchTerm] = useState('');
+
+            useEffect(() => {
+                if (!db || !userProfile) return;
+
+                setLoading(true);
+                setErrorMsg('');
+                setIndexLink(null);
+                const { collectionGroup, query, where, onSnapshot, orderBy } = window.firebaseSDK;
+                
+                let q = query(collectionGroup(db, 'transactions'), orderBy('date', 'desc'));
+                
+                if (selectedMonth) {
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    q = query(q, where('date', '>=', startOfMonth), where('date', '<=', endOfMonth));
+                }
+
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    if (managedShops.length > 0) {
+                        q = query(q, where("shop", "in", managedShops));
+                    } else {
+                        q = query(q, where("shop", "==", "null")); 
+                    }
+                } else if (userProfile.role === 'Staff') {
+                    q = query(q, where("employeeId", "==", userProfile.id));
+                }
+
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    const txs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setTransactions(txs);
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Deposit Report Error:", error);
+                    if (error.code === 'failed-precondition') {
+                        setErrorMsg("Database Index Required");
+                        const match = error.message.match(/https:\/\/console\.firebase\.google\.com[^\s]+/);
+                        if (match) {
+                            setIndexLink(match[0]);
+                        }
+                    } else {
+                        setErrorMsg(error.message);
+                    }
+                    setTransactions([]);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, [db, userProfile, selectedMonth, retryTrigger]);
+
+            useEffect(() => {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
+                }
+            }, [userProfile]);
+            
+            const availableShops = useMemo(() => {
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
+                if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
+                    return shops.filter(s => userProfile.shop.includes(s.name));
+                }
+                return [];
+            }, [shops, userProfile]);
+
+            const { depositTransactions, totalDeposits } = useMemo(() => {
+                const filtered = transactions.filter(tx => {
+                    const shopMatch = !selectedShop || tx.shop === selectedShop;
+                    const searchMatch = !searchTerm || (tx.staffName && tx.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
+                    const isCashDeposit = tx.type === 'contribution' && !tx.payrollId;
+                    return shopMatch && searchMatch && isCashDeposit;
+                });
+                
+                const total = filtered.reduce((sum, tx) => sum + (tx.amountDeducted || 0), 0);
+                return { depositTransactions: filtered, totalDeposits: total };
+            }, [transactions, selectedShop, searchTerm]);
+
+            const handleExportExcel = useCallback(() => {
+                const dataToExport = depositTransactions.map(tx => ({ 
+                    'Date': Utils.formatRequestDate(tx.date),
+                    'Staff Name': tx.staffName,
+                    'Shop': tx.shop,
+                    'Amount (KHR)': tx.amountDeducted,
+                    'Note': tx.note || 'Manual Cash Deposit'
+                }));
+                const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+                const workbook = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(workbook, worksheet, "Cash Deposits");
+                worksheet["!cols"] = [ { wch: 20 }, { wch: 25 }, { wch: 20 }, { wch: 15 }, { wch: 30 } ];
+                XLSX.writeFile(workbook, `Cash_Deposit_Report_${selectedMonth}.xlsx`);
+            }, [depositTransactions, selectedMonth]);
+
+            return (
+                <Card>
+                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
+                        <h3 className="text-xl font-semibold text-slate-100">Deposit Cash Report</h3>
+                        <div className="flex flex-wrap gap-4 items-center">
+                            <input type="text" placeholder="Search by name..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="input w-full sm:w-auto" />
+                             {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop))) && (
+                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
+                                    {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                        </div>
+                    </div>
+
+                    {errorMsg && (
+                        <div className="mb-6 p-4 bg-red-900/30 border border-red-500/50 rounded-lg text-red-200 flex flex-col items-center justify-center gap-4 text-center">
+                            <div>
+                                <p className="font-bold text-lg flex items-center justify-center"><i className="fas fa-database mr-2 text-yellow-400"></i> {errorMsg}</p>
+                                {indexLink ? (
+                                    <p className="text-sm mt-2 opacity-90 max-w-lg">
+                                        Firebase requires a specialized index for this report.
+                                    </p>
+                                ) : (
+                                    <p className="text-sm mt-2 opacity-90">Open console (F12) to see details.</p>
+                                )}
+                            </div>
+                            <div className="flex gap-4">
+                                {indexLink && (
+                                    <a 
+                                        href={indexLink} 
+                                        target="_blank" 
+                                        rel="noopener noreferrer" 
+                                        className="bg-yellow-600 hover:bg-yellow-500 text-white font-bold py-2 px-6 rounded-lg shadow-lg flex items-center transition-transform transform hover:scale-105"
+                                    >
+                                        <i className="fas fa-hammer mr-2"></i> Create Missing Index
+                                    </a>
+                                )}
+                                <Button variant="secondary" onClick={() => setRetryTrigger(prev => prev + 1)} icon="fa-sync">
+                                    Retry Connection
+                                </Button>
+                            </div>
+                        </div>
+                    )}
+
+                     {loading ? (
+                        <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
+                    ) : (
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-slate-700">
+                            <thead className="bg-slate-900/50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {depositTransactions.length === 0 ? (
+                                    <tr><td colSpan="5" className="px-4 py-8 text-center text-slate-500">No cash deposits found for this period.</td></tr>
+                                ) : (
+                                    depositTransactions.map(tx => (
+                                        <tr key={tx.id} className="hover:bg-slate-700/50">
+                                            <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.formatRequestDate(tx.date)}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-200">{tx.staffName}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300">{tx.shop}</td>
+                                            <td className="px-4 py-4 text-sm text-right font-semibold text-green-400">
+                                                {Utils.formatCurrency(tx.amountDeducted)}
+                                            </td>
+                                            <td className="px-4 py-4 text-sm text-slate-400">{tx.note || 'Manual Cash Deposit'}</td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                            <tfoot className="bg-slate-900/50">
+                                <tr>
+                                    <td colSpan="3" className="px-4 py-3 text-right font-bold text-green-400 uppercase">Total Cash Deposits</td>
+                                    <td className="px-4 py-3 text-right font-bold text-green-400">{Utils.formatCurrency(totalDeposits)}</td>
+                                    <td></td>
+                                </tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                    )}
+                </Card>
+            );
+        };
         
         // NEW: Main Savings Program Page (Tab Container)
         const SavingsProgramPage = ({ userProfile }) => {
-            // REMOVED: Tab state and TabbedPage wrapper
+            // MODIFIED: Re-introduced TabbedPage to include the new report tab
+            const [activeTab, setActiveTab] = useState('participants');
+            
+            const tabs = {
+                participants: 'Participants',
+                history: 'Transaction History',
+                depositReport: 'Deposit Cash Report' // NEW TAB
+            };
+
             return (
-                // NEW: Added a div wrapper to stack the two components
-                <div className="space-y-6">
-                    <ParticipantsTab userProfile={userProfile} />
-                    <SavingsHistoryTab userProfile={userProfile} />
-                </div>
+                <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
+                    <div id="participants"><ParticipantsTab userProfile={userProfile} /></div>
+                    <div id="history"><SavingsHistoryTab userProfile={userProfile} /></div>
+                    <div id="depositReport"><DepositCashReportTab userProfile={userProfile} /></div>
+                </TabbedPage>
             );
         };
         // --- END SAVINGS PROGRAM PAGE COMPONENTS ---
@@ -3953,6 +4573,14 @@
                     alert("Please select a shop for the leave request.");
                     return;
                 }
+
+                // --- BUG FIX: Validation to prevent 0 days or negative dates ---
+                if (formData.numberOfDays <= 0) {
+                    alert("Invalid date range. The Return Date cannot be before the Leave Date.");
+                    return;
+                }
+                // --- END FIX ---
+
                 const dataToSave = { ...formData };
                 if (dataToSave.leaveDate && dataToSave.leaveDate === dataToSave.returnDate) {
                     const returnDate = new Date(dataToSave.returnDate);
@@ -7526,21 +8154,322 @@
         // --- END PAYROLL PAGE ---
 
         // --- START EXPENSE REPORT PAGE ---
-        const ExpenseReportPage = ({ userProfile }) => {
-            const { where } = window.firebaseSDK;
-            
-            const payrollQueryConstraints = useMemo(() => {
-                if (!userProfile) return [where("shop", "==", "null")];
-                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return [];
-                if (userProfile.role === 'Shop Manager') {
-                    const shops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
-                    if (shops.length > 0) return [where("shop", "in", shops)];
-                    return [where("shop", "==", "null")];
+        
+        // NEW: Component to manage Operational (Shop) Expenses
+        const OperationalExpensesTab = ({ userProfile }) => {
+            const { db } = useFirebase();
+            // MODIFIED: Get expenseCategories from context
+            const { shops, expenseCategories } = useAppData();
+            const { where, addDoc, updateDoc, deleteDoc, doc, collection, serverTimestamp } = window.firebaseSDK;
+
+            const [expenses, setExpenses] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingExpense, setEditingExpense] = useState(null);
+            const [expenseToDelete, setExpenseToDelete] = useState(null);
+
+            // Filters
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [selectedCategory, setSelectedCategory] = useState('');
+
+            // MODIFIED: Use database categories if available, otherwise fallback to defaults
+            const categoriesList = useMemo(() => {
+                if (expenseCategories && expenseCategories.length > 0) {
+                    return expenseCategories.map(c => c.name).sort();
                 }
-                return [where("shop", "==", "null")];
+                return ['Utilities (Water/Electric)', 'Internet/Phone', 'Office Supplies', 'Cleaning Supplies', 'Maintenance/Repairs', 'Rent', 'Staff Welfare', 'Transportation', 'Marketing', 'Other'];
+            }, [expenseCategories]);
+
+            // Fetch Expenses
+            useEffect(() => {
+                if (!db || !userProfile) return;
+                setLoading(true);
+
+                const { query, onSnapshot, orderBy } = window.firebaseSDK;
+                const collectionRef = collection(db, 'shopExpenses');
+                
+                // Base constraints based on role
+                let constraints = [orderBy('date', 'desc')];
+                
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    if (managedShops.length > 0) {
+                        constraints.push(where("shop", "in", managedShops));
+                    } else {
+                        constraints.push(where("shop", "==", "null"));
+                    }
+                } else if (userProfile.role === 'Staff') {
+                     constraints.push(where("shop", "==", "null")); // Staff cannot see expenses
+                }
+
+                const q = query(collectionRef, ...constraints);
+
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setExpenses(items);
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Error fetching expenses:", error);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, [db, userProfile]);
+
+            // Set initial shop filter
+            useEffect(() => {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
+                }
             }, [userProfile]);
 
-            const { data: payrollHistory } = useCollection('payrollHistory', payrollQueryConstraints);
+            const availableShops = useMemo(() => {
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return shops;
+                if (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
+                    return shops.filter(s => userProfile.shop.includes(s.name));
+                }
+                return [];
+            }, [shops, userProfile]);
+
+            // Filter logic
+            const filteredExpenses = useMemo(() => {
+                return expenses.filter(exp => {
+                    const dateMatch = !selectedMonth || exp.date.startsWith(selectedMonth);
+                    const shopMatch = !selectedShop || exp.shop === selectedShop;
+                    const catMatch = !selectedCategory || exp.category === selectedCategory;
+                    return dateMatch && shopMatch && catMatch;
+                });
+            }, [expenses, selectedMonth, selectedShop, selectedCategory]);
+
+            // Calculate Total
+            const totalAmount = useMemo(() => filteredExpenses.reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0), [filteredExpenses]);
+
+            // Handlers
+            const handleOpenModal = (expense = null) => {
+                setEditingExpense(expense);
+                setIsModalOpen(true);
+            };
+
+            const handleSave = async (formData) => {
+                try {
+                    const data = { ...formData, amount: parseFloat(formData.amount) };
+                    if (editingExpense) {
+                        await updateDoc(doc(db, 'shopExpenses', editingExpense.id), { ...data, updatedAt: serverTimestamp() });
+                    } else {
+                        await addDoc(collection(db, 'shopExpenses'), { ...data, createdAt: serverTimestamp(), createdBy: userProfile.id });
+                    }
+                    setIsModalOpen(false);
+                    setEditingExpense(null);
+                } catch (error) {
+                    console.error("Error saving expense:", error);
+                    alert("Failed to save expense.");
+                }
+            };
+
+            const handleDelete = async () => {
+                if (!expenseToDelete) return;
+                try {
+                    await deleteDoc(doc(db, 'shopExpenses', expenseToDelete.id));
+                    setExpenseToDelete(null);
+                } catch (error) {
+                    console.error("Error deleting expense:", error);
+                }
+            };
+
+            const handleExportExcel = () => {
+                const data = filteredExpenses.map(e => ({
+                    'Date': e.date,
+                    'Shop': e.shop,
+                    'Category': e.category,
+                    'Description': e.description,
+                    'Amount (KHR)': e.amount,
+                    'Recorded By': e.recordedBy || '-'
+                }));
+                const ws = XLSX.utils.json_to_sheet(data);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Operational Expenses");
+                XLSX.writeFile(wb, `Operational_Expenses_${selectedMonth}.xlsx`);
+            };
+
+            const canManage = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager';
+
+            return (
+                <Card>
+                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
+                        <h3 className="text-xl font-semibold text-slate-100">Operational Expenses</h3>
+                        <div className="flex flex-wrap gap-4 items-center">
+                            {canManage && (
+                                <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
+                                    <option value="">{userProfile.role === 'Admin' || userProfile.role === 'CEO' ? 'All Shops' : 'All My Shops'}</option>
+                                    {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                </select>
+                            )}
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                            <select value={selectedCategory} onChange={e => setSelectedCategory(e.target.value)} className="select w-full sm:w-auto">
+                                <option value="">All Categories</option>
+                                {/* MODIFIED: Map over the dynamic list */}
+                                {categoriesList.map(c => <option key={c} value={c}>{c}</option>)}
+                            </select>
+                            {canManage && <Button variant="primary" icon="fa-plus" onClick={() => handleOpenModal()}>Add Expense</Button>}
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                        </div>
+                    </div>
+
+                    {loading ? (
+                        <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-slate-700">
+                                <thead className="bg-slate-900/50">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Category</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Description</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                        {canManage && <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>}
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {filteredExpenses.length === 0 ? (
+                                        <tr><td colSpan="6" className="px-4 py-8 text-center text-slate-500">No expenses found.</td></tr>
+                                    ) : (
+                                        filteredExpenses.map(exp => (
+                                            <tr key={exp.id} className="hover:bg-slate-700/50">
+                                                <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{exp.date}</td>
+                                                <td className="px-4 py-4 text-sm text-slate-300">{exp.shop}</td>
+                                                <td className="px-4 py-4 text-sm text-slate-200">
+                                                    <span className="px-2 py-1 bg-slate-700 rounded text-xs">{exp.category}</span>
+                                                </td>
+                                                <td className="px-4 py-4 text-sm text-slate-300">{exp.description}</td>
+                                                <td className="px-4 py-4 text-sm text-right font-semibold text-orange-400">{Utils.formatCurrency(exp.amount)}</td>
+                                                {canManage && (
+                                                    <td className="px-4 py-4 text-center">
+                                                        <div className="flex items-center justify-center gap-2">
+                                                            <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(exp)} />
+                                                            <Button variant="icon-delete" icon="fa-trash" onClick={() => setExpenseToDelete(exp)} />
+                                                        </div>
+                                                    </td>
+                                                )}
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                                <tfoot className="bg-slate-900/50">
+                                    <tr>
+                                        <td colSpan="4" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Total Expenses</td>
+                                        <td className="px-4 py-3 text-right font-bold text-orange-400">{Utils.formatCurrency(totalAmount)}</td>
+                                        {canManage && <td></td>}
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+                    )}
+
+                    <ExpenseModal 
+                        isOpen={isModalOpen} 
+                        onClose={() => setIsModalOpen(false)} 
+                        onSave={handleSave} 
+                        expense={editingExpense} 
+                        categories={categoriesList} // MODIFIED: Pass dynamic list
+                        availableShops={availableShops}
+                        userProfile={userProfile}
+                    />
+                    <ConfirmationModal 
+                        isOpen={!!expenseToDelete} 
+                        onClose={() => setExpenseToDelete(null)} 
+                        onConfirm={handleDelete} 
+                        title="Delete Expense" 
+                        message="Are you sure you want to delete this expense record?" 
+                    />
+                </Card>
+            );
+        };
+
+        const ExpenseModal = ({ isOpen, onClose, onSave, expense, categories, availableShops, userProfile }) => {
+            const [formData, setFormData] = useState({});
+
+            useEffect(() => {
+                if (isOpen) {
+                    const initialShop = (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop) && userProfile.shop.length === 1) 
+                        ? userProfile.shop[0] 
+                        : '';
+
+                    setFormData(expense || {
+                        date: new Date().toISOString().slice(0, 10),
+                        shop: initialShop,
+                        category: categories[0],
+                        amount: '',
+                        description: '',
+                        recordedBy: userProfile.name
+                    });
+                }
+            }, [isOpen, expense, userProfile]);
+
+            const handleChange = (e) => {
+                setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!formData.amount || formData.amount <= 0) {
+                    alert("Please enter a valid amount.");
+                    return;
+                }
+                onSave(formData);
+            };
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-md">
+                    <form onSubmit={handleSubmit}>
+                        <ModalHeader title={expense ? "Edit Expense" : "Add Shop Expense"} onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Date</label>
+                                    <input type="date" name="date" value={formData.date} onChange={handleChange} className="input" required />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Shop</label>
+                                    <select name="shop" value={formData.shop} onChange={handleChange} className="select" required>
+                                        <option value="">Select Shop</option>
+                                        {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Category</label>
+                                    <select name="category" value={formData.category} onChange={handleChange} className="select" required>
+                                        {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Amount (KHR)</label>
+                                    <input type="number" name="amount" value={formData.amount} onChange={handleChange} className="input font-bold text-orange-400" placeholder="0" required />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Description / Item Name</label>
+                                    <textarea name="description" value={formData.description} onChange={handleChange} className="input" rows="3" placeholder="e.g., Bought 5 packs of A4 paper"></textarea>
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Save Expense</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+
+        const PayrollExpensesTab = ({ userProfile }) => {
+            const { where } = window.firebaseSDK;
+            // ... (Previous logic from ExpenseReportPage goes here) ...
+            // RE-USE EXISTING LOGIC from the original ExpenseReportPage component
+            // to populate this tab.
+            
+            // COPYING LOGIC FROM OLD ExpenseReportPage
+            const { data: payrollHistory } = useCollection('payrollHistory', []); // Query constraints logic handles permissions below
             const { data: shops } = useCollection('shops');
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
@@ -7561,7 +8490,22 @@
 
             const { expenseSummary, totals } = useMemo(() => {
                 if (!payrollHistory.length) return { expenseSummary: [], totals: {} };
-                const filteredHistory = payrollHistory.filter(rec => (!selectedShop || rec.shop === selectedShop) && (!selectedMonth || rec.month === selectedMonth));
+                
+                // Client-side filtering because useCollection reused logic is tricky here without props
+                const filteredHistory = payrollHistory.filter(rec => {
+                    const shopMatch = !selectedShop || rec.shop === selectedShop;
+                    const monthMatch = !selectedMonth || rec.month === selectedMonth;
+                    
+                    // Role check
+                    let roleMatch = false;
+                    if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') roleMatch = true;
+                    else if (userProfile?.role === 'Shop Manager') {
+                        const managed = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                        roleMatch = managed.includes(rec.shop);
+                    }
+                    
+                    return shopMatch && monthMatch && roleMatch;
+                });
                 
                 const summary = filteredHistory.reduce((acc, rec) => {
                     if (!rec.shop || !rec.month) return acc;
@@ -7576,9 +8520,6 @@
                 }, {});
 
                 const summaryArray = Object.values(summary).map(item => {
-                    // FIX: The Account Note was double-counting savings payback.
-                    // Savings Payback is already included in the 'totalFinalSalary' (as it's part of Gross Salary).
-                    // We must remove it from this sum to prevent double-counting.
                     const accountNote = (item.totalFinalSalary || 0) + (item.totalLoanDed || 0) + (item.totalOtherDed || 0) + (item.totalSavingsDed || 0);
                     return { ...item, accountNote };
                 }).sort((a, b) => b.month.localeCompare(a.month) || a.shopName.localeCompare(b.shopName));
@@ -7594,14 +8535,14 @@
                 }, { totalLoanDed: 0, totalOtherDed: 0, totalSavingsDed: 0, totalSavingsPayback: 0, totalFinalSalary: 0, totalAccountNote: 0 });
                 
                 return { expenseSummary: summaryArray, totals };
-            }, [payrollHistory, selectedShop, selectedMonth]);
+            }, [payrollHistory, selectedShop, selectedMonth, userProfile]);
             
             const canFilterByShop = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || (userProfile?.role === 'Shop Manager' && Array.isArray(userProfile.shop));
 
             return (
                 <Card>
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
-                        <CardTitle>Expense Report Summary</CardTitle>
+                        <h3 className="text-xl font-semibold text-slate-100">Payroll Expense Summary</h3>
                         <div className="flex flex-wrap gap-4 items-center">
                             {canFilterByShop && (
                                 <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto">
@@ -7614,6 +8555,21 @@
                     </div>
                     <div className="overflow-x-auto"><table className="min-w-full divide-y divide-slate-700"><thead className="bg-slate-900/50"><tr><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Month</th><th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Loan Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Other Ded.</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Saving Program</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Savings Payback</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Total Final Salary</th><th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Account Note</th></tr></thead><tbody className="divide-y divide-slate-700">{expenseSummary.map((item, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="px-4 py-4 text-sm text-slate-200">{item.month}</td><td className="px-4 py-4 text-sm text-slate-300">{item.shopName}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalLoanDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalOtherDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalSavingsDed)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right">{Utils.formatCurrency(item.totalSavingsPayback)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.totalFinalSalary)}</td><td className="px-4 py-4 text-sm text-slate-300 text-right font-semibold">{Utils.formatCurrency(item.accountNote)}</td></tr>))}</tbody><tfoot className="bg-slate-900/50"><tr><td colSpan="2" className="px-4 py-3 text-right font-bold text-slate-300 uppercase">Sub-Total</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalLoanDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalOtherDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsDed)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalSavingsPayback)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalFinalSalary)}</td><td className="px-4 py-3 text-right font-bold text-slate-300">{Utils.formatCurrency(totals.totalAccountNote)}</td></tr></tfoot></table></div>
                 </Card>
+            );
+        };
+
+        const ExpenseReportPage = ({ userProfile }) => {
+            const [activeTab, setActiveTab] = useState('payrollExpenses');
+            const tabs = { 
+                payrollExpenses: 'Payroll Expenses', 
+                operationalExpenses: 'Operational Expenses' 
+            };
+
+            return (
+                <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
+                    <div id="payrollExpenses"><PayrollExpensesTab userProfile={userProfile} /></div>
+                    <div id="operationalExpenses"><OperationalExpensesTab userProfile={userProfile} /></div>
+                </TabbedPage>
             );
         };
         // --- END EXPENSE REPORT PAGE ---
@@ -7869,6 +8825,7 @@
         // --- END POLICY BOARD PAGE ---
 
         // --- START USER ACTIVITY PAGE ---
+        // ... (UserActivityPage code remains unchanged) ...
         const UserActivityPage = () => {
             const { db } = useFirebase();
             const { data: employees } = useCollection('employees');
@@ -8013,6 +8970,390 @@
             );
         };
         // --- END USER ACTIVITY PAGE ---
+
+        // --- NEW: DASHBOARD SUMMARY PAGE ---
+        const DashboardSummaryPage = ({ userProfile, setActivePage }) => {
+            const { employees, shops, shifts, isLoading } = useAppData(); 
+            const { db } = useFirebase();
+            const { collection, query, where, getDocs, limit, orderBy } = window.firebaseSDK;
+
+            const [pendingLeavesCount, setPendingLeavesCount] = useState(0);
+            // REMOVED: recentLogs state
+            // REMOVED: loadingLogs state
+            const [dailyStats, setDailyStats] = useState([]);
+            const [loadingStats, setLoadingStats] = useState(true);
+
+            // Fetch extra dashboard data
+            useEffect(() => {
+                if (!db) return;
+
+                const fetchDashboardData = async () => {
+                    // 1. Pending Leaves Count
+                    try {
+                        let leaveQ = query(collection(db, 'leaveRequests'), where('status', '==', 'Pending'));
+                        
+                        if (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop)) {
+                            leaveQ = query(leaveQ, where('shop', 'in', userProfile.shop));
+                        } else if (userProfile.role === 'Staff') {
+                            leaveQ = query(leaveQ, where('staffId', '==', userProfile.id));
+                        }
+
+                        const leaveSnap = await getDocs(leaveQ);
+                        setPendingLeavesCount(leaveSnap.size);
+                    } catch (err) {
+                        console.error("Error fetching dashboard leave count", err);
+                    }
+
+                    // REMOVED: Recent Activity Logs fetching logic
+                };
+
+                fetchDashboardData();
+            }, [db, userProfile]);
+
+            // --- NEW: Calculate Daily Attendance Stats per Shop ---
+            useEffect(() => {
+                if (!db || isLoading || !employees || !shops) return;
+
+                const calculateDailyStats = async () => {
+                    setLoadingStats(true);
+                    try {
+                        const today = new Date();
+                        const startOfDay = new Date(today); startOfDay.setHours(0, 0, 0, 0);
+                        const endOfDay = new Date(today); endOfDay.setHours(23, 59, 59, 999);
+                        const todayStr = today.toISOString().slice(0, 10);
+
+                        let attQ = query(collection(db, 'attendance'), where('timestamp', '>=', startOfDay), where('timestamp', '<=', endOfDay));
+                        let leaveQ = query(collection(db, 'leaveRequests'), where('returnDate', '>=', todayStr));
+
+                        const [attSnap, leaveSnap] = await Promise.all([getDocs(attQ), getDocs(leaveQ)]);
+                        const attendanceDocs = attSnap.docs.map(d => d.data());
+                        const leaveDocs = leaveSnap.docs.map(d => d.data()).filter(l => l.status === 'Approved');
+
+                        const relevantShops = (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop))
+                            ? shops.filter(s => userProfile.shop.includes(s.name))
+                            : shops;
+
+                        const stats = relevantShops.map(shop => {
+                            const shopEmployees = employees.filter(e => {
+                                const eShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                                return eShops.includes(shop.name) && e.status === 'Active';
+                            });
+
+                            let presentCount = 0;
+                            let lateCount = 0;
+                            let leaveCount = 0;
+
+                            shopEmployees.forEach(emp => {
+                                const empAtt = attendanceDocs.filter(a => a.employeeId === emp.id && a.shop === shop.name);
+                                const isPresent = empAtt.length > 0;
+
+                                if (isPresent) {
+                                    presentCount++;
+                                    const firstIn = empAtt.find(a => a.type === 'in');
+                                    if (firstIn && firstIn.timestamp) {
+                                        const shift = shifts.find(s => s.name === emp.shift && s.shopName === shop.name);
+                                        if (shift?.lateThreshold) {
+                                            const checkInDate = firstIn.timestamp.toDate();
+                                            const [lateH, lateM] = shift.lateThreshold.split(':').map(Number);
+                                            const timeInZone = checkInDate.toLocaleTimeString('en-GB', { timeZone: shop.timezone || 'Asia/Phnom_Penh', hour: '2-digit', minute: '2-digit' });
+                                            const [checkH, checkM] = timeInZone.split(':').map(Number);
+                                            
+                                            if (checkH > lateH || (checkH === lateH && checkM > lateM)) {
+                                                lateCount++;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    const isOnLeave = leaveDocs.some(l => 
+                                        l.staffId === emp.id && 
+                                        l.leaveDate <= todayStr && 
+                                        l.returnDate > todayStr
+                                    );
+                                    if (isOnLeave) {
+                                        leaveCount++;
+                                    }
+                                }
+                            });
+
+                            return {
+                                id: shop.id,
+                                name: shop.name,
+                                totalStaff: shopEmployees.length,
+                                present: presentCount,
+                                late: lateCount,
+                                leave: leaveCount,
+                                absent: Math.max(0, shopEmployees.length - presentCount - leaveCount)
+                            };
+                        });
+
+                        setDailyStats(stats);
+                    } catch (error) {
+                        console.error("Error calculating daily stats:", error);
+                    } finally {
+                        setLoadingStats(false);
+                    }
+                };
+
+                calculateDailyStats();
+            }, [db, employees, shops, shifts, userProfile, isLoading]);
+
+            // --- Calculations ---
+            const visibleEmployees = useMemo(() => {
+                if (!employees) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return employees;
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    return employees.filter(e => {
+                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                        return empShops.some(s => managedShops.includes(s));
+                    });
+                }
+                return employees.filter(e => e.id === userProfile.id);
+            }, [employees, userProfile]);
+
+            const activeEmployees = visibleEmployees.filter(e => e.status === 'Active');
+            
+            const totalEstimatedPayroll = activeEmployees.reduce((sum, emp) => {
+                const salary = parseFloat(String(emp.salary).replace(/[^0-9.-]/g, '')) || 0;
+                return sum + salary;
+            }, 0);
+
+            // REMOVED: shopDistribution calculation
+
+            // --- Redesigned Helper Components ---
+            
+            // 1. Modern Metric Card
+            const DashboardMetricCard = ({ title, value, subtitle, icon, color, onClick }) => (
+                <div 
+                    onClick={onClick}
+                    className={`relative p-6 rounded-2xl border border-slate-800 shadow-xl backdrop-blur-sm overflow-hidden group transition-all duration-300 hover:shadow-2xl hover:border-slate-700 hover:-translate-y-1 ${onClick ? 'cursor-pointer' : ''} bg-gradient-to-br from-slate-900 to-slate-950`}
+                >
+                    {/* Glowing effect behind icon */}
+                    <div className={`absolute -right-6 -top-6 w-32 h-32 bg-${color}-500/10 rounded-full blur-3xl group-hover:bg-${color}-500/20 transition-all duration-500`}></div>
+                    
+                    <div className="relative z-10">
+                        <div className="flex justify-between items-start mb-4">
+                            <div className={`p-3 rounded-xl bg-${color}-500/10 text-${color}-400 border border-${color}-500/20 group-hover:scale-110 transition-transform duration-300`}>
+                                <i className={`fas ${icon} text-xl`}></i>
+                            </div>
+                        </div>
+                        
+                        <h3 className="text-3xl sm:text-4xl font-black text-white tracking-tight mb-1 truncate font-sans">
+                            {value}
+                        </h3>
+                        <p className="text-sm font-medium text-slate-400 uppercase tracking-wider">{title}</p>
+                        
+                        <div className="mt-4 pt-4 border-t border-slate-800/50 flex items-center gap-2">
+                            <div className={`w-2 h-2 rounded-full bg-${color}-500 animate-pulse`}></div>
+                            <p className="text-xs text-slate-500 font-medium">{subtitle}</p>
+                        </div>
+                    </div>
+                </div>
+            );
+
+            // 2. Modern Action Button
+            const QuickActionButton = ({ icon, label, onClick, color, desc }) => (
+                <button 
+                    onClick={onClick}
+                    className="relative group flex flex-col items-start p-5 rounded-2xl border border-slate-800 bg-slate-900/50 hover:bg-slate-800/80 transition-all duration-300 hover:shadow-lg hover:border-slate-700 text-left w-full overflow-hidden"
+                >
+                    <div className={`absolute right-0 top-0 w-24 h-24 bg-${color}-500/5 rounded-full blur-2xl group-hover:bg-${color}-500/10 transition-all duration-500 -mr-8 -mt-8`}></div>
+                    
+                    <div className={`mb-3 p-3 rounded-lg bg-${color}-500/10 group-hover:bg-${color}-500/20 text-${color}-400 transition-colors duration-300`}>
+                        <i className={`fas ${icon} text-xl`}></i>
+                    </div>
+                    <span className="text-sm font-bold text-slate-200 group-hover:text-white transition-colors block">{label}</span>
+                    <span className="text-[10px] text-slate-500 font-medium mt-1 uppercase tracking-wide">{desc}</span>
+                </button>
+            );
+
+            if (isLoading) return <div className="text-center py-20"><i className="fas fa-spinner fa-spin text-4xl text-blue-500"></i><p className="mt-4 text-slate-400 animate-pulse">Initializing Dashboard...</p></div>;
+
+            return (
+                <div className="space-y-8 animate-fade-in pb-10">
+                    
+                    {/* --- 1. Welcome Banner (Hero Section) --- */}
+                    <div className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-blue-900 to-indigo-900 shadow-2xl border border-blue-700/30">
+                        {/* Background Patterns */}
+                        <div className="absolute top-0 right-0 -mr-20 -mt-20 w-96 h-96 bg-blue-500/20 rounded-full blur-3xl"></div>
+                        <div className="absolute bottom-0 left-0 -ml-20 -mb-20 w-64 h-64 bg-indigo-500/20 rounded-full blur-3xl"></div>
+                        
+                        <div className="relative z-10 flex flex-col md:flex-row justify-between items-end md:items-center p-8">
+                            <div>
+                                <p className="text-blue-200 font-medium mb-1 flex items-center gap-2">
+                                    <i className="fas fa-sun text-yellow-400"></i> Good {new Date().getHours() < 12 ? 'Morning' : new Date().getHours() < 18 ? 'Afternoon' : 'Evening'},
+                                </p>
+                                <h2 className="text-3xl md:text-4xl font-bold text-white mb-2 tracking-tight">
+                                    {userProfile?.name}
+                                </h2>
+                                <p className="text-blue-100/80 text-sm max-w-md">
+                                    Here's your daily operational overview. You have <span className="font-bold text-white underline decoration-yellow-400 decoration-2 underline-offset-2">{pendingLeavesCount} pending requests</span> requiring attention.
+                                </p>
+                            </div>
+                            <div className="mt-6 md:mt-0 text-right bg-white/10 backdrop-blur-md rounded-xl p-4 border border-white/10 shadow-lg">
+                                <p className="text-3xl font-black text-white tracking-wide font-mono">
+                                    {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </p>
+                                <p className="text-xs text-blue-200 font-semibold uppercase tracking-widest mt-1">
+                                    {new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* --- 2. Key Metrics Grid --- */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 sm:gap-6">
+                        {/* Custom Operations Card (Split 2-Column Design) */}
+                        <div className="relative p-6 rounded-2xl border border-slate-800 shadow-xl backdrop-blur-sm overflow-hidden group transition-all duration-300 hover:shadow-2xl hover:border-slate-700 hover:-translate-y-1 bg-gradient-to-br from-slate-900 to-slate-950">
+                            <div className="absolute -right-6 -top-6 w-32 h-32 bg-indigo-500/10 rounded-full blur-3xl group-hover:bg-indigo-500/20 transition-all duration-500"></div>
+                            
+                            <div className="relative z-10 h-full flex flex-col justify-between">
+                                <div className="flex justify-between items-start mb-4">
+                                    <div className="p-3 rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 group-hover:scale-110 transition-transform duration-300">
+                                        <i className="fas fa-building-user text-xl"></i>
+                                    </div>
+                                    <p className="text-sm font-medium text-slate-400 uppercase tracking-wider mt-1">Operations</p>
+                                </div>
+                                
+                                <div className="grid grid-cols-2 divide-x divide-slate-800 mt-2">
+                                    <div className="pr-4">
+                                        <h3 className="text-3xl sm:text-4xl font-black text-white tracking-tight mb-1">{activeEmployees.length}</h3>
+                                        <p className="text-xs font-bold text-slate-500 uppercase">Active Staff</p>
+                                    </div>
+                                    <div className="pl-4">
+                                        <h3 className="text-3xl sm:text-4xl font-black text-white tracking-tight mb-1">{shops.length}</h3>
+                                        <p className="text-xs font-bold text-slate-500 uppercase">Active Shops</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <DashboardMetricCard 
+                            title="Est. Payroll" 
+                            value={Utils.formatCurrency(totalEstimatedPayroll)} 
+                            subtitle="Monthly Base"
+                            icon="fa-money-bill-wave" 
+                            color="emerald" 
+                        />
+                        <DashboardMetricCard 
+                            title="Pending Requests" 
+                            value={pendingLeavesCount} 
+                            subtitle="Action Required"
+                            icon="fa-clock" 
+                            color="amber"
+                            onClick={() => setActivePage('checkinme')}
+                        />
+                    </div>
+
+                    {/* --- 3. Main Content Grid --- */}
+                    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                        
+                        {/* LEFT COL: Attendance (Span 2) */}
+                        <div className="xl:col-span-2 space-y-6">
+                            
+                            {/* Live Attendance Table */}
+                            <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg overflow-hidden flex flex-col h-full">
+                                <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900/50">
+                                    <div>
+                                        <h3 className="text-lg font-bold text-white flex items-center gap-3">
+                                            <span className="flex h-3 w-3 relative">
+                                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                                                <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+                                            </span>
+                                            Live Attendance
+                                        </h3>
+                                        <p className="text-xs text-slate-400 mt-1">Real-time status across all locations</p>
+                                    </div>
+                                    <button onClick={() => setActivePage('attendanceReport')} className="text-xs text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors border border-slate-700">Full Report</button>
+                                </div>
+                                
+                                <div className="overflow-x-auto">
+                                    {loadingStats ? (
+                                        <div className="flex justify-center items-center h-48"><i className="fas fa-spinner fa-spin text-2xl text-blue-500"></i></div>
+                                    ) : dailyStats.length === 0 ? (
+                                        <div className="flex flex-col justify-center items-center h-48 text-slate-500">
+                                            <i className="fas fa-store-slash text-4xl mb-3 opacity-30"></i>
+                                            <p className="text-sm">No shop data available.</p>
+                                        </div>
+                                    ) : (
+                                        <table className="w-full text-left">
+                                            <thead className="bg-slate-950 text-xs uppercase text-slate-500 font-bold tracking-wider">
+                                                <tr>
+                                                    <th className="p-4 pl-6">Shop Location</th>
+                                                    <th className="p-4 text-center hidden sm:table-cell">Total Staff</th>
+                                                    <th className="p-4 text-center">Present</th>
+                                                    <th className="p-4 text-center">Late</th>
+                                                    <th className="p-4 text-center">Leave</th>
+                                                    <th className="p-4 text-center hidden sm:table-cell pr-6">Absent</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-800 text-sm">
+                                                {dailyStats.map(stat => (
+                                                    <tr key={stat.id} className="hover:bg-slate-800/50 transition-colors group">
+                                                        <td className="p-4 pl-6 font-medium text-slate-200">
+                                                            <div className="flex items-center gap-3">
+                                                                <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center text-slate-400 group-hover:text-blue-400 transition-colors">
+                                                                    <i className="fas fa-map-marker-alt"></i>
+                                                                </div>
+                                                                <div>
+                                                                    {stat.name}
+                                                                    <span className="sm:hidden text-xs text-slate-500 block mt-0.5">Total: {stat.totalStaff}</span>
+                                                                </div>
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-4 text-center text-slate-400 font-medium hidden sm:table-cell">{stat.totalStaff}</td>
+                                                        <td className="p-4 text-center">
+                                                            <div className="inline-flex items-center justify-center px-3 py-1 rounded-md text-xs font-bold bg-green-500/10 text-green-400 border border-green-500/20">
+                                                                {stat.present}
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-4 text-center">
+                                                            <div className={`inline-flex items-center justify-center px-3 py-1 rounded-md text-xs font-bold ${stat.late > 0 ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 'text-slate-600 bg-slate-800/50'}`}>
+                                                                {stat.late}
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-4 text-center">
+                                                            <div className={`inline-flex items-center justify-center px-3 py-1 rounded-md text-xs font-bold ${stat.leave > 0 ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' : 'text-slate-600 bg-slate-800/50'}`}>
+                                                                {stat.leave}
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-4 text-center text-slate-500 hidden sm:table-cell pr-6">
+                                                            {stat.absent > 0 ? <span className="text-slate-400 font-bold">{stat.absent}</span> : '-'}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            {/* REMOVED: Staff Distribution Chart */}
+                        </div>
+
+                        {/* RIGHT COL: Quick Actions (Span 1) */}
+                        <div className="space-y-6">
+                            
+                            {/* Command Center (Quick Actions) */}
+                            <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg p-6">
+                                <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                                    <i className="fas fa-bolt text-yellow-400"></i> Command Center
+                                </h3>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <QuickActionButton icon="fa-calendar-check" label="Check In" desc="Start/End Day" color="blue" onClick={() => setActivePage('checkinme')} />
+                                    <QuickActionButton icon="fa-user-plus" label="Add Staff" desc="New Profile" color="emerald" onClick={() => setActivePage('employees')} />
+                                    <QuickActionButton icon="fa-calculator" label="Payroll" desc="Run Monthly" color="amber" onClick={() => setActivePage('payroll')} />
+                                    <QuickActionButton icon="fa-cog" label="Settings" desc="System Config" color="slate" onClick={() => setActivePage('settings')} />
+                                </div>
+                            </div>
+
+                            {/* REMOVED: Recent Activity Timeline */}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+        // --- END DASHBOARD SUMMARY PAGE ---
 
         // --- START SETTINGS PAGE ---
         
@@ -8264,24 +9605,24 @@
             const { data: shops } = useCollection('shops');
             const { data: positions } = useCollection('positions');
             const { data: shifts } = useCollection('shifts');
+            // MODIFIED: Fetch categories here to pass to the CRUD component
+            const { data: expenseCategories } = useCollection('expenseCategories');
+            
             const [activeTab, setActiveTab] = useState(initialTab);
-            // NEW: Get userProfile to conditionally show migration tab
             const { userProfile } = useFirebase(); 
 
-            // NEW: Effect to update the active tab if the initialTab prop changes
-            // This allows the Dashboard to control which tab is shown.
             useEffect(() => {
                 setActiveTab(initialTab);
             }, [initialTab]);
             
-            // NEW: Add migration tab only for Admins
+            // MODIFIED: Added 'expenses' tab
             const tabs = useMemo(() => {
                 const baseTabs = { 
                     shop: 'Shop & Shift Management', 
                     position: 'Position Management', 
+                    expenses: 'Expense Categories', // NEW TAB
                     memo: 'Memo Alert' 
                 };
-                // REMOVED: The logic adding the 'migration' tab has been deleted.
                 return baseTabs;
             }, [userProfile]);
 
@@ -8340,6 +9681,15 @@
             const positionListColumns = [
                 { header: 'Position Name', accessor: 'position' }
             ];
+            
+            // NEW: Config for Expense Categories
+            const expenseCategoryFormFields = [
+                { name: 'name', label: 'Category Name', required: true }
+            ];
+            
+            const expenseCategoryListColumns = [
+                { header: 'Category Name', accessor: 'name' }
+            ];
             // END FIX
 
             return (
@@ -8352,9 +9702,18 @@
                         </div>
                     </div>
                     <div id="position"><SettingsCRUD title="Position" collectionName="positions" items={positions} formFields={positionFormFields} listColumns={positionListColumns} /></div>
+                    {/* NEW: Render the Expense Categories tab */}
+                    <div id="expenses">
+                        <SettingsCRUD 
+                            title="Expense Category" 
+                            collectionName="expenseCategories" 
+                            items={expenseCategories} 
+                            formFields={expenseCategoryFormFields} 
+                            listColumns={expenseCategoryListColumns} 
+                        />
+                    </div>
                     {/* REVISED: Use the new memo management component */}
                     <div id="memo"><MemoAlertTab /></div>
-                    {/* REMOVED: The div for the 'migration' tab has been deleted. */}
                 </TabbedPage>
             );
         }
@@ -8369,24 +9728,10 @@
             const [processLog, setProcessLog] = useState([]);
             const [processComplete, setProcessComplete] = useState(false);
 
-            // Fetch all data needed for calculations in one go, using one-time fetches for efficiency
-            // REMOVED: All useStaticCollection hooks have been removed from here to prevent
-            // the 87,000+ reads on page load. Data will now be fetched *inside* handleTriggerPayroll.
-            /*
-            const { data: allShops, loading: shopsLoading } = useStaticCollection('shops');
-            const { data: employees, loading: employeesLoading } = useStaticCollection('employees');
-            const { data: attendance, loading: attendanceLoading } = useStaticCollection('attendance');
-            ... (and so on) ...
-            */
-
-            // MODIFIED: This check is no longer needed here, as data is fetched on-demand.
-            // const allDataReady = !shopsLoading && !employeesLoading && !attendanceLoading && !leaveLoading && !otLoading && !loansLoading && !statesLoading && !revisionsLoading;
-            // NEW: We still need a static list of shops for the dropdown.
+            // Use static collection for shops dropdown only
             const { data: allShops } = useStaticCollection('shops');
 
-
             const handleTriggerPayroll = async () => {
-                // MODIFIED: Removed the 'allDataReady' check which was causing a ReferenceError
                 if (!triggerConfirmed || !selectedShop || !selectedMonth) {
                     alert("Please select a shop, month, and confirm the action.");
                     return;
@@ -8396,16 +9741,27 @@
                 setProcessLog([]);
                 setProcessComplete(false);
 
-                // --- START MODIFICATION: Fetch all data on-demand ---
-                setProcessLog(prev => [...prev, 'Fetching all required data... This may take a moment.']);
+                // --- OPTIMIZED DATA FETCHING ---
+                setProcessLog(prev => [...prev, 'Fetching data for selected month...']);
 
-                // FIX 1: Added 'writeBatch', 'doc', and 'serverTimestamp' which are needed inside the processing loop.
                 const { collection, getDocs, query, where, writeBatch, doc, serverTimestamp } = window.firebaseSDK;
 
                 let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions;
                 let savingsData;
 
                 try {
+                    // 1. Calculate Date Range for the selected month to filter queries
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    // Start of month
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    // End of month (last millisecond)
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    
+                    // String formats for fields that store dates as strings (YYYY-MM-DD)
+                    const startStr = startOfMonth.toISOString().slice(0, 10);
+                    const endStr = endOfMonth.toISOString().slice(0, 10);
+
+                    // 2. Prepare Optimized Queries
                     const [
                         shopsSnap,
                         empSnap,
@@ -8415,19 +9771,28 @@
                         loanSnap,
                         stateSnap,
                         revSnap,
-                        // MODIFIED (STEP 5): Add 'savingsSnap'
                         savingsSnap
                     ] = await Promise.all([
                         getDocs(collection(db, 'shops')),
-                        getDocs(collection(db, 'employees')),
-                        getDocs(collection(db, 'attendance')),
-                        getDocs(collection(db, 'leaveRequests')),
-                        getDocs(collection(db, 'otRequests')),
-                        getDocs(collection(db, 'staffLoans')),
-                        getDocs(collection(db, 'employeeStates')),
-                        getDocs(collection(db, 'salaryRevisions')),
-                        // MODIFIED (STEP 5): Add query for 'savingprogram'
-                        getDocs(collection(db, 'savingprogram'))
+                        getDocs(collection(db, 'employees')), // Employees are needed to check status
+                        
+                        // OPTIMIZATION: Only fetch attendance for the specific month
+                        getDocs(query(collection(db, 'attendance'), where('timestamp', '>=', startOfMonth), where('timestamp', '<=', endOfMonth))),
+                        
+                        // OPTIMIZATION: Only fetch leave overlapping the month
+                        // (Simplified to leave starting before end of month for safety, logic handles exact overlap)
+                        getDocs(query(collection(db, 'leaveRequests'), where('leaveDate', '<=', endStr))), 
+                        
+                        // OPTIMIZATION: Only fetch OT in range
+                        getDocs(query(collection(db, 'otRequests'), where('reqDate', '>=', startStr), where('reqDate', '<=', endStr))),
+                        
+                        getDocs(collection(db, 'staffLoans')), // Active loans needed
+                        
+                        // OPTIMIZATION: Only fetch states (deductions/engagements) in range
+                        getDocs(query(collection(db, 'employeeStates'), where('date', '>=', startStr), where('date', '<=', endStr))),
+                        
+                        getDocs(collection(db, 'salaryRevisions')), // Revisions history needed
+                        getDocs(collection(db, 'savingprogram'))    // Savings status needed
                     ]);
 
                     allShopsData = shopsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -8438,10 +9803,9 @@
                     staffLoans = loanSnap.docs.map(d => ({ id: d.id, ...d.data() }));
                     employeeStates = stateSnap.docs.map(d => ({ id: d.id, ...d.data() }));
                     salaryRevisions = revSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    // MODIFIED (STEP 5): Process 'savingsData'
                     savingsData = savingsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-                    setProcessLog(prev => [...prev, 'All data fetched successfully.']);
+                    setProcessLog(prev => [...prev, `Data fetched. (${attendance.length} attendance records found for this month)`]);
 
                 } catch (fetchError) {
                     console.error("Critical error fetching bulk data:", fetchError);
@@ -8449,7 +9813,7 @@
                     setIsProcessing(false);
                     return;
                 }
-                // --- END MODIFICATION ---
+                // --- END OPTIMIZATION ---
 
                 // MODIFIED: Use the locally fetched data
                 const allData = { shops: allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
@@ -8468,32 +9832,19 @@
                     setIsProcessing(false);
                     return;
                 }
-                
-                // Check if payroll for this shop/month already exists to prevent duplicates
-                // --- BUG FIX: This check is flawed. It checks for the whole shop, not per-employee. ---
-                // --- This logic will be removed and moved inside the loop. ---
-                /*
-                const payrollCheckQuery = query(collection(db, "payrollHistory"), where("month", "==", selectedMonth), where("shop", "==", selectedShop));
-                const existingPayrollSnap = await getDocs(payrollCheckQuery);
-                if (!existingPayrollSnap.empty) {
-                     setProcessLog(prev => [...prev, `Warning: Payroll for ${selectedShop} for ${selectedMonth} may already exist. Please check history.`]);
-                }
-                */
 
                 setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
                 
-                // --- NEW: Get start/end of month for savings query ---
+                // --- NEW: Re-calculate dates for the transaction query loop ---
                 const [year, month] = selectedMonth.split('-').map(Number);
                 const startDate = new Date(year, month - 1, 1);
                 const endDate = new Date(year, month, 0, 23, 59, 59, 999);
-                // --- END NEW ---
 
                 let successCount = 0;
                 for (const employee of employeesToProcess) {
                     await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
                     
-                    // --- NEW DUPLICATE CHECK (BUG FIX) ---
-                    // Check if a payroll record already exists for this specific employee and month.
+                    // --- DUPLICATE CHECK ---
                     try {
                         const payrollCheckQuery = query(
                             collection(db, "payrollHistory"), 
@@ -8503,32 +9854,26 @@
                         const existingPayrollSnap = await getDocs(payrollCheckQuery);
                         
                         if (!existingPayrollSnap.empty) {
-                            // A record already exists. Log it and skip this employee.
                             setProcessLog(prev => [...prev, `[Skipped] ${employee.name}: Payroll record already exists for ${selectedMonth}.`]);
-                            continue; // Move to the next employee
+                            continue; 
                         }
                     } catch (checkError) {
                         setProcessLog(prev => [...prev, `[Error] Failed to check duplicates for ${employee.name}: ${checkError.message}`]);
-                        continue; // Skip this employee due to the check error
+                        continue; 
                     }
-                    // --- END DUPLICATE CHECK ---
 
                     setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
 
-                    // --- NEW: Fetch savings withdrawals for this specific employee and month ---
+                    // --- FETCH SAVINGS WITHDRAWALS ---
                     let employeeSavingsWithdrawals = [];
                     try {
                         const q = query(
-                            // MODIFIED (STEP 6.A): Path changed from 'savingsTransactions' to the new subcollection
                             collection(db, 'savingprogram', employee.id, 'transactions'),
-                            // FIX 2 (Index Error): Removed the 'type' filter from the query. We will filter in JS.
-                            // where("type", "==", "withdrawal"), 
                             where("date", ">=", startDate),
                             where("date", "<=", endDate)
                         );
                         
                         const querySnapshot = await getDocs(q);
-                        // FIX 2 (Index Error): Apply the 'type' filter here in JavaScript
                         employeeSavingsWithdrawals = querySnapshot.docs
                             .map(doc => ({ id: doc.id, ...doc.data() }))
                             .filter(tx => tx.type === 'withdrawal');
@@ -8538,17 +9883,11 @@
                         }
                     } catch (error) {
                         console.error(`Error fetching savings withdrawals for ${employee.name}:`, error);
-                         setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}... (Error fetching withdrawals)`]);
+                         // Don't stop the process, just log
                     }
-                    // --- END NEW ---
 
-                    // Here we call the logic from our hook, but directly.
-                    // This is a simplified version; in a real large-scale app, this would be a backend function.
-                    
-                    // MODIFIED (STEP 5): Get this employee's savingsData from the Map
                     const employeeSavingsData = savingsDataMap.get(employee.id) || null;
                     
-                    // --- MODIFIED CALL: Pass the fetched withdrawals and savingsData to the calculator ---
                     const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals, employeeSavingsData);
                     
                     if (calculations.netSalary !== undefined) {
@@ -8560,20 +9899,13 @@
                         const payrollDocRef = doc(collection(db, "payrollHistory"));
                         batch.set(payrollDocRef, payrollData);
                         
-                        // Handle loan deduction logic
+                        // Handle loan deduction
                         if (inputs.loanDeduction > 0) {
-                            // --- BUG FIX: Use deterministic logic to find the correct loan ---
-                            // This ensures the deduction is applied to the *correct* loan,
-                            // by finding the one with the latest effectiveDate.
                             const applicableLoans = (staffLoans || [])
-                                .filter(l => l.staffId === employee.id && 
-                                             l.status === 'Active' &&
-                                             (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth)
-                                )
+                                .filter(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth))
                                 .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
                             
                             const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
-                            // --- END FIX ---
 
                             if (activeLoan) {
                                 const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
@@ -8583,7 +9915,7 @@
                                 batch.update(doc(db, 'staffLoans', activeLoan.id), { totalPaid: newTotalPaid, status: newStatus });
                                 
                                 batch.set(doc(collection(db, 'loanPayments')), { 
-                                    paymentDate: `${selectedMonth}-${new Date(year, month, 0).getDate()}`, // Use year/month from above
+                                    paymentDate: `${selectedMonth}-${new Date(year, month, 0).getDate()}`, 
                                     staffId: employee.id, 
                                     staffName: employee.name, 
                                     shop: shopName, 
@@ -8591,30 +9923,25 @@
                                     amountPaid: inputs.loanDeduction, 
                                     remainingBalance: newBalance, 
                                     note: "Paid via payroll",
-                                    payrollId: payrollDocRef.id // Link to the payroll doc
+                                    payrollId: payrollDocRef.id 
                                 });
                             }
                         }
 
-                        // --- Batch commit and Savings Contribution ---
+                        // --- Commit and Process Savings ---
                         try {
                             await batch.commit();
 
-                            // --- NEW: Step 3 - Process Savings Contribution (after batch commit) ---
                             if (calculations.savingsDeduction > 0) {
-                                // MODIFIED (STEP 5): Pass the 'shopName' to the utility function
-                                // NEW: Log before calling
-                                console.log(`[Payroll Trigger] Calling manageSavingsContribution for ${employee.name}, Amount: ${calculations.savingsDeduction}`);
                                 await Utils.manageSavingsContribution(
                                     db,
                                     employee.id,
                                     employee.name,
-                                    shopName, // Pass the shopName
+                                    shopName,
                                     calculations.savingsDeduction,
-                                    payrollDocRef.id // Use the ID from the ref created for the batch
+                                    payrollDocRef.id
                                 );
                             }
-                            // --- END: Step 3 ---
 
                             successCount++;
                             setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully processed for ${employee.name}.`]);
@@ -8630,7 +9957,7 @@
                 setProcessLog(prev => [...prev, `\nProcess finished. Successfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`]);
                 setIsProcessing(false);
                 setProcessComplete(true);
-                setTriggerConfirmed(false); // Reset confirmation checkbox
+                setTriggerConfirmed(false); 
             };
 
             return (
@@ -8663,7 +9990,6 @@
 
                         <Button 
                             onClick={handleTriggerPayroll} 
-                            // MODIFIED: Removed !allDataReady check
                             disabled={!triggerConfirmed || isProcessing || !selectedShop}
                             variant="danger"
                             className="w-full py-3 text-base"
@@ -8730,24 +10056,30 @@
 
             const handleSave = useCallback(async (item) => {
                 const { doc, updateDoc, addDoc, collection } = window.firebaseSDK;
+                
+                // --- BUG FIX: Check for duplicates on BOTH Create and Update ---
+                if (collectionName === 'shifts') {
+                    const isDuplicate = items.some(existingShift => 
+                        existingShift.name === item.name && 
+                        existingShift.shopName === item.shopName &&
+                        existingShift.id !== item.id // Exclude itself when editing
+                    );
+
+                    if (isDuplicate) {
+                        alert(`A shift with the name "${item.name}" already exists for "${item.shopName}". Please choose a different name.`);
+                        return; // Stop the save
+                    }
+                }
+                // --- END FIX ---
+
                 try {
                     if (item.id) { const { id, ...data } = item; await updateDoc(doc(db, collectionName, id), data); } 
                     else { 
-                        // NEW: Add a duplicate check specifically for new shifts before saving.
-                        if (collectionName === 'shifts') {
-                            const isDuplicate = items.some(
-                                existingShift => existingShift.name === item.name && existingShift.shopName === item.shopName
-                            );
-                            if (isDuplicate) {
-                                alert(`A shift with the name "${item.name}" already exists for "${item.shopName}". Please choose a different name.`);
-                                return; // Stop the function to prevent saving a duplicate.
-                            }
-                        }
                         await addDoc(collection(db, collectionName), item); 
                     }
                     setEditingItem(null); setNewItem(getInitialState());
                 } catch (e) { console.error(`Error saving ${collectionName}:`, e); }
-            }, [db, collectionName, getInitialState, items]); // Added `items` to dependency array for duplicate check
+            }, [db, collectionName, getInitialState, items]); 
             
             const handleDelete = useCallback(async () => {
                 if (!itemToDelete) return;
@@ -8805,6 +10137,8 @@
         const Sidebar = memo(({ activePage, setActivePage, isSidebarOpen, toggleSidebar, userProfile }) => {
             const { isOnline } = useConnectivity();
             const sidebarLinks = useMemo(() => [ 
+                // NEW: Added Dashboard as the first link
+                { key: 'dashboard', icon: 'fa-chart-pie', label: 'Dashboard' },
                 { key: 'policy', icon: 'fa-book-open', label: 'Policy Board' },
                 { key: 'employees', icon: 'fa-users', label: 'Employees' }, 
                 { key: 'checkinme', icon: 'fa-user-clock', label: 'CheckInMe' }, 
@@ -8820,13 +10154,12 @@
             // Filter sidebar links based on user permissions
             const availableLinks = useMemo(() => {
                 if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return sidebarLinks; // Admin & CEO see all available links
-                if (!userProfile?.permissions) {
-                    // If no permissions array exists, just show the policy board to be safe.
-                    return sidebarLinks.filter(link => link.key === 'policy');
-                }
-                // Create a set of allowed pages, ensuring 'policy' is always included without duplication.
-                const allowedPages = new Set(userProfile.permissions);
+                
+                // --- MODIFIED: Ensure 'dashboard' is available for everyone ---
+                // Staff might have limited dashboard view, but they should see the link.
+                const allowedPages = new Set(userProfile?.permissions || []);
                 allowedPages.add('policy');
+                allowedPages.add('dashboard'); // Everyone gets dashboard
         
                 return sidebarLinks.filter(link => allowedPages.has(link.key));
             }, [userProfile, sidebarLinks]);
@@ -8963,15 +10296,15 @@
             // Set the default page based on user role and permissions
             useEffect(() => {
                 if (userProfile) {
-                    let defaultPage = 'checkinme'; // Fallback for staff
+                    // --- MODIFIED: Default Page Logic ---
+                    let defaultPage = 'dashboard'; // Default for everyone now
+
                     if (userProfile.role === 'Admin' || userProfile.role === 'Shop Manager') {
-                        // Default Admins/Managers to Employees page if they have access, otherwise their first permission
-                        defaultPage = userProfile.permissions?.includes('employees') 
-                            ? 'employees' 
-                            : userProfile.permissions?.[0] || 'checkinme';
-                    } else if (userProfile.permissions && userProfile.permissions.length > 0) {
-                        // For other roles, default to their first permission
-                        defaultPage = userProfile.permissions[0];
+                        defaultPage = 'dashboard';
+                    } else if (userProfile.role === 'Staff') {
+                        // For staff, default to CheckInMe or their first permission if dashboard is deemed too noisy
+                        // But for now, let's try giving them the dashboard too (it filters data for them)
+                        defaultPage = 'dashboard';
                     }
                     setActivePage(defaultPage);
                 }
@@ -9008,6 +10341,8 @@
             }, []);
 
             const pageTitles = useMemo(() => ({ 
+                // NEW: Added Dashboard Title
+                dashboard: 'Overview Dashboard',
                 employees: 'Employees', checkinme: 'CheckInMe', attendanceReport: 'Attendance Report', 
                 payroll: 'Payroll', 
                 hrBanking: 'HR Banking',
@@ -9019,11 +10354,15 @@
             const totalPending = pendingLeaves.length + pendingOTs.length;
             // Renders the component for the currently active page
             const renderActivePage = useCallback(() => {
-                const hasPermission = (userProfile?.role === 'Admin') || (userProfile?.role === 'CEO' && activePage !== 'sysConfig') || userProfile?.permissions?.includes(activePage) || activePage === 'policy';
+                // MODIFIED: Ensure dashboard is always permitted
+                const hasPermission = (userProfile?.role === 'Admin') || (userProfile?.role === 'CEO' && activePage !== 'sysConfig') || userProfile?.permissions?.includes(activePage) || activePage === 'policy' || activePage === 'dashboard';
+                
                 if (!activePage) return null;
                 if (!hasPermission) return <Card><CardTitle>Access Denied</CardTitle><p>You do not have permission to view this page.</p></Card>;
                 
                 switch(activePage) {
+                    // NEW: Render the Dashboard Summary Page
+                    case 'dashboard': return <DashboardSummaryPage userProfile={userProfile} setActivePage={setActivePage} />;
                     case 'employees': return <EmployeesPage userProfile={userProfile} />;
                     case 'checkinme': return <CheckInMePage userProfile={userProfile} initialTab={initialCheckInMeTab} />;
                     // REMOVED: savingProgram case
