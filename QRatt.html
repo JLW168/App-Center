@@ -36,7 +36,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, query, where, orderBy, limit, getDocs, serverTimestamp, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, query, where, orderBy, limit, getDocs, onSnapshot, serverTimestamp, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyB7_pnmwHj6aOeZRTykPvNusNFYReaTY6Q",
@@ -53,7 +53,7 @@
         const auth = getAuth(app);
         enableIndexedDbPersistence(db).catch(err => console.log("Persistence error", err.code));
 
-        window.fb = { auth, db, signInWithEmailAndPassword, signOut, collection, addDoc, query, where, orderBy, limit, getDocs, serverTimestamp };
+        window.fb = { auth, db, signInWithEmailAndPassword, signOut, collection, addDoc, query, where, orderBy, limit, getDocs, onSnapshot, serverTimestamp };
     </script>
 
     <script type="text/babel">
@@ -146,6 +146,13 @@
 
         const ScannerModal = ({ isOpen, onClose, onScan }) => {
             const scannerRef = useRef(null); 
+            // FIX: Use ref to always access the latest onScan callback without re-initializing the scanner
+            const onScanRef = useRef(onScan);
+
+            useEffect(() => {
+                onScanRef.current = onScan;
+            }, [onScan]);
+
             useEffect(() => {
                 if (isOpen && !scannerRef.current) {
                     const timer = setTimeout(() => {
@@ -153,7 +160,13 @@
                             const html5QrCode = new Html5Qrcode("reader");
                             scannerRef.current = html5QrCode;
                             html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } },
-                                (decodedText) => { html5QrCode.stop().then(() => { scannerRef.current = null; onScan(decodedText); }).catch(console.error); },
+                                (decodedText) => { 
+                                    html5QrCode.stop().then(() => { 
+                                        scannerRef.current = null; 
+                                        // Call the latest callback
+                                        if (onScanRef.current) onScanRef.current(decodedText); 
+                                    }).catch(console.error); 
+                                },
                                 () => {}
                             ).catch(err => { console.error("Scanner Error:", err); alert("Unable to start camera. Ensure HTTPS and permissions."); onClose(); });
                         } catch(e) { console.error(e); }
@@ -161,7 +174,7 @@
                     return () => clearTimeout(timer);
                 }
                 return () => { if (scannerRef.current) scannerRef.current.stop().catch(console.warn); };
-            }, [isOpen]);
+            }, [isOpen]); // Only run on open toggle
 
             if (!isOpen) return null;
             return (
@@ -179,6 +192,7 @@
         const MainScreen = ({ user }) => {
             const [scanning, setScanning] = useState(false);
             const [lastRecord, setLastRecord] = useState(null);
+            const [todayRecords, setTodayRecords] = useState([]);
             const [loading, setLoading] = useState(false);
             const [currentTime, setCurrentTime] = useState(Utils.getFormattedDate());
             const [alertState, setAlertState] = useState({ isOpen: false, title: '', message: '', type: 'info' });
@@ -194,10 +208,28 @@
                 return () => clearInterval(timer);
             }, []);
 
-            // Fetch Last Record
+            // Real-time Fetch: Today's Records & Last Record State
             useEffect(() => {
-                const q = window.fb.query(window.fb.collection(window.fb.db, 'attendance'), window.fb.where('employeeId', '==', user.uid), window.fb.orderBy('timestamp', 'desc'), window.fb.limit(1));
-                window.fb.getDocs(q).then(snap => { if (!snap.empty) setLastRecord(snap.docs[0].data()); });
+                const startOfDay = new Date();
+                startOfDay.setHours(0, 0, 0, 0);
+
+                const q = window.fb.query(
+                    window.fb.collection(window.fb.db, 'attendance'),
+                    window.fb.where('employeeId', '==', user.uid),
+                    window.fb.where('timestamp', '>=', startOfDay),
+                    window.fb.orderBy('timestamp', 'desc')
+                );
+                
+                const unsubscribe = window.fb.onSnapshot(q, (snapshot) => {
+                    const records = snapshot.docs.map(doc => doc.data());
+                    setTodayRecords(records);
+                    if (records.length > 0) {
+                        setLastRecord(records[0]);
+                    } else {
+                        setLastRecord(null); // Reset to "Checked Out" (Start of day state)
+                    }
+                });
+                return () => unsubscribe();
             }, [user]);
 
             const getGPS = () => new Promise((resolve) => {
@@ -221,29 +253,42 @@
                     const shopSnap = await window.fb.getDocs(q);
                     if (shopSnap.empty) { showAlert("Invalid QR Code", "Shop not recognized.", "error"); return; }
 
-                    // 3. Security Check (Assignment)
                     const shopData = shopSnap.docs[0].data();
                     const userShops = Array.isArray(user.shop) ? user.shop : [user.shop];
                     const isAssigned = user.role === 'Admin' || user.role === 'CEO' || userShops.includes(qrText);
                     if (!isAssigned) { showAlert("Access Denied", `You are not assigned to ${qrText}.`, "error"); return; }
 
-                    // 4. Security Check (Distance)
+                    // 3. Security Check (Distance)
                     if (shopData.latitude && shopData.longitude) {
                         const dist = Utils.getDistance(gps.latitude, gps.longitude, parseFloat(shopData.latitude), parseFloat(shopData.longitude));
                         const radius = parseFloat(shopData.radius) || 500;
                         if (dist > radius) { showAlert("Security Alert", `Too far from location.\nDist: ${Math.round(dist)}m (Max: ${radius}m)`, "error"); return; }
                     }
 
-                    // 5. Save & Update
+                    // 4. Save & Update
                     const type = (lastRecord && lastRecord.type === 'in') ? 'out' : 'in';
-                    const payload = { employeeId: user.uid, employeeName: user.displayName, shop: qrText, timestamp: window.fb.serverTimestamp(), type, verificationMethod: 'qr', location: gps };
+                    const payload = { 
+                        employeeId: user.uid, 
+                        employeeName: user.displayName, 
+                        shop: qrText, 
+                        timestamp: window.fb.serverTimestamp(), 
+                        type, 
+                        verificationMethod: 'qr', 
+                        location: gps 
+                    };
+                    
+                    // FIX: Ensure db is accessible
+                    if (!window.fb || !window.fb.db) throw new Error("Database connection lost");
+
                     await window.fb.addDoc(window.fb.collection(window.fb.db, 'attendance'), payload);
                     
+                    // Update UI immediately with current time
                     setLastRecord({ ...payload, timestamp: { toDate: () => new Date() } });
                     showAlert("Success", `Successfully Checked ${type.toUpperCase()}\nLocation: ${qrText}\nTime: ${Utils.getFormattedDate().shortStr}\nStatus: Verified`, "success");
 
                 } catch (error) {
-                    console.error(error); showAlert("System Error", "Failed to save data.", "error");
+                    console.error("Check-in Error:", error); 
+                    showAlert("System Error", `Failed to save data: ${error.message}`, "error");
                 } finally { setLoading(false); }
             };
 
@@ -261,7 +306,7 @@
                         <button onClick={() => window.fb.signOut(window.fb.auth)} className="text-red-400 bg-slate-700/50 p-3 rounded-xl hover:bg-slate-700 transition-colors border border-slate-600"><i className="fas fa-power-off text-lg"></i></button>
                     </div>
 
-                    <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-8 relative overflow-hidden">
+                    <div className="flex-1 flex flex-col items-center justify-center p-6 space-y-6 relative overflow-hidden">
                         <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 rounded-full blur-[100px] opacity-20 pointer-events-none transition-colors duration-700 ${isCheckedIn ? 'bg-green-500' : 'bg-slate-500'}`}></div>
 
                         <div className={`relative z-10 w-full max-w-sm rounded-3xl p-8 flex flex-col items-center justify-center shadow-2xl transition-all duration-500 border ${isCheckedIn ? 'bg-slate-800/90 border-green-500/30' : 'bg-slate-800/90 border-slate-600/30'}`}>
@@ -275,13 +320,19 @@
                             <div className="mb-6 font-mono text-2xl font-bold text-slate-300 tracking-widest bg-black/20 px-6 py-2 rounded-xl border border-white/5 shadow-inner">{currentTime.time}</div>
 
                             <div className="w-full bg-slate-900/60 rounded-xl p-4 border border-slate-700/50 backdrop-blur-sm">
-                                <div className="flex justify-between items-center mb-1.5">
-                                    <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wide">Last Activity</span>
-                                    <span className="text-xs text-slate-400 font-mono bg-slate-800 px-2 py-0.5 rounded">{lastRecord?.timestamp?.toDate ? lastRecord.timestamp.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '--:--'}</span>
+                                <div className="flex justify-between items-center mb-1.5 border-b border-slate-700/50 pb-2">
+                                    <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wide">Today's Activity</span>
+                                    <span className="text-xs text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full">{todayRecords.length} scans</span>
                                 </div>
-                                <div className="flex items-center gap-2">
-                                    <i className={`fas fa-map-marker-alt text-sm ${isCheckedIn ? 'text-green-500' : 'text-slate-500'}`}></i>
-                                    <span className="text-sm font-bold text-slate-200 truncate">{lastRecord?.shop || 'No recent activity'}</span>
+                                <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar">
+                                    {todayRecords.length === 0 && <p className="text-xs text-slate-600 italic text-center py-2">No activity today</p>}
+                                    {todayRecords.map((rec, idx) => (
+                                        <div key={idx} className="flex justify-between items-center text-xs">
+                                            <span className="text-slate-400 font-mono">{rec.timestamp?.toDate ? rec.timestamp.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '--:--'}</span>
+                                            <span className={`font-bold ${rec.type === 'in' ? 'text-green-400' : 'text-red-400'}`}>{rec.type.toUpperCase()}</span>
+                                            <span className="text-slate-500 truncate max-w-[80px]">{rec.shop}</span>
+                                        </div>
+                                    ))}
                                 </div>
                             </div>
                         </div>
