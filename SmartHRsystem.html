@@ -1156,7 +1156,23 @@
         // MODIFIED: Updated NotificationBell to accept and display birthdayNotifications
         const NotificationBell = ({ pendingLeaves = [], pendingOTs = [], birthdayNotifications = [], onNotificationClick }) => {
             const [isOpen, setIsOpen] = useState(false);
+            // NEW: Ref to track the dropdown container for click-outside detection
+            const wrapperRef = useRef(null);
+
             const totalCount = pendingLeaves.length + pendingOTs.length + (birthdayNotifications ? birthdayNotifications.length : 0);
+
+            // NEW: Effect to close dropdown when clicking outside
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
+                        setIsOpen(false);
+                    }
+                };
+                document.addEventListener("mousedown", handleClickOutside);
+                return () => {
+                    document.removeEventListener("mousedown", handleClickOutside);
+                };
+            }, [wrapperRef]);
 
             const handleLeaveClick = () => {
                 onNotificationClick('leaveRequest');
@@ -1169,7 +1185,7 @@
             };
 
             return (
-                <div className="relative">
+                <div className="relative" ref={wrapperRef}>
                     <button onClick={() => setIsOpen(!isOpen)} className="relative text-slate-400 hover:text-white focus:outline-none">
                         <i className="fas fa-bell text-xl"></i>
                         {totalCount > 0 && (
@@ -5727,6 +5743,8 @@
             const [searchTerm, setSearchTerm] = useState('');
             // NEW: State for Month Filter (Defaults to current month)
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            // NEW: State for Status Filter
+            const [filterStatus, setFilterStatus] = useState('All');
             
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [editingRecord, setEditingRecord] = useState(null);
@@ -5756,14 +5774,22 @@
                 return records.filter(r => 
                     (!selectedShop || r.shop === selectedShop) &&
                     (!searchTerm || r.staffName.toLowerCase().includes(searchTerm.toLowerCase())) &&
-                    // NEW: Filter by selected month
-                    (!selectedMonth || r.date.startsWith(selectedMonth))
+                    // FIX: If filterStatus is 'Pending', ignore the month filter to show backlog. 
+                    // Otherwise, apply the month filter as usual.
+                    ((filterStatus === 'Pending') || (!selectedMonth || r.date.startsWith(selectedMonth))) &&
+                    (filterStatus === 'All' || r.status === filterStatus)
                 ).sort((a,b) => b.date.localeCompare(a.date));
-            }, [records, selectedShop, searchTerm, selectedMonth]); // Added selectedMonth dependency
+            }, [records, selectedShop, searchTerm, selectedMonth, filterStatus]);
 
             const handleSave = async (formData) => {
                 const { addDoc, updateDoc, doc, collection, serverTimestamp } = window.firebaseSDK;
                 const { id, ...data } = formData;
+                
+                // MODIFIED: Auto-approve Deductions (No approval needed)
+                if (data.statusState === 'Deduction') {
+                    data.status = 'Approved';
+                }
+
                 try {
                     if (id) await updateDoc(doc(db, 'employeeStates', id), data);
                     else await addDoc(collection(db, 'employeeStates'), { ...data, createdAt: serverTimestamp() });
@@ -5794,13 +5820,24 @@
                         <SearchInput value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
                         <ShopFilterSelect userProfile={userProfile} shops={shops} selectedShop={selectedShop} onChange={e => setSelectedShop(e.target.value)} />
                         
-                        {/* NEW: Month Filter Input */}
                         <input 
                             type="month" 
                             value={selectedMonth} 
                             onChange={e => setSelectedMonth(e.target.value)} 
                             className="input w-full sm:w-auto" 
                         />
+
+                        {/* NEW: Status Filter Dropdown */}
+                        <select 
+                            value={filterStatus} 
+                            onChange={e => setFilterStatus(e.target.value)} 
+                            className="select w-full sm:w-auto"
+                        >
+                            <option value="All">All Status</option>
+                            <option value="Pending">Pending</option>
+                            <option value="Approved">Approved</option>
+                            <option value="Rejected">Rejected</option>
+                        </select>
 
                         {canManage && <Button variant="primary" icon="fa-plus" onClick={() => { setEditingRecord(null); setIsModalOpen(true); }}>Add Record</Button>}
                     </PageHeader>
@@ -5858,14 +5895,62 @@
         // --- END EMPLOYEE STATE COMPONENTS ---
         
         // Component: Main CheckInMe Page (Tab Container)
-        const CheckInMePage = ({ userProfile, initialTab = 'checkInOut' }) => {
+        // MODIFIED: Added pendingLeaves and pendingOTs props to display badges
+        const CheckInMePage = ({ userProfile, initialTab = 'checkInOut', pendingLeaves = [], pendingOTs = [] }) => {
             // FIX: Split prop into ID, Action, and Timestamp to handle unique events
             const [propTabId, propAction, propTs] = initialTab ? initialTab.split(':') : ['checkInOut', null, null];
             
+            const { db } = useFirebase(); // Ensure db is available
             const [activeTab, setActiveTab] = useState('checkInOut');
             
             // NEW: State to track which quick action ID has already been handled (consumed)
             const [handledActionId, setHandledActionId] = useState(null);
+
+            // NEW: State for Pending Employee States (Engagements/Deductions) Count
+            const [pendingStatesCount, setPendingStatesCount] = useState(0);
+
+            // NEW: Effect to fetch pending employee states for badge
+            useEffect(() => {
+                if (!userProfile || !db) return;
+                const { role, shop } = userProfile;
+                const canManage = role === 'Admin' || role === 'CEO' || role === 'Shop Manager';
+                
+                if (!canManage) {
+                    setPendingStatesCount(0);
+                    return;
+                }
+
+                const { query, collection, where, onSnapshot } = window.firebaseSDK;
+                // Query ALL pending states first
+                let q = query(collection(db, 'employeeStates'), where('status', '==', 'Pending'));
+
+                if (role === 'Shop Manager') {
+                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
+                    if (managedShops.length > 0) {
+                        q = query(q, where('shop', 'in', managedShops));
+                    } else {
+                        setPendingStatesCount(0); // Manager with no shops
+                        return;
+                    }
+                }
+                
+                // Admin/CEO sees all pending
+                const unsub = onSnapshot(q, (snapshot) => {
+                    // FIX: Strict Client-Side Filter
+                    // Ensure we ONLY count 'Engagement' types for the badge.
+                    // This ignores any 'Deduction' records that might accidentally remain 'Pending'.
+                    const engagementCount = snapshot.docs.filter(doc => {
+                        const data = doc.data();
+                        return data.statusState === 'Engagement';
+                    }).length;
+                    
+                    setPendingStatesCount(engagementCount);
+                }, (error) => {
+                    console.error("Error fetching pending states count:", error);
+                });
+                
+                return () => unsub();
+            }, [userProfile, db]);
 
             // Sync active tab when initialTab prop changes (e.g., incoming Quick Action)
             useEffect(() => {
@@ -5873,10 +5958,6 @@
             }, [initialTab, propTabId]);
             
             // FIX: Helper to determine if we should auto-open the modal.
-            // It returns true ONLY if:
-            // 1. The current active tab matches the requested tab.
-            // 2. The action is 'new'.
-            // 3. This specific action timestamp hasn't been handled yet.
             const shouldAutoOpen = (tabKey) => {
                 const uniqueActionId = `${tabKey}:${propAction}:${propTs}`;
                 return activeTab === tabKey && 
@@ -5947,12 +6028,41 @@
                 ]
             };
 
-            // MODIFIED: Define tabs with icons
+            const canManage = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager';
+
+            // MODIFIED: Define tabs with icons AND badges
             const tabs = { 
                 checkInOut: <span><i className="fas fa-fingerprint mr-2 text-blue-400"></i>Check In/Out</span>, 
-                leaveRequest: <span><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Request</span>, 
-                otRequest: <span><i className="fas fa-clock mr-2 text-purple-400"></i>OT Request</span>, 
-                employeeState: <span><i className="fas fa-file-contract mr-2 text-yellow-400"></i>Engagements / Deductions</span> 
+                leaveRequest: (
+                    <span className="flex items-center gap-2">
+                        <span><i className="fas fa-calendar-minus mr-1 text-orange-400"></i>Leave Request</span>
+                        {canManage && pendingLeaves.length > 0 && (
+                            <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">
+                                {pendingLeaves.length}
+                            </span>
+                        )}
+                    </span>
+                ),
+                otRequest: (
+                    <span className="flex items-center gap-2">
+                        <span><i className="fas fa-clock mr-1 text-purple-400"></i>OT Request</span>
+                        {canManage && pendingOTs.length > 0 && (
+                            <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">
+                                {pendingOTs.length}
+                            </span>
+                        )}
+                    </span>
+                ),
+                employeeState: (
+                    <span className="flex items-center gap-2">
+                        <span><i className="fas fa-file-contract mr-1 text-yellow-400"></i>Engagements / Deductions</span>
+                        {canManage && pendingStatesCount > 0 && (
+                            <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">
+                                {pendingStatesCount}
+                            </span>
+                        )}
+                    </span>
+                ) 
             };
 
             return (
@@ -10831,36 +10941,95 @@
 
         // --- INSERTED MISSING COMPONENT: Task Modal ---
         const TaskModal = ({ isOpen, onClose, onSave, task, userProfile, kpis, employees }) => {
+            const { shops } = useAppData(); // Use global shops data
             const [formData, setFormData] = useState({});
             
-            // Filter employees based on role
-            const availableEmployees = useMemo(() => {
-                if (!employees) return [];
-                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return employees.filter(e => e.status === 'Active');
+            // Determine allowed shops for the dropdown
+            const availableShops = useMemo(() => {
+                if (!shops) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return shops;
                 if (userProfile.role === 'Shop Manager') {
                     const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                    return employees.filter(e => {
-                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
-                        return e.status === 'Active' && empShops.some(s => myShops.includes(s));
-                    });
+                    return shops.filter(s => myShops.includes(s.name));
                 }
-                return [];
-            }, [employees, userProfile]);
+                return []; 
+            }, [shops, userProfile]);
+
+            // Filter employees based on selected shop
+            const availableEmployees = useMemo(() => {
+                if (!employees) return [];
+                // If staff, not relevant as dropdown is hidden/disabled
+                if (userProfile.role === 'Staff') return [];
+
+                let filtered = employees.filter(e => e.status === 'Active');
+                
+                // Filter by selected shop if any
+                if (formData.shopName) {
+                    filtered = filtered.filter(e => {
+                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                        return empShops.includes(formData.shopName);
+                    });
+                } else if (userProfile.role === 'Shop Manager') {
+                     // If no shop selected yet, limit to managed shops
+                     const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                     filtered = filtered.filter(e => {
+                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                        return empShops.some(s => myShops.includes(s));
+                     });
+                }
+                return filtered;
+            }, [employees, userProfile, formData.shopName]);
 
             useEffect(() => {
                 if (isOpen) {
-                    setFormData(task ? { ...task } : {
+                    const now = new Date();
+                    // Default or extract Date/Time
+                    let initialDate = now.toISOString().slice(0, 10);
+                    let initialTime = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+                    
+                    if (task && task.taskTimestamp) {
+                        const d = task.taskTimestamp.toDate ? task.taskTimestamp.toDate() : new Date(task.taskTimestamp);
+                        initialDate = d.toISOString().slice(0, 10);
+                        initialTime = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+                    }
+
+                    // Default Shop
+                    let initialShop = '';
+                    if (task) {
+                        initialShop = task.shopName || '';
+                    } else if (userProfile.role === 'Shop Manager') {
+                         const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                         if (myShops.length === 1) initialShop = myShops[0];
+                    } else if (userProfile.role === 'Staff') {
+                         initialShop = Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop;
+                    }
+
+                    setFormData(task ? { 
+                        ...task,
+                        date: initialDate,
+                        time: initialTime,
+                        shopName: initialShop
+                    } : {
                         text: '',
                         kpiId: '',
                         staffId: userProfile.role === 'Staff' ? userProfile.id : '',
-                        link: '',
+                        date: initialDate,
+                        time: initialTime,
+                        shopName: initialShop
                     });
                 }
             }, [isOpen, task, userProfile]);
 
             const handleChange = (e) => {
                 const { name, value } = e.target;
-                setFormData(prev => ({ ...prev, [name]: value }));
+                setFormData(prev => {
+                    const next = { ...prev, [name]: value };
+                    // If shop changes, reset staff selection (unless staff role)
+                    if (name === 'shopName' && userProfile.role !== 'Staff') {
+                        next.staffId = ''; 
+                    }
+                    return next;
+                });
             };
 
             const handleSubmit = (e) => {
@@ -10869,17 +11038,12 @@
                 
                 // Enrich data before saving
                 let staffName = '';
-                let shopName = '';
                 
                 if (userProfile.role === 'Staff') {
                     staffName = userProfile.name;
-                    shopName = Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop;
                 } else if (formData.staffId) {
                     const emp = employees.find(e => e.id === formData.staffId);
-                    if (emp) {
-                        staffName = emp.name;
-                        shopName = Array.isArray(emp.shop) ? emp.shop[0] : emp.shop;
-                    }
+                    if (emp) staffName = emp.name;
                 }
 
                 let kpiText = '';
@@ -10888,27 +11052,62 @@
                     if (kpi) kpiText = kpi.name;
                 }
 
+                // Construct timestamp from inputs
+                const taskDateTime = new Date(`${formData.date}T${formData.time}`);
+
                 onSave({
                     ...formData,
                     staffName,
-                    shopName,
-                    kpiText
+                    kpiText,
+                    taskTimestamp: taskDateTime
                 });
             };
 
-            const canAssignStaff = userProfile.role !== 'Staff';
+            const canManage = userProfile.role !== 'Staff';
 
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-lg">
-                    <form onSubmit={handleSubmit}>
+                    <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
                         <ModalHeader title={task ? "Edit Task" : "Add New Task"} onClose={onClose} />
                         <ModalBody>
                             <div className="space-y-4">
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">Task Description</label>
-                                    <textarea name="text" value={formData.text || ''} onChange={handleChange} className="input" rows="3" required placeholder="What needs to be done?" />
+                                {/* 1 & 2. Date & Time */}
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Date</label>
+                                        <input type="date" name="date" value={formData.date || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Time</label>
+                                        <input type="time" name="time" value={formData.time || ''} onChange={handleChange} className="input" required />
+                                    </div>
                                 </div>
-                                
+
+                                {/* 3. Shop */}
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Shop</label>
+                                    {canManage ? (
+                                        <select name="shopName" value={formData.shopName || ''} onChange={handleChange} className="select" required>
+                                            <option value="">Select Shop</option>
+                                            {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                        </select>
+                                    ) : (
+                                        <input value={formData.shopName || ''} className="input" disabled />
+                                    )}
+                                </div>
+
+                                {/* 4. Staff Name */}
+                                {canManage && (
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Assign To (Staff Name)</label>
+                                        <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required disabled={!formData.shopName}>
+                                            <option value="">Select Staff</option>
+                                            {availableEmployees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                                        </select>
+                                    </div>
+                                )}
+
+                                {/* 5. KPI */}
                                 <div>
                                     <label className="text-sm font-medium text-slate-400">Link to KPI (Optional)</label>
                                     <select name="kpiId" value={formData.kpiId || ''} onChange={handleChange} className="select">
@@ -10917,19 +11116,10 @@
                                     </select>
                                 </div>
 
-                                {canAssignStaff && (
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-400">Assign To</label>
-                                        <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required>
-                                            <option value="">Select Staff</option>
-                                            {availableEmployees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-                                        </select>
-                                    </div>
-                                )}
-
+                                {/* 6. Task Description */}
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400">External Link (Optional)</label>
-                                    <input name="link" value={formData.link || ''} onChange={handleChange} className="input" placeholder="https://..." />
+                                    <label className="text-sm font-medium text-slate-400">Task Description</label>
+                                    <textarea name="text" value={formData.text || ''} onChange={handleChange} className="input" rows="3" required placeholder="What needs to be done?" />
                                 </div>
                             </div>
                         </ModalBody>
@@ -11048,7 +11238,8 @@
                         await addDoc(collection(db, 'tasks'), {
                             ...formData,
                             status: KANBAN_STATUS.TODO,
-                            taskTimestamp: serverTimestamp(),
+                            // FIX: Use provided timestamp or fallback to server time
+                            taskTimestamp: formData.taskTimestamp || serverTimestamp(), 
                             creatorUid: userProfile.id
                         });
                     }
@@ -13824,7 +14015,12 @@
                                     onClick={() => setShowComments(!showComments)}
                                     className={`flex items-center gap-1.5 text-sm font-bold transition-colors ${showComments ? 'text-blue-400' : 'text-slate-400 hover:text-blue-400'}`}
                                 >
-                                    <i className="far fa-comment-alt"></i> Comment
+                                    <i className="far fa-comment-alt"></i> 
+                                    {notice.commentCount > 0 ? (
+                                        <span>{notice.commentCount} Comment{notice.commentCount !== 1 ? 's' : ''}</span>
+                                    ) : (
+                                        <span>Comment</span>
+                                    )}
                                 </button>
                             </div>
 
@@ -14313,21 +14509,31 @@
         // --- START LAYOUT & MAIN APP COMPONENTS ---
         
         // NEW: System Launch Pad Component (Redesigned to match "JLW Manager" Image)
-        // MODIFIED: Refactored to use APP_MODULES global config
-        // MODIFIED: Added 'companyHubUnreadCount' prop
         const SystemLaunchPad = ({ isOpen, onClose, activePage, onNavigate, userProfile, currentTime, pendingLeaves, pendingOTs, onNotificationClick, auth, setInitialCheckInMeTab, allowedLinkKeys, companyHubUnreadCount }) => {
             const { db } = useFirebase();
             const { employees } = useAppData(); 
             const [isEmployeeModalOpen, setIsEmployeeModalOpen] = useState(false);
-            // FIX: Added state for profile menu to ensure it works on mobile (touch) instead of relying on hover
             const [isProfileOpen, setIsProfileOpen] = useState(false);
+            const profileRef = useRef(null);
+
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (profileRef.current && !profileRef.current.contains(event.target)) {
+                        setIsProfileOpen(false);
+                    }
+                };
+                if (isProfileOpen) {
+                    document.addEventListener("mousedown", handleClickOutside);
+                }
+                return () => {
+                    document.removeEventListener("mousedown", handleClickOutside);
+                };
+            }, [isProfileOpen]);
 
             if (!isOpen) return null;
 
-            // NEW: Parse base page from activePage (which might contain params like "employees:add_new")
             const activeBasePage = activePage.split(':')[0];
 
-            // Quick Action Handlers
             const handleQuickAction = (action) => {
                 switch(action) {
                     case 'checkInOut':
@@ -14337,13 +14543,11 @@
                         break;
                     case 'leaveRequest':
                         onNavigate('checkinme');
-                        // MODIFIED: Append ':new' and timestamp to force update and trigger modal
                         setInitialCheckInMeTab(`leaveRequest:new:${Date.now()}`);
                         onClose();
                         break;
                     case 'otRequest':
                         onNavigate('checkinme');
-                        // MODIFIED: Append ':new' and timestamp to force update and trigger modal
                         setInitialCheckInMeTab(`otRequest:new:${Date.now()}`);
                         onClose();
                         break;
@@ -14356,17 +14560,14 @@
             };
 
             const handleSaveEmployee = async (formData) => {
-               // ... (Existing save logic) ...
-               // (Keeping the logic same as before to save space in display, but it works exactly as the previous version)
                 const { addDoc, updateDoc, doc, collection, setDoc, serverTimestamp } = window.firebaseSDK;
-                const { id, ...dataToSave } = formData;
+                const { id, enrollInSavings, ...dataToSave } = formData;
+                
                 try {
                     const newDocRef = await addDoc(collection(db, 'employees'), dataToSave);
                     const savedEmployeeId = newDocRef.id;
-                    
                     const shopName = Array.isArray(dataToSave.shop) ? (dataToSave.shop[0] || '') : (dataToSave.shop || '');
 
-                    // --- NEW: AUTO-CREATE WELCOME NOTICE (Quick Action) ---
                     try {
                         await addDoc(collection(db, 'memoAlerts'), {
                             title: `🎉 Welcome ${dataToSave.name}!`,
@@ -14384,27 +14585,29 @@
                     } catch (noticeError) {
                         console.error("Failed to create welcome notice:", noticeError);
                     }
-                    // --- END WELCOME NOTICE ---
 
-                    try {
-                        const today = new Date();
-                        const savingsDefaults = {
-                            employeeId: savedEmployeeId,
-                            employeeName: dataToSave.name,
-                            shop: shopName,
-                            savingsProgramStatus: 'Active',
-                            savingsPercentage: 5, 
-                            savingsJoinDate: today.toISOString().slice(0, 10),
-                            savingsEffectiveMonth: today.toISOString().slice(0, 7), 
-                            currentBalance: 0,
-                            mySavingCredit: 0,
-                            mySavingWithdrawalTotal: 0,
-                            lastUpdated: serverTimestamp()
-                        };
-                        await setDoc(doc(db, 'savingprogram', savedEmployeeId), savingsDefaults);
-                    } catch (savingsError) {
-                        console.error("Failed to auto-enroll:", savingsError);
+                    if (enrollInSavings !== false) {
+                        try {
+                            const today = new Date();
+                            const savingsDefaults = {
+                                employeeId: savedEmployeeId,
+                                employeeName: dataToSave.name,
+                                shop: shopName,
+                                savingsProgramStatus: 'Active',
+                                savingsPercentage: 5, 
+                                savingsJoinDate: today.toISOString().slice(0, 10),
+                                savingsEffectiveMonth: today.toISOString().slice(0, 7), 
+                                currentBalance: 0,
+                                mySavingCredit: 0,
+                                mySavingWithdrawalTotal: 0,
+                                lastUpdated: serverTimestamp()
+                            };
+                            await setDoc(doc(db, 'savingprogram', savedEmployeeId), savingsDefaults);
+                        } catch (savingsError) {
+                            console.error("Failed to auto-enroll:", savingsError);
+                        }
                     }
+
                     Utils.logUserActivity(db, auth, 'Add Employee (Quick Action)', {
                         id: savedEmployeeId,
                         name: dataToSave.name,
@@ -14421,10 +14624,8 @@
             const canAddStaff = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager';
 
             return (
-                <div className="fixed inset-0 z-50 flex flex-col animate-fade-in bg-[#0f172a]"> {/* Dark Slate 950/Black */}
-                    {/* Header Section */}
+                <div className="fixed inset-0 z-50 flex flex-col animate-fade-in bg-[#0f172a]">
                     <header className="px-6 py-5 flex justify-between items-center z-30 relative shrink-0">
-                        {/* Branding */}
                         <div className="flex items-center gap-3">
                             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/30">
                                 <i className="fas fa-layer-group text-white text-lg"></i>
@@ -14435,9 +14636,7 @@
                             </div>
                         </div>
 
-                        {/* Profile / Clock */}
                         <div className="flex items-center gap-4">
-                            {/* MODIFIED: Removed 'hidden sm:flex' to show clock on mobile */}
                             <div className="flex flex-col items-end">
                                 <span className="text-xs font-bold text-slate-200 font-mono">
                                     {currentTime?.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit' })}
@@ -14447,8 +14646,7 @@
                                 </span>
                             </div>
                             
-                            {/* FIX: Replaced CSS-hover group with React state toggle for mobile compatibility */}
-                            <div className="relative">
+                            <div className="relative" ref={profileRef}>
                                 <button 
                                     onClick={() => setIsProfileOpen(!isProfileOpen)}
                                     className="w-10 h-10 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 hover:text-white hover:border-slate-500 transition-all shadow-md focus:outline-none focus:ring-2 focus:ring-slate-600 overflow-hidden"
@@ -14459,7 +14657,6 @@
                                         userProfile?.name?.charAt(0)
                                     )}
                                 </button>
-                                {/* Logout Dropdown */}
                                 {isProfileOpen && (
                                     <div className="absolute right-0 mt-2 w-48 bg-slate-800 rounded-xl shadow-xl py-1 border border-slate-700 z-50 animate-fade-in">
                                         <div className="px-4 py-2 border-b border-slate-700 mb-1">
@@ -14483,15 +14680,10 @@
                         </div>
                     </header>
                     
-                    {/* Scrollable Content */}
                     <div className="flex-1 overflow-y-auto px-6 pb-20">
                         <div className="max-w-md mx-auto sm:max-w-5xl">
-                            
-                            {/* APP GRID (3 Columns) */}
                             <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-4 mb-8">
-                                {/* OPTIMIZATION: Map over APP_MODULES instead of props */}
                                 {APP_MODULES.map(module => {
-                                    // FIX: Compare against activeBasePage instead of the raw string
                                     const isActive = activeBasePage === module.key;
                                     const isLocked = allowedLinkKeys && !allowedLinkKeys.has(module.key);
                                     
@@ -14501,15 +14693,12 @@
                                             onClick={() => { 
                                                 if (isLocked) return; 
                                                 onNavigate(module.key); 
-                                                // FIX: Explicitly reset the CheckInMe tab to default when navigating via the main icon.
                                                 if (module.key === 'checkinme') {
                                                     setInitialCheckInMeTab('checkInOut');
                                                 }
                                                 onClose(); 
                                             }}
-                                            className={`group flex flex-col items-center justify-center gap-3 aspect-[4/5] w-full relative 
-                                                ${isLocked ? 'cursor-not-allowed' : 'cursor-pointer'}
-                                            `}
+                                            className={`group flex flex-col items-center justify-center gap-3 aspect-[4/5] w-full relative ${isLocked ? 'cursor-not-allowed' : 'cursor-pointer'}`}
                                         >
                                             <div className={`
                                                 w-full aspect-square rounded-[28px] flex items-center justify-center relative
@@ -14517,10 +14706,8 @@
                                                 shadow-lg transition-all duration-300
                                                 ${!isLocked ? 'group-active:scale-95 group-hover:bg-[#253045]' : 'opacity-90'} 
                                             `}>
-                                                {/* OPTIMIZATION: Use color/bg from global config directly */}
                                                 <i className={`fas ${module.icon} text-3xl sm:text-4xl ${module.color} drop-shadow-md`}></i>
 
-                                                {/* NEW: Company Hub Notification Badge */}
                                                 {module.key === 'companyHub' && companyHubUnreadCount > 0 && (
                                                     <div className="absolute -top-1 -right-1 w-6 h-6 bg-red-500 rounded-full flex items-center justify-center border-2 border-[#0f172a] shadow-sm z-20 animate-bounce-short">
                                                         <span className="text-[10px] font-bold text-white leading-none">
@@ -14548,17 +14735,12 @@
                                 })}
                             </div>
 
-                            {/* QUICK ACTIONS HEADER */}
                             <div className="mb-4 mt-2">
                                 <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest pl-1">Quick Actions</h3>
                             </div>
 
-                            {/* QUICK ACTION CARDS */}
                             <div className="space-y-4">
-                                <button 
-                                    onClick={() => handleQuickAction('checkInOut')}
-                                    className="w-full relative overflow-hidden rounded-[24px] bg-gradient-to-r from-orange-500 to-amber-500 p-6 flex justify-between items-center shadow-lg shadow-orange-500/20 group active:scale-[0.98] transition-transform"
-                                >
+                                <button onClick={() => handleQuickAction('checkInOut')} className="w-full relative overflow-hidden rounded-[24px] bg-gradient-to-r from-orange-500 to-amber-500 p-6 flex justify-between items-center shadow-lg shadow-orange-500/20 group active:scale-[0.98] transition-transform">
                                     <div className="text-left z-10">
                                         <h3 className="text-lg font-bold text-white mb-1">Check In / Out</h3>
                                         <p className="text-orange-100 text-xs font-medium">Daily Attendance Log</p>
@@ -14570,10 +14752,7 @@
                                 </button>
 
                                 <div className="grid grid-cols-2 gap-4">
-                                    <button 
-                                        onClick={() => handleQuickAction('leaveRequest')}
-                                        className="relative overflow-hidden rounded-[24px] bg-gradient-to-br from-pink-600 to-rose-500 p-5 flex flex-col justify-between h-32 shadow-lg shadow-pink-500/20 group active:scale-[0.98] transition-transform"
-                                    >
+                                    <button onClick={() => handleQuickAction('leaveRequest')} className="relative overflow-hidden rounded-[24px] bg-gradient-to-br from-pink-600 to-rose-500 p-5 flex flex-col justify-between h-32 shadow-lg shadow-pink-500/20 group active:scale-[0.98] transition-transform">
                                         <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center mb-2">
                                             <i className="fas fa-calendar-minus text-white"></i>
                                         </div>
@@ -14582,10 +14761,7 @@
                                         </div>
                                     </button>
 
-                                    <button 
-                                        onClick={() => handleQuickAction('otRequest')}
-                                        className="relative overflow-hidden rounded-[24px] bg-gradient-to-br from-violet-600 to-purple-600 p-5 flex flex-col justify-between h-32 shadow-lg shadow-purple-500/20 group active:scale-[0.98] transition-transform"
-                                    >
+                                    <button onClick={() => handleQuickAction('otRequest')} className="relative overflow-hidden rounded-[24px] bg-gradient-to-br from-violet-600 to-purple-600 p-5 flex flex-col justify-between h-32 shadow-lg shadow-purple-500/20 group active:scale-[0.98] transition-transform">
                                         <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center mb-2">
                                             <i className="fas fa-clock text-white"></i>
                                         </div>
@@ -14596,10 +14772,7 @@
                                 </div>
 
                                 {canAddStaff && (
-                                    <button 
-                                        onClick={() => handleQuickAction('addStaff')}
-                                        className="w-full relative overflow-hidden rounded-[24px] bg-[#1E293B] border border-slate-700/50 p-5 flex justify-between items-center shadow-lg group active:scale-[0.98] transition-transform"
-                                    >
+                                    <button onClick={() => handleQuickAction('addStaff')} className="w-full relative overflow-hidden rounded-[24px] bg-[#1E293B] border border-slate-700/50 p-5 flex justify-between items-center shadow-lg group active:scale-[0.98] transition-transform">
                                         <div className="flex items-center gap-4">
                                             <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center">
                                                 <i className="fas fa-user-plus text-xl"></i>
@@ -14615,7 +14788,6 @@
                                     </button>
                                 )}
                             </div>
-
                         </div>
                     </div>
                     
@@ -14625,6 +14797,7 @@
                         onSave={handleSaveEmployee}
                         userProfile={userProfile}
                         isViewOnly={false}
+                        allEmployees={employees}
                     />
                 </div>
             );
@@ -14632,267 +14805,181 @@
 
         // --- START MAIN APP COMPONENT ---
         const AppContent = () => {
-            // FIX: Added 'db' to the destructuring here so it is available for the effects below
             const { userProfile, loading, auth, db } = useFirebase();
             const [activePage, setActivePage] = useState('dashboard');
-            
-            // FIX: Destructure 'where' from firebaseSDK so it is available for notificationConstraints
-            const { where } = window.firebaseSDK;
-            
-            // MODIFIED: Get global data for Birthday Logic
+            const { where, collection, query, onSnapshot, orderBy } = window.firebaseSDK;
             const { employees, shops } = useAppData(); 
 
-            // --- NEW: Fetch Data for Company Hub Badge (Notices & Policies) ---
+            // --- Company Hub Badge Logic ---
             const { data: allNotices } = useCollection('memoAlerts');
             const { data: allPolicies } = useCollection('policies');
 
             const companyHubUnreadCount = useMemo(() => {
                 if (!userProfile) return 0;
-
-                // 1. Calculate Unread Notices (Active & Relevant Shop)
                 const unreadNoticesCount = (allNotices || []).filter(n => {
-                    // Filter: Must be Active for Staff
                     if (userProfile.role === 'Staff' && n.status !== 'Active') return false;
-
-                    // Filter: Must match user's shop (if targetShops is defined)
                     if (n.targetShops && n.targetShops.length > 0) {
                         const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                        // If user has no shops (e.g., brand new admin), they might see everything or nothing. Let's assume see if admin.
                         if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO' && !userShops.some(s => n.targetShops.includes(s))) {
                             return false;
                         }
                     }
-
-                    // Count if user ID is NOT in readBy array
                     return !(n.readBy || []).includes(userProfile.id);
                 }).length;
-
-                // 2. Calculate Unread Policies
                 const unreadPoliciesCount = (allPolicies || []).filter(p => {
                     return !(p.readBy || []).includes(userProfile.id);
                 }).length;
-
                 return unreadNoticesCount + unreadPoliciesCount;
             }, [allNotices, allPolicies, userProfile]);
-            // --- END NEW BADGE LOGIC ---
 
-            // ... (existing state)
+            // App States
             const [isLaunchPadOpen, setIsLaunchPadOpen] = useState(true);
             const [isHeaderProfileOpen, setIsHeaderProfileOpen] = useState(false);
             const [initialCheckInMeTab, setInitialCheckInMeTab] = useState('checkInOut');
             const { isOnline } = useConnectivity();
             const [currentTime, setCurrentTime] = useState(new Date());
+            const headerProfileRef = useRef(null);
+            
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (headerProfileRef.current && !headerProfileRef.current.contains(event.target)) {
+                        setIsHeaderProfileOpen(false);
+                    }
+                };
+                if (isHeaderProfileOpen) {
+                    document.addEventListener("mousedown", handleClickOutside);
+                }
+                return () => {
+                    document.removeEventListener("mousedown", handleClickOutside);
+                };
+            }, [isHeaderProfileOpen]);
 
-            // --- NEW: State for Pending Meeting Alert ---
+            // Meeting Alert States
             const [pendingMeetingInvites, setPendingMeetingInvites] = useState([]);
             const [isMeetingAlertOpen, setIsMeetingAlertOpen] = useState(false);
-            // State to ensure we don't annoy the user if they manually close it once per session
-            const [hasViewedAlert, setHasViewedAlert] = useState(false);
-            
-            // --- NEW: State for Birthday Celebration Pop-up ---
-            const [isBirthdayPopupOpen, setIsBirthdayPopupOpen] = useState(false);
-            const [hasViewedBirthday, setHasViewedBirthday] = useState(false);
 
             useEffect(() => {
-                const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-                return () => clearInterval(timer);
-            }, []);
-
-            // --- STEP 1 RE-EXECUTION: BIRTHDAY NOTIFICATION LOGIC ---
-            // Calculates birthdays for today based on SHOP TIMEZONE
-            const birthdayNotifications = useMemo(() => {
-                if (!employees || !shops || !userProfile) return [];
-                
-                return employees.filter(emp => {
-                    // Basic checks
-                    if (emp.status !== 'Active' || !emp.dob) return false;
-
-                    // 1. Determine Employee's Shop Timezone
-                    const empShopName = Array.isArray(emp.shop) ? emp.shop[0] : emp.shop;
-                    const shop = shops.find(s => s.name === empShopName);
-                    const timezone = shop?.timezone;
-
-                    // 2. Get Today's Date String in THAT timezone (e.g., "-12-25")
-                    const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => new Date() }, timezone);
-                    // Extract MM-DD from YYYY-MM-DD
-                    const todaySuffix = todayStr.substring(4); // gets "-MM-DD"
-
-                    // 3. Date Check
-                    if (!emp.dob.endsWith(todaySuffix)) return false;
-
-                    // 4. Role-based visibility check
-                    if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return true;
-                    
-                    // Logic for Staff and Managers to see shop colleagues
-                    if (userProfile.role === 'Shop Manager' || userProfile.role === 'Staff') {
-                        const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                        const empShops = Array.isArray(emp.shop) ? emp.shop : [emp.shop];
-                        
-                        // Employee must be in one of the user's shops
-                        const isColleague = empShops.some(s => myShops.includes(s));
-                        return isColleague;
-                    }
-                    
-                    return false;
-                });
-            }, [employees, shops, userProfile]);
-            
-            // --- NEW: Trigger Birthday Pop-up automatically ---
-            useEffect(() => {
-                // If there are birthdays today, we haven't seen the popup yet, and we aren't loading
-                if (birthdayNotifications.length > 0 && !hasViewedBirthday && !loading) {
-                    // Wait a moment for the dashboard to render, then show pop-up
-                    const timer = setTimeout(() => {
-                        setIsBirthdayPopupOpen(true);
-                        setHasViewedBirthday(true); // Mark as viewed so it doesn't open again this session
-                    }, 2000);
-                    return () => clearTimeout(timer);
-                }
-            }, [birthdayNotifications, hasViewedBirthday, loading]);
-            
-            // --- END STEP 1 ---
-
-            // --- NEW: Effect to fetch Pending Meetings for Alert ---
-            useEffect(() => {
-                if (!userProfile || !db) return;
-                
-                const { collection, query, where, onSnapshot } = window.firebaseSDK;
-                const now = new Date();
-                // Filter out past meetings (older than yesterday to allow some buffer)
-                const yesterday = new Date(now);
-                yesterday.setDate(yesterday.getDate() - 1);
-                const dateFilterStr = yesterday.toISOString().slice(0, 10);
-
-                // Query for meetings where the user is invited
-                // Note: We filter 'status' in JS because Firestore map queries are limited
+                if (!db || !userProfile) return;
+                const now = new Date().toISOString().slice(0, 10);
                 const q = query(
                     collection(db, 'meetings'),
-                    where('invitedStaffIds', 'array-contains', userProfile.id),
-                    where('date', '>=', dateFilterStr)
+                    where('date', '>=', now),
+                    orderBy('date', 'asc')
                 );
-
+                
                 const unsubscribe = onSnapshot(q, (snapshot) => {
-                    const meetings = snapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
-                    
+                    const meetings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     const pending = meetings.filter(m => {
-                        const myResponse = m.responses?.[userProfile.id];
-                        // Show if no response object exists OR status is 'pending'
-                        // Also ensure meeting isn't cancelled/completed
-                        return (!myResponse || myResponse.status === 'pending') && m.status !== 'Cancelled';
+                        const isInvited = (m.invitedStaffIds || []).includes(userProfile.id);
+                        const myResponse = (m.responses || {})[userProfile.id];
+                        return isInvited && (!myResponse || myResponse.status === 'pending') && m.status !== 'Completed';
                     });
                     
-                    // Sort by date/time (soonest first)
-                    pending.sort((a, b) => {
-                        const dateA = new Date(`${a.date}T${a.startTime}`);
-                        const dateB = new Date(`${b.date}T${b.startTime}`);
-                        return dateA - dateB;
-                    });
-
-                    setPendingMeetingInvites(pending);
-
-                    // Auto-open logic: Only if we haven't dismissed it yet and there are items
-                    if (pending.length > 0 && !hasViewedAlert) {
-                        setIsMeetingAlertOpen(true);
-                    }
-                }, (error) => {
-                    console.error("Error fetching meeting alerts:", error);
-                });
-
-                return () => unsubscribe();
-            }, [userProfile, db, hasViewedAlert]);
-
-            // --- NEW: Handler for Meeting Alert Response ---
-            const handleAlertRespond = async (meeting, type, reason) => {
-                const { doc, updateDoc } = window.firebaseSDK;
-                try {
-                    const meetingRef = doc(db, 'meetings', meeting.id);
-                    const fieldPath = `responses.${userProfile.id}`;
-                    
-                    await updateDoc(meetingRef, {
-                        [fieldPath]: {
-                            status: type,
-                            reason: reason || '',
-                            timestamp: new Date().toISOString()
+                    if (pending.length > 0) {
+                        setPendingMeetingInvites(pending);
+                        if (!sessionStorage.getItem('meetingAlertShown')) {
+                            setIsMeetingAlertOpen(true);
+                            sessionStorage.setItem('meetingAlertShown', 'true');
                         }
-                    });
-                    
-                    // If that was the last one, close the modal
-                    if (pendingMeetingInvites.length <= 1) {
-                        setIsMeetingAlertOpen(false);
                     }
-                } catch (error) {
-                    console.error("Error saving response from alert:", error);
-                    alert("Failed to update status. Please try again.");
-                }
+                });
+                return () => unsubscribe();
+            }, [db, userProfile]);
+
+            const handleCloseAlert = () => setIsMeetingAlertOpen(false);
+            const handleAlertRespond = (meeting, type, reason) => {
+                // ... (Logic handled in MeetingRoomTab or passed down if needed, but for alert we just close for now or implement direct update)
+                // For simplicity, we just close the alert and let them manage in the meeting tab or implement a direct update here.
+                // Implementing direct update for completeness:
+                const { doc, updateDoc } = window.firebaseSDK;
+                const meetingRef = doc(db, 'meetings', meeting.id);
+                const fieldPath = `responses.${userProfile.id}`;
+                updateDoc(meetingRef, {
+                    [fieldPath]: { status: type, reason: reason || '', timestamp: new Date().toISOString() }
+                }).catch(console.error);
+                
+                // Remove from local list
+                setPendingMeetingInvites(prev => prev.filter(m => m.id !== meeting.id));
+                if (pendingMeetingInvites.length <= 1) setIsMeetingAlertOpen(false);
             };
 
-            const handleCloseAlert = () => {
-                setIsMeetingAlertOpen(false);
-                setHasViewedAlert(true); // Don't auto-open again this session
-            };
-
-            // Fetch pending requests for notifications
-            const { db: dbInstance } = useFirebase(); // Renamed to avoid conflict if any, though scope is fine here
-            // Note: We already use 'db' from useFirebase at top of component, so line above is redundant but harmless.
-            
-            const notificationConstraints = useMemo(() => {
-                if (!userProfile) return [where("status", "==", "ImpossibleValue")]; 
-                const { role, shop, id } = userProfile;
-                if (role === 'Admin' || role === 'CEO') return [where("status", "==", "Pending")];
-                if (role === 'Shop Manager') {
-                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
-                    if (managedShops.length > 0) return [where("status", "==", "Pending"), where("shop", "in", managedShops)];
-                }
-                return [where("status", "==", "ImpossibleValue")]; 
-            }, [userProfile]);
-
-            const { data: pendingLeaves } = useCollection('leaveRequests', notificationConstraints);
-            const { data: pendingOTs } = useCollection('otRequests', notificationConstraints);
+            // Birthday Alert
+            const [isBirthdayPopupOpen, setIsBirthdayPopupOpen] = useState(false);
+            const [birthdayNotifications, setBirthdayNotifications] = useState([]);
 
             useEffect(() => {
-                if (!loading && !userProfile && auth && !auth.currentUser) {
-                    // console.log("No user, stay on login");
-                }
-            }, [userProfile, loading, auth]);
+                if (!employees || !shops || !userProfile) return;
+                
+                // Logic to check birthdays (Copied from BirthdayWidget logic)
+                const socialEmployees = employees.filter(e => {
+                    if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return true;
+                    const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                    const eShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                    return eShops.some(s => myShops.includes(s));
+                });
 
-            const handleNotificationClick = (type) => {
+                const todayBirthdays = socialEmployees.filter(emp => {
+                    if (emp.status !== 'Active' || !emp.dob) return false;
+                    const empShopName = Array.isArray(emp.shop) ? emp.shop[0] : emp.shop;
+                    const shop = shops.find(s => s.name === empShopName);
+                    const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => new Date() }, shop?.timezone);
+                    const [tYear, tMonth, tDay] = todayStr.split('-').map(Number);
+                    const [y, m, d] = emp.dob.split('-').map(Number);
+                    return m === tMonth && d === tDay;
+                });
+
+                if (todayBirthdays.length > 0) {
+                    setBirthdayNotifications(todayBirthdays);
+                    const lastSeen = localStorage.getItem('lastBirthdayPopup');
+                    const todayKey = new Date().toDateString();
+                    if (lastSeen !== todayKey) {
+                        setIsBirthdayPopupOpen(true);
+                        localStorage.setItem('lastBirthdayPopup', todayKey);
+                    }
+                }
+            }, [employees, shops, userProfile]);
+
+            // Permissions
+            const allowedLinkKeys = useMemo(() => {
+                if (!userProfile) return new Set();
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return null; // All Access
+                
+                const base = new Set(['dashboard', 'companyHub', 'tasks']); // Everyone gets these
+                if (userProfile.permissions) {
+                    userProfile.permissions.forEach(p => base.add(p));
+                }
+                return base;
+            }, [userProfile]);
+
+            // Clock
+            useEffect(() => { const timer = setInterval(() => setCurrentTime(new Date()), 1000); return () => clearInterval(timer); }, []);
+
+            // Pending Counts
+            const notificationConstraints = useMemo(() => {
+                if (!userProfile) return { leave: [], ot: [] };
+                const { role, shop } = userProfile;
+                if (role === 'Admin' || role === 'CEO') return { leave: [where("status", "==", "Pending")], ot: [where("status", "==", "Pending")] };
+                if (role === 'Shop Manager') {
+                    const shopsArr = Array.isArray(shop) ? shop : [shop];
+                    return { leave: [where("status", "==", "Pending"), where("shop", "in", shopsArr)], ot: [where("status", "==", "Pending"), where("shop", "in", shopsArr)] };
+                }
+                return { leave: [where("status", "==", "impossible")], ot: [where("status", "==", "impossible")] };
+            }, [userProfile]);
+
+            const { data: pendingLeaves } = useCollection('leaveRequests', notificationConstraints.leave);
+            const { data: pendingOTs } = useCollection('otRequests', notificationConstraints.ot);
+
+            const handleNotificationClick = (target) => {
                 setActivePage('checkinme');
-                setInitialCheckInMeTab(type); 
+                setInitialCheckInMeTab(target);
+                setIsLaunchPadOpen(false);
             };
 
-            // OPTIMIZATION: Replaced large useMemo array with global APP_MODULES constant lookup
-            // MODIFIED: Logic to parse "page:params" format
-            const [activePageKey, activePageParams] = useMemo(() => {
-                const parts = activePage.split(':');
-                return [parts[0], parts.slice(1).join(':')];
-            }, [activePage]);
+            // Active Page Handling (Parsing params)
+            const activePageKey = activePage.split(':')[0];
+            const activePageParams = activePage.split(':')[1] ? activePage.split(':').slice(1).join(':') : null;
 
-            const currentPageTitle = useMemo(() => {
-                const module = APP_MODULES.find(m => m.key === activePageKey);
-                return module ? module.label : '';
-            }, [activePageKey]);
-
-            // OPTIMIZATION: Streamlined permission logic using APP_MODULES
-            const availableLinks = useMemo(() => {
-                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') return APP_MODULES;
-                
-                const allowedPages = new Set(userProfile?.permissions || []);
-                allowedPages.add('companyHub'); // MERGED: Allow access to the hub globally (like notices/policy before)
-                allowedPages.add('dashboard');
-                allowedPages.add('tasks'); // Grant Task Manager access to everyone
-        
-                return APP_MODULES.filter(link => allowedPages.has(link.key));
-            }, [userProfile]);
-            
-            // Generate allowed keys set for Launch Pad locking
-            const allowedLinkKeys = useMemo(() => {
-                return new Set(availableLinks.map(link => link.key));
-            }, [availableLinks]);
-
-            // Renders the component for the currently active page
             const renderActivePage = useCallback(() => {
-                // MODIFIED: Use activePageKey for permission checks
-                // Added 'tasks' and 'notices' to the global allowance list
                 const hasPermission = (userProfile?.role === 'Admin') || (userProfile?.role === 'CEO' && activePageKey !== 'sysConfig') || userProfile?.permissions?.includes(activePageKey) || activePageKey === 'companyHub' || activePageKey === 'dashboard' || activePageKey === 'tasks';
                 
                 if (!activePageKey) return null;
@@ -14900,28 +14987,26 @@
                 
                 switch(activePageKey) {
                     case 'dashboard': return <DashboardSummaryPage userProfile={userProfile} setActivePage={setActivePage} onNavigateWithTab={handleNotificationClick} />;
-                    case 'companyHub': return <CompanyHubPage userProfile={userProfile} />; // MERGED: New Route
+                    case 'companyHub': return <CompanyHubPage userProfile={userProfile} />;
                     case 'employees': return <EmployeesPage userProfile={userProfile} pageParams={activePageParams} />;
-                    case 'checkinme': return <CheckInMePage userProfile={userProfile} initialTab={initialCheckInMeTab} />;
+                    case 'checkinme': return <CheckInMePage userProfile={userProfile} initialTab={initialCheckInMeTab} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />;
                     case 'attendanceReport': return <AttendanceReportPage userProfile={userProfile} />;
                     case 'payroll': return <PayrollPage userProfile={userProfile} />;
                     case 'hrBanking': return <HRBankingPage userProfile={userProfile} />;
                     case 'expenseReport': return <ExpenseReportPage userProfile={userProfile} />;
                     case 'assets': return <AssetManagerPage userProfile={userProfile} />;
                     case 'tasks': return <TaskBoardPage userProfile={userProfile} />;
-                    case 'policy': return <PolicyBoardPage userProfile={userProfile} />;
                     case 'userActivity': return <UserActivityPage />;
                     case 'settings': return <SettingsPage />;
                     default: return <UnderConstructionPage title="Page Not Found" />;
                 }
-            }, [activePageKey, activePageParams, userProfile, initialCheckInMeTab]);
+            }, [activePageKey, activePageParams, userProfile, initialCheckInMeTab, pendingLeaves, pendingOTs]);
 
             if (loading) return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white"><i className="fas fa-spinner fa-spin text-4xl mr-3"></i> Loading System...</div>;
             if (!userProfile) return <LoginPage />;
 
             return (
-                <div className="flex h-screen bg-slate-900 overflow-hidden flex-col">
-                    {/* Unified System Launch Pad (Overlay) */}
+                <div className="flex h-screen bg-[#0f172a] text-slate-300 font-sans overflow-hidden">
                     <SystemLaunchPad 
                         isOpen={isLaunchPadOpen} 
                         onClose={() => setIsLaunchPadOpen(false)} 
@@ -14935,109 +15020,92 @@
                         auth={auth}
                         setInitialCheckInMeTab={setInitialCheckInMeTab}
                         allowedLinkKeys={allowedLinkKeys}
-                        companyHubUnreadCount={companyHubUnreadCount} // PASS PROP HERE
+                        companyHubUnreadCount={companyHubUnreadCount}
                     />
 
-                    {/* Unified Header (Used for both Desktop & Mobile) */}
-                    <header className="bg-slate-800 shadow-md p-4 flex justify-between items-center z-30 relative shrink-0">
-                        <div className="flex items-center">
-                            {/* Branding is now the "Home" trigger. */}
-                            <button 
-                                onClick={() => setIsLaunchPadOpen(true)} 
-                                className="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-700/50 transition-colors group focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                                title="Go to Home / Launch Pad"
-                            >
-                                <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-900/50 group-hover:scale-105 transition-transform duration-200">
-                                    <i className="fas fa-building-user text-white text-sm"></i>
+                    <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
+                        <header className="px-6 py-4 flex justify-between items-center bg-slate-900/80 border-b border-slate-800 shrink-0 z-40 backdrop-blur-md">
+                            <div className="flex items-center gap-4">
+                                <button onClick={() => setIsLaunchPadOpen(true)} className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors">
+                                    <i className="fas fa-bars text-xl"></i>
+                                </button>
+                                
+                                <div className="hidden md:flex items-center bg-slate-800 rounded-lg px-3 py-1.5 border border-slate-700 w-64">
+                                    <i className="fas fa-search text-slate-500 mr-2 text-xs"></i>
+                                    <input type="text" placeholder="Quick Search..." className="bg-transparent border-none outline-none text-xs text-slate-300 w-full placeholder-slate-500" />
                                 </div>
-                                <h2 className="text-lg font-bold text-white tracking-tight group-hover:text-blue-100 transition-colors hidden xs:block">HR System</h2>
-                            </button>
-
-                            {/* Header Breadcrumb / Page Name Display */}
-                            <div className="flex items-center animate-fade-in ml-1">
-                                <i className="fas fa-chevron-right text-slate-600 mx-2 sm:mx-3 text-[10px] sm:text-xs"></i>
-                                <h2 className="text-sm sm:text-base font-semibold text-blue-400 tracking-wide truncate max-w-[120px] sm:max-w-none">
-                                    {currentPageTitle}
-                                </h2>
-                            </div>
-                        </div>
-
-                        <div className="flex items-center gap-3">
-                            {/* Live Clock (Compact) */}
-                            {/* MODIFIED: Removed 'hidden sm:flex' to show clock on mobile */}
-                            <div className="flex flex-col items-end mr-1">
-                                <span className="text-xs font-bold text-slate-200 font-mono leading-none">
-                                    {currentTime.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit' })}
-                                </span>
-                                <span className="text-[9px] text-slate-400 font-medium uppercase tracking-wide leading-none mt-0.5">
-                                    {currentTime.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                                </span>
                             </div>
 
-                            {/* MODIFIED: Pass birthdayNotifications to NotificationBell */}
-                            <NotificationBell 
-                                pendingLeaves={pendingLeaves} 
-                                pendingOTs={pendingOTs} 
-                                birthdayNotifications={birthdayNotifications}
-                                onNotificationClick={handleNotificationClick} 
-                            />
-                            
-                            {/* FIX: Replaced CSS-hover group with React state toggle for mobile compatibility */}
-                            <div className="relative">
-                                <button 
-                                    onClick={() => setIsHeaderProfileOpen(!isHeaderProfileOpen)}
-                                    className="flex items-center text-sm font-medium text-slate-300 hover:text-white focus:outline-none"
-                                >
-                                    {userProfile?.photo ? (
-                                        <img src={userProfile.photo} alt={userProfile.name} className="w-8 h-8 rounded-full object-cover shadow-md border border-blue-400" />
-                                    ) : (
-                                        <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-white font-bold shadow-md border border-blue-400">
-                                            {userProfile.name.charAt(0)}
+                            <div className="flex items-center gap-3">
+                                <div className="flex flex-col items-end mr-1">
+                                    <span className="text-xs font-bold text-slate-200 font-mono leading-none">
+                                        {currentTime.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit' })}
+                                    </span>
+                                    <span className="text-[9px] text-slate-400 font-medium uppercase tracking-wide leading-none mt-0.5">
+                                        {currentTime.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                                    </span>
+                                </div>
+
+                                <NotificationBell 
+                                    pendingLeaves={pendingLeaves} 
+                                    pendingOTs={pendingOTs} 
+                                    birthdayNotifications={birthdayNotifications}
+                                    onNotificationClick={handleNotificationClick} 
+                                />
+                                
+                                <div className="relative" ref={headerProfileRef}>
+                                    <button 
+                                        onClick={() => setIsHeaderProfileOpen(!isHeaderProfileOpen)}
+                                        className="flex items-center text-sm font-medium text-slate-300 hover:text-white focus:outline-none"
+                                    >
+                                        {userProfile?.photo ? (
+                                            <img src={userProfile.photo} alt={userProfile.name} className="w-8 h-8 rounded-full object-cover shadow-md border border-blue-400" />
+                                        ) : (
+                                            <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-white font-bold shadow-md border border-blue-400">
+                                                {userProfile.name.charAt(0)}
+                                            </div>
+                                        )}
+                                    </button>
+                                    {isHeaderProfileOpen && (
+                                        <div className="absolute right-0 mt-2 w-48 bg-slate-800 rounded-md shadow-lg py-1 border border-slate-700 z-50 animate-fade-in">
+                                            <div className="px-4 py-2 border-b border-slate-700 mb-1">
+                                                <p className="text-xs text-slate-400">Signed in as</p>
+                                                <p className="text-sm font-bold text-white truncate">{userProfile?.name}</p>
+                                            </div>
+                                            <a 
+                                                href="#" 
+                                                onClick={(e) => { 
+                                                    e.preventDefault(); 
+                                                    window.firebaseSDK.signOut(auth);
+                                                    setIsHeaderProfileOpen(false); 
+                                                }} 
+                                                className="block px-4 py-2 text-sm text-red-400 hover:bg-slate-700"
+                                            >
+                                                <i className="fas fa-sign-out-alt mr-2"></i> Sign out
+                                            </a>
                                         </div>
                                     )}
-                                </button>
-                                {isHeaderProfileOpen && (
-                                    <div className="absolute right-0 mt-2 w-48 bg-slate-800 rounded-md shadow-lg py-1 border border-slate-700 z-50 animate-fade-in">
-                                        <div className="px-4 py-2 border-b border-slate-700 mb-1">
-                                            <p className="text-xs text-slate-400">Signed in as</p>
-                                            <p className="text-sm font-bold text-white truncate">{userProfile?.name}</p>
-                                        </div>
-                                        <a 
-                                            href="#" 
-                                            onClick={(e) => { 
-                                                e.preventDefault(); 
-                                                window.firebaseSDK.signOut(auth);
-                                                setIsHeaderProfileOpen(false); 
-                                            }} 
-                                            className="block px-4 py-2 text-sm text-red-400 hover:bg-slate-700"
-                                        >
-                                            <i className="fas fa-sign-out-alt mr-2"></i> Sign out
-                                        </a>
-                                    </div>
-                                )}
+                                </div>
                             </div>
-                        </div>
-                    </header>
+                        </header>
 
-                    {/* Main Content Area */}
-                    <main className="flex-1 overflow-y-auto p-4 sm:p-6 pb-24 relative scroll-smooth w-full max-w-7xl mx-auto">
-                        {renderActivePage()}
-                    </main>
+                        <main className="flex-1 overflow-y-auto p-4 sm:p-6 pb-24 relative scroll-smooth w-full max-w-7xl mx-auto">
+                            {renderActivePage()}
+                        </main>
 
-                    {/* NEW: Render the Pending Meetings Alert Modal */}
-                    <PendingMeetingsModal 
-                        isOpen={isMeetingAlertOpen} 
-                        onClose={handleCloseAlert} 
-                        meetings={pendingMeetingInvites} 
-                        onRespond={handleAlertRespond} 
-                    />
-                    
-                    {/* NEW: Render the Birthday Celebration Pop-up */}
-                    <BirthdayCelebrationModal 
-                        isOpen={isBirthdayPopupOpen}
-                        onClose={() => setIsBirthdayPopupOpen(false)}
-                        celebrants={birthdayNotifications}
-                    />
+                        <PendingMeetingsModal 
+                            isOpen={isMeetingAlertOpen} 
+                            onClose={handleCloseAlert} 
+                            meetings={pendingMeetingInvites} 
+                            onRespond={handleAlertRespond} 
+                        />
+                        
+                        <BirthdayCelebrationModal 
+                            isOpen={isBirthdayPopupOpen}
+                            onClose={() => setIsBirthdayPopupOpen(false)}
+                            celebrants={birthdayNotifications}
+                        />
+                    </div>
                 </div>
             );
         };
