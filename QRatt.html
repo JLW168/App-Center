@@ -70,6 +70,22 @@
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
 
+        // --- UTILS ---
+        const getDistance = (lat1, lon1, lat2, lon2) => {
+            const R = 6371e3; // Earth radius in meters
+            const φ1 = lat1 * Math.PI/180;
+            const φ2 = lat2 * Math.PI/180;
+            const Δφ = (lat2-lat1) * Math.PI/180;
+            const Δλ = (lon2-lon1) * Math.PI/180;
+
+            const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                      Math.cos(φ1) * Math.cos(φ2) *
+                      Math.sin(Δλ/2) * Math.sin(Δλ/2);
+            
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c; // Distance in meters
+        };
+
         // --- COMPONENTS ---
 
         const LoginScreen = ({ onLogin }) => {
@@ -212,7 +228,6 @@
                         (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
                         (err) => { 
                             console.warn("GPS Error", err); 
-                            // Resolve null so check-in proceeds even if GPS fails (QR is trusted)
                             resolve(null); 
                         },
                         { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
@@ -223,34 +238,71 @@
             const handleScanSuccess = async (qrText) => {
                 setScanning(false);
                 setLoading(true);
-                setStatus(`Identifying Shop: ${qrText}...`);
+                setStatus(`Verifying location for: ${qrText}...`);
 
                 try {
-                    // 1. Get GPS (Background)
+                    // 1. Get GPS (MANDATORY for Security Check)
                     const gps = await getGPS();
                     
-                    // 2. Determine Action (Toggle In/Out based on last record)
-                    // If no last record, default to 'in'. If last was 'in', now is 'out'.
+                    if (!gps) {
+                        alert("Location Access Required.\n\nPlease enable GPS to verify you are at the shop.");
+                        setLoading(false);
+                        return;
+                    }
+
+                    // 2. Fetch Shop Details from Firestore to get coordinates
+                    const shopsRef = window.fb.collection(window.fb.db, 'shops');
+                    const q = window.fb.query(shopsRef, window.fb.where("name", "==", qrText));
+                    const querySnapshot = await window.fb.getDocs(q);
+
+                    if (querySnapshot.empty) {
+                        alert("Invalid QR Code. Shop not found in system.");
+                        setLoading(false);
+                        return;
+                    }
+
+                    const shopData = querySnapshot.docs[0].data();
+                    
+                    // 3. VALIDATE DISTANCE
+                    if (shopData.latitude && shopData.longitude) {
+                        const distance = getDistance(
+                            gps.latitude, 
+                            gps.longitude, 
+                            parseFloat(shopData.latitude), 
+                            parseFloat(shopData.longitude)
+                        );
+                        
+                        const allowedRadius = parseFloat(shopData.radius) || 500; // Default 500m
+
+                        if (distance > allowedRadius) {
+                            alert(`Security Alert: You are too far from ${qrText}.\n\nDistance: ${Math.round(distance)}m\nAllowed Radius: ${allowedRadius}m\n\nPlease move closer to the shop.`);
+                            setLoading(false);
+                            return; // STOP EXECUTION - Security Block
+                        }
+                    } else {
+                        console.warn("Shop coordinates missing in database. Skipping distance check.");
+                    }
+
+                    // 4. Determine Action (Toggle In/Out based on last record)
                     const type = (lastRecord && lastRecord.type === 'in') ? 'out' : 'in';
                     
-                    // 3. Save to Firestore
-                    // Note: We trust the QR text is the Shop Name (as per settings generator)
+                    // 5. Save to Firestore
                     const payload = {
                         employeeId: user.uid,
                         employeeName: user.displayName || 'Staff',
-                        shop: qrText, // The QR code contains the Shop Name
+                        shop: qrText, 
                         timestamp: window.fb.serverTimestamp(),
                         type: type,
                         verificationMethod: 'qr',
-                        location: gps || { manual: true, note: 'QR Scan - No GPS' }
+                        location: gps
                     };
 
                     await window.fb.addDoc(window.fb.collection(window.fb.db, 'attendance'), payload);
 
-                    // 4. Update UI
+                    // 6. Update UI
                     setLastRecord({ ...payload, timestamp: { toDate: () => new Date() } }); // Mock timestamp for immediate UI update
                     setStatus('Success!');
-                    alert(`Successfully Checked ${type.toUpperCase()} at ${qrText}`);
+                    alert(`Successfully Checked ${type.toUpperCase()} at ${qrText}\n(Verified Location)`);
 
                 } catch (error) {
                     console.error("Check-in failed", error);
