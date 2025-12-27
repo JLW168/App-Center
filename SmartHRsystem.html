@@ -56,6 +56,8 @@
         html, body { 
             font-family: 'Inter', sans-serif;
             overflow-x: hidden; /* Prevents horizontal scrolling */
+            /* NEW: Prevents browser history swipe navigation on mobile to allow app gestures */
+            overscroll-behavior-x: none;
         }
 
         /* OPTIMIZATION: Splash Screen Styles */
@@ -9872,6 +9874,17 @@
                         { name: "returnDate", mode: "ASCENDING" }
                     ]
                 },
+                // --- NEW INDEX ADDED (CheckInMe Optimization) ---
+                {
+                    title: "CheckInMe: Staff Leave Range",
+                    description: "Required for querying leave requests by Staff ID and Return Date.",
+                    collection: "leaveRequests",
+                    scope: "COLLECTION",
+                    fields: [
+                        { name: "staffId", mode: "ASCENDING" },
+                        { name: "returnDate", mode: "ASCENDING" }
+                    ]
+                },
                 // --- END NEW INDEXES ---
                 // --- NEW: Added Missing Index for Employee States Badge ---
                 {
@@ -16404,16 +16417,91 @@
         const AppContent = () => {
             const { userProfile, loading, auth, db } = useFirebase();
             const [activePage, setActivePage] = useState('dashboard');
-            const { where, collection, query, onSnapshot, orderBy } = window.firebaseSDK;
-            // PHASE 3.1: Get moduleConfig
-            const { employees, shops, moduleConfig = {} } = useAppData(); 
+            
+            // FIX: Ensure SDK is ready or handle gracefully. 
+            // In a real app, we might wait, but here we assume provider handles loading.
+            const { where, collection, query, onSnapshot, orderBy } = window.firebaseSDK || {}; 
+            
+            const { employees, shops, kpis, moduleConfig = {} } = useAppData(); 
 
-            // OPTIMIZATION: Logic to remove Splash Screen only when app is ready
+            // --- HOOKS MOVED TO TOP (Fixes Error #310) ---
+            
+            // 1. Swipe Logic State
+            const [touchStart, setTouchStart] = useState(null);
+            const [touchEnd, setTouchEnd] = useState(null);
+
+            // 2. Global Search State
+            const [globalSearchTerm, setGlobalSearchTerm] = useState('');
+            const [searchResults, setSearchResults] = useState({ pages: [], staff: [] });
+            const searchContainerRef = useRef(null);
+
+            // 3. Notification & Badge State
+            const [popupNotice, setPopupNotice] = useState(null);
+            const [dismissedNoticeIds, setDismissedNoticeIds] = useState(new Set());
+            const [pendingMeetingInvites, setPendingMeetingInvites] = useState([]);
+            const [isMeetingAlertOpen, setIsMeetingAlertOpen] = useState(false);
+            const [isBirthdayPopupOpen, setIsBirthdayPopupOpen] = useState(false);
+            const [birthdayNotifications, setBirthdayNotifications] = useState([]);
+
+            // 4. UI State
+            const [isLaunchPadOpen, setIsLaunchPadOpen] = useState(true);
+            const [isHeaderProfileOpen, setIsHeaderProfileOpen] = useState(false);
+            const [initialCheckInMeTab, setInitialCheckInMeTab] = useState('checkInOut');
+            const [currentTime, setCurrentTime] = useState(new Date());
+            const headerProfileRef = useRef(null);
+            
+            // 5. Modal State for Quick Actions
+            const [isEmployeeModalOpen, setIsEmployeeModalOpen] = useState(false);
+            const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+            const [isProfileOpen, setIsProfileOpen] = useState(false);
+            const profileRef = useRef(null);
+
+            // 6. Connectivity
+            const { isOnline } = useConnectivity();
+
+            // 7. Data Fetching Hooks (Must be unconditional)
+            const { data: allNotices } = useCollection('memoAlerts');
+            const { data: allPolicies } = useCollection('policies');
+
+            // Access Control Logic
+            const allowedLinkKeys = useMemo(() => {
+                if (!userProfile) return new Set();
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return null; 
+                const base = new Set(['dashboard', 'companyHub', 'tasks']); 
+                if (userProfile.permissions) { userProfile.permissions.forEach(p => base.add(p)); }
+                return base;
+            }, [userProfile]);
+
+            // Notification Constraints
+            const notificationConstraints = useMemo(() => {
+                if (!userProfile || !window.firebaseSDK) return { leave: [], ot: [], state: [] };
+                const { role, shop } = userProfile;
+                const { where } = window.firebaseSDK;
+                const pendingStatus = where("status", "==", "Pending");
+
+                if (role === 'Admin' || role === 'CEO') {
+                    return { leave: [pendingStatus], ot: [pendingStatus], state: [pendingStatus] };
+                }
+                if (role === 'Shop Manager') {
+                    const shopsArr = Array.isArray(shop) ? shop : [shop];
+                    if (shopsArr.length === 0) return { leave: [where("status", "==", "impossible")], ot: [where("status", "==", "impossible")], state: [where("status", "==", "impossible")] };
+                    const shopFilter = where("shop", "in", shopsArr);
+                    return { leave: [pendingStatus, shopFilter], ot: [pendingStatus, shopFilter], state: [pendingStatus, shopFilter] };
+                }
+                return { leave: [where("status", "==", "impossible")], ot: [where("status", "==", "impossible")], state: [where("status", "==", "impossible")] };
+            }, [userProfile]);
+
+            const { data: pendingLeaves } = useCollection('leaveRequests', notificationConstraints.leave);
+            const { data: pendingOTs } = useCollection('otRequests', notificationConstraints.ot);
+            const { data: pendingStates } = useCollection('employeeStates', notificationConstraints.state);
+
+            // --- EFFECTS ---
+
+            // Splash Screen Removal
             useEffect(() => {
                 if (!loading) {
                     const splash = document.getElementById('splash-screen');
                     if (splash) {
-                        // Small delay to ensure React render cycle is complete
                         setTimeout(() => {
                             splash.style.opacity = '0';
                             setTimeout(() => splash.remove(), 500);
@@ -16422,16 +16510,11 @@
                 }
             }, [loading]);
 
-            // --- START NEW: Global Search State & Logic ---
-            const [globalSearchTerm, setGlobalSearchTerm] = useState('');
-            const [searchResults, setSearchResults] = useState({ pages: [], staff: [] });
-            const searchContainerRef = useRef(null);
-
-            // Close search when clicking outside
+            // Search Click Outside
             useEffect(() => {
                 const handleClickOutside = (event) => {
                     if (searchContainerRef.current && !searchContainerRef.current.contains(event.target)) {
-                        setGlobalSearchTerm(''); // Clear/Close search
+                        setGlobalSearchTerm('');
                     }
                 };
                 document.addEventListener("mousedown", handleClickOutside);
@@ -16445,31 +16528,19 @@
                     return;
                 }
                 const term = globalSearchTerm.toLowerCase();
-                
-                // 1. Filter Pages (Modules)
-                // PHASE 3.1: Also filter out disabled modules from search results
                 const pages = APP_MODULES.filter(m => 
                     (allowedLinkKeys === null || allowedLinkKeys.has(m.key)) && 
-                    moduleConfig[m.key] !== false && // Check if enabled
+                    moduleConfig[m.key] !== false && 
                     m.label.toLowerCase().includes(term)
                 );
-
-                // 2. Filter Staff (Limit to 5 results)
                 const staff = (employees || []).filter(e => 
                     e.name.toLowerCase().includes(term) || 
                     (e.position && e.position.toLowerCase().includes(term))
                 ).slice(0, 5);
-
                 setSearchResults({ pages, staff });
             }, [globalSearchTerm, employees, allowedLinkKeys, moduleConfig]);
-            // --- END NEW ---
 
-            // ... (keep Company Hub Badge Logic, Priority Notice Logic, Birthday Logic, Permissions, Clock, Pending Counts) ...
-            const { data: allNotices } = useCollection('memoAlerts');
-            const { data: allPolicies } = useCollection('policies');
-            const [popupNotice, setPopupNotice] = useState(null);
-            const [dismissedNoticeIds, setDismissedNoticeIds] = useState(new Set());
-
+            // Notice Logic
             useEffect(() => {
                 if (!allNotices || !userProfile || !currentTime) return;
                 const currentHHMM = currentTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
@@ -16491,46 +16562,10 @@
                 setPopupNotice(activeUrgentNotice || null);
             }, [allNotices, userProfile, currentTime, dismissedNoticeIds]);
 
-            const handleAcknowledgeNotice = async (notice) => {
-                if (!notice || !userProfile?.id) return;
-                const { doc, updateDoc, arrayUnion } = window.firebaseSDK;
-                try {
-                    const noticeRef = doc(db, 'memoAlerts', notice.id);
-                    await updateDoc(noticeRef, { readBy: arrayUnion(userProfile.id) });
-                    setPopupNotice(null);
-                } catch (error) { console.error("Error acknowledging notice:", error); }
-            };
-
-            const handleRemindLater = () => { if (popupNotice) { setDismissedNoticeIds(prev => new Set(prev).add(popupNotice.id)); setPopupNotice(null); } };
-
-            const companyHubUnreadCount = useMemo(() => {
-                if (!userProfile) return 0;
-                const unreadNoticesCount = (allNotices || []).filter(n => {
-                    if (userProfile.role === 'Staff' && n.status !== 'Active') return false;
-                    if (n.targetShops && n.targetShops.length > 0) {
-                        const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                        if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO' && !userShops.some(s => n.targetShops.includes(s))) return false;
-                    }
-                    return !(n.readBy || []).includes(userProfile.id);
-                }).length;
-                const unreadPoliciesCount = (allPolicies || []).filter(p => { return !(p.readBy || []).includes(userProfile.id); }).length;
-                return unreadNoticesCount + unreadPoliciesCount;
-            }, [allNotices, allPolicies, userProfile]);
-
-            const [isLaunchPadOpen, setIsLaunchPadOpen] = useState(true);
-            const [isHeaderProfileOpen, setIsHeaderProfileOpen] = useState(false);
-            const [initialCheckInMeTab, setInitialCheckInMeTab] = useState('checkInOut');
-            const { isOnline } = useConnectivity();
-            const [currentTime, setCurrentTime] = useState(new Date());
-            const headerProfileRef = useRef(null);
-            
-            useEffect(() => { const handleClickOutside = (event) => { if (headerProfileRef.current && !headerProfileRef.current.contains(event.target)) setIsHeaderProfileOpen(false); }; if (isHeaderProfileOpen) document.addEventListener("mousedown", handleClickOutside); return () => document.removeEventListener("mousedown", handleClickOutside); }, [isHeaderProfileOpen]);
-
-            const [pendingMeetingInvites, setPendingMeetingInvites] = useState([]);
-            const [isMeetingAlertOpen, setIsMeetingAlertOpen] = useState(false);
-
+            // Meeting Alerts
             useEffect(() => {
                 if (!db || !userProfile) return;
+                const { collection, query, where, orderBy, onSnapshot } = window.firebaseSDK;
                 const now = new Date().toISOString().slice(0, 10);
                 const q = query(collection(db, 'meetings'), where('date', '>=', now), orderBy('date', 'asc'));
                 const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -16548,19 +16583,7 @@
                 return () => unsubscribe();
             }, [db, userProfile]);
 
-            const handleCloseAlert = () => setIsMeetingAlertOpen(false);
-            const handleAlertRespond = (meeting, type, reason) => {
-                const { doc, updateDoc } = window.firebaseSDK;
-                const meetingRef = doc(db, 'meetings', meeting.id);
-                const fieldPath = `responses.${userProfile.id}`;
-                updateDoc(meetingRef, { [fieldPath]: { status: type, reason: reason || '', timestamp: new Date().toISOString() } }).catch(console.error);
-                setPendingMeetingInvites(prev => prev.filter(m => m.id !== meeting.id));
-                if (pendingMeetingInvites.length <= 1) setIsMeetingAlertOpen(false);
-            };
-
-            const [isBirthdayPopupOpen, setIsBirthdayPopupOpen] = useState(false);
-            const [birthdayNotifications, setBirthdayNotifications] = useState([]);
-
+            // Birthday Logic
             useEffect(() => {
                 if (!employees || !shops || !userProfile) return;
                 const socialEmployees = employees.filter(e => {
@@ -16586,60 +16609,107 @@
                 }
             }, [employees, shops, userProfile]);
 
-            const allowedLinkKeys = useMemo(() => {
-                if (!userProfile) return new Set();
-                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return null; 
-                const base = new Set(['dashboard', 'companyHub', 'tasks']); 
-                if (userProfile.permissions) { userProfile.permissions.forEach(p => base.add(p)); }
-                return base;
-            }, [userProfile]);
+            // Profile Dropdown Outside Click
+            useEffect(() => { 
+                const handleClickOutside = (event) => { 
+                    if (profileRef.current && !profileRef.current.contains(event.target)) {
+                        setIsProfileOpen(false);
+                    }
+                };
+                if (isProfileOpen) document.addEventListener("mousedown", handleClickOutside); 
+                return () => document.removeEventListener("mousedown", handleClickOutside); 
+            }, [isProfileOpen]);
 
+            // Header Profile Outside Click
+            useEffect(() => { 
+                const handleClickOutside = (event) => { 
+                    if (headerProfileRef.current && !headerProfileRef.current.contains(event.target)) 
+                        setIsHeaderProfileOpen(false); 
+                }; 
+                if (isHeaderProfileOpen) document.addEventListener("mousedown", handleClickOutside); 
+                return () => document.removeEventListener("mousedown", handleClickOutside); 
+            }, [isHeaderProfileOpen]);
+
+            // Clock
             useEffect(() => { const timer = setInterval(() => setCurrentTime(new Date()), 1000); return () => clearInterval(timer); }, []);
 
-            // FIX: Added 'state' to notificationConstraints to fetch pending engagements
-            const notificationConstraints = useMemo(() => {
-                if (!userProfile) return { leave: [], ot: [], state: [] };
-                const { role, shop } = userProfile;
-                const pendingStatus = where("status", "==", "Pending");
+            // --- COMPUTED VALUES ---
 
-                if (role === 'Admin' || role === 'CEO') {
-                    return { 
-                        leave: [pendingStatus], 
-                        ot: [pendingStatus],
-                        state: [pendingStatus]
-                    };
-                }
-                if (role === 'Shop Manager') {
-                    const shopsArr = Array.isArray(shop) ? shop : [shop];
-                    if (shopsArr.length === 0) return { leave: [where("status", "==", "impossible")], ot: [where("status", "==", "impossible")], state: [where("status", "==", "impossible")] };
-                    
-                    const shopFilter = where("shop", "in", shopsArr);
-                    return { 
-                        leave: [pendingStatus, shopFilter], 
-                        ot: [pendingStatus, shopFilter],
-                        state: [pendingStatus, shopFilter]
-                    };
-                }
-                return { leave: [where("status", "==", "impossible")], ot: [where("status", "==", "impossible")], state: [where("status", "==", "impossible")] };
-            }, [userProfile]);
+            const companyHubUnreadCount = useMemo(() => {
+                if (!userProfile) return 0;
+                const unreadNoticesCount = (allNotices || []).filter(n => {
+                    if (userProfile.role === 'Staff' && n.status !== 'Active') return false;
+                    if (n.targetShops && n.targetShops.length > 0) {
+                        const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                        if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO' && !userShops.some(s => n.targetShops.includes(s))) return false;
+                    }
+                    return !(n.readBy || []).includes(userProfile.id);
+                }).length;
+                const unreadPoliciesCount = (allPolicies || []).filter(p => { return !(p.readBy || []).includes(userProfile.id); }).length;
+                return unreadNoticesCount + unreadPoliciesCount;
+            }, [allNotices, allPolicies, userProfile]);
 
-            const { data: pendingLeaves } = useCollection('leaveRequests', notificationConstraints.leave);
-            const { data: pendingOTs } = useCollection('otRequests', notificationConstraints.ot);
-            // FIX: Fetch pending states
-            const { data: pendingStates } = useCollection('employeeStates', notificationConstraints.state);
 
+            // --- HANDLERS ---
+            
             const handleNotificationClick = (target) => {
                 setActivePage('checkinme');
                 setInitialCheckInMeTab(target);
                 setIsLaunchPadOpen(false);
             };
 
+            const handleAcknowledgeNotice = async (notice) => {
+                if (!notice || !userProfile?.id) return;
+                const { doc, updateDoc, arrayUnion } = window.firebaseSDK;
+                try {
+                    const noticeRef = doc(db, 'memoAlerts', notice.id);
+                    await updateDoc(noticeRef, { readBy: arrayUnion(userProfile.id) });
+                    setPopupNotice(null);
+                } catch (error) { console.error("Error acknowledging notice:", error); }
+            };
+
+            const handleRemindLater = () => { if (popupNotice) { setDismissedNoticeIds(prev => new Set(prev).add(popupNotice.id)); setPopupNotice(null); } };
+            const handleCloseAlert = () => setIsMeetingAlertOpen(false);
+            
+            const handleAlertRespond = (meeting, type, reason) => {
+                const { doc, updateDoc } = window.firebaseSDK;
+                const meetingRef = doc(db, 'meetings', meeting.id);
+                const fieldPath = `responses.${userProfile.id}`;
+                updateDoc(meetingRef, { [fieldPath]: { status: type, reason: reason || '', timestamp: new Date().toISOString() } }).catch(console.error);
+                setPendingMeetingInvites(prev => prev.filter(m => m.id !== meeting.id));
+                if (pendingMeetingInvites.length <= 1) setIsMeetingAlertOpen(false);
+            };
+
+            // Swipe Logic Handlers
+            const minSwipeDistance = 50; 
+            const onTouchStart = (e) => {
+                setTouchEnd(null); 
+                setTouchStart({ x: e.targetTouches[0].clientX, y: e.targetTouches[0].clientY });
+            };
+            const onTouchMove = (e) => {
+                setTouchEnd({ x: e.targetTouches[0].clientX, y: e.targetTouches[0].clientY });
+            };
+            const onTouchEnd = () => {
+                if (!touchStart || !touchEnd) return;
+                const distanceX = touchStart.x - touchEnd.x;
+                const distanceY = touchStart.y - touchEnd.y;
+                const isHorizontal = Math.abs(distanceX) > Math.abs(distanceY);
+                if (isHorizontal) {
+                    const isRightSwipe = distanceX < -minSwipeDistance;
+                    if (isRightSwipe && !isLaunchPadOpen) {
+                         setIsLaunchPadOpen(true);
+                    }
+                }
+            };
+            
+            // --- EARLY RETURNS (Now Safe because hooks are above) ---
+            if (loading) return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white"><i className="fas fa-spinner fa-spin text-4xl mr-3"></i> Loading System...</div>;
+            if (!userProfile) return <LoginPage />;
+
             const activePageKey = activePage.split(':')[0];
             const activePageParams = activePage.split(':')[1] ? activePage.split(':').slice(1).join(':') : null;
             
-            const renderActivePage = useCallback(() => {
-                // PHASE 3.1: Access Control Check
-                // If a module is disabled in config, block rendering and show a message.
+            const renderActivePage = () => {
                 if (moduleConfig && moduleConfig[activePageKey] === false) {
                     return (
                         <div className="flex flex-col items-center justify-center h-full text-slate-500 animate-fade-in">
@@ -16650,17 +16720,13 @@
                             <p className="max-w-md text-center text-slate-400 leading-relaxed">
                                 The <strong>{activePageKey}</strong> module is currently disabled by the system administrator.
                             </p>
-                            <button 
-                                onClick={() => setActivePage('dashboard')} 
-                                className="mt-8 px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors text-sm font-bold shadow-lg shadow-blue-900/20"
-                            >
+                            <button onClick={() => setActivePage('dashboard')} className="mt-8 px-6 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors text-sm font-bold shadow-lg shadow-blue-900/20">
                                 Return to Dashboard
                             </button>
                         </div>
                     );
                 }
 
-                // MODIFIED: Explicitly deny 'settings' access for CEO
                 const hasPermission = (userProfile?.role === 'Admin') || 
                                       (userProfile?.role === 'CEO' && activePageKey !== 'sysConfig' && activePageKey !== 'settings') || 
                                       userProfile?.permissions?.includes(activePageKey) || 
@@ -16686,10 +16752,7 @@
                     case 'settings': return <SettingsPage />;
                     default: return <UnderConstructionPage title="Page Not Found" />;
                 }
-            }, [activePageKey, activePageParams, userProfile, initialCheckInMeTab, pendingLeaves, pendingOTs, moduleConfig]); // Add moduleConfig dep
-
-            if (loading) return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white"><i className="fas fa-spinner fa-spin text-4xl mr-3"></i> Loading System...</div>;
-            if (!userProfile) return <LoginPage />;
+            };
 
             return (
                 <div className="flex h-screen bg-[#0f172a] text-slate-300 font-sans overflow-hidden">
@@ -16705,7 +16768,6 @@
                         currentTime={currentTime}
                         pendingLeaves={pendingLeaves}
                         pendingOTs={pendingOTs}
-                        // FIX: Pass pendingStates as pendingEngagements
                         pendingEngagements={pendingStates}
                         onNotificationClick={handleNotificationClick}
                         auth={auth}
@@ -16714,8 +16776,12 @@
                         companyHubUnreadCount={companyHubUnreadCount}
                     />
 
-                    <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
-                        {/* NEW: Offline Banner inserted at the top of the content area */}
+                    <div 
+                        className="flex-1 flex flex-col min-w-0 overflow-hidden relative"
+                        onTouchStart={onTouchStart}
+                        onTouchMove={onTouchMove}
+                        onTouchEnd={onTouchEnd}
+                    >
                         <OfflineBanner />
                         
                         <header className="px-6 py-4 flex justify-between items-center bg-slate-900/80 border-b border-slate-800 shrink-0 z-40 backdrop-blur-md">
@@ -16761,7 +16827,6 @@
                                             )}
                                         </div>
                                     )}
-                                    {globalSearchTerm && searchResults.pages.length === 0 && searchResults.staff.length === 0 && (<div className="absolute top-full left-0 right-0 mt-2 bg-slate-800 border border-slate-700 rounded-lg shadow-xl p-4 z-50 text-center"><p className="text-xs text-slate-500 italic">No matches found.</p></div>)}
                                 </div>
                             </div>
 
