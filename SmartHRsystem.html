@@ -13694,7 +13694,7 @@
             useEffect(() => {
                 const fetchTeamData = async () => {
                     if (!db || !userProfile || !shops || shops.length === 0) {
-                        // Wait for shops to load
+                        // Wait for shops to load to get Timezones
                         if (shops && shops.length > 0) setLoading(false); 
                         return;
                     }
@@ -13703,12 +13703,15 @@
                         const { collection, query, where, getDocs } = window.firebaseSDK;
                         
                         // FIX: Timezone Robustness
-                        // Instead of querying exact "Start of Day" (Browser Time), we query a buffer of ±24 hours.
-                        // Then we filter in memory based on each shop's specific timezone "Today".
+                        // Query a wider buffer (±2 Days) to account for extreme timezone differences.
+                        // Precise filtering happens in-memory below.
                         const now = new Date();
-                        const bufferStart = new Date(now); bufferStart.setDate(bufferStart.getDate() - 1); // Yesterday
-                        const bufferEnd = new Date(now); bufferEnd.setDate(bufferEnd.getDate() + 1); // Tomorrow
+                        const bufferStart = new Date(now); bufferStart.setDate(bufferStart.getDate() - 2); 
+                        const bufferEnd = new Date(now); bufferEnd.setDate(bufferEnd.getDate() + 2);
                         
+                        const bufferStartStr = bufferStart.toISOString().slice(0, 10);
+                        const bufferEndStr = bufferEnd.toISOString().slice(0, 10);
+
                         // 1. Fetch ALL Attendance for Buffer Period
                         const attQ = query(
                             collection(db, 'attendance'),
@@ -13716,27 +13719,25 @@
                             where('timestamp', '<=', bufferEnd)
                         );
 
-                        // 2. Fetch Active Leaves (Overlapping Today)
-                        // Note: We fetch active leaves generally and filter by date later
+                        // 2. Fetch Active Leaves
                         const leaveQ = query(
                             collection(db, 'leaveRequests'),
                             where('status', '==', 'Approved'),
-                            where('returnDate', '>=', bufferStart.toISOString().slice(0,10)) 
+                            where('returnDate', '>=', bufferStartStr) 
                         );
 
-                        // 3. Fetch OT (Buffer)
+                        // 3. Fetch OT
                         const otQ = query(
                             collection(db, 'otRequests'),
                             where('status', '==', 'Approved'),
-                            where('reqDate', '>=', bufferStart.toISOString().slice(0,10)),
-                            where('reqDate', '<=', bufferEnd.toISOString().slice(0,10))
+                            where('reqDate', '>=', bufferStartStr),
+                            where('reqDate', '<=', bufferEndStr)
                         );
 
                         const [attSnap, leaveSnap, otSnap] = await Promise.all([
                             getDocs(attQ), getDocs(leaveQ), getDocs(otQ)
                         ]);
 
-                        // Helper: Check if record belongs to user's scope
                         const isAllowedShop = (recordShop) => {
                             if (!recordShop) return false;
                             if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return true;
@@ -13748,11 +13749,10 @@
                             return recordShop === myShop;
                         };
 
-                        // Helper: Get "Today" string (YYYY-MM-DD) for a specific shop
+                        // Helper: Get "Today" string (YYYY-MM-DD) for a specific shop's timezone
                         const getShopToday = (shopName) => {
                             const shop = shops.find(s => s.name === shopName);
-                            // If shop not found or no timezone, default to browser
-                            const tz = shop?.timezone; 
+                            const tz = shop?.timezone; // Default to browser if undefined
                             return Utils.formatDateInTimezone({ toDate: () => new Date() }, tz).localDate;
                         };
 
@@ -13764,14 +13764,13 @@
                             if (!isAllowedShop(d.shop)) return;
                             if (!d.timestamp) return;
 
-                            // FIX: Strict Timezone Match
                             // 1. Get Shop's Today
                             const shopTodayStr = getShopToday(d.shop);
                             // 2. Get Record's Date in Shop's TZ
                             const shopObj = shops.find(s => s.name === d.shop);
                             const recordDateStr = Utils.formatDateInTimezone(d.timestamp, shopObj?.timezone).localDate;
 
-                            // 3. Only process if dates match
+                            // 3. Strict Match: Only show attendance that happened "Today" in that shop
                             if (shopTodayStr !== recordDateStr) return;
 
                             if (!dailyStatsMap[d.employeeId]) {
@@ -13805,7 +13804,6 @@
                         const presentList = Object.values(dailyStatsMap)
                             .filter(rec => rec.inTime !== null)
                             .map(rec => {
-                                // Format time using Shop's Timezone
                                 const fmt = (date) => date.toLocaleTimeString('en-US', { timeZone: rec.timezone, hour: '2-digit', minute:'2-digit', hour12: true });
                                 const inStr = fmt(rec.inTime);
                                 const outStr = rec.outTime ? fmt(rec.outTime) : '-';
@@ -13824,15 +13822,28 @@
                             .filter(l => {
                                 if (!isAllowedShop(l.shop)) return false;
                                 const shopToday = getShopToday(l.shop);
-                                // Check overlap: Start <= Today <= End
-                                return l.leaveDate <= shopToday && l.returnDate >= shopToday;
+                                
+                                // FIX: Normalize dates to strings (YYYY-MM-DD) to avoid string comparison bugs
+                                const leaveStart = (l.leaveDate || '').substring(0, 10);
+                                const leaveEnd = (l.returnDate || '').substring(0, 10);
+                                
+                                // FIX: Check overlap: Start <= Today < End 
+                                // (Return Date is the day they are BACK, so it is exclusive)
+                                return leaveStart <= shopToday && leaveEnd > shopToday;
                             })
-                            .map(l => ({
-                                id: l.staffId,
-                                name: l.staffName,
-                                info: `${l.shop} • ${l.leaveSession || 'Full Day'}`,
-                                status: l.leaveType
-                            }));
+                            .map(l => {
+                                // NEW: Add Date Range to info
+                                const dStart = Utils.formatISOToDisplay(l.leaveDate);
+                                const dEnd = Utils.formatISOToDisplay(l.returnDate);
+                                const dateRange = dStart === dEnd ? dStart : `${dStart} to ${dEnd}`;
+
+                                return {
+                                    id: l.staffId,
+                                    name: l.staffName,
+                                    info: `${l.shop} • ${dateRange} • ${l.leaveSession || 'Full Day'}`,
+                                    status: l.leaveType
+                                };
+                            });
 
                         // --- PROCESS OT ---
                         const otList = otSnap.docs
@@ -13840,7 +13851,10 @@
                             .filter(o => {
                                 if (!isAllowedShop(o.shop)) return false;
                                 const shopToday = getShopToday(o.shop);
-                                return o.reqDate === shopToday;
+                                
+                                // FIX: Strict normalized comparison
+                                const otDate = (o.reqDate || '').substring(0, 10);
+                                return otDate === shopToday;
                             })
                             .map(o => ({
                                 id: o.staffId,
