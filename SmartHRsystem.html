@@ -884,9 +884,6 @@
             const { userProfile, db } = useFirebase();
             const { where } = window.firebaseSDK;
             
-            // REMOVED: Old conflicting moduleConfig state and useEffect
-            // const [moduleConfig, setModuleConfig] = useState({}); 
-            
             // Create role-based query constraints to prevent permission errors.
             const employeeQueryConstraints = useMemo(() => {
                 if (!userProfile) {
@@ -934,8 +931,21 @@
             }, [sysConfigData]);
             // --- FIX END ---
 
+            // --- NEW: SAFETY TIMEOUT (Resilience Fix) ---
+            // If Firebase takes more than 8 seconds to connect (e.g. "Backend didn't respond"), 
+            // force the app to load so the user can see the UI (possibly in offline mode with cached data).
+            const [forceShow, setForceShow] = useState(false);
+            
+            useEffect(() => {
+                const timer = setTimeout(() => {
+                    setForceShow(true);
+                }, 8000); // 8 seconds safety valve
+                return () => clearTimeout(timer);
+            }, []);
+
             // Combine all loading states into a single flag.
-            const isLoading = employeesLoading || shopsLoading || shiftsLoading || positionsLoading || categoriesLoading || kpisLoading || configLoading;
+            // If forceShow is true, we ignore individual loading states.
+            const isLoading = !forceShow && (employeesLoading || shopsLoading || shiftsLoading || positionsLoading || categoriesLoading || kpisLoading || configLoading);
 
             const value = useMemo(() => ({
                 employees,
@@ -7265,29 +7275,25 @@
             const [reportData, setReportData] = useState({ leaveRequests: [], otRequests: [] });
             const [loading, setLoading] = useState(false);
 
-            // PHASE 3 OPTIMIZATION: For Admins/CEOs, we now fetch this data on-demand in the child components.
-            const isRealTime = userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO';
+            // PHASE 3 OPTIMIZATION: For Admins/CEOs AND Shop Managers, we now fetch this data on-demand.
+            // FIX: Only 'Staff' role should use real-time listeners for reports. 
+            // Managers viewing 44+ people should fetch strictly by date range to save quota.
+            const isRealTime = userProfile?.role === 'Staff';
             
             const staffQueryConstraints = useMemo(() => {
                 const { role, id, shop } = userProfile || {};
                 if (role === 'Staff' && id) {
                     return [where("staffId", "==", id)];
                 }
-                if (role === 'Shop Manager') {
-                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
-                    if (managedShops.length > 0) {
-                        return [where("shop", "in", managedShops)];
-                    }
-                    return [where("staffId", "==", "null")]; // No shops assigned, so return no results.
-                }
-                return []; // Admin query is built on-demand.
+                // Managers & Admins return empty here because they use the on-demand fetch in the child components
+                return []; 
             }, [userProfile]);
             
-            // Real-time data for Staff/Managers
+            // Real-time data for Staff Only
             const { data: realTimeLeaveRequests } = useCollection('leaveRequests', isRealTime ? staffQueryConstraints : []);
             const { data: realTimeOtRequests } = useCollection('otRequests', isRealTime ? staffQueryConstraints : []);
             
-            // On-demand data for Admins (passed down)
+            // On-demand data for Admins/Managers (passed down)
             const leaveRequests = isRealTime ? realTimeLeaveRequests : reportData.leaveRequests;
             const otRequests = isRealTime ? realTimeOtRequests : reportData.otRequests;
 
@@ -7408,20 +7414,16 @@
             const [adminAttendance, setAdminAttendance] = useState([]);
             
             // PHASE 2 & 3: Combined logic for fetching attendance data.
-            const isRealTime = userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO';
+            // FIX: Managers now use isRealTime = false (On Demand) to save quota
+            const isRealTime = userProfile?.role === 'Staff';
+
             const attendanceQueryConstraints = useMemo(() => {
-                // This is ONLY for real-time listeners (Staff/Manager)
-                // FIX: If Admin/CEO (not real-time), return a dummy constraint to PREVENT fetching the entire collection.
+                // This is ONLY for real-time listeners (Staff)
                 if (!isRealTime) return [where("shop", "==", "___NON_EXISTENT_SHOP___")]; 
                 
-                const { role, id, shop } = userProfile || {};
+                const { role, id } = userProfile || {};
                 if (role === 'Staff' && id) return [where("employeeId", "==", id)];
                 
-                if (role === 'Shop Manager') {
-                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
-                    if (managedShops.length > 0) return [where("shop", "in", managedShops)];
-                    return [where("employeeId", "==", "null")];
-                }
                 // Fallback for unexpected cases
                 return [where("shop", "==", "___NON_EXISTENT_SHOP___")];
             }, [userProfile, isRealTime]);
@@ -7430,9 +7432,10 @@
             const attendance = isRealTime ? realTimeAttendance : adminAttendance;
             const isReportLoading = isRealTime ? attendanceLoading : isAdminLoading;
             
-            // PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN (OPTIMIZED) ---
+            // PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN & MANAGERS (OPTIMIZED) ---
             useEffect(() => {
-                if (userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO') return;
+                // Fetch if NOT staff
+                if (userProfile?.role === 'Staff') return;
 
                 const fetchAdminData = async () => {
                     setLoadingAdminReport(true);
@@ -7449,9 +7452,6 @@
                     }
                     
                     // --- FIX: BUFFER FOR TIMEZONE OFFSET ---
-                    // Extend the query range by 24 hours in both directions.
-                    // This ensures we catch records that belong to "Today" in the Shop's timezone
-                    // even if the Admin's browser timezone thinks it's "Yesterday" or "Tomorrow".
                     const bufferStart = new Date(startDate);
                     bufferStart.setDate(bufferStart.getDate() - 1);
                     
@@ -7465,10 +7465,27 @@
                     let leaveQuery = query(collection(db, 'leaveRequests'), where('returnDate', '>=', bufferStart.toISOString().slice(0, 10)));
                     let otQuery = query(collection(db, 'otRequests'), where('reqDate', '>=', bufferStart.toISOString().slice(0, 10)), where('reqDate', '<=', bufferEnd.toISOString().slice(0, 10)));
                     
-                    if (selectedShop) {
-                        attendanceQuery = query(attendanceQuery, where('shop', '==', selectedShop));
-                        leaveQuery = query(leaveQuery, where('shop', '==', selectedShop));
-                        otQuery = query(otQuery, where('shop', '==', selectedShop));
+                    // Apply Shop Filtering Logic
+                    let targetShop = selectedShop;
+                    
+                    // If Manager hasn't selected a shop yet, and has managed shops, we must filter by "in" or handle manually
+                    if (!targetShop && userProfile.role === 'Shop Manager') {
+                         const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                         if (managedShops.length > 0) {
+                             attendanceQuery = query(attendanceQuery, where('shop', 'in', managedShops));
+                             leaveQuery = query(leaveQuery, where('shop', 'in', managedShops));
+                             otQuery = query(otQuery, where('shop', 'in', managedShops));
+                         } else {
+                             // No shops assigned
+                             setAdminAttendance([]);
+                             setAdminReportData({ leaveRequests: [], otRequests: [] });
+                             setLoadingAdminReport(false);
+                             return;
+                         }
+                    } else if (targetShop) {
+                        attendanceQuery = query(attendanceQuery, where('shop', '==', targetShop));
+                        leaveQuery = query(leaveQuery, where('shop', '==', targetShop));
+                        otQuery = query(otQuery, where('shop', '==', targetShop));
                     }
                     // --- OPTIMIZATION END ---
 
@@ -7479,6 +7496,7 @@
                             getDocs(otQuery)
                         ]);
                         
+                        // Client-side filtering ensures exact match if complex logic needed
                         const attendanceData = attSnap.docs.map(d => ({id: d.id, ...d.data()}))
                             .filter(rec => {
                                 const shopMatch = !selectedShop || rec.shop === selectedShop;
@@ -7505,7 +7523,7 @@
                         setAdminReportData({ leaveRequests: leaveData, otRequests: otData });
 
                     } catch (error) {
-                        console.error("Error fetching admin report data:", error);
+                        console.error("Error fetching report data:", error);
                     } finally {
                         setLoadingAdminReport(false);
                     }
@@ -7904,35 +7922,23 @@
             const [adminEmployeeStates, setAdminEmployeeStates] = useState([]);
 
             // PHASE 2 & 3: Combined logic for fetching data.
-            const isRealTime = userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO';
+            // FIX: Managers use On Demand (isRealTime = false)
+            const isRealTime = userProfile?.role === 'Staff';
             
             const realTimeQueryConstraints = useMemo(() => {
-                // FIX: Block Admin/CEO from fetching all data in real-time by returning a dummy constraint.
-                // This prevents the background listener from downloading the entire collection, which is slow.
-                const dummyConstraint = [where("shop", "==", "___NON_EXISTENT_SHOP___")];
-                
-                if (!isRealTime) return { attendance: dummyConstraint, employeeStates: dummyConstraint };
+                if (!isRealTime) return { attendance: [where("shop", "==", "___NON_EXISTENT_SHOP___")], employeeStates: [where("shop", "==", "___NON_EXISTENT_SHOP___")] };
 
-                const { role, id, shop } = userProfile || {};
+                const { role, id } = userProfile || {};
                 
                 let attendanceCons = [], statesCons = [];
 
                 if (role === 'Staff' && id) {
                     attendanceCons = [where("employeeId", "==", id)];
                     statesCons = [where("staffId", "==", id)];
-                } else if (role === 'Shop Manager') {
-                    const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
-                    if (managedShops.length > 0) {
-                        attendanceCons = [where("shop", "in", managedShops)];
-                        statesCons = [where("shop", "in", managedShops)];
-                    } else {
-                        attendanceCons = [where("employeeId", "==", "null")];
-                        statesCons = [where("staffId", "==", "null")];
-                    }
                 } else {
-                    // Fallback for unexpected cases
-                     attendanceCons = dummyConstraint;
-                     statesCons = dummyConstraint;
+                     // Fallback
+                     attendanceCons = [where("shop", "==", "___NON_EXISTENT_SHOP___")];
+                     statesCons = [where("shop", "==", "___NON_EXISTENT_SHOP___")];
                 }
                 return { attendance: attendanceCons, employeeStates: statesCons };
             }, [userProfile, isRealTime]);
@@ -7943,9 +7949,9 @@
             const attendance = isRealTime ? realTimeAttendance : adminAttendance;
             const employeeStates = isRealTime ? realTimeEmployeeStates : adminEmployeeStates;
 
-             // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN ---
+             // --- PHASE 3: ON-DEMAND DATA FETCHING FOR ADMIN & MANAGERS ---
             useEffect(() => {
-                if (userProfile?.role !== 'Admin' && userProfile?.role !== 'CEO') return;
+                if (userProfile?.role === 'Staff') return;
 
                 const fetchAdminData = async () => {
                     setLoadingAdminReport(true);
@@ -7970,8 +7976,6 @@
                     const endDate = `${targetMonth}-${daysInMonth}`; 
 
                     // --- FIX: Add Timezone Buffer (±2 Days) ---
-                    // This ensures we catch records that are "in this month" according to the Shop's Timezone
-                    // even if they look like prev/next month in UTC or Admin's Browser Time.
                     const bufferStart = new Date(startDate);
                     bufferStart.setDate(bufferStart.getDate() - 2);
                     
@@ -7984,12 +7988,27 @@
                     let leaveQuery = query(collection(db, 'leaveRequests'), where('returnDate', '>=', startDate));
                     let otQuery = query(collection(db, 'otRequests'), where('reqDate', '>=', startDate), where('reqDate', '<=', endDate));
                     
-                    // Apply Shop Filter at the Database Level if a shop is selected
-                    if (selectedShop) {
-                        attendanceQuery = query(attendanceQuery, where('shop', '==', selectedShop));
-                        statesQuery = query(statesQuery, where('shop', '==', selectedShop));
-                        leaveQuery = query(leaveQuery, where('shop', '==', selectedShop));
-                        otQuery = query(otQuery, where('shop', '==', selectedShop));
+                    // Apply Shop Filter at the Database Level
+                    let targetShop = selectedShop;
+                    if (!targetShop && userProfile.role === 'Shop Manager') {
+                         const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                         if (managedShops.length > 0) {
+                             // Use 'in' query for managed shops list
+                             attendanceQuery = query(attendanceQuery, where('shop', 'in', managedShops));
+                             statesQuery = query(statesQuery, where('shop', 'in', managedShops));
+                             leaveQuery = query(leaveQuery, where('shop', 'in', managedShops));
+                             otQuery = query(otQuery, where('shop', 'in', managedShops));
+                         } else {
+                             setAdminAttendance([]); setAdminEmployeeStates([]);
+                             setAdminReportData({ leaveRequests: [], otRequests: [] });
+                             setLoadingAdminReport(false);
+                             return;
+                         }
+                    } else if (targetShop) {
+                        attendanceQuery = query(attendanceQuery, where('shop', '==', targetShop));
+                        statesQuery = query(statesQuery, where('shop', '==', targetShop));
+                        leaveQuery = query(leaveQuery, where('shop', '==', targetShop));
+                        otQuery = query(otQuery, where('shop', '==', targetShop));
                     }
                     // --- OPTIMIZATION END ---
                     
@@ -8031,7 +8050,7 @@
                         setAdminReportData({ leaveRequests: leaveData, otRequests: otData });
 
                     } catch (error) {
-                        console.error("Error fetching admin work day report data:", error);
+                        console.error("Error fetching work day report data:", error);
                     } finally {
                         setLoadingAdminReport(false);
                     }
@@ -8381,29 +8400,91 @@
 
             const { shops, employees, shifts } = useAppData();
 
-            // PHASE 2 OPTIMIZATION: Add query constraints for Shop Managers
+            // --- OPTIMIZATION: DATE RANGE CONSTRAINTS (The Silent Killer Fix) ---
+            const dateConstraints = useMemo(() => {
+                if (!selectedMonth) return null;
+                const [y, m] = selectedMonth.split('-').map(Number);
+                // Calculate Start/End of month for DB queries
+                const startOfMonth = new Date(y, m - 1, 1);
+                const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                
+                // String formats for YYYY-MM-DD fields
+                const startStr = `${selectedMonth}-01`;
+                const endStr = `${selectedMonth}-31`; 
+
+                return { start: startOfMonth, end: endOfMonth, startStr, endStr };
+            }, [selectedMonth]);
+
+            // PHASE 2 OPTIMIZATION: Query constraints for Shop Managers AND Date Range
             const payrollQueryConstraints = useMemo(() => {
                 const { role, shop, id } = userProfile || {};
+                const { start, end, startStr, endStr } = dateConstraints || {};
                 
+                // Guard: If no date selected, return empty/dummy to prevent fetch
+                if (!start) return { attendance: [where("shop", "==", "___")], leave: [], ot: [], loan: [], state: [], salary: [] };
+
+                // Helper to build constraints based on base filters (shop/id)
+                const build = (baseFilters) => {
+                    return {
+                        // Attendance: Filter by Shop AND Date Range (Crucial for quota)
+                        attendance: [...baseFilters.attendance, where("timestamp", ">=", start), where("timestamp", "<=", end)],
+                        // Leaves: Overlap logic (simple: returnDate >= start of month)
+                        leave: [...baseFilters.shop, where("returnDate", ">=", startStr)],
+                        // OT: Within month
+                        ot: [...baseFilters.shop, where("reqDate", ">=", startStr), where("reqDate", "<=", endStr)],
+                        // Loans: Only Active ones
+                        loan: [...baseFilters.shop, where("status", "==", "Active")],
+                        // States: Within month
+                        state: [...baseFilters.shop, where("date", ">=", startStr), where("date", "<=", endStr)],
+                        // Salary: All revisions (usually small collection)
+                        salary: [...baseFilters.salary]
+                    };
+                };
+                
+                // --- FIX: PRIORITY TO SELECTED EMPLOYEE ---
+                // If a specific employee is selected (in the UI), we MUST fetch their attendance 
+                // by ID, ignoring the Shop Filter. This ensures Multi-Shop employees (like Mr. A)
+                // get attendance records from "Shop D" even if "Shop F" is selected in the dropdown.
+                if (selectedEmployeeId) {
+                    return build({
+                        // Attendance: STRICTLY by Employee ID
+                        attendance: [where("employeeId", "==", selectedEmployeeId)],
+                        // Others: Also by Employee ID for safety/consistency
+                        shop: [where("staffId", "==", selectedEmployeeId)],
+                        salary: [where("staffId", "==", selectedEmployeeId)]
+                    });
+                }
+                // --- END FIX ---
+
                 if (role === 'Admin' || role === 'CEO') {
-                    if (!selectedShop) return { attendance: [where("shop", "==", "null")], leave: [where("shop", "==", "null")], ot: [where("shop", "==", "null")], loan: [where("shop", "==", "null")], state: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] };
-                    return { attendance: [where("shop", "==", selectedShop)], leave: [where("shop", "==", selectedShop)], ot: [where("shop", "==", selectedShop)], loan: [where("shop", "==", selectedShop)], state: [where("shop", "==", selectedShop)], salary: [where("shopName", "==", selectedShop)] };
+                    if (!selectedShop) return build({ shop: [where("shop", "==", "null")], attendance: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] });
+                    return build({ 
+                        shop: [where("shop", "==", selectedShop)], 
+                        attendance: [where("shop", "==", selectedShop)],
+                        salary: [where("shopName", "==", selectedShop)] 
+                    });
                 }
 
                 if (role === 'Shop Manager') {
                     const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
                     if (managedShops.length > 0) {
-                        return { attendance: [where("shop", "in", managedShops)], leave: [where("shop", "in", managedShops)], ot: [where("shop", "in", managedShops)], loan: [where("shop", "in", managedShops)], state: [where("shop", "in", managedShops)], salary: [where("shopName", "in", managedShops)] };
+                        const shopFilter = selectedShop ? [where("shop", "==", selectedShop)] : [where("shop", "in", managedShops)];
+                        const salaryFilter = selectedShop ? [where("shopName", "==", selectedShop)] : [where("shopName", "in", managedShops)];
+                        return build({ shop: shopFilter, attendance: shopFilter, salary: salaryFilter });
                     }
                 }
                 
                 if (role === 'Staff' && id) {
-                    return { attendance: [where("employeeId", "==", id)], leave: [where("staffId", "==", id)], ot: [where("staffId", "==", id)], loan: [where("staffId", "==", id)], state: [where("staffId", "==", id)], salary: [where("staffId", "==", id)] };
+                    return build({ 
+                        shop: [where("staffId", "==", id)], 
+                        attendance: [where("employeeId", "==", id)],
+                        salary: [where("staffId", "==", id)] 
+                    });
                 }
 
-                return { attendance: [where("shop", "==", "null")], leave: [where("shop", "==", "null")], ot: [where("shop", "==", "null")], loan: [where("shop", "==", "null")], state: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] };
+                return build({ shop: [where("shop", "==", "null")], attendance: [where("shop", "==", "null")], salary: [where("shopName", "==", "null")] });
 
-            }, [userProfile, selectedShop]);
+            }, [userProfile, selectedShop, selectedEmployeeId, dateConstraints]); // Added selectedEmployeeId dependency
             
             const { data: attendanceData } = useCollection('attendance', payrollQueryConstraints.attendance);
             const { data: leaveRequestsData } = useCollection('leaveRequests', payrollQueryConstraints.leave);
@@ -8577,9 +8658,16 @@
                     setIsProcessing(false);
                     return;
                 }
-                const shopName = Array.isArray(selectedEmployee.shop) ? selectedEmployee.shop[0] : selectedEmployee.shop;
-                const { addDoc, collection, serverTimestamp, doc, updateDoc, getDocs, query, where } = window.firebaseSDK;
                 
+                // FIX: Prioritize 'primaryShop' for Payroll Expense attribution
+                // This ensures Shop Managers with multi-shops get paid under their main branch.
+                const shopName = selectedEmployee.primaryShop 
+                    ? selectedEmployee.primaryShop 
+                    : (Array.isArray(selectedEmployee.shop) ? selectedEmployee.shop[0] : selectedEmployee.shop);
+
+                const { addDoc, collection, serverTimestamp, doc, updateDoc, getDocs, query, where, runTransaction } = window.firebaseSDK;
+                
+                // 1. Duplicate Check
                 if (!editingRecord) {
                     const payrollCheckQuery = query(collection(db, "payrollHistory"), where("employeeId", "==", selectedEmployee.id), where("month", "==", selectedMonth));
                     const existingPayrollSnap = await getDocs(payrollCheckQuery);
@@ -8590,55 +8678,158 @@
                     }
                 }
 
+                // Prepare Data
                 const finalInputsForSave = { ...displayInputs, loanDeduction: manualLoanDeduction };
-                const payrollData = { month: selectedMonth, shop: shopName, employeeId: selectedEmployee.id, employeeName: selectedEmployee.name, baseSalary: displayCalculations.baseSalary, netSalary: displayCalculations.netSalary, manualInputs: finalInputsForSave, calculations: displayCalculations };
+                const payrollData = { 
+                    month: selectedMonth, 
+                    shop: shopName, 
+                    employeeId: selectedEmployee.id, 
+                    employeeName: selectedEmployee.name, 
+                    baseSalary: displayCalculations.baseSalary, 
+                    netSalary: displayCalculations.netSalary, 
+                    manualInputs: finalInputsForSave, 
+                    calculations: displayCalculations 
+                };
                 
-                let payrollRecordId;
-                let success = false;
-                try {
-                    if (editingRecord) { 
-                        await updateDoc(doc(db, 'payrollHistory', editingRecord.id), payrollData); 
-                        payrollRecordId = editingRecord.id;
-                    } 
-                    else { 
-                        const newDocRef = await addDoc(collection(db, 'payrollHistory'), { ...payrollData, createdAt: serverTimestamp() }); 
-                        payrollRecordId = newDocRef.id;
-                    }
-                    
-                    if (finalInputsForSave.loanDeduction > 0) {
-                        const applicableLoans = (allData.staffLoans || [])
-                            .filter(l => l.staffId === selectedEmployee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth))
-                            .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
-
-                        const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
-
-                        if (activeLoan) {
-                            const newTotalPaid = (activeLoan.totalPaid || 0) + finalInputsForSave.loanDeduction;
-                            const newBalance = activeLoan.loanAmount - newTotalPaid;
-                            const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
-                            await updateDoc(doc(db, 'staffLoans', activeLoan.id), { totalPaid: newTotalPaid, status: newStatus });
-                            await addDoc(collection(db, 'loanPayments'), { paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, staffId: selectedEmployee.id, staffName: selectedEmployee.name, shop: shopName, loanId: activeLoan.id, amountPaid: finalInputsForSave.loanDeduction, remainingBalance: newBalance, note: "Paid via payroll", payrollId: payrollRecordId });
-                        }
-                    }
-
-                    if (displayCalculations.savingsDeduction > 0) {
-                        await Utils.manageSavingsContribution(db, selectedEmployee.id, selectedEmployee.name, shopName, displayCalculations.savingsDeduction, payrollRecordId);
-                    }
-
-                    alert('Payroll saved successfully!');
-                    success = true;
-                } catch (error) {
-                    console.error("Error saving payroll: ", error);
-                    alert('Failed to save payroll.');
-                    success = false;
+                // 2. Identify Active Loan (if any)
+                let activeLoan = null;
+                if (finalInputsForSave.loanDeduction > 0) {
+                    const applicableLoans = (allData.staffLoans || [])
+                        .filter(l => l.staffId === selectedEmployee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth))
+                        .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
+                    if (applicableLoans.length > 0) activeLoan = applicableLoans[0];
                 }
 
-                if (success) {
+                // 3. Prepare Savings Data
+                const savingsAmount = parseFloat(displayCalculations.savingsDeduction) || 0;
+
+                try {
+                    // --- ATOMIC TRANSACTION ---
+                    // This guarantees that Payroll, Loan, and Savings ALL update together or NOT AT ALL.
+                    await runTransaction(db, async (transaction) => {
+                        // A. Reads MUST come first
+                        let savingsDoc = null;
+                        let loanDoc = null;
+
+                        // Read Savings Doc
+                        const savingsRef = doc(db, 'savingprogram', selectedEmployee.id);
+                        if (savingsAmount > 0) {
+                            savingsDoc = await transaction.get(savingsRef);
+                        }
+
+                        // Read Loan Doc
+                        let loanRef = null;
+                        if (activeLoan) {
+                            loanRef = doc(db, 'staffLoans', activeLoan.id);
+                            loanDoc = await transaction.get(loanRef);
+                        }
+
+                        // B. Writes
+                        
+                        // 1. Save Payroll Record
+                        let payrollRef;
+                        if (editingRecord) {
+                            payrollRef = doc(db, 'payrollHistory', editingRecord.id);
+                            transaction.update(payrollRef, payrollData);
+                        } else {
+                            payrollRef = doc(collection(db, 'payrollHistory'));
+                            transaction.set(payrollRef, { ...payrollData, createdAt: serverTimestamp() });
+                        }
+
+                        // 2. Update Loan (if exists)
+                        if (activeLoan && loanDoc && loanDoc.exists()) {
+                            const newTotalPaid = (loanDoc.data().totalPaid || 0) + finalInputsForSave.loanDeduction;
+                            const newBalance = loanDoc.data().loanAmount - newTotalPaid;
+                            const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
+                            
+                            transaction.update(loanRef, { totalPaid: newTotalPaid, status: newStatus });
+                            
+                            // Log Loan Payment
+                            const loanPayRef = doc(collection(db, 'loanPayments'));
+                            transaction.set(loanPayRef, { 
+                                paymentDate: `${selectedMonth}-${new Date(selectedMonth.split('-')[0], selectedMonth.split('-')[1], 0).getDate()}`, 
+                                staffId: selectedEmployee.id, 
+                                staffName: selectedEmployee.name, 
+                                shop: shopName, 
+                                loanId: activeLoan.id, 
+                                amountPaid: finalInputsForSave.loanDeduction, 
+                                remainingBalance: newBalance, 
+                                note: "Paid via payroll", 
+                                payrollId: payrollRef.id 
+                            });
+                        }
+
+                        // 3. Update Savings (if amount > 0)
+                        if (savingsAmount > 0) {
+                            const parseSafeFloat = (val) => {
+                                if (val === null || val === undefined) return 0;
+                                const num = parseFloat(val);
+                                return isNaN(num) ? 0 : num;
+                            };
+
+                            let currentBalance = 0;
+                            let currentWithdrawals = 0;
+
+                            if (savingsDoc && savingsDoc.exists()) {
+                                currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
+                                currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                            }
+
+                            const newBalance = currentBalance + savingsAmount;
+                            const newCredit = newBalance + currentWithdrawals;
+
+                            // Update/Create Main Savings Doc
+                            const savingsUpdateData = { 
+                                currentBalance: newBalance, 
+                                mySavingCredit: newCredit, 
+                                lastUpdated: serverTimestamp() 
+                            };
+
+                            if (savingsDoc && savingsDoc.exists()) {
+                                transaction.update(savingsRef, savingsUpdateData);
+                            } else {
+                                // Fallback: Create if missing
+                                transaction.set(savingsRef, { 
+                                    ...savingsUpdateData,
+                                    employeeId: selectedEmployee.id,
+                                    employeeName: selectedEmployee.name,
+                                    shop: shopName,
+                                    mySavingWithdrawalTotal: 0,
+                                    savingsProgramStatus: 'Active',
+                                    savingsPercentage: 0
+                                });
+                            }
+
+                            // Add Savings Transaction Log
+                            const savingsLogRef = doc(collection(db, 'savingprogram', selectedEmployee.id, 'transactions'));
+                            transaction.set(savingsLogRef, {
+                                employeeId: selectedEmployee.id,
+                                staffName: selectedEmployee.name,
+                                shop: shopName,
+                                date: serverTimestamp(),
+                                amountDeducted: savingsAmount,
+                                type: 'contribution',
+                                payrollId: payrollRef.id,
+                                note: 'Payroll Deduction'
+                            });
+                        }
+                    });
+
+                    // Success!
+                    alert('Payroll and all associated records saved successfully!');
+                    
                     setTimeout(() => {
                         handleDownloadPayslip();
                         onSaveSuccess(selectedMonth);
                     }, 500);
-                } else {
+
+                } catch (error) {
+                    console.error("Error saving payroll:", error);
+                    let msg = "Failed to save payroll.";
+                    if (error.code === 'resource-exhausted') {
+                        msg = "Daily Database Quota Exceeded. The operation was cancelled to prevent data corruption. Please try again tomorrow.";
+                    }
+                    alert(msg);
                     setIsProcessing(false);
                 }
             };
@@ -8718,166 +8909,132 @@
             );
         };
 
-        const PayrollHistoryTab = ({ onEdit, userProfile }) => {
+        // --- RESTORED COMPONENT: Payroll History Tab ---
+        const PayrollHistoryTab = ({ userProfile, onEdit }) => {
             const { db } = useFirebase();
-            const { where, query, collection, getDocs, doc, runTransaction, deleteDoc, collectionGroup } = window.firebaseSDK;
-
+            const { shops } = useAppData(); 
+            const [history, setHistory] = useState([]);
+            const [loading, setLoading] = useState(true);
             const [selectedShop, setSelectedShop] = useState('');
             const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
-            const [history, setHistory] = useState([]);
-            const [loading, setLoading] = useState(false);
-            const { shops } = useAppData();
-
-            useEffect(() => {
-                const fetchHistory = async () => {
-                    if (!userProfile) return;
-                    setLoading(true);
-
-                    const { role, shop } = userProfile;
-                    let q = query(collection(db, 'payrollHistory'));
-
-                    if (role === 'Shop Manager') {
-                        const managedShops = Array.isArray(shop) ? shop : (shop ? [shop] : []);
-                        if (managedShops.length > 0) {
-                            if (selectedShop) {
-                                q = query(q, where("shop", "==", selectedShop));
-                            } else {
-                                q = query(q, where("shop", "in", managedShops));
-                            }
-                        } else {
-                            q = query(q, where("shop", "==", "null"));
-                        }
-                    } else if (role === 'Admin' || role === 'CEO') {
-                        if (selectedShop) {
-                            q = query(q, where("shop", "==", selectedShop));
-                        } else {
-                            q = query(q, where("shop", "==", "null"));
-                        }
-                    } else { // Staff
-                        q = query(q, where("employeeId", "==", userProfile.id));
-                    }
-                    
-                    if (selectedMonth) {
-                        q = query(q, where("month", "==", selectedMonth));
-                    }
-                    
-                    try {
-                        const snapshot = await getDocs(q);
-                        const historyData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                        setHistory(historyData);
-                    } catch (error) {
-                        console.error("Error fetching payroll history:", error);
-                    } finally {
-                        setLoading(false);
-                    }
-                };
-
-                fetchHistory();
-            }, [db, userProfile, selectedMonth, selectedShop]);
-
+            const [searchTerm, setSearchTerm] = useState('');
             const [recordToDelete, setRecordToDelete] = useState(null);
-            
-            useEffect(() => { 
-                if (userProfile && userProfile.role === 'Shop Manager' && (!Array.isArray(userProfile.shop) || userProfile.shop.length === 1)) {
-                     setSelectedShop(userProfile.shop || ''); 
-                } else {
-                    setSelectedShop('');
+
+            // Fetch Data
+            useEffect(() => {
+                if (!db || !userProfile) return;
+                setLoading(true);
+                
+                const { collection, query, orderBy, onSnapshot, where } = window.firebaseSDK;
+                let q = query(collection(db, 'payrollHistory'), orderBy('month', 'desc'));
+
+                if (userProfile.role === 'Staff') {
+                    q = query(q, where('employeeId', '==', userProfile.id));
+                } else if (userProfile.role === 'Shop Manager') {
+                     const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                     if (myShops.length > 0) {
+                        q = query(q, where('shop', 'in', myShops));
+                     } else {
+                        q = query(q, where('shop', '==', 'null'));
+                     }
+                }
+
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setHistory(data);
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Error fetching payroll history:", error);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, [db, userProfile]);
+
+            // Set initial shop filter
+            useEffect(() => {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
                 }
             }, [userProfile]);
 
-            const { filteredHistory, totals } = useMemo(() => {
-                const sorted = [...history].sort((a,b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
-                const totals = sorted.reduce((acc, curr) => { 
-                    acc.baseSalary += curr.baseSalary || 0; 
-                    acc.engagements += curr.calculations?.engagements || 0;
-                    acc.otSalary += curr.calculations?.otSalary || 0;
-                    acc.totalSavingsPayback += curr.calculations?.totalSavingsWithdrawal || 0; 
-                    acc.loanDeduction += curr.manualInputs?.loanDeduction || 0; 
-                    acc.otherDeductions += curr.calculations?.otherDeductions || 0;
-                    acc.savingsDeduction += curr.calculations?.savingsDeduction || 0; 
-                    acc.netSalary += curr.netSalary || 0; 
-                    return acc; 
-                }, { baseSalary: 0, engagements: 0, otSalary: 0, totalSavingsPayback: 0, loanDeduction: 0, otherDeductions: 0, savingsDeduction: 0, netSalary: 0 });
-                return { filteredHistory: sorted, totals };
-            }, [history]);
+            // Filter Data
+            const filteredHistory = useMemo(() => {
+                return history.filter(rec => {
+                    const shopMatch = !selectedShop || rec.shop === selectedShop;
+                    const monthMatch = !selectedMonth || rec.month === selectedMonth;
+                    const searchMatch = !searchTerm || rec.employeeName.toLowerCase().includes(searchTerm.toLowerCase());
+                    return shopMatch && monthMatch && searchMatch;
+                });
+            }, [history, selectedShop, selectedMonth, searchTerm]);
 
+            // Calculate Totals
+            const totals = useMemo(() => {
+                return filteredHistory.reduce((acc, curr) => ({
+                    baseSalary: acc.baseSalary + (parseFloat(curr.baseSalary) || 0),
+                    engagements: acc.engagements + (parseFloat(curr.calculations?.engagements) || 0),
+                    otSalary: acc.otSalary + (parseFloat(curr.calculations?.otSalary) || 0),
+                    totalSavingsPayback: acc.totalSavingsPayback + (parseFloat(curr.calculations?.totalSavingsWithdrawal) || 0),
+                    loanDeduction: acc.loanDeduction + (parseFloat(curr.manualInputs?.loanDeduction) || 0),
+                    otherDeductions: acc.otherDeductions + (parseFloat(curr.calculations?.otherDeductions) || 0),
+                    savingsDeduction: acc.savingsDeduction + (parseFloat(curr.calculations?.savingsDeduction) || 0),
+                    netSalary: acc.netSalary + (parseFloat(curr.netSalary) || 0)
+                }), { baseSalary: 0, engagements: 0, otSalary: 0, totalSavingsPayback: 0, loanDeduction: 0, otherDeductions: 0, savingsDeduction: 0, netSalary: 0 });
+            }, [filteredHistory]);
+
+            // Delete Handler with Rollback
             const handleDelete = async () => {
                 if (!recordToDelete) return;
-                
-                const payrollId = recordToDelete.id;
-                const employeeId = recordToDelete.employeeId;
-                const loanDeductionAmount = recordToDelete.manualInputs?.loanDeduction || 0;
-                const savingsContributionAmount = recordToDelete.calculations?.savingsDeduction || 0;
-
                 try {
-                    const loanPaymentQuery = query(collection(db, 'loanPayments'), where("payrollId", "==", payrollId));
-                    const loanPaymentSnap = await getDocs(loanPaymentQuery);
+                    const { writeBatch, doc, getDocs, query, where, increment, collection } = window.firebaseSDK;
+                    const batch = writeBatch(db);
 
-                    const savingsTxQuery = query(
-                        collection(db, 'savingprogram', employeeId, 'transactions'), 
-                        where("payrollId", "==", payrollId), 
-                        where("type", "==", "contribution")
-                    );
-                    const savingsTxSnap = await getDocs(savingsTxQuery);
+                    // 1. Delete Payroll Record
+                    batch.delete(doc(db, 'payrollHistory', recordToDelete.id));
 
-                    await runTransaction(db, async (transaction) => {
-                        if (loanDeductionAmount > 0) {
-                            if (!loanPaymentSnap.empty) {
-                                const loanPaymentDoc = loanPaymentSnap.docs[0];
-                                const loanPaymentData = loanPaymentDoc.data();
-                                const loanId = loanPaymentData.loanId;
-                                const amountPaidInPayroll = loanPaymentData.amountPaid || 0;
-
-                                const staffLoanRef = doc(db, 'staffLoans', loanId);
-                                const staffLoanDoc = await transaction.get(staffLoanRef);
-
-                                if (staffLoanDoc.exists()) {
-                                    const staffLoanData = staffLoanDoc.data();
-                                    const currentTotalPaid = staffLoanData.totalPaid || 0;
-                                    const newTotalPaid = Math.max(0, currentTotalPaid - amountPaidInPayroll); 
-                                    const newStatus = newTotalPaid < staffLoanData.loanAmount ? 'Active' : 'Paid Off';
-
-                                    transaction.update(staffLoanRef, { 
-                                        totalPaid: newTotalPaid,
-                                        status: newStatus 
-                                    });
-                                }
-                                transaction.delete(loanPaymentDoc.ref);
-                            }
+                    // 2. Find and Delete Linked Loan Payments & Revert Loan Balance
+                    const loanQuery = query(collection(db, 'loanPayments'), where('payrollId', '==', recordToDelete.id));
+                    const loanSnap = await getDocs(loanQuery);
+                    loanSnap.forEach(d => {
+                        const payData = d.data();
+                        batch.delete(d.ref);
+                        if (payData.loanId) {
+                            const loanRef = doc(db, 'staffLoans', payData.loanId);
+                            batch.update(loanRef, { 
+                                totalPaid: increment(-payData.amountPaid),
+                                status: 'Active' 
+                            });
                         }
-
-                        if (savingsContributionAmount > 0) {
-                            if (!savingsTxSnap.empty) {
-                                const savingsTxDoc = savingsTxSnap.docs[0];
-                                const amountContributed = savingsTxDoc.data().amountDeducted || 0;
-                                
-                                const employeeSavingsRef = doc(db, 'savingprogram', employeeId);
-                                const employeeSavingsDoc = await transaction.get(employeeSavingsRef);
-
-                                if (employeeSavingsDoc.exists()) {
-                                    const currentBalance = employeeSavingsDoc.data().currentBalance || 0;
-                                    const newBalance = Math.max(0, currentBalance - amountContributed); 
-
-                                    transaction.update(employeeSavingsRef, { 
-                                        currentBalance: newBalance 
-                                    });
-                                }
-                                transaction.delete(savingsTxDoc.ref);
-                            }
-                        }
-                        
-                        const payrollHistoryRef = doc(db, 'payrollHistory', payrollId);
-                        transaction.delete(payrollHistoryRef);
                     });
-                    
-                    setHistory(prevHistory => prevHistory.filter(record => record.id !== payrollId));
-                    alert('Payroll record and associated transactions deleted successfully.');
 
-                } catch (error) {
-                    console.error("Error during transactional delete of payroll record:", error);
-                    alert(`Failed to delete payroll record: ${error.message}`);
-                } finally {
-                    setRecordToDelete(null); 
+                    // 3. Find and Delete Linked Savings Transactions & Revert Savings Balance
+                    const savingsQuery = query(
+                        collection(db, 'savingprogram', recordToDelete.employeeId, 'transactions'), 
+                        where('payrollId', '==', recordToDelete.id)
+                    );
+                    const savingsSnap = await getDocs(savingsQuery);
+                    let savingsAmountRevert = 0;
+                    savingsSnap.forEach(d => {
+                        const txData = d.data();
+                        if (txData.type === 'contribution') {
+                            savingsAmountRevert += (txData.amountDeducted || 0);
+                        }
+                        batch.delete(d.ref);
+                    });
+
+                    if (savingsAmountRevert > 0) {
+                        const savingsRef = doc(db, 'savingprogram', recordToDelete.employeeId);
+                        batch.update(savingsRef, {
+                            currentBalance: increment(-savingsAmountRevert),
+                            mySavingCredit: increment(-savingsAmountRevert)
+                        });
+                    }
+
+                    await batch.commit();
+                    setRecordToDelete(null);
+                } catch (err) {
+                    console.error("Delete error:", err);
+                    alert("Failed to delete record.");
                 }
             };
 
@@ -10866,239 +11023,311 @@
                 setProcessLog([]);
                 setProcessComplete(false);
 
-                // --- OPTIMIZED DATA FETCHING ---
-                setProcessLog(prev => [...prev, 'Fetching data for selected month...']);
+                const { collection, getDocs, query, where, doc, serverTimestamp, runTransaction } = window.firebaseSDK;
 
-                const { collection, getDocs, query, where, writeBatch, doc, serverTimestamp } = window.firebaseSDK;
-
-                let allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions;
-                let savingsData;
+                // --- STEP 1: IDENTIFY WORKLOAD (Metadata Fetch) ---
+                setProcessLog(prev => [...prev, 'Step 1: Identifying unprocessed employees...']);
 
                 try {
-                    // 1. Calculate Date Range for the selected month to filter queries
+                    // 1. Prepare Payroll Check Query (Fetch ALL for month to prevent multi-shop duplicates)
+                    const payrollCheckQuery = query(collection(db, 'payrollHistory'), where('month', '==', selectedMonth));
+
+                    // 2. Fetch Base Data (Metadata only)
+                    const [shopsSnap, empSnap, revSnap, savingsSnap, payrollSnap] = await Promise.all([
+                        getDocs(collection(db, 'shops')),
+                        getDocs(collection(db, 'employees')),
+                        getDocs(collection(db, 'salaryRevisions')),
+                        getDocs(collection(db, 'savingprogram')),
+                        getDocs(payrollCheckQuery)
+                    ]);
+
+                    const allEmployees = empSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    // Create a Set of ALL IDs paid this month, regardless of shop
+                    const existingPayrollIds = new Set(payrollSnap.docs.map(d => d.data().employeeId));
+
+                    // 3. Filter: Active AND In Shop AND Not Processed
+                    const employeesToProcess = allEmployees.filter(e => {
+                        // Check if employee belongs to selected shop (either as primary or in array)
+                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                        const isShopMatch = selectedShop === 'ALL_SHOPS' || empShops.includes(selectedShop);
+                        
+                        // Only process if they match the shop AND are not in the global 'paid' list
+                        return e.status === 'Active' && isShopMatch && !existingPayrollIds.has(e.id);
+                    });
+
+                    if (employeesToProcess.length === 0) {
+                        setProcessLog(prev => [...prev, 'All active employees in this shop are already processed.']);
+                        alert("No pending employees found. Payroll is up to date for this month.");
+                        setIsProcessing(false);
+                        return;
+                    }
+
+                    setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} pending employees (Skipped ${existingPayrollIds.size} already done).`]);
+
+                    // --- STEP 2: SMART DATA FETCHING (Corrected for Multi-Shop) ---
+                    setProcessLog(prev => [...prev, 'Step 2: Fetching attendance & records...']);
+
+                    const targetIds = employeesToProcess.map(e => e.id);
+                    const useTargetedFetch = targetIds.length <= 10;
+
+                    // Date Ranges
                     const [y, m] = selectedMonth.split('-').map(Number);
-                    // Start of month
                     const startOfMonth = new Date(y, m - 1, 1);
-                    // End of month (last millisecond)
                     const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
-                    
-                    // String formats for fields that store dates as strings (YYYY-MM-DD)
                     const startStr = startOfMonth.toISOString().slice(0, 10);
                     const endStr = endOfMonth.toISOString().slice(0, 10);
 
-                    // 2. Prepare Optimized Queries
-                    // Define base references
+                    // Refs
                     const attRef = collection(db, 'attendance');
                     const leaveRef = collection(db, 'leaveRequests');
                     const otRef = collection(db, 'otRequests');
                     const stateRef = collection(db, 'employeeStates');
+                    const loanRef = collection(db, 'staffLoans');
 
-                    // Define Base Date Constraints
-                    let attConstraints = [where('timestamp', '>=', startOfMonth), where('timestamp', '<=', endOfMonth)];
-                    let leaveConstraints = [where('leaveDate', '<=', endStr)]; 
-                    let otConstraints = [where('reqDate', '>=', startStr), where('reqDate', '<=', endStr)];
-                    let stateConstraints = [where('date', '>=', startStr), where('date', '<=', endStr)];
+                    let attQ, leaveQ, otQ, stateQ, loanQ;
 
-                    // --- NEW OPTIMIZATION: Apply Shop Filter to DB Query ---
-                    // If a specific shop is selected (not ALL_SHOPS), filter data at the source.
-                    // This drastically reduces reads and bandwidth.
-                    if (selectedShop && selectedShop !== 'ALL_SHOPS') {
-                        attConstraints.push(where('shop', '==', selectedShop));
-                        leaveConstraints.push(where('shop', '==', selectedShop));
-                        otConstraints.push(where('shop', '==', selectedShop));
-                        stateConstraints.push(where('shop', '==', selectedShop));
+                    if (useTargetedFetch) {
+                        // OPTION A: Targeted Fetch (Low Volume) - Fetches by ID, so gets ALL shops automatically.
+                        setProcessLog(prev => [...prev, `> Optimizing: Using Targeted Fetch for ${targetIds.length} users...`]);
+                        
+                        attQ = query(attRef, where('employeeId', 'in', targetIds), where('timestamp', '>=', startOfMonth), where('timestamp', '<=', endOfMonth));
+                        leaveQ = query(leaveRef, where('staffId', 'in', targetIds), where('returnDate', '>=', startStr));
+                        otQ = query(otRef, where('staffId', 'in', targetIds), where('reqDate', '>=', startStr), where('reqDate', '<=', endStr));
+                        stateQ = query(stateRef, where('staffId', 'in', targetIds), where('date', '>=', startStr), where('date', '<=', endStr));
+                        loanQ = query(loanRef, where('staffId', 'in', targetIds), where('status', '==', 'Active'));
+                    } else {
+                        // OPTION B: Bulk Fetch (High Volume) - COMPLEX MULTI-SHOP FIX
+                        setProcessLog(prev => [...prev, `> High Volume: Using Bulk Fetch...`]);
+                        
+                        let baseAttConstraints = [where('timestamp', '>=', startOfMonth), where('timestamp', '<=', endOfMonth)];
+                        let baseLeaveConstraints = [where('leaveDate', '<=', endStr)];
+                        let baseOtConstraints = [where('reqDate', '>=', startStr), where('reqDate', '<=', endStr)];
+                        let baseStateConstraints = [where('date', '>=', startStr), where('date', '<=', endStr)];
+                        let baseLoanConstraints = [where('status', '==', 'Active')];
+
+                        // --- FIX START: Determine Involved Shops ---
+                        // Instead of filtering by 'selectedShop' (which misses records from other shops),
+                        // we calculate all shops these employees work at.
+                        const involvedShopsSet = new Set();
+                        if (selectedShop === 'ALL_SHOPS') {
+                            // Admin Mode: Fetch everything, no shop filter
+                        } else {
+                            // Manager/Single Shop Mode:
+                            // We must include 'selectedShop' AND any other shops our employees belong to 
+                            // (if the current user has permission to see them).
+                            employeesToProcess.forEach(e => {
+                                const eShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                                eShops.forEach(s => involvedShopsSet.add(s));
+                            });
+                        }
+                        const involvedShops = Array.from(involvedShopsSet);
+                        // --- FIX END ---
+
+                        // Construct Query
+                        if (selectedShop === 'ALL_SHOPS' || involvedShops.length === 0) {
+                             // Fetch Global (Admin)
+                             attQ = query(attRef, ...baseAttConstraints);
+                             leaveQ = query(leaveRef, ...baseLeaveConstraints);
+                             otQ = query(otRef, ...baseOtConstraints);
+                             stateQ = query(stateRef, ...baseStateConstraints);
+                             loanQ = query(loanRef, ...baseLoanConstraints);
+                        } else {
+                             // Fetch for Involved Shops
+                             // Note: 'in' operator supports max 10 values. If > 10, we fallback to manager's permitted shops or fetch all if Admin.
+                             // For simplicity/robustness here: if it exceeds 10, we'll try to rely on the userProfile permissions.
+                             
+                             let shopsToQuery = involvedShops;
+                             if (involvedShops.length > 10) {
+                                 // Fallback: If user is manager, use their profile shops. If Admin, fetch all.
+                                 if (userProfile.role === 'Shop Manager') {
+                                     shopsToQuery = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                                 } else {
+                                     // Admin with > 10 involved shops... fetch all is safer than crashing
+                                     shopsToQuery = null; 
+                                 }
+                             }
+
+                             if (shopsToQuery) {
+                                 attQ = query(attRef, where('shop', 'in', shopsToQuery), ...baseAttConstraints);
+                                 leaveQ = query(leaveRef, where('shop', 'in', shopsToQuery), ...baseLeaveConstraints);
+                                 otQ = query(otRef, where('shop', 'in', shopsToQuery), ...baseOtConstraints);
+                                 stateQ = query(stateRef, where('shop', 'in', shopsToQuery), ...baseStateConstraints);
+                                 loanQ = query(loanRef, where('shop', 'in', shopsToQuery), ...baseLoanConstraints);
+                             } else {
+                                 // Fallback for huge lists
+                                 attQ = query(attRef, ...baseAttConstraints);
+                                 leaveQ = query(leaveRef, ...baseLeaveConstraints);
+                                 otQ = query(otRef, ...baseOtConstraints);
+                                 stateQ = query(stateRef, ...baseStateConstraints);
+                                 loanQ = query(loanRef, ...baseLoanConstraints);
+                             }
+                        }
                     }
 
-                    const [
-                        shopsSnap,
-                        empSnap,
-                        attSnap,
-                        leaveSnap,
-                        otSnap,
-                        loanSnap,
-                        stateSnap,
-                        revSnap,
-                        savingsSnap
-                    ] = await Promise.all([
-                        getDocs(collection(db, 'shops')),
-                        getDocs(collection(db, 'employees')), // Employees are kept global to handle complex shop/role logic safely
-                        
-                        // Execute Optimized Queries
-                        getDocs(query(attRef, ...attConstraints)),
-                        getDocs(query(leaveRef, ...leaveConstraints)), 
-                        getDocs(query(otRef, ...otConstraints)),
-                        
-                        getDocs(collection(db, 'staffLoans')), // Loans are small, keep all
-                        
-                        getDocs(query(stateRef, ...stateConstraints)),
-                        
-                        getDocs(collection(db, 'salaryRevisions')), 
-                        getDocs(collection(db, 'savingprogram'))    
+                    const [attSnap, leaveSnap, otSnap, loanSnap, stateSnap] = await Promise.all([
+                        getDocs(attQ), getDocs(leaveQ), getDocs(otQ), getDocs(loanQ), getDocs(stateQ)
                     ]);
 
-                    allShopsData = shopsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    employees = empSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    attendance = attSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    leaveRequests = leaveSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    otRequests = otSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    staffLoans = loanSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    employeeStates = stateSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    salaryRevisions = revSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    savingsData = savingsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setProcessLog(prev => [...prev, `Data loaded. (${attSnap.docs.length} attendance records)`]);
 
-                    setProcessLog(prev => [...prev, `Data fetched. (${attendance.length} attendance records found)`]);
+                    // Assemble AllData object for the calculator
+                    const allData = {
+                        shops: shopsSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        employees: allEmployees,
+                        attendance: attSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        leaveRequests: leaveSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        otRequests: otSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        staffLoans: loanSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        employeeStates: stateSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        salaryRevisions: revSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+                    };
+                    
+                    const savingsDataMap = new Map(savingsSnap.docs.map(d => [d.id, { id: d.id, ...d.data() }]));
+
+                    // --- STEP 3: PROCESS LOOP ---
+                    setProcessLog(prev => [...prev, `Starting calculation...`]);
+                    
+                    const startDate = new Date(y, m - 1, 1);
+                    const endDate = new Date(y, m, 0, 23, 59, 59, 999);
+
+                    let successCount = 0;
+                    for (const employee of employeesToProcess) {
+                        await new Promise(res => setTimeout(res, 20)); // Small delay for UI responsiveness
+
+                        setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
+
+                        // Fetch Savings Withdrawals (Per User - Necessary due to subcollection structure)
+                        // Note: This is 1 read per user. Unavoidable without Collection Group Index on Date range.
+                        let employeeSavingsWithdrawals = [];
+                        try {
+                            const q = query(
+                                collection(db, 'savingprogram', employee.id, 'transactions'),
+                                where("date", ">=", startDate),
+                                where("date", "<=", endDate)
+                            );
+                            const qs = await getDocs(q);
+                            employeeSavingsWithdrawals = qs.docs.map(doc => ({ id: doc.id, ...doc.data() })).filter(tx => tx.type === 'withdrawal');
+                        } catch (error) {
+                            console.error(`Error fetching savings withdrawals for ${employee.name}:`, error);
+                        }
+
+                        const employeeSavingsData = savingsDataMap.get(employee.id) || null;
+                        const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals, employeeSavingsData);
+                        
+                        if (calculations.netSalary !== undefined) {
+                            // FIX: Prioritize 'primaryShop' for Expense Attribution
+                            const shopName = employee.primaryShop 
+                                ? employee.primaryShop 
+                                : (Array.isArray(employee.shop) ? employee.shop[0] : employee.shop);
+
+                            const payrollData = { 
+                                month: selectedMonth, shop: shopName, employeeId: employee.id, employeeName: employee.name, 
+                                baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, 
+                                manualInputs: inputs, calculations: calculations, createdAt: serverTimestamp() 
+                            };
+                            
+                            const activeLoan = (inputs.loanDeduction > 0) ? (allData.staffLoans || [])
+                                .filter(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth))
+                                .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'))[0] : null;
+
+                            const savingsAmount = calculations.savingsDeduction;
+
+                            try {
+                                await runTransaction(db, async (transaction) => {
+                                    // Reads
+                                    let savingsDoc = null;
+                                    let loanDoc = null;
+                                    const savingsRef = doc(db, 'savingprogram', employee.id);
+                                    if (savingsAmount > 0) savingsDoc = await transaction.get(savingsRef);
+                                    
+                                    let loanRef = null;
+                                    if (activeLoan) {
+                                        loanRef = doc(db, 'staffLoans', activeLoan.id);
+                                        loanDoc = await transaction.get(loanRef);
+                                    }
+
+                                    // Writes
+                                    const payrollDocRef = doc(collection(db, "payrollHistory"));
+                                    transaction.set(payrollDocRef, payrollData);
+
+                                    // Loan Update
+                                    if (activeLoan && loanDoc && loanDoc.exists()) {
+                                        const newTotalPaid = (loanDoc.data().totalPaid || 0) + inputs.loanDeduction;
+                                        const newBalance = loanDoc.data().loanAmount - newTotalPaid;
+                                        const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
+                                        transaction.update(loanRef, { totalPaid: newTotalPaid, status: newStatus });
+                                        
+                                        const loanPayRef = doc(collection(db, 'loanPayments'));
+                                        transaction.set(loanPayRef, { 
+                                            paymentDate: `${selectedMonth}-${new Date(y, m, 0).getDate()}`, 
+                                            staffId: employee.id, staffName: employee.name, shop: shopName, 
+                                            loanId: activeLoan.id, amountPaid: inputs.loanDeduction, 
+                                            remainingBalance: newBalance, note: "Paid via payroll", payrollId: payrollDocRef.id 
+                                        });
+                                    }
+
+                                    // Savings Update
+                                    if (savingsAmount > 0) {
+                                        const parseSafeFloat = (val) => {
+                                            if (val === null || val === undefined) return 0;
+                                            const num = parseFloat(val);
+                                            return isNaN(num) ? 0 : num;
+                                        };
+                                        let currentBalance = 0;
+                                        let currentWithdrawals = 0;
+                                        if (savingsDoc && savingsDoc.exists()) {
+                                            currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
+                                            currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
+                                        }
+                                        const newBalance = currentBalance + savingsAmount;
+                                        const newCredit = newBalance + currentWithdrawals;
+                                        const savingsUpdateData = { currentBalance: newBalance, mySavingCredit: newCredit, lastUpdated: serverTimestamp() };
+                                        
+                                        if (savingsDoc && savingsDoc.exists()) {
+                                            transaction.update(savingsRef, savingsUpdateData);
+                                        } else {
+                                            transaction.set(savingsRef, { 
+                                                ...savingsUpdateData, employeeId: employee.id, employeeName: employee.name, shop: shopName, mySavingWithdrawalTotal: 0, savingsProgramStatus: 'Active', savingsPercentage: 0 
+                                            });
+                                        }
+                                        const savingsLogRef = doc(collection(db, 'savingprogram', employee.id, 'transactions'));
+                                        transaction.set(savingsLogRef, {
+                                            employeeId: employee.id, staffName: employee.name, shop: shopName, date: serverTimestamp(), amountDeducted: savingsAmount, type: 'contribution', payrollId: payrollDocRef.id, note: 'Payroll Deduction'
+                                        });
+                                    }
+                                });
+
+                                successCount++;
+                                setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully processed for ${employee.name}.`]);
+                            } catch (error) {
+                                let msg = error.message;
+                                if (error.code === 'resource-exhausted') msg = "Database Quota Exceeded.";
+                                setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${msg}`]);
+                            }
+                        } else {
+                            setProcessLog(prev => [...prev.slice(0, -1), `[Skipped] Could not calculate salary for ${employee.name}.`]);
+                        }
+                    } // End Loop
+
+                    const finishMsg = `Process finished.\nSuccessfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`;
+                    setProcessLog(prev => [...prev, finishMsg]);
+                    setIsProcessing(false);
+                    setProcessComplete(true);
+                    setTriggerConfirmed(false); 
+                    
+                    if (successCount === employeesToProcess.length) {
+                        alert("Success! All payroll records generated and saved.");
+                    } else if (successCount === 0) {
+                        alert("Process Failed. No records were saved.");
+                    } else {
+                        alert(`Process Complete with Warnings.\n\nSuccess: ${successCount}\nFailed/Skipped: ${employeesToProcess.length - successCount}\n\nPlease check the log.`);
+                    }
 
                 } catch (fetchError) {
-                    console.error("Critical error fetching bulk data:", fetchError);
-                    setProcessLog(prev => [...prev, `FATAL ERROR: Could not fetch data. ${fetchError.message}`]);
+                    console.error("Critical error in payroll trigger:", fetchError);
+                    setProcessLog(prev => [...prev, `FATAL ERROR: ${fetchError.message}`]);
                     setIsProcessing(false);
-                    return;
                 }
-                // --- END OPTIMIZATION ---
-
-                // MODIFIED: Use the locally fetched data
-                const allData = { shops: allShopsData, employees, attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions };
-                // MODIFIED (STEP 5): Create a Map for savings data
-                const savingsDataMap = new Map(savingsData.map(d => [d.id, d]));
-
-                let employeesToProcess = [];
-                if (selectedShop === 'ALL_SHOPS') {
-                    employeesToProcess = employees.filter(e => e.status === 'Active');
-                } else {
-                    employeesToProcess = employees.filter(e => e.status === 'Active' && (Array.isArray(e.shop) ? e.shop.includes(selectedShop) : e.shop === selectedShop));
-                }
-
-                if (employeesToProcess.length === 0) {
-                    setProcessLog(['No active employees found for the selected shop.']);
-                    setIsProcessing(false);
-                    return;
-                }
-
-                setProcessLog(prev => [...prev, `Found ${employeesToProcess.length} employees. Starting payroll generation...`]);
-                
-                // --- NEW: Re-calculate dates for the transaction query loop ---
-                const [year, month] = selectedMonth.split('-').map(Number);
-                const startDate = new Date(year, month - 1, 1);
-                const endDate = new Date(year, month, 0, 23, 59, 59, 999);
-
-                let successCount = 0;
-                for (const employee of employeesToProcess) {
-                    await new Promise(res => setTimeout(res, 50)); // Tiny delay for UI to update
-                    
-                    // --- DUPLICATE CHECK ---
-                    try {
-                        const payrollCheckQuery = query(
-                            collection(db, "payrollHistory"), 
-                            where("employeeId", "==", employee.id), 
-                            where("month", "==", selectedMonth)
-                        );
-                        const existingPayrollSnap = await getDocs(payrollCheckQuery);
-                        
-                        if (!existingPayrollSnap.empty) {
-                            setProcessLog(prev => [...prev, `[Skipped] ${employee.name}: Payroll record already exists for ${selectedMonth}.`]);
-                            continue; 
-                        }
-                    } catch (checkError) {
-                        setProcessLog(prev => [...prev, `[Error] Failed to check duplicates for ${employee.name}: ${checkError.message}`]);
-                        continue; 
-                    }
-
-                    setProcessLog(prev => [...prev, `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}...`]);
-
-                    // --- FETCH SAVINGS WITHDRAWALS ---
-                    let employeeSavingsWithdrawals = [];
-                    try {
-                        const q = query(
-                            collection(db, 'savingprogram', employee.id, 'transactions'),
-                            where("date", ">=", startDate),
-                            where("date", "<=", endDate)
-                        );
-                        
-                        const querySnapshot = await getDocs(q);
-                        employeeSavingsWithdrawals = querySnapshot.docs
-                            .map(doc => ({ id: doc.id, ...doc.data() }))
-                            .filter(tx => tx.type === 'withdrawal');
-                            
-                        if (employeeSavingsWithdrawals.length > 0) {
-                             setProcessLog(prev => [...prev.slice(0, -1), `[${successCount + 1}/${employeesToProcess.length}] Calculating for ${employee.name}... (Found ${employeeSavingsWithdrawals.length} withdrawals)`]);
-                        }
-                    } catch (error) {
-                        console.error(`Error fetching savings withdrawals for ${employee.name}:`, error);
-                         // Don't stop the process, just log
-                    }
-
-                    const employeeSavingsData = savingsDataMap.get(employee.id) || null;
-                    
-                    const { inputs, calculations } = calculatePayrollForEmployee(employee, selectedMonth, allData, undefined, employeeSavingsWithdrawals, employeeSavingsData);
-                    
-                    if (calculations.netSalary !== undefined) {
-                        const batch = writeBatch(db);
-                        
-                        const shopName = Array.isArray(employee.shop) ? employee.shop[0] : employee.shop;
-                        const payrollData = { month: selectedMonth, shop: shopName, employeeId: employee.id, employeeName: employee.name, baseSalary: calculations.baseSalary, netSalary: calculations.netSalary, manualInputs: inputs, calculations: calculations, createdAt: serverTimestamp() };
-                        
-                        const payrollDocRef = doc(collection(db, "payrollHistory"));
-                        batch.set(payrollDocRef, payrollData);
-                        
-                        // Handle loan deduction
-                        if (inputs.loanDeduction > 0) {
-                            const applicableLoans = (staffLoans || [])
-                                .filter(l => l.staffId === employee.id && l.status === 'Active' && (!l.effectiveDate || l.effectiveDate.slice(0, 7) <= selectedMonth))
-                                .sort((a, b) => (b.effectiveDate || '0000-00').localeCompare(a.effectiveDate || '0000-00'));
-                            
-                            const activeLoan = applicableLoans.length > 0 ? applicableLoans[0] : null;
-
-                            if (activeLoan) {
-                                const newTotalPaid = (activeLoan.totalPaid || 0) + inputs.loanDeduction;
-                                const newBalance = activeLoan.loanAmount - newTotalPaid;
-                                const newStatus = newBalance <= 0 ? 'Paid Off' : 'Active';
-                                
-                                batch.update(doc(db, 'staffLoans', activeLoan.id), { totalPaid: newTotalPaid, status: newStatus });
-                                
-                                batch.set(doc(collection(db, 'loanPayments')), { 
-                                    paymentDate: `${selectedMonth}-${new Date(year, month, 0).getDate()}`, 
-                                    staffId: employee.id, 
-                                    staffName: employee.name, 
-                                    shop: shopName, 
-                                    loanId: activeLoan.id, 
-                                    amountPaid: inputs.loanDeduction, 
-                                    remainingBalance: newBalance, 
-                                    note: "Paid via payroll",
-                                    payrollId: payrollDocRef.id 
-                                });
-                            }
-                        }
-
-                        // --- Commit and Process Savings ---
-                        try {
-                            await batch.commit();
-
-                            if (calculations.savingsDeduction > 0) {
-                                await Utils.manageSavingsContribution(
-                                    db,
-                                    employee.id,
-                                    employee.name,
-                                    shopName,
-                                    calculations.savingsDeduction,
-                                    payrollDocRef.id
-                                );
-                            }
-
-                            successCount++;
-                            setProcessLog(prev => [...prev.slice(0, -1), `[${successCount}/${employeesToProcess.length}] Successfully processed for ${employee.name}.`]);
-                        
-                        } catch (error) {
-                             setProcessLog(prev => [...prev.slice(0, -1), `[Error] Failed to save for ${employee.name}: ${error.message}`]);
-                        }
-                    } else {
-                         setProcessLog(prev => [...prev.slice(0, -1), `[Skipped] Could not calculate salary for ${employee.name}.`]);
-                    }
-                }
-
-                setProcessLog(prev => [...prev, `\nProcess finished. Successfully generated payroll for ${successCount} out of ${employeesToProcess.length} employees.`]);
-                setIsProcessing(false);
-                setProcessComplete(true);
-                setTriggerConfirmed(false); 
             };
 
             return (
