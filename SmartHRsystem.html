@@ -14297,41 +14297,59 @@
         };
 
         // --- NEW WIDGET: TEAM STATUS (Who is Present/Leave/OT Today) ---
-        const TeamStatusWidget = ({ userProfile, db }) => {
-            const { shops } = useAppData();
+        // FIX: Wrapped in memo to prevent re-rendering every second due to parent clock, which caused scroll reset
+        const TeamStatusWidget = memo(({ userProfile, db }) => {
+            // MODIFIED: Destructure 'employees' to access staff photos
+            const { shops, employees } = useAppData();
             const [activeTab, setActiveTab] = useState('present');
             const [data, setData] = useState({ present: [], leave: [], ot: [], titleSuffix: '' });
             const [loading, setLoading] = useState(true);
+            
+            // FIX: Ref to track initial load to prevent spinner flash (and scroll reset) on updates
+            const isFirstLoad = useRef(true);
 
             useEffect(() => {
                 const fetchTeamData = async () => {
-                    if (!db || !userProfile || !shops || shops.length === 0) {
-                        // Wait for shops to load to get Timezones
-                        if (shops && shops.length > 0) setLoading(false); 
-                        return;
-                    }
+                    if (!db || !userProfile || !shops) return;
 
                     try {
+                        // FIX: Only set loading true on first mount/load. 
+                        // Subsequent updates (e.g. profile change) will update data silently without destroying the DOM/Scroll.
+                        if (isFirstLoad.current) {
+                            setLoading(true);
+                        }
+                        
                         const { collection, query, where, getDocs } = window.firebaseSDK;
                         
-                        // FIX: Timezone Robustness
-                        // Query a wider buffer (±2 Days) to account for extreme timezone differences.
-                        // Precise filtering happens in-memory below.
+                        // OPTIMIZATION 1: Tighten Timezone Buffer
+                        // Instead of ±2 days (48h), we use ±30h. 
+                        // This covers the earliest timezone (UTC+14) to latest (UTC-12) safely.
                         const now = new Date();
-                        const bufferStart = new Date(now); bufferStart.setDate(bufferStart.getDate() - 2); 
-                        const bufferEnd = new Date(now); bufferEnd.setDate(bufferEnd.getDate() + 2);
+                        const bufferStart = new Date(now.getTime() - (30 * 60 * 60 * 1000)); 
+                        const bufferEnd = new Date(now.getTime() + (30 * 60 * 60 * 1000));
                         
                         const bufferStartStr = bufferStart.toISOString().slice(0, 10);
                         const bufferEndStr = bufferEnd.toISOString().slice(0, 10);
 
-                        // 1. Fetch ALL Attendance for Buffer Period
-                        const attQ = query(
+                        // OPTIMIZATION 2: Server-Side Shop Filtering for Managers
+                        // If Manager has specific shops, filter DB query to reduce download size.
+                        const isManager = userProfile.role === 'Shop Manager';
+                        const managedShops = isManager ? (Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop]) : [];
+                        // Firestore 'in' query supports max 10 items.
+                        const canUseDbFilter = isManager && managedShops.length > 0 && managedShops.length <= 10;
+
+                        // 1. Fetch Attendance (Optimized)
+                        let attQ = query(
                             collection(db, 'attendance'),
                             where('timestamp', '>=', bufferStart),
                             where('timestamp', '<=', bufferEnd)
                         );
+                        if (canUseDbFilter) {
+                            attQ = query(attQ, where('shop', 'in', managedShops));
+                        }
 
                         // 2. Fetch Active Leaves
+                        // (Leaves are low volume, safe to filter client-side to avoid index complexity)
                         const leaveQ = query(
                             collection(db, 'leaveRequests'),
                             where('status', '==', 'Approved'),
@@ -14353,19 +14371,25 @@
                         const isAllowedShop = (recordShop) => {
                             if (!recordShop) return false;
                             if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return true;
-                            if (userProfile.role === 'Shop Manager') {
-                                const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                                return myShops.includes(recordShop);
-                            }
+                            if (isManager) return managedShops.includes(recordShop);
                             const myShop = Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop;
                             return recordShop === myShop;
                         };
 
                         // Helper: Get "Today" string (YYYY-MM-DD) for a specific shop's timezone
+                        // Optimization: Memoize shop map for O(1) lookup
+                        const shopMap = new Map(shops.map(s => [s.name, s]));
                         const getShopToday = (shopName) => {
-                            const shop = shops.find(s => s.name === shopName);
-                            const tz = shop?.timezone; // Default to browser if undefined
+                            const shop = shopMap.get(shopName);
+                            const tz = shop?.timezone; 
                             return Utils.formatDateInTimezone({ toDate: () => new Date() }, tz).localDate;
+                        };
+
+                        // NEW: Helper to look up photo from global employees list
+                        const getEmployeePhoto = (id) => {
+                            if (!employees) return null;
+                            const emp = employees.find(e => e.id === id);
+                            return emp ? emp.photo : null;
                         };
 
                         // --- PROCESS ATTENDANCE ---
@@ -14373,13 +14397,15 @@
 
                         attSnap.docs.forEach(doc => {
                             const d = doc.data();
-                            if (!isAllowedShop(d.shop)) return;
+                            
+                            // Client-side fallback filter (for Admin or >10 shops)
+                            if (!canUseDbFilter && !isAllowedShop(d.shop)) return;
                             if (!d.timestamp) return;
 
                             // 1. Get Shop's Today
                             const shopTodayStr = getShopToday(d.shop);
                             // 2. Get Record's Date in Shop's TZ
-                            const shopObj = shops.find(s => s.name === d.shop);
+                            const shopObj = shopMap.get(d.shop);
                             const recordDateStr = Utils.formatDateInTimezone(d.timestamp, shopObj?.timezone).localDate;
 
                             // 3. Strict Match: Only show attendance that happened "Today" in that shop
@@ -14422,9 +14448,10 @@
                                 
                                 return {
                                     id: rec.id,
-                                    name: rec.name,
-                                    info: `${rec.shop} • In: ${inStr} - Out: ${outStr}`,
-                                    status: rec.latestType === 'in' ? 'Online' : 'Offline'
+                                    name: `${rec.name} (${rec.shop})`,
+                                    info: `In: ${inStr} - Out: ${outStr}`,
+                                    status: rec.latestType === 'in' ? 'Online' : 'Offline',
+                                    photo: getEmployeePhoto(rec.id) // NEW: Include photo
                                 };
                             });
 
@@ -14434,26 +14461,20 @@
                             .filter(l => {
                                 if (!isAllowedShop(l.shop)) return false;
                                 const shopToday = getShopToday(l.shop);
-                                
-                                // FIX: Normalize dates to strings (YYYY-MM-DD) to avoid string comparison bugs
                                 const leaveStart = (l.leaveDate || '').substring(0, 10);
                                 const leaveEnd = (l.returnDate || '').substring(0, 10);
-                                
-                                // FIX: Check overlap: Start <= Today < End 
-                                // (Return Date is the day they are BACK, so it is exclusive)
                                 return leaveStart <= shopToday && leaveEnd > shopToday;
                             })
                             .map(l => {
-                                // NEW: Add Date Range to info
                                 const dStart = Utils.formatISOToDisplay(l.leaveDate);
                                 const dEnd = Utils.formatISOToDisplay(l.returnDate);
                                 const dateRange = dStart === dEnd ? dStart : `${dStart} to ${dEnd}`;
-
                                 return {
                                     id: l.staffId,
-                                    name: l.staffName,
-                                    info: `${l.shop} • ${dateRange} • ${l.leaveSession || 'Full Day'}`,
-                                    status: l.leaveType
+                                    name: `${l.staffName} (${l.shop})`,
+                                    info: `${dateRange} • ${l.leaveSession || 'Full Day'}`,
+                                    status: l.leaveType,
+                                    photo: getEmployeePhoto(l.staffId) // NEW: Include photo
                                 };
                             });
 
@@ -14463,21 +14484,20 @@
                             .filter(o => {
                                 if (!isAllowedShop(o.shop)) return false;
                                 const shopToday = getShopToday(o.shop);
-                                
-                                // FIX: Strict normalized comparison
                                 const otDate = (o.reqDate || '').substring(0, 10);
                                 return otDate === shopToday;
                             })
                             .map(o => ({
                                 id: o.staffId,
-                                name: o.staffName,
-                                info: `${o.shop} • ${o.session || 'OT'}`,
-                                status: `${o.numberOfOTDays} Day(s)`
+                                name: `${o.staffName} (${o.shop})`,
+                                info: `${o.session || 'OT'}`,
+                                status: `${o.numberOfOTDays} Day(s)`,
+                                photo: getEmployeePhoto(o.staffId) // NEW: Include photo
                             }));
 
                         let headerTitleSuffix = "My Shop";
                         if (userProfile.role === 'Admin' || userProfile.role === 'CEO') headerTitleSuffix = "All Shops";
-                        else if (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop) && userProfile.shop.length > 1) headerTitleSuffix = "My Shops";
+                        else if (isManager && managedShops.length > 1) headerTitleSuffix = "My Shops";
                         else if (userProfile.shop) headerTitleSuffix = Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop;
 
                         setData({ present: presentList, leave: leaveList, ot: otList, titleSuffix: headerTitleSuffix });
@@ -14486,21 +14506,28 @@
                         console.error("Error fetching team status:", error);
                     } finally {
                         setLoading(false);
+                        isFirstLoad.current = false;
                     }
                 };
 
                 fetchTeamData();
-            }, [db, userProfile, shops]); // Added 'shops' to dependency to ensure timezones are loaded
+            }, [db, userProfile, shops, employees]); // MODIFIED: Added employees to dependency array
 
             const renderList = (list, emptyMsg, icon, color) => {
                 if (list.length === 0) return <div className="text-center py-8 text-slate-500 text-sm">{emptyMsg}</div>;
                 return (
                     <div className="space-y-3">
                         {list.map((item, idx) => (
-                            <div key={`${item.id}-${idx}`} className="flex items-center justify-between p-3 rounded-lg bg-slate-800/50 border border-slate-700/50 hover:bg-slate-800 transition-colors">
+                            // FIX: Use stable item ID key instead of dynamic string to prevent re-render scroll jumps
+                            <div key={item.id || idx} className="flex items-center justify-between p-3 rounded-lg bg-slate-800/50 border border-slate-700/50 hover:bg-slate-800 transition-colors">
                                 <div className="flex items-center gap-3">
-                                    <div className={`w-8 h-8 rounded-full bg-${color}-500/20 text-${color}-400 flex items-center justify-center border border-${color}-500/30`}>
-                                        <i className={`fas ${icon}`}></i>
+                                    {/* MODIFIED: Display Photo if available, else Fallback Icon */}
+                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center overflow-hidden border border-${color}-500/30 shrink-0 ${item.photo ? 'bg-slate-700' : `bg-${color}-500/20 text-${color}-400`}`}>
+                                        {item.photo ? (
+                                            <img src={item.photo} alt={item.name} className="w-full h-full object-cover" />
+                                        ) : (
+                                            <i className={`fas ${icon}`}></i>
+                                        )}
                                     </div>
                                     <div>
                                         <p className="text-sm font-bold text-slate-200">{item.name}</p>
@@ -14536,8 +14563,7 @@
                             </button>
                         </div>
                     </div>
-                    {/* FIX: Removed max-h-80 to allow full height expansion like KPI card */}
-                    {/* MODIFIED: Added max-h-[500px] to force vertical scrollbar on large screens when content overflows */}
+                    {/* Max Height set to 500px for consistency with KPI Card */}
                     <div className="flex-1 overflow-y-auto p-4 custom-scrollbar max-h-[500px]">
                         {loading ? (
                             <div className="flex justify-center py-8"><i className="fas fa-spinner fa-spin text-2xl text-blue-500"></i></div>
@@ -14551,7 +14577,7 @@
                     </div>
                 </div>
             );
-        };
+        });
 
         // --- NEW WIDGET: BIRTHDAY CELEBRATION (Upcoming & Today) ---
         // FIX: Added useAppData to access shops for Timezone calculation
@@ -14862,6 +14888,113 @@
             );
         };
 
+        // --- NEW WIDGET: KPI Stats Widget (Admin/Manager Version) ---
+        // This version displays a list of STAFF sorted by performance
+        // FIX: Wrapped in memo to prevent scroll resetting on parent re-renders (clock ticks)
+        const KPIStatsWidget = memo(({ stats, title, icon, color, onNavigate }) => {
+            // Calculate Overall Score dynamically from the aggregated breakdown
+            const { overallScore, totalVolume } = useMemo(() => {
+                if (!stats || stats.length === 0) return { overallScore: 0, totalVolume: 0 };
+                
+                let totalSum = 0;
+                let totalCount = 0;
+                
+                stats.forEach(s => {
+                    // Reconstruct totals from the aggregated stats object
+                    if (s.totalScore !== undefined && s.scoreCount) {
+                        totalSum += s.totalScore;
+                        totalCount += s.scoreCount;
+                    }
+                });
+                
+                return {
+                    overallScore: totalCount > 0 ? Math.round(totalSum / totalCount) : 0,
+                    totalVolume: totalCount
+                };
+            }, [stats]);
+
+            const getScoreColor = (score) => {
+                if (score >= 90) return 'text-green-400 border-green-500';
+                if (score >= 70) return 'text-yellow-400 border-yellow-500';
+                return 'text-red-400 border-red-500';
+            };
+            
+            const getScoreBg = (score) => {
+                if (score >= 90) return 'bg-green-500/10';
+                if (score >= 70) return 'bg-yellow-500/10';
+                return 'bg-red-500/10';
+            };
+
+            return (
+                <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg overflow-hidden flex flex-col h-full">
+                    <div className="p-5 border-b border-slate-800 flex justify-between items-center bg-slate-900/80 shrink-0">
+                        <div className="flex items-center gap-3">
+                            <div className={`p-2 bg-${color}-500/10 rounded-lg text-${color}-400`}>
+                                <i className={`fas ${icon}`}></i>
+                            </div>
+                            <h3 className="text-lg font-bold text-white">{title}</h3>
+                        </div>
+                        <button onClick={onNavigate} className="text-xs font-bold text-blue-400 hover:text-blue-300">
+                            VIEW DETAILS
+                        </button>
+                    </div>
+                    
+                    {(!stats || stats.length === 0) ? (
+                        <div className="flex-1 flex flex-col items-center justify-center p-6 text-slate-500">
+                            <i className="fas fa-chart-line text-3xl mb-2 opacity-50"></i>
+                            <p className="text-sm">No KPI data available this month.</p>
+                        </div>
+                    ) : (
+                        <div className="flex-1 overflow-y-auto p-4 custom-scrollbar max-h-[500px]">
+                            {/* Overall Score Header */}
+                            <div className="flex items-center gap-5 mb-6 px-2 pb-4 border-b border-slate-800/50">
+                                <div className={`relative w-16 h-16 rounded-full flex items-center justify-center border-4 ${getScoreColor(overallScore)} ${getScoreBg(overallScore)} shadow-lg shrink-0`}>
+                                    <span className={`text-xl font-bold ${getScoreColor(overallScore).split(' ')[0]}`}>{overallScore}%</span>
+                                </div>
+                                <div>
+                                    <p className="text-slate-400 text-xs uppercase font-bold tracking-wider mb-0.5">Average Performance</p>
+                                    <p className="text-2xl font-bold text-white leading-none">{totalVolume}</p>
+                                    <p className="text-slate-500 text-[10px] mt-0.5">Total Tasks Evaluated</p>
+                                </div>
+                            </div>
+
+                            <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-3 px-1">
+                                Top Performers
+                            </h4>
+                            
+                            <div className="space-y-3">
+                                {stats.map((item, idx) => (
+                                    <div 
+                                        key={item.id || idx} // FIX: Use stable ID key instead of index to prevent re-render glitches
+                                        className="flex items-center justify-between p-3 rounded-xl bg-slate-800/40 border border-slate-700/50 hover:bg-slate-800 transition-colors group"
+                                    >
+                                        <div className="flex items-center gap-3 overflow-hidden">
+                                            {/* MODIFIED: Display Photo if available, else Initials */}
+                                            <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-slate-300 font-bold text-sm shrink-0 border border-slate-600 overflow-hidden">
+                                                {item.photo ? (
+                                                    <img src={item.photo} alt={item.name} className="w-full h-full object-cover" />
+                                                ) : (
+                                                    item.name.charAt(0)
+                                                )}
+                                            </div>
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-bold text-slate-200 truncate group-hover:text-blue-300 transition-colors">{item.name}</p>
+                                                <p className="text-[10px] text-slate-500 truncate">{item.shop} • {item.count} Tasks</p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div className={`w-12 h-12 rounded-full flex items-center justify-center border-2 ${getScoreColor(item.avgScore)} ${getScoreBg(item.avgScore)} shrink-0`}>
+                                            <span className={`text-xs font-bold ${getScoreColor(item.avgScore).split(' ')[0]}`}>{item.avgScore}%</span>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        });
+
         const DashboardSummaryPage = ({ userProfile, setActivePage, onNavigateWithTab, pendingLeaves = [], pendingOTs = [] }) => {
             // ... (rest of DashboardSummaryPage logic)
             // MODIFIED: Added 'kpis' to useAppData destructuring
@@ -14892,6 +15025,11 @@
             
             // --- NEW: Task Modal State ---
             const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+
+            // FIX: Create stable handler for KPI navigation to prevent widget re-renders
+            const handleScorecardNav = useCallback(() => {
+                setActivePage('tasks:scorecard');
+            }, [setActivePage]);
 
             // --- STEP 1 RE-EXECUTION: PREPARE SOCIAL/COLLEAGUE DATA FOR BIRTHDAYS ---
             // This logic allows Staff to see their colleagues' birthdays, even if they can't see their payroll data.
@@ -14983,30 +15121,65 @@
                             const kpiSnap = await getDocs(kpiQuery);
                             const tasks = kpiSnap.docs.map(d => d.data()).filter(t => t.status === 'done'); // Ensure status is done
 
-                            // Aggregate Data
+                            // REVISED: Aggregation Logic based on Role
                             const statsMap = {};
                             
                             tasks.forEach(task => {
-                                const kpiName = task.kpiText || 'General Tasks';
-                                if (!statsMap[kpiName]) {
-                                    statsMap[kpiName] = { name: kpiName, count: 0, totalScore: 0, scoreCount: 0 };
-                                }
-                                statsMap[kpiName].count += 1;
-                                
-                                // Parse score "100% - Excellent" -> 100
+                                // Extract numeric score
+                                let scoreVal = 0;
+                                let hasScore = false;
                                 if (task.auditScore) {
                                     const scoreMatch = task.auditScore.match(/(\d+)%/);
                                     if (scoreMatch) {
-                                        statsMap[kpiName].totalScore += parseInt(scoreMatch[1], 10);
-                                        statsMap[kpiName].scoreCount += 1;
+                                        scoreVal = parseInt(scoreMatch[1], 10);
+                                        hasScore = true;
                                     }
+                                }
+
+                                // Key Selection:
+                                // If Staff: Aggregate by KPI Category
+                                // If Admin/Manager: Aggregate by Staff ID
+                                let key, name, shop, photo;
+                                
+                                if (isStaff) {
+                                    key = task.kpiText || 'General Tasks';
+                                    name = key;
+                                    shop = null;
+                                    photo = null;
+                                } else {
+                                    key = task.staffId;
+                                    if (!key) return; // Skip if no staff ID
+                                    name = task.staffName || 'Unknown';
+                                    shop = task.shopName || 'Unknown';
+                                    
+                                    // MODIFIED: Look up photo from employees list
+                                    const staffObj = employees ? employees.find(e => e.id === key) : null;
+                                    photo = staffObj ? staffObj.photo : null;
+                                }
+
+                                if (!statsMap[key]) {
+                                    statsMap[key] = { 
+                                        name: name,
+                                        shop: shop,
+                                        photo: photo, // NEW: Store photo
+                                        count: 0, 
+                                        totalScore: 0, 
+                                        scoreCount: 0 
+                                    };
+                                }
+                                
+                                statsMap[key].count += 1;
+                                
+                                if (hasScore) {
+                                    statsMap[key].totalScore += scoreVal;
+                                    statsMap[key].scoreCount += 1;
                                 }
                             });
 
                             const statsArray = Object.values(statsMap).map(s => ({
                                 ...s,
                                 avgScore: s.scoreCount > 0 ? Math.round(s.totalScore / s.scoreCount) : 0
-                            })).sort((a, b) => b.count - a.count); // Sort by volume
+                            })).sort((a, b) => b.avgScore - a.avgScore); // Sort by Score (High to Low)
 
                             setKpiStats(statsArray);
                         }
@@ -15117,7 +15290,7 @@
                 };
 
                 fetchDashboardData();
-            }, [db, userProfile]);
+            }, [db, userProfile, employees]); // MODIFIED: Added 'employees' to dependencies so photos update
 
             // --- Calculations ---
             const visibleEmployees = useMemo(() => {
@@ -15193,46 +15366,8 @@
                 </button>
             );
 
-            const KPIStatsWidget = ({ stats, title, icon, color }) => (
-                <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg overflow-hidden flex flex-col h-full">
-                    <div className="p-5 border-b border-slate-800 flex justify-between items-center bg-slate-900/80 shrink-0">
-                        <div className="flex items-center gap-3">
-                            <div className={`p-2 bg-${color}-500/10 rounded-lg text-${color}-400`}>
-                                <i className={`fas ${icon}`}></i>
-                            </div>
-                            <h3 className="text-lg font-bold text-white">{title}</h3>
-                        </div>
-                        {/* MODIFIED: Link directly to the scorecard tab */}
-                        <button onClick={() => setActivePage('tasks:scorecard')} className="text-xs font-bold text-blue-400 hover:text-blue-300">
-                            VIEW DETAILS
-                        </button>
-                    </div>
-                    {/* FIX: Removed max-h-64 to let it fill the card height, added custom-scrollbar for smooth touch scrolling */}
-                    <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
-                        {stats.length === 0 ? (
-                            <p className="text-slate-500 text-sm text-center py-8">No KPI data for this month.</p>
-                        ) : (
-                            stats.map((item, idx) => (
-                                <div key={idx} className="flex items-center justify-between p-3 rounded-xl bg-slate-800/50 border border-slate-700/50">
-                                    <div className="flex-1 min-w-0 pr-4">
-                                        <p className="text-sm font-semibold text-slate-200 truncate">{item.name}</p>
-                                        <div className="flex items-center gap-2 mt-1">
-                                            <div className="flex-1 h-1.5 bg-slate-700 rounded-full overflow-hidden">
-                                                <div className={`h-full bg-${color}-500 rounded-full`} style={{ width: `${Math.min(100, item.avgScore)}%` }}></div>
-                                            </div>
-                                            <span className="text-[10px] text-slate-400 font-mono">{item.avgScore}% Qual.</span>
-                                        </div>
-                                    </div>
-                                    <div className="text-right">
-                                        <span className="block text-lg font-bold text-white leading-none">{item.count}</span>
-                                        <span className="text-[10px] text-slate-500 uppercase">Tasks</span>
-                                    </div>
-                                </div>
-                            ))
-                        )}
-                    </div>
-                </div>
-            );
+            // FIX: Removed duplicate KPIStatsWidget definition from here. 
+            // It is already defined and memoized globally above DashboardSummaryPage.
 
             // MODIFIED: Use Skeleton instead of Spinner
             if (isLoading) return <DashboardSkeleton />;
@@ -15344,7 +15479,14 @@
 
                         {/* 5. KPI STATS (Order 5) */}
                         <div className="order-5 col-span-2 lg:order-5 lg:col-span-3 h-[500px] lg:h-auto">
-                            <KPIStatsWidget stats={kpiStats} title="KPI Performance" icon="fa-chart-pie" color="purple" />
+                            {/* MODIFIED: Use stable handleScorecardNav */}
+                            <KPIStatsWidget 
+                                stats={kpiStats} 
+                                title="Performance Scorecard" 
+                                icon="fa-chart-pie" 
+                                color="purple" 
+                                onNavigate={handleScorecardNav}
+                            />
                         </div>
 
                         {/* NEW POSITION: 6. BIRTHDAY CELEBRATIONS (Under KPI) */}
@@ -17482,11 +17624,12 @@
 
             // --- HANDLERS ---
             
-            const handleNotificationClick = (target) => {
+            // FIX: Memoize this handler to prevent DashboardSummaryPage re-rendering
+            const handleNotificationClick = useCallback((target) => {
                 setActivePage('checkinme');
                 setInitialCheckInMeTab(target);
                 setIsLaunchPadOpen(false);
-            };
+            }, []);
 
             const handleAcknowledgeNotice = async (notice) => {
                 if (!notice || !userProfile?.id) return;
