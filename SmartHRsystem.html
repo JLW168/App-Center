@@ -12919,11 +12919,9 @@
 
         // --- INSERTED MISSING COMPONENT: TaskKanbanTab ---
         const TaskKanbanTab = ({ userProfile }) => {
-            // ... (keep existing TaskKanbanTab code) ...
             const { db } = useFirebase();
-            // MODIFIED: Added 'shops' to destructuring
             const { kpis, employees, shops } = useAppData(); 
-            const { collection, query, where, onSnapshot, orderBy, addDoc, updateDoc, deleteDoc, doc, serverTimestamp } = window.firebaseSDK;
+            const { collection, query, where, onSnapshot, orderBy, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, limit } = window.firebaseSDK;
 
             const [tasks, setTasks] = useState([]);
             const [loading, setLoading] = useState(true);
@@ -12937,52 +12935,84 @@
             // Filters
             const [filterStaff, setFilterStaff] = useState('');
             const [filterKpi, setFilterKpi] = useState('');
-            // NEW: Added Shop and Manager-Only filters
             const [filterShop, setFilterShop] = useState(''); 
             const [filterManagerOnly, setFilterManagerOnly] = useState(false);
+            
+            // NEW: Month Filter State (Defaults to Current Month)
+            const [filterMonth, setFilterMonth] = useState(new Date().toISOString().slice(0, 7));
 
-            // ... (Rest of existing TaskKanbanTab logic remains identical) ...
-            // --- BUG FIX: Filter employees dropdown based on selected shop ---
+            // NEW: Pagination State for History
+            const [currentPage, setCurrentPage] = useState(1);
+            const itemsPerPage = 50;
+
+            // --- NEW: AUTO-REJECT LOGIC FOR OVERDUE TASKS (>10 Hours) ---
+            useEffect(() => {
+                if (!tasks || tasks.length === 0 || !db) return;
+
+                const checkAndRejectOverdue = async () => {
+                    const now = new Date();
+                    const { updateDoc, doc, serverTimestamp } = window.firebaseSDK;
+
+                    // Filter for tasks that are IN_PROGRESS and started > 10 hours ago
+                    const overdueTasks = tasks.filter(t => {
+                        if (t.status !== KANBAN_STATUS.IN_PROGRESS || !t.progressTimestamp) return false;
+                        
+                        const start = t.progressTimestamp.toDate ? t.progressTimestamp.toDate() : new Date(t.progressTimestamp);
+                        const diffMs = now - start;
+                        const diffHours = diffMs / (1000 * 60 * 60);
+                        
+                        return diffHours > 10;
+                    });
+
+                    if (overdueTasks.length > 0) {
+                        console.log(`[Auto-Bot] Rejecting ${overdueTasks.length} overdue tasks (>10h)...`);
+                        
+                        // Process rejections
+                        await Promise.all(overdueTasks.map(t => 
+                            updateDoc(doc(db, 'tasks', t.id), {
+                                status: KANBAN_STATUS.DONE, // Move to Done/History
+                                completedTimestamp: serverTimestamp(),
+                                auditScore: 'Rejected',
+                                // MODIFIED: Simplified comment as requested
+                                auditComment: 'Task over Due Time!',
+                                auditorName: 'System Auto-Bot'
+                            }).catch(err => console.error("Failed to auto-reject task:", t.id, err))
+                        ));
+                    }
+                };
+
+                // Run check immediately on load/update, then every minute
+                checkAndRejectOverdue();
+                const interval = setInterval(checkAndRejectOverdue, 60000); 
+                return () => clearInterval(interval);
+            }, [tasks, db]); // Re-run when tasks list updates to catch new overdues
+            // --- END AUTO-REJECT LOGIC ---
+
             const employeesForFilter = useMemo(() => {
                 if (!employees) return [];
-                // If no shop selected, show all active employees
                 if (!filterShop) return employees.filter(e => e.status === 'Active');
-                
-                // If shop selected, filter employees belonging to that shop
                 return employees.filter(e => {
                     const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
                     return empShops.includes(filterShop) && e.status === 'Active';
                 });
             }, [employees, filterShop]);
 
-            // --- NEW: Filter KPIs based on selected Staff's Position ---
             const kpisForFilter = useMemo(() => {
                 if (!kpis) return [];
-                
-                // If a specific staff is selected, filter KPIs by their position
                 if (filterStaff) {
                     const staff = employees.find(e => e.id === filterStaff);
                     if (staff && staff.position) {
-                        return kpis.filter(k => 
-                            Array.isArray(k.assignedPositions) && 
-                            k.assignedPositions.includes(staff.position)
-                        );
+                        return kpis.filter(k => Array.isArray(k.assignedPositions) && k.assignedPositions.includes(staff.position));
                     }
-                    // If staff found but has no position, or staff not found, return empty or all? 
-                    // Returning empty prevents confusion if position is missing.
                     return []; 
                 }
-                
-                // If no staff selected, show all KPIs
                 return kpis; 
             }, [kpis, employees, filterStaff]);
 
-            // Reset staff filter if the selected shop changes
             useEffect(() => {
                 setFilterStaff('');
             }, [filterShop]);
 
-            // Reset KPI filter if the selected staff changes to prevent invalid states
             useEffect(() => {
                 setFilterKpi('');
             }, [filterStaff]);
@@ -12992,11 +13022,19 @@
                 if (!db || !userProfile) return;
                 setLoading(true);
 
-                // --- FIX: LIMIT FETCH SIZE ---
-                // Prevent fetching thousands of historic tasks on load.
-                // Added limit(100) to keep the board snappy.
-                const { limit } = window.firebaseSDK;
-                let q = query(collection(db, 'tasks'), orderBy('taskTimestamp', 'desc'), limit(100));
+                // MODIFIED: Calculate Date Range for the selected month
+                const [y, m] = filterMonth.split('-').map(Number);
+                const startOfMonth = new Date(y, m - 1, 1);
+                const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+
+                // MODIFIED: Apply Date Range Filter to the Base Query
+                // Note: We remove the 'limit(500)' because the month filter acts as a natural pagination/limit.
+                let q = query(
+                    collection(db, 'tasks'), 
+                    where('taskTimestamp', '>=', startOfMonth),
+                    where('taskTimestamp', '<=', endOfMonth),
+                    orderBy('taskTimestamp', 'desc')
+                );
 
                 if (userProfile.role === 'Staff') {
                     q = query(q, where('staffId', '==', userProfile.id));
@@ -13019,24 +13057,18 @@
                 });
 
                 return () => unsubscribe();
-            }, [db, userProfile]);
+            }, [db, userProfile, filterMonth]); // Added filterMonth dependency
 
             // Filter Logic
             const filteredTasks = useMemo(() => {
                 return tasks.filter(t => {
-                    // Standard Filters
                     if (filterStaff && t.staffId !== filterStaff) return false;
                     if (filterKpi && t.kpiId !== filterKpi) return false;
-                    
-                    // NEW: Shop Filter
                     if (filterShop && t.shopName !== filterShop) return false;
-
-                    // NEW: Manager Only Filter (Check if assigned staff is a Shop Manager)
                     if (filterManagerOnly) {
                         const staff = employees.find(e => e.id === t.staffId);
                         if (!staff || staff.role !== 'Shop Manager') return false;
                     }
-
                     return true;
                 });
             }, [tasks, filterStaff, filterKpi, filterShop, filterManagerOnly, employees]);
@@ -13049,6 +13081,19 @@
                 [KANBAN_STATUS.DONE]: filteredTasks.filter(t => t.status === KANBAN_STATUS.DONE),
             };
 
+            // NEW: Pagination Logic
+            const completedTasks = columns[KANBAN_STATUS.DONE];
+            const totalPages = Math.ceil(completedTasks.length / itemsPerPage);
+            const paginatedHistory = useMemo(() => {
+                const start = (currentPage - 1) * itemsPerPage;
+                return completedTasks.slice(start, start + itemsPerPage);
+            }, [completedTasks, currentPage]);
+
+            // Reset page when filters change (tasks array changes)
+            useEffect(() => {
+                setCurrentPage(1);
+            }, [tasks.length, filterShop, filterStaff]);
+
             // Actions
             const handleTaskAction = async (action, task, payload) => {
                 setProcessingTaskIds(prev => new Set(prev).add(task.id));
@@ -13058,10 +13103,8 @@
 
                     if (action === 'move') {
                         updateData.status = payload.newStatus;
-                        // Handle timestamps
                         if (payload.newStatus === KANBAN_STATUS.IN_PROGRESS) updateData.progressTimestamp = serverTimestamp();
                         if (payload.newStatus === KANBAN_STATUS.AUDITING) updateData.workCompletedTimestamp = serverTimestamp();
-                        // Reset rejection comments if moving back
                         if (payload.comment) updateData.auditComment = payload.comment; 
                     } 
                     else if (action === 'approve') {
@@ -13089,7 +13132,6 @@
                         await addDoc(collection(db, 'tasks'), {
                             ...formData,
                             status: KANBAN_STATUS.TODO,
-                            // FIX: Use provided timestamp or fallback to server time
                             taskTimestamp: formData.taskTimestamp || serverTimestamp(), 
                             creatorUid: userProfile.id
                         });
@@ -13113,15 +13155,21 @@
             };
 
             const canManage = userProfile.role !== 'Staff';
-            // NEW: Check if user is Admin or CEO to show special filters
             const isAdminOrCEO = userProfile.role === 'Admin' || userProfile.role === 'CEO';
 
             return (
                 <div className="flex flex-col space-y-6">
-                    {/* Toolbar */}
                     <div className="flex flex-wrap gap-4 justify-between items-center mb-0 bg-slate-800/50 p-4 rounded-xl border border-slate-700">
                         <div className="flex flex-wrap gap-4 items-center flex-1">
-                            {/* NEW: Shop Filter Dropdown */}
+                            {/* NEW: Month Filter Input */}
+                            <input 
+                                type="month" 
+                                value={filterMonth} 
+                                onChange={e => setFilterMonth(e.target.value)} 
+                                className="input w-auto text-sm font-medium"
+                                title="Filter by Creation Month"
+                            />
+
                             <ShopFilterSelect 
                                 userProfile={userProfile}
                                 shops={shops}
@@ -13129,7 +13177,6 @@
                                 onChange={e => setFilterShop(e.target.value)}
                             />
 
-                            {/* NEW: Shop Manager Only Checkbox */}
                             {isAdminOrCEO && (
                                 <label className={`flex items-center gap-2 cursor-pointer px-3 py-1.5 rounded-lg border transition-colors ${filterManagerOnly ? 'bg-blue-600 border-blue-500 text-white shadow-md' : 'bg-slate-700/50 border-slate-600 text-slate-300 hover:bg-slate-700'}`}>
                                     <input 
@@ -13145,13 +13192,11 @@
                             {canManage && (
                                 <select value={filterStaff} onChange={e => setFilterStaff(e.target.value)} className="select text-sm w-auto">
                                     <option value="">All Staff</option>
-                                    {/* FIX: Use employeesForFilter instead of raw employees list */}
                                     {employeesForFilter.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                                 </select>
                             )}
                             <select value={filterKpi} onChange={e => setFilterKpi(e.target.value)} className="select text-sm w-auto">
                                 <option value="">All KPIs</option>
-                                {/* FIX: Use kpisForFilter instead of raw kpis list */}
                                 {kpisForFilter.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
                             </select>
                         </div>
@@ -13160,12 +13205,10 @@
                         </Button>
                     </div>
 
-                    {/* Board & History */}
                     {loading ? (
                         <div className="flex justify-center items-center py-20"><i className="fas fa-spinner fa-spin text-3xl text-blue-500"></i></div>
                     ) : (
                         <>
-                            {/* Active Columns */}
                             <div className="overflow-x-auto pb-2">
                                 <div className="flex gap-4 min-w-[900px]">
                                     <KanbanColumn title="To Do" status={KANBAN_STATUS.TODO} tasks={columns[KANBAN_STATUS.TODO]} color="slate" userProfile={userProfile} onEdit={(t) => { setEditingTask(t); setIsModalOpen(true); }} onDelete={setTaskToDelete} onTaskAction={handleTaskAction} processingTaskIds={processingTaskIds} />
@@ -13174,14 +13217,13 @@
                                 </div>
                             </div>
 
-                            {/* Completed History Table (Replaces 'Done' Column) */}
                             <Card>
                                 <div className="flex justify-between items-center mb-4">
                                     <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
                                         <i className="fas fa-history text-green-400"></i> Completed Tasks History
                                     </h3>
                                     <div className="text-xs text-slate-400 bg-slate-800 px-3 py-1 rounded-full border border-slate-700 font-mono">
-                                        Total: {columns[KANBAN_STATUS.DONE].length}
+                                        Total: {completedTasks.length}
                                     </div>
                                 </div>
                                 <div className="overflow-x-auto">
@@ -13194,13 +13236,16 @@
                                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
                                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">KPI</th>
                                                 <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Result</th>
-                                                {/* NEW: Manager Review Column */}
                                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Manager Review</th>
                                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Auditor</th>
+                                                {(userProfile.role === 'Admin' || userProfile.role === 'CEO') && (
+                                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                                                )}
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-700">
-                                            {columns[KANBAN_STATUS.DONE].map(task => (
+                                            {/* MODIFIED: Render paginated list */}
+                                            {paginatedHistory.map(task => (
                                                 <tr key={task.id} className="hover:bg-slate-700/50 transition-colors">
                                                     <td className="px-4 py-3 text-sm text-slate-300 whitespace-nowrap">{formatFullDateTime(task.completedTimestamp)}</td>
                                                     <td className="px-4 py-3 text-sm text-slate-200 font-medium">{task.text}</td>
@@ -13216,7 +13261,6 @@
                                                             {task.auditScore || 'Approved'}
                                                         </span>
                                                     </td>
-                                                    {/* NEW: Manager Review Content */}
                                                     <td className="px-4 py-3 text-sm text-slate-300 italic border-l border-slate-700/50">
                                                         {task.auditComment ? (
                                                             <span className="text-yellow-200/80">"{task.auditComment}"</span>
@@ -13225,20 +13269,60 @@
                                                         )}
                                                     </td>
                                                     <td className="px-4 py-3 text-sm text-slate-400">{task.auditorName || 'System'}</td>
+                                                    {(userProfile.role === 'Admin' || userProfile.role === 'CEO') && (
+                                                        <td className="px-4 py-3 text-center whitespace-nowrap">
+                                                            <Button 
+                                                                variant="icon-delete" 
+                                                                icon="fa-trash" 
+                                                                onClick={() => setTaskToDelete(task)} 
+                                                                title="Delete History Record" 
+                                                            />
+                                                        </td>
+                                                    )}
                                                 </tr>
                                             ))}
-                                            {columns[KANBAN_STATUS.DONE].length === 0 && (
-                                                <tr><td colSpan="8" className="px-4 py-8 text-center text-slate-500 italic">No completed tasks found.</td></tr>
+                                            {completedTasks.length === 0 && (
+                                                <tr><td colSpan="9" className="px-4 py-8 text-center text-slate-500 italic">No completed tasks found for this month.</td></tr>
                                             )}
                                         </tbody>
                                     </table>
                                 </div>
+                                
+                                {/* NEW: Pagination Controls */}
+                                {totalPages > 1 && (
+                                    <div className="flex justify-between items-center mt-4 pt-4 border-t border-slate-700">
+                                        <div className="text-xs text-slate-400">
+                                            Showing {(currentPage - 1) * itemsPerPage + 1} to {Math.min(currentPage * itemsPerPage, completedTasks.length)} of {completedTasks.length} entries
+                                        </div>
+                                        <div className="flex gap-2">
+                                            <Button 
+                                                variant="secondary" 
+                                                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                                                disabled={currentPage === 1}
+                                                className="text-xs py-1 px-3 h-8"
+                                            >
+                                                Previous
+                                            </Button>
+                                            <div className="flex items-center justify-center bg-slate-800 rounded px-3 text-sm font-bold text-slate-300 border border-slate-700">
+                                                Page {currentPage} of {totalPages}
+                                            </div>
+                                            <Button 
+                                                variant="secondary" 
+                                                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                                                disabled={currentPage === totalPages}
+                                                className="text-xs py-1 px-3 h-8"
+                                            >
+                                                Next
+                                            </Button>
+                                        </div>
+                                    </div>
+                                )}
                             </Card>
                         </>
                     )}
 
                     <TaskModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onSave={handleSaveTask} task={editingTask} userProfile={userProfile} kpis={kpis} employees={employees} />
-                    <ConfirmationModal isOpen={!!taskToDelete} onClose={() => setTaskToDelete(null)} onConfirm={handleDeleteTask} title="Delete Task" message="Are you sure you want to delete this task?" />
+                    <ConfirmationModal isOpen={!!taskToDelete} onClose={() => setTaskToDelete(null)} onConfirm={handleDeleteTask} title="Delete Task" message="Are you sure you want to delete this task? This action cannot be undone." />
                 </div>
             );
         };
@@ -14310,7 +14394,7 @@
 
             useEffect(() => {
                 const fetchTeamData = async () => {
-                    if (!db || !userProfile || !shops) return;
+                    if (!db || !userProfile || !shops || shops.length === 0) return;
 
                     try {
                         // FIX: Only set loading true on first mount/load. 
@@ -14323,7 +14407,6 @@
                         
                         // OPTIMIZATION 1: Tighten Timezone Buffer
                         // Instead of ±2 days (48h), we use ±30h. 
-                        // This covers the earliest timezone (UTC+14) to latest (UTC-12) safely.
                         const now = new Date();
                         const bufferStart = new Date(now.getTime() - (30 * 60 * 60 * 1000)); 
                         const bufferEnd = new Date(now.getTime() + (30 * 60 * 60 * 1000));
@@ -14332,10 +14415,8 @@
                         const bufferEndStr = bufferEnd.toISOString().slice(0, 10);
 
                         // OPTIMIZATION 2: Server-Side Shop Filtering for Managers
-                        // If Manager has specific shops, filter DB query to reduce download size.
                         const isManager = userProfile.role === 'Shop Manager';
                         const managedShops = isManager ? (Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop]) : [];
-                        // Firestore 'in' query supports max 10 items.
                         const canUseDbFilter = isManager && managedShops.length > 0 && managedShops.length <= 10;
 
                         // 1. Fetch Attendance (Optimized)
@@ -14349,7 +14430,6 @@
                         }
 
                         // 2. Fetch Active Leaves
-                        // (Leaves are low volume, safe to filter client-side to avoid index complexity)
                         const leaveQ = query(
                             collection(db, 'leaveRequests'),
                             where('status', '==', 'Approved'),
@@ -14377,7 +14457,6 @@
                         };
 
                         // Helper: Get "Today" string (YYYY-MM-DD) for a specific shop's timezone
-                        // Optimization: Memoize shop map for O(1) lookup
                         const shopMap = new Map(shops.map(s => [s.name, s]));
                         const getShopToday = (shopName) => {
                             const shop = shopMap.get(shopName);
@@ -14398,17 +14477,13 @@
                         attSnap.docs.forEach(doc => {
                             const d = doc.data();
                             
-                            // Client-side fallback filter (for Admin or >10 shops)
                             if (!canUseDbFilter && !isAllowedShop(d.shop)) return;
                             if (!d.timestamp) return;
 
-                            // 1. Get Shop's Today
                             const shopTodayStr = getShopToday(d.shop);
-                            // 2. Get Record's Date in Shop's TZ
                             const shopObj = shopMap.get(d.shop);
                             const recordDateStr = Utils.formatDateInTimezone(d.timestamp, shopObj?.timezone).localDate;
 
-                            // 3. Strict Match: Only show attendance that happened "Today" in that shop
                             if (shopTodayStr !== recordDateStr) return;
 
                             if (!dailyStatsMap[d.employeeId]) {
@@ -14451,7 +14526,7 @@
                                     name: `${rec.name} (${rec.shop})`,
                                     info: `In: ${inStr} - Out: ${outStr}`,
                                     status: rec.latestType === 'in' ? 'Online' : 'Offline',
-                                    photo: getEmployeePhoto(rec.id) // NEW: Include photo
+                                    photo: getEmployeePhoto(rec.id)
                                 };
                             });
 
@@ -14463,6 +14538,7 @@
                                 const shopToday = getShopToday(l.shop);
                                 const leaveStart = (l.leaveDate || '').substring(0, 10);
                                 const leaveEnd = (l.returnDate || '').substring(0, 10);
+                                // Leave logic: Active today
                                 return leaveStart <= shopToday && leaveEnd > shopToday;
                             })
                             .map(l => {
@@ -14474,7 +14550,7 @@
                                     name: `${l.staffName} (${l.shop})`,
                                     info: `${dateRange} • ${l.leaveSession || 'Full Day'}`,
                                     status: l.leaveType,
-                                    photo: getEmployeePhoto(l.staffId) // NEW: Include photo
+                                    photo: getEmployeePhoto(l.staffId)
                                 };
                             });
 
@@ -14492,7 +14568,7 @@
                                 name: `${o.staffName} (${o.shop})`,
                                 info: `${o.session || 'OT'}`,
                                 status: `${o.numberOfOTDays} Day(s)`,
-                                photo: getEmployeePhoto(o.staffId) // NEW: Include photo
+                                photo: getEmployeePhoto(o.staffId)
                             }));
 
                         let headerTitleSuffix = "My Shop";
@@ -14511,17 +14587,15 @@
                 };
 
                 fetchTeamData();
-            }, [db, userProfile, shops, employees]); // MODIFIED: Added employees to dependency array
+            }, [db, userProfile, shops, employees]); 
 
             const renderList = (list, emptyMsg, icon, color) => {
                 if (list.length === 0) return <div className="text-center py-8 text-slate-500 text-sm">{emptyMsg}</div>;
                 return (
                     <div className="space-y-3">
                         {list.map((item, idx) => (
-                            // FIX: Use stable item ID key instead of dynamic string to prevent re-render scroll jumps
                             <div key={item.id || idx} className="flex items-center justify-between p-3 rounded-lg bg-slate-800/50 border border-slate-700/50 hover:bg-slate-800 transition-colors">
                                 <div className="flex items-center gap-3">
-                                    {/* MODIFIED: Display Photo if available, else Fallback Icon */}
                                     <div className={`w-10 h-10 rounded-full flex items-center justify-center overflow-hidden border border-${color}-500/30 shrink-0 ${item.photo ? 'bg-slate-700' : `bg-${color}-500/20 text-${color}-400`}`}>
                                         {item.photo ? (
                                             <img src={item.photo} alt={item.name} className="w-full h-full object-cover" />
@@ -14552,13 +14626,14 @@
                             </h3>
                         </div>
                         <div className="flex p-1 bg-slate-800 rounded-lg">
-                            <button onClick={() => setActiveTab('present')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all ${activeTab === 'present' ? 'bg-green-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+                            {/* FIX: Added type="button" and touch-manipulation to ensure instant tap response on mobile */}
+                            <button type="button" onClick={() => setActiveTab('present')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all touch-manipulation ${activeTab === 'present' ? 'bg-green-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
                                 Present ({data.present.length})
                             </button>
-                            <button onClick={() => setActiveTab('leave')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all ${activeTab === 'leave' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+                            <button type="button" onClick={() => setActiveTab('leave')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all touch-manipulation ${activeTab === 'leave' ? 'bg-pink-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
                                 Leave ({data.leave.length})
                             </button>
-                            <button onClick={() => setActiveTab('ot')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all ${activeTab === 'ot' ? 'bg-purple-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
+                            <button type="button" onClick={() => setActiveTab('ot')} className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all touch-manipulation ${activeTab === 'ot' ? 'bg-purple-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}>
                                 OT ({data.ot.length})
                             </button>
                         </div>
@@ -14995,7 +15070,10 @@
             );
         });
 
-        const DashboardSummaryPage = ({ userProfile, setActivePage, onNavigateWithTab, pendingLeaves = [], pendingOTs = [] }) => {
+        // FIX: Wrapped DashboardSummaryPage in memo to prevent it from re-rendering every second 
+        // when the parent AppContent's clock updates. This stabilizes the children widgets (like TeamStatus)
+        // and fixes touch interaction issues on mobile.
+        const DashboardSummaryPage = memo(({ userProfile, setActivePage, onNavigateWithTab, pendingLeaves = [], pendingOTs = [] }) => {
             // ... (rest of DashboardSummaryPage logic)
             // MODIFIED: Added 'kpis' to useAppData destructuring
             const { employees, shops, isLoading, kpis } = useAppData(); 
@@ -15594,7 +15672,7 @@
                     </div>
                 </div>
             );
-        };
+        }); // FIX: Added closing parenthesis ')' for the memo wrapper
         // --- END DASHBOARD SUMMARY PAGE ---
 
         // --- START POLICY BOARD PAGE ---
