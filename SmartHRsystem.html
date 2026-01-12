@@ -494,42 +494,75 @@
         };
         
         // Custom hook for real-time Firestore collection data
-        const useCollection = (collectionName, queryConstraints = []) => {
+        // MODIFIED: Added 'persistKey' for instant offline loading (Stale-While-Revalidate pattern)
+        const useCollection = (collectionName, queryConstraints = [], persistKey = null) => {
             const { db, currentUser } = useFirebase(); 
-            const [data, setData] = useState([]);
-            const [loading, setLoading] = useState(true);
+            
+            // OPTIMIZATION: Initialize state from LocalStorage if key is provided
+            const [data, setData] = useState(() => {
+                if (persistKey) {
+                    try {
+                        const cached = localStorage.getItem(persistKey);
+                        if (cached) {
+                            // console.log(`Loaded ${collectionName} from cache.`);
+                            return JSON.parse(cached);
+                        }
+                    } catch (e) {
+                        console.error(`Error parsing cache for ${persistKey}`, e);
+                    }
+                }
+                return [];
+            });
+
+            // OPTIMIZATION: If we have cached data, we are NOT loading.
+            const [loading, setLoading] = useState(() => {
+                if (persistKey && localStorage.getItem(persistKey)) return false;
+                return true;
+            });
             
             // FIX: Use a ref to store the serialized constraints to prevent effect loops
-            // if the array reference changes but the content is the same.
             const constraintsRef = useRef(JSON.stringify(queryConstraints));
             if (constraintsRef.current !== JSON.stringify(queryConstraints)) {
                 constraintsRef.current = JSON.stringify(queryConstraints);
             }
 
             useEffect(() => {
-                if (!db || !currentUser) { 
-                    setLoading(true);
+                // If we have cache, we don't block. If no cache, set loading true.
+                if ((!db || !currentUser)) { 
+                    if (!persistKey || data.length === 0) setLoading(true);
                     return;
                 }
 
-                setLoading(true);
+                // Only set loading to true if we don't have cached data to show
+                if ((!persistKey || data.length === 0)) setLoading(true);
+                
                 const { collection, onSnapshot, query } = window.firebaseSDK;
                 
-                // Parse the stable constraints string back to array
-                // Note: We need to pass the actual objects, so we use the prop passed in, 
-                // but depend on the string ref for the effect trigger.
                 const q = query(collection(db, collectionName), ...queryConstraints);
                 
                 const unsubscribe = onSnapshot(q, (querySnapshot) => {
                     const items = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    
+                    // Update State
                     setData(items);
+                    
+                    // Update Cache (Silent Background Update)
+                    if (persistKey) {
+                        try {
+                            localStorage.setItem(persistKey, JSON.stringify(items));
+                        } catch (e) {
+                            // Handle quota exceeded or storage errors silently
+                            console.warn("LocalStorage full/error:", e);
+                        }
+                    }
+                    
                     setLoading(false);
                 }, (error) => {
                     console.error(`Error fetching collection ${collectionName}:`, error);
                     setLoading(false);
                 });
                 return () => unsubscribe();
-            }, [db, currentUser, collectionName, constraintsRef.current]); // Depend on stable string
+            }, [db, currentUser, collectionName, constraintsRef.current, persistKey]); // Depend on stable string & persistKey
             
             return { data, loading };
         };
@@ -996,21 +1029,24 @@
                 return [where("uid", "==", uid)];
             }, [userProfile?.role, userProfile?.uid, JSON.stringify(userProfile?.shop)]); // Deep compare shop array
 
-            // FIX: Switched from useStaticCollection to useCollection (Real-Time)
-            const { data: employees, loading: employeesLoading } = useCollection('employees', employeeQueryConstraints);
-            const { data: shops, loading: shopsLoading } = useCollection('shops');
-            const { data: shifts, loading: shiftsLoading } = useCollection('shifts');
-            const { data: positions, loading: positionsLoading } = useCollection('positions');
+            // FIX: Applied 'persistKey' to all global collections for instant load
+            // Employees cache is keyed by User ID to ensure different users don't see wrong cached data on shared devices
+            const employeesCacheKey = userProfile ? `hr_cache_employees_${userProfile.uid}` : null;
+            
+            const { data: employees, loading: employeesLoading } = useCollection('employees', employeeQueryConstraints, employeesCacheKey);
+            const { data: shops, loading: shopsLoading } = useCollection('shops', [], 'hr_cache_shops');
+            const { data: shifts, loading: shiftsLoading } = useCollection('shifts', [], 'hr_cache_shifts');
+            const { data: positions, loading: positionsLoading } = useCollection('positions', [], 'hr_cache_positions');
             
             // NEW: Fetch Expense Categories in real-time
-            const { data: expenseCategories, loading: categoriesLoading } = useCollection('expenseCategories');
+            const { data: expenseCategories, loading: categoriesLoading } = useCollection('expenseCategories', [], 'hr_cache_expense_cats');
 
             // NEW: Fetch KPIs globally
-            const { data: kpis, loading: kpisLoading } = useCollection('kpis');
+            const { data: kpis, loading: kpisLoading } = useCollection('kpis', [], 'hr_cache_kpis');
 
             // --- FIX START: Fetch System Configuration for Feature Toggles ---
             // We use 'systemConfig' collection as the single source of truth for toggles.
-            const { data: sysConfigData, loading: configLoading } = useCollection('systemConfig');
+            const { data: sysConfigData, loading: configLoading } = useCollection('systemConfig', [], 'hr_cache_sys_config');
             
             const moduleConfig = useMemo(() => {
                 if (!sysConfigData) return {};
@@ -10696,7 +10732,7 @@
                         categories={categoriesList} 
                         availableShops={availableShops}
                         userProfile={userProfile}
-                        shopFunds={shopFunds} // NEW: Pass funds to modal for validation
+                        shopFunds={shopFunds} 
                     />
                     
                     <TopUpModal 
@@ -10752,7 +10788,6 @@
                 onSave(formData);
             };
 
-            // Calculate max fund if shop selected
             const currentFund = formData.shop && shopFunds ? (shopFunds[formData.shop] || 0) : 0;
 
             return (
@@ -10796,7 +10831,6 @@
                                     <input type="number" name="amount" value={formData.amount} onChange={handleChange} className="input font-bold text-orange-400" placeholder="0" required />
                                 </div>
                                 
-                                {/* New Checkbox for Shop Fund */}
                                 {formData.shop && !expense && (
                                     <div className="flex items-center p-3 border border-slate-600 rounded-lg bg-slate-700/30">
                                         <input 
@@ -10830,17 +10864,211 @@
             );
         };
 
+        // --- NEW: Summary Expense Tab (Consolidated View) ---
+        const SummaryExpenseTab = ({ userProfile }) => {
+            const { db } = useFirebase();
+            const { shops } = useAppData();
+            const { collection, query, where, getDocs } = window.firebaseSDK;
+
+            const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+            const [loading, setLoading] = useState(false);
+            const [summary, setSummary] = useState([]);
+            const [totals, setTotals] = useState({ payroll: 0, opsCash: 0, opsFund: 0, total: 0 });
+
+            useEffect(() => {
+                if (!db || !userProfile) return;
+                
+                const fetchData = async () => {
+                    setLoading(true);
+                    
+                    const startStr = `${selectedMonth}-01`;
+                    const endStr = `${selectedMonth}-31`;
+
+                    // 1. Fetch Payroll (Stored by 'month' string YYYY-MM)
+                    const payrollQ = query(collection(db, 'payrollHistory'), where('month', '==', selectedMonth));
+                    
+                    // 2. Fetch Expenses (Stored by 'date' string YYYY-MM-DD)
+                    const expenseQ = query(collection(db, 'shopExpenses'), where('date', '>=', startStr), where('date', '<=', endStr));
+
+                    try {
+                        const [payrollSnap, expenseSnap] = await Promise.all([getDocs(payrollQ), getDocs(expenseQ)]);
+                        
+                        const payrolls = payrollSnap.docs.map(d => d.data());
+                        const expenses = expenseSnap.docs.map(d => d.data());
+
+                        // Aggregation Map by Shop
+                        const shopMap = {};
+
+                        // Initialize shops based on permissions
+                        const allowedShops = (userProfile.role === 'Admin' || userProfile.role === 'CEO') 
+                            ? shops 
+                            : (userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop) 
+                                ? shops.filter(s => userProfile.shop.includes(s.name)) 
+                                : []);
+
+                        allowedShops.forEach(s => {
+                            shopMap[s.name] = { name: s.name, payroll: 0, opsCash: 0, opsFund: 0 };
+                        });
+
+                        // Process Payrolls
+                        payrolls.forEach(p => {
+                            const sName = p.shop;
+                            // Only add if shop is allowed/tracked
+                            if (shopMap[sName]) {
+                                shopMap[sName].payroll += (parseFloat(p.netSalary) || 0);
+                            }
+                        });
+
+                        // Process Expenses
+                        expenses.forEach(e => {
+                            const sName = e.shop;
+                            if (shopMap[sName]) {
+                                const amt = parseFloat(e.amount) || 0;
+                                if (e.paidViaFund) {
+                                    shopMap[sName].opsFund += amt;
+                                } else {
+                                    shopMap[sName].opsCash += amt;
+                                }
+                            }
+                        });
+
+                        // Convert to Array & Filter
+                        const finalSummary = Object.values(shopMap).sort((a, b) => a.name.localeCompare(b.name));
+
+                        // Calculate Grand Totals
+                        const grandTotals = finalSummary.reduce((acc, curr) => ({
+                            payroll: acc.payroll + curr.payroll,
+                            opsCash: acc.opsCash + curr.opsCash,
+                            opsFund: acc.opsFund + curr.opsFund,
+                            total: acc.total + curr.payroll + curr.opsCash + curr.opsFund
+                        }), { payroll: 0, opsCash: 0, opsFund: 0, total: 0 });
+
+                        setSummary(finalSummary);
+                        setTotals(grandTotals);
+
+                    } catch (err) {
+                        console.error("Error fetching summary:", err);
+                    } finally {
+                        setLoading(false);
+                    }
+                };
+
+                fetchData();
+            }, [db, selectedMonth, userProfile, shops]);
+
+            const handleExportExcel = () => {
+                const data = summary.map(s => ({
+                    'Shop Name': s.name,
+                    'Payroll Expense': s.payroll,
+                    'Operational (Cash)': s.opsCash,
+                    'Petty Cash Spent': s.opsFund,
+                    'Total Expense': s.payroll + s.opsCash + s.opsFund
+                }));
+                
+                // Add Totals Row
+                data.push({
+                    'Shop Name': 'GRAND TOTAL',
+                    'Payroll Expense': totals.payroll,
+                    'Operational (Cash)': totals.opsCash,
+                    'Petty Cash Spent': totals.opsFund,
+                    'Total Expense': totals.total
+                });
+
+                Utils.exportToExcel(data, "Expense Summary", `Expense_Summary_${selectedMonth}.xlsx`);
+            };
+
+            return (
+                <Card>
+                    <div className="flex flex-wrap gap-4 justify-between items-center mb-6">
+                        <h3 className="text-xl font-semibold text-slate-100">Financial Overview</h3>
+                        <div className="flex flex-wrap gap-4 items-center">
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                        </div>
+                    </div>
+
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg">
+                            <p className="text-xs text-slate-400 uppercase font-bold tracking-wider">Total Expense</p>
+                            <p className="text-2xl font-bold text-white mt-1">{Utils.formatCurrency(totals.total)}</p>
+                        </div>
+                        <div className="bg-slate-800 p-4 rounded-xl border border-emerald-900/30 shadow-lg">
+                            <p className="text-xs text-emerald-400 uppercase font-bold tracking-wider"><i className="fas fa-users mr-1"></i> Payroll</p>
+                            <p className="text-xl font-bold text-slate-200 mt-1">{Utils.formatCurrency(totals.payroll)}</p>
+                        </div>
+                        <div className="bg-slate-800 p-4 rounded-xl border border-orange-900/30 shadow-lg">
+                            <p className="text-xs text-orange-400 uppercase font-bold tracking-wider"><i className="fas fa-money-bill mr-1"></i> Ops (Cash)</p>
+                            <p className="text-xl font-bold text-slate-200 mt-1">{Utils.formatCurrency(totals.opsCash)}</p>
+                        </div>
+                        <div className="bg-slate-800 p-4 rounded-xl border border-blue-900/30 shadow-lg">
+                            <p className="text-xs text-blue-400 uppercase font-bold tracking-wider"><i className="fas fa-wallet mr-1"></i> Petty Cash</p>
+                            <p className="text-xl font-bold text-slate-200 mt-1">{Utils.formatCurrency(totals.opsFund)}</p>
+                        </div>
+                    </div>
+
+                    {loading ? (
+                        <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-400"></i></div>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-slate-700">
+                                <thead className="bg-slate-900/50">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop Name</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Payroll</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Ops (Cash)</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Petty Cash</th>
+                                        <th className="px-4 py-3 text-right text-xs font-bold text-white uppercase">Total</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {summary.length === 0 ? (
+                                        <tr><td colSpan="5" className="px-4 py-8 text-center text-slate-500">No data found for this month.</td></tr>
+                                    ) : (
+                                        summary.map((s, idx) => (
+                                            <tr key={idx} className="hover:bg-slate-700/50">
+                                                <td className="px-4 py-4 text-sm text-slate-200 font-medium">{s.name}</td>
+                                                <td className="px-4 py-4 text-sm text-right text-emerald-300">{Utils.formatCurrency(s.payroll)}</td>
+                                                <td className="px-4 py-4 text-sm text-right text-orange-300">{Utils.formatCurrency(s.opsCash)}</td>
+                                                <td className="px-4 py-4 text-sm text-right text-blue-300">{Utils.formatCurrency(s.opsFund)}</td>
+                                                <td className="px-4 py-4 text-sm text-right font-bold text-white bg-slate-800/30">
+                                                    {Utils.formatCurrency(s.payroll + s.opsCash + s.opsFund)}
+                                                </td>
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                                <tfoot className="bg-slate-900/80 font-bold border-t border-slate-600">
+                                    <tr>
+                                        <td className="px-4 py-3 text-slate-300">GRAND TOTAL</td>
+                                        <td className="px-4 py-3 text-right text-emerald-400">{Utils.formatCurrency(totals.payroll)}</td>
+                                        <td className="px-4 py-3 text-right text-orange-400">{Utils.formatCurrency(totals.opsCash)}</td>
+                                        <td className="px-4 py-3 text-right text-blue-400">{Utils.formatCurrency(totals.opsFund)}</td>
+                                        <td className="px-4 py-3 text-right text-white text-lg">{Utils.formatCurrency(totals.total)}</td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </div>
+                    )}
+                </Card>
+            );
+        };
+
         // --- FIX: ADDED MISSING EXPENSE REPORT PAGE (Placeholder) ---
         const ExpenseReportPage = ({ userProfile }) => {
-            const [activeTab, setActiveTab] = useState('payrollExpenses');
+            // MODIFIED: Set Summary as default active tab
+            const [activeTab, setActiveTab] = useState('summary');
+            
             const tabs = {
-                payrollExpenses: 'Payroll Expenses',
-                operationalExpenses: 'Operational Expenses'
+                summary: <span><i className="fas fa-chart-line mr-2 text-yellow-400"></i>Summary</span>,
+                payrollExpenses: <span><i className="fas fa-users mr-2 text-emerald-400"></i>Payroll</span>,
+                operationalExpenses: <span><i className="fas fa-receipt mr-2 text-blue-400"></i>Operational</span>
             };
 
             return (
                 <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
-                    {/* MODIFIED: Replaced placeholder with restored component */}
+                    {/* MODIFIED: Included new Summary Tab */}
+                    <div id="summary"><SummaryExpenseTab userProfile={userProfile} /></div>
                     <div id="payrollExpenses"><PayrollExpensesTab userProfile={userProfile} /></div>
                     <div id="operationalExpenses"><OperationalExpensesTab userProfile={userProfile} /></div>
                 </TabbedPage>
@@ -17195,7 +17423,8 @@
         // OPTIMIZATION: Wrapped in memo to prevent unnecessary re-renders when parent state changes
         const NoticeCard = memo(({ notice, userProfile, canManage, onEdit, onDelete, onMarkRead, onViewStats, employees }) => {
             const { db } = useFirebase();
-            const { doc, updateDoc, arrayUnion, arrayRemove, collection, addDoc, serverTimestamp, query, orderBy, onSnapshot, deleteDoc, increment } = window.firebaseSDK;
+            // MODIFIED: Added 'limit' to destructuring
+            const { doc, updateDoc, arrayUnion, arrayRemove, collection, addDoc, serverTimestamp, query, orderBy, onSnapshot, deleteDoc, increment, limit } = window.firebaseSDK;
             
             const [showComments, setShowComments] = useState(false);
             const [comments, setComments] = useState([]);
@@ -17203,17 +17432,62 @@
             const [isSubmittingComment, setIsSubmittingComment] = useState(false);
             const [showLikesModal, setShowLikesModal] = useState(false);
             
+            // NEW: State for "See More" truncation
+            const [isExpanded, setIsExpanded] = useState(false);
+            
             // NEW: State for Editing Comments
             const [editingCommentId, setEditingCommentId] = useState(null);
             const [editText, setEditText] = useState('');
+
+            // NEW: State for Latest Comment Preview
+            const [latestComment, setLatestComment] = useState(null);
 
             const isLiked = (notice.likes || []).includes(userProfile.id);
             const likeCount = (notice.likes || []).length;
             const isRead = (notice.readBy || []).includes(userProfile.id);
 
+            // Resolve Author Info
+            const author = employees ? employees.find(e => e.id === notice.authorId) : null;
+            const authorPhoto = author ? author.photo : null;
+            const authorName = notice.authorName || 'System Admin';
+            const authorRole = author ? author.position : 'Admin';
+
+            // Helper: Time Ago
+            const timeAgo = (date) => {
+                if (!date) return 'Just now';
+                const d = date.toDate ? date.toDate() : new Date(date);
+                const seconds = Math.floor((new Date() - d) / 1000);
+                let interval = seconds / 31536000;
+                if (interval > 1) return Math.floor(interval) + "y";
+                interval = seconds / 2592000;
+                if (interval > 1) return Math.floor(interval) + "mo";
+                interval = seconds / 86400;
+                if (interval > 1) return Math.floor(interval) + "d";
+                interval = seconds / 3600;
+                if (interval > 1) return Math.floor(interval) + "h";
+                interval = seconds / 60;
+                if (interval > 1) return Math.floor(interval) + "m";
+                return "Just now";
+            };
+
+            // NEW: Fetch Latest Comment Always (For Preview)
+            useEffect(() => {
+                if (!db || !notice.id) return;
+                // Query for the single latest comment
+                const q = query(collection(db, 'memoAlerts', notice.id, 'comments'), orderBy('createdAt', 'desc'), limit(1));
+                const unsubscribe = onSnapshot(q, (snapshot) => {
+                    if (!snapshot.empty) {
+                        setLatestComment({ id: snapshot.docs[0].id, ...snapshot.docs[0].data() });
+                    } else {
+                        setLatestComment(null);
+                    }
+                });
+                return () => unsubscribe();
+            }, [notice.id, db]);
+
             // Fetch comments real-time ONLY when section is open
             useEffect(() => {
-                if (!showComments || !notice.id) return; // FIX: Added return for clean effect
+                if (!showComments || !notice.id) return;
                 
                 const q = query(collection(db, 'memoAlerts', notice.id, 'comments'), orderBy('createdAt', 'asc'));
                 const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -17223,7 +17497,6 @@
                 return () => unsubscribe();
             }, [showComments, notice.id, db]);
 
-            // MODIFIED: Get liker objects (name + photo) instead of just names
             const likers = useMemo(() => {
                 if (!notice.likes || !employees) return [];
                 return notice.likes.map(id => {
@@ -17256,7 +17529,6 @@
                         userName: userProfile.name,
                         createdAt: serverTimestamp()
                     });
-                    // Increment count on notice
                     await updateDoc(doc(db, 'memoAlerts', notice.id), { commentCount: increment(1) });
                     setNewComment('');
                 } catch (err) {
@@ -17266,267 +17538,354 @@
                 }
             };
 
-            // NEW: Handle Delete Comment
             const handleDeleteComment = async (e, commentId) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-                
+                if (e) { e.preventDefault(); e.stopPropagation(); }
                 if (!window.confirm("Are you sure you want to delete this comment?")) return;
-                
                 try {
-                    // 1. Delete the comment document from subcollection
                     await deleteDoc(doc(db, 'memoAlerts', notice.id, 'comments', commentId));
-                    
-                    // 2. Try to decrement count safely
-                    try {
-                        await updateDoc(doc(db, 'memoAlerts', notice.id), { commentCount: increment(-1) });
-                    } catch (countError) {
-                        console.warn("Could not update comment count:", countError);
-                    }
-                } catch (err) {
-                    console.error("Error deleting comment:", err);
-                    alert("Failed to delete comment.");
-                }
+                    try { await updateDoc(doc(db, 'memoAlerts', notice.id), { commentCount: increment(-1) }); } catch (countError) {}
+                } catch (err) { console.error("Error deleting comment:", err); }
             };
 
-            // NEW: Handle Start Editing
             const handleStartEdit = (comment, e) => {
-                if (e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
+                if (e) { e.preventDefault(); e.stopPropagation(); }
                 setEditingCommentId(comment.id);
                 setEditText(comment.text);
             };
 
-            // NEW: Handle Save Edited Comment
             const handleSaveEdit = async (commentId) => {
                 if (!editText.trim()) return;
                 try {
-                    await updateDoc(doc(db, 'memoAlerts', notice.id, 'comments', commentId), {
-                        text: editText,
-                        updatedAt: serverTimestamp() // Track edit time if needed
-                    });
+                    await updateDoc(doc(db, 'memoAlerts', notice.id, 'comments', commentId), { text: editText, updatedAt: serverTimestamp() });
                     setEditingCommentId(null);
                     setEditText('');
-                } catch (err) {
-                    console.error("Error updating comment:", err);
-                }
+                } catch (err) { console.error("Error updating comment:", err); }
             };
             
             const formatCommentTime = (timestamp) => {
                 if (!timestamp) return 'Just now';
                 const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-                return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                const now = new Date();
+                const diffMs = now - date;
+                const diffMins = Math.floor(diffMs / 60000);
+                if (diffMins < 1) return 'Just now';
+                if (diffMins < 60) return `${diffMins}m`;
+                const diffHours = Math.floor(diffMins / 60);
+                if (diffHours < 24) return `${diffHours}h`;
+                return date.toLocaleDateString();
             };
 
-            return (
-                <div className={`rounded-xl border shadow-lg overflow-hidden transition-all duration-300 flex flex-col ${
-                    isRead && !canManage
-                        ? 'bg-slate-800 border-slate-700 opacity-90' 
-                        : 'bg-slate-800 border-yellow-500/50 shadow-yellow-900/20 ring-1 ring-yellow-500/20'
-                }`}>
-                    {/* ... (Content remains the same, omitted for brevity as logic was the focus) ... */}
-                    <div className="p-5 flex-1">
-                        <div className="flex justify-between items-start mb-3">
-                            <div>
-                                <div className="flex items-center gap-2 mb-1">
-                                    <h3 className="text-lg font-bold text-white">{notice.title}</h3>
-                                    {!isRead && !canManage && (
-                                        <span className="bg-yellow-500 text-slate-900 text-[10px] font-bold px-2 py-0.5 rounded-full animate-pulse">NEW</span>
-                                    )}
-                                    {notice.status === 'Inactive' && (
-                                        <span className="bg-red-500/20 text-red-400 text-[10px] font-bold px-2 py-0.5 rounded-full border border-red-500/30">Inactive</span>
-                                    )}
-                                </div>
-                                <p className="text-xs text-slate-500">
-                                    <i className="fas fa-calendar mr-1"></i> 
-                                    {notice.createdAt?.toDate ? notice.createdAt.toDate().toLocaleDateString() : 'Just now'}
-                                    <span className="mx-2">•</span>
-                                    By {notice.authorName || 'Admin'}
-                                </p>
-                            </div>
-                            
-                            {notice.targetShops && notice.targetShops.length > 0 ? (
-                                <span className="px-2 py-1 bg-slate-700 text-[10px] rounded text-slate-300 border border-slate-600">
-                                    {notice.targetShops.length > 2 ? `${notice.targetShops.length} Shops` : notice.targetShops.join(', ')}
-                                </span>
-                            ) : (
-                                <span className="px-2 py-1 bg-blue-900/30 text-[10px] rounded text-blue-300 border border-blue-800/50">
-                                    Global
-                                </span>
-                            )}
-                        </div>
-                        
-                        <div className="prose prose-invert prose-sm max-w-none mb-4">
-                            <p className="text-slate-300 whitespace-pre-wrap leading-relaxed">{notice.content}</p>
-                        </div>
-                    </div>
-                    
-                    {/* Action Footer */}
-                    <div className="px-5 py-3 bg-slate-900/50 border-t border-slate-700/50 flex flex-col gap-3">
-                        <div className="flex justify-between items-center">
-                            {/* Social Buttons */}
-                            <div className="flex items-center gap-4">
-                                <div className="flex items-center">
-                                    <button 
-                                        onClick={handleToggleLike}
-                                        className={`flex items-center gap-1.5 text-sm font-bold transition-colors ${isLiked ? 'text-pink-500' : 'text-slate-400 hover:text-pink-400'}`}
-                                        title="Like this notice"
-                                    >
-                                        <i className={`${isLiked ? 'fas' : 'far'} fa-heart`}></i>
-                                    </button>
-                                    {likeCount > 0 && (
-                                        <button 
-                                            onClick={() => setShowLikesModal(true)}
-                                            className="ml-1.5 text-xs font-semibold text-slate-400 hover:text-white hover:underline transition-colors"
-                                            title="View who liked"
-                                        >
-                                            {likeCount} Like{likeCount !== 1 ? 's' : ''}
-                                        </button>
-                                    )}
-                                </div>
-                                <button 
-                                    onClick={() => setShowComments(!showComments)}
-                                    className={`flex items-center gap-1.5 text-sm font-bold transition-colors ${showComments ? 'text-blue-400' : 'text-slate-400 hover:text-blue-400'}`}
-                                >
-                                    <i className="far fa-comment-alt"></i> 
-                                    {notice.commentCount > 0 ? (
-                                        <span>{notice.commentCount} Comment{notice.commentCount !== 1 ? 's' : ''}</span>
-                                    ) : (
-                                        <span>Comment</span>
-                                    )}
-                                </button>
-                            </div>
+            // Truncation Logic
+            const contentLimit = 280;
+            const isLongContent = notice.content && notice.content.length > contentLimit;
+            const displayContent = isExpanded || !isLongContent ? notice.content : `${notice.content.slice(0, contentLimit)}...`;
 
-                            {/* Management / Acknowledge Buttons */}
-                            <div className="flex items-center gap-3">
-                                {canManage ? (
-                                    <>
-                                        <Button variant="secondary" onClick={() => onViewStats(notice)} className="text-xs py-1 px-2 h-8" title="View Stats">
-                                            <i className="fas fa-chart-pie mr-1"></i> {(notice.readBy || []).length}
-                                        </Button>
-                                        <div className="h-4 w-px bg-slate-700 mx-1"></div>
-                                        <button onClick={() => onEdit(notice)} className="text-blue-400 hover:text-white transition-colors p-1"><i className="fas fa-edit"></i></button>
-                                        <button onClick={() => onDelete(notice)} className="text-red-400 hover:text-white transition-colors p-1"><i className="fas fa-trash"></i></button>
-                                    </>
+            return (
+                <div className={`
+                    relative group transition-all duration-300 mb-6
+                    bg-[#1E293B] border border-slate-700/60 shadow-lg 
+                    rounded-2xl overflow-hidden
+                    ${!isRead && !canManage ? 'ring-1 ring-yellow-500/50 shadow-yellow-500/10' : 'hover:border-slate-600'}
+                `}>
+                    {/* NEW: Unread Dot Indicator (Cleaner than a big badge) */}
+                    {!isRead && !canManage && (
+                        <div className="absolute top-4 right-4 w-2.5 h-2.5 bg-yellow-500 rounded-full animate-pulse z-10 shadow-sm shadow-yellow-500/50"></div>
+                    )}
+
+                    {/* --- CARD HEADER --- */}
+                    <div className="p-4 flex justify-between items-start">
+                        <div className="flex gap-3 items-center">
+                            {/* Avatar */}
+                            <div className="w-10 h-10 rounded-full bg-slate-700 border border-slate-600 flex items-center justify-center overflow-hidden shrink-0 shadow-inner">
+                                {authorPhoto ? (
+                                    <img src={authorPhoto} alt={authorName} className="w-full h-full object-cover" />
                                 ) : (
-                                    !isRead ? (
-                                        <Button variant="primary" onClick={() => onMarkRead(notice)} className="text-xs py-1 px-4 bg-yellow-600 hover:bg-yellow-500 text-white shadow-lg shadow-yellow-900/20 h-auto animate-pulse">
-                                            <i className="fas fa-check-double mr-1"></i> Acknowledge
-                                        </Button>
-                                    ) : (
-                                        <span className="text-xs font-bold text-green-500 flex items-center gap-1 bg-green-900/20 px-3 py-1 rounded-full border border-green-900/30">
-                                            <i className="fas fa-check-circle"></i> Read
-                                        </span>
-                                    )
+                                    <span className="text-sm font-bold text-slate-400">{authorName.charAt(0)}</span>
                                 )}
                             </div>
+                            
+                            {/* Meta Info */}
+                            <div className="flex flex-col min-w-0">
+                                <h4 className="font-bold text-white text-sm leading-tight truncate pr-4">{authorName}</h4>
+                                <div className="flex items-center gap-1.5 text-[11px] text-slate-400 mt-0.5">
+                                    <span className="text-slate-500">{authorRole}</span>
+                                    <span className="text-slate-600">•</span>
+                                    <span>{timeAgo(notice.createdAt)}</span>
+                                    <span className="text-slate-600">•</span>
+                                    {notice.targetShops && notice.targetShops.length > 0 ? (
+                                        <div className="flex items-center gap-1 bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded text-[10px] font-medium">
+                                            <i className="fas fa-store"></i> 
+                                            <span className="truncate max-w-[80px]">{notice.targetShops.length > 1 ? 'Multiple' : notice.targetShops[0]}</span>
+                                        </div>
+                                    ) : (
+                                        <div className="flex items-center gap-1 bg-slate-700/50 text-slate-400 px-1.5 py-0.5 rounded text-[10px] font-medium">
+                                            <i className="fas fa-globe"></i> Global
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
                         </div>
+                        
+                        {/* Admin Actions Dropdown */}
+                        {canManage && (
+                            <div className="relative group/menu ml-auto">
+                                <button className="w-8 h-8 rounded-full hover:bg-slate-700/50 flex items-center justify-center text-slate-400 hover:text-white transition-colors">
+                                    <i className="fas fa-ellipsis-h"></i>
+                                </button>
+                                <div className="absolute right-0 mt-1 w-32 bg-slate-800 border border-slate-700 rounded-xl shadow-xl py-1 hidden group-hover/menu:block z-20 animate-fade-in origin-top-right">
+                                    <button onClick={() => onViewStats(notice)} className="w-full text-left px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-700 hover:text-white flex items-center gap-2">
+                                        <i className="fas fa-chart-pie text-blue-400 w-4 text-center"></i> Analytics
+                                    </button>
+                                    <button onClick={() => onEdit(notice)} className="w-full text-left px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-700 hover:text-white flex items-center gap-2">
+                                        <i className="fas fa-edit text-yellow-400 w-4 text-center"></i> Edit
+                                    </button>
+                                    <div className="h-px bg-slate-700/50 my-1"></div>
+                                    <button onClick={() => onDelete(notice)} className="w-full text-left px-3 py-2 text-xs font-medium text-red-400 hover:bg-red-900/20 flex items-center gap-2">
+                                        <i className="fas fa-trash w-4 text-center"></i> Delete
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
 
-                        {/* Comments Section */}
-                        {showComments && (
-                            <div className="mt-2 pt-3 border-t border-slate-700/50 animate-fade-in">
-                                <div className="space-y-3 mb-3 max-h-48 overflow-y-auto custom-scrollbar pr-1">
-                                    {comments.length === 0 && <p className="text-xs text-slate-500 italic">No comments yet. Be the first!</p>}
-                                    {comments.map(comment => {
-                                        // Resolve user details from employees list
-                                        const commenter = employees ? employees.find(e => e.id === comment.userId) : null;
-                                        const displayName = commenter ? commenter.name : comment.userName;
-                                        const displayPhoto = commenter ? commenter.photo : null;
-                                        const isMyComment = comment.userId === userProfile.id;
+                    {/* --- CARD CONTENT --- */}
+                    <div className="px-4 pb-2">
+                        {notice.title && <h3 className="text-base font-bold text-white mb-2 leading-snug tracking-tight">{notice.title}</h3>}
+                        <div className="text-sm text-slate-300 whitespace-pre-wrap leading-relaxed break-words font-light">
+                            {displayContent}
+                        </div>
+                        {isLongContent && (
+                            <button 
+                                onClick={() => setIsExpanded(!isExpanded)}
+                                className="text-xs font-bold text-blue-400 hover:text-blue-300 mt-1 focus:outline-none"
+                            >
+                                {isExpanded ? 'Show less' : 'Read more'}
+                            </button>
+                        )}
+                    </div>
 
-                                        return (
-                                            <div key={comment.id} className="flex gap-2 group">
-                                                {/* MODIFIED: Show Photo or Initial */}
-                                                <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 shrink-0 border border-slate-600 overflow-hidden">
-                                                    {displayPhoto ? (
-                                                        <img src={displayPhoto} alt={displayName} className="w-full h-full object-cover" />
-                                                    ) : (
-                                                        displayName ? displayName.charAt(0) : '?'
-                                                    )}
-                                                </div>
-                                                <div className="bg-slate-800/80 rounded-2xl rounded-tl-none p-2.5 text-xs text-slate-300 flex-1 border border-slate-700/50 relative">
-                                                    <div className="flex justify-between items-baseline mb-1">
-                                                        <span className="font-bold text-slate-200 text-sm">{displayName}</span>
-                                                        <span className="text-[10px] text-slate-500">{formatCommentTime(comment.createdAt)}</span>
-                                                    </div>
-                                                    
-                                                    {/* NEW: Edit Mode vs View Mode */}
+                    {/* --- STATS & DIVIDER --- */}
+                    <div className="px-4 pt-3 mt-1">
+                        <div className="flex justify-between items-center text-[11px] text-slate-500 border-b border-slate-700/50 pb-3">
+                            <div className="flex items-center gap-1 cursor-pointer hover:text-blue-400 transition-colors" onClick={() => likeCount > 0 && setShowLikesModal(true)}>
+                                {likeCount > 0 && (
+                                    <>
+                                        <div className="w-4 h-4 rounded-full bg-blue-500 text-white flex items-center justify-center text-[8px] shadow-sm">
+                                            <i className="fas fa-thumbs-up"></i>
+                                        </div>
+                                        <span>{likeCount}</span>
+                                    </>
+                                )}
+                            </div>
+                            <div className="flex gap-3">
+                                <span>{notice.commentCount || 0} Comments</span>
+                                {canManage && <span>{(notice.readBy || []).length} Reads</span>}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* --- ACTION BAR (Grid Layout for Mobile) --- */}
+                    <div className="grid grid-cols-3 gap-px bg-slate-700/30">
+                        {/* Like Button */}
+                        <button 
+                            onClick={handleToggleLike}
+                            className={`
+                                py-3 text-xs sm:text-sm font-medium transition-colors flex items-center justify-center gap-2 hover:bg-slate-700/50
+                                ${isLiked ? 'text-blue-400' : 'text-slate-400 hover:text-slate-200'}
+                            `}
+                        >
+                            <i className={`${isLiked ? 'fas' : 'far'} fa-thumbs-up ${isLiked ? 'animate-bounce-short' : ''} text-lg`}></i>
+                            Like
+                        </button>
+                        
+                        {/* Comment Button */}
+                        <button 
+                            onClick={() => setShowComments(!showComments)}
+                            className={`
+                                py-3 text-xs sm:text-sm font-medium transition-colors flex items-center justify-center gap-2 hover:bg-slate-700/50
+                                ${showComments ? 'text-blue-400 bg-slate-700/50' : 'text-slate-400 hover:text-slate-200'}
+                            `}
+                        >
+                            <i className="far fa-comment-alt text-lg"></i>
+                            Comment
+                        </button>
+
+                        {/* Read/Status Button */}
+                        {!canManage ? (
+                            <button 
+                                onClick={() => !isRead && onMarkRead(notice)}
+                                disabled={isRead}
+                                className={`
+                                    py-3 text-xs sm:text-sm font-medium transition-colors flex items-center justify-center gap-2 hover:bg-slate-700/50
+                                    ${isRead ? 'text-green-500 cursor-default' : 'text-slate-400 hover:text-slate-200'}
+                                `}
+                            >
+                                <i className={`fas ${isRead ? 'fa-check-double' : 'fa-check'} text-lg`}></i>
+                                {isRead ? 'Seen' : 'Mark Read'}
+                            </button>
+                        ) : (
+                            <div className="flex items-center justify-center text-slate-500 text-xs cursor-default">
+                                Admin View
+                            </div>
+                        )}
+                    </div>
+
+                    {/* --- NEW: LATEST COMMENT PREVIEW (When Collapsed) --- */}
+                    {!showComments && latestComment && (
+                        <div 
+                            className="bg-black/10 px-4 py-3 border-t border-slate-700/30 cursor-pointer hover:bg-slate-800/50 transition-colors group/preview"
+                            onClick={() => setShowComments(true)}
+                        >
+                            <div className="flex gap-2.5 items-start">
+                                {/* Preview Avatar */}
+                                <div className="w-6 h-6 rounded-full bg-slate-700 flex-shrink-0 overflow-hidden border border-slate-600 mt-0.5">
+                                    {(() => {
+                                        const prevAuth = employees ? employees.find(e => e.id === latestComment.userId) : null;
+                                        return prevAuth && prevAuth.photo ? (
+                                            <img src={prevAuth.photo} alt={prevAuth.name} className="w-full h-full object-cover" />
+                                        ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-[8px] text-slate-300 font-bold">{(latestComment.userName || '?').charAt(0)}</div>
+                                        );
+                                    })()}
+                                </div>
+                                
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-baseline gap-2">
+                                        <span className="text-xs font-bold text-slate-300">
+                                            {(() => {
+                                                const prevAuth = employees ? employees.find(e => e.id === latestComment.userId) : null;
+                                                return prevAuth ? prevAuth.name : latestComment.userName;
+                                            })()}
+                                        </span>
+                                        <span className="text-[10px] text-slate-500">{formatCommentTime(latestComment.createdAt)}</span>
+                                    </div>
+                                    <p className="text-xs text-slate-400 line-clamp-1 group-hover/preview:text-slate-300 transition-colors">
+                                        {latestComment.text}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* --- COMMENTS SECTION --- */}
+                    {showComments && (
+                        <div className="bg-black/20 p-4 border-t border-slate-700/50 animate-fade-in">
+                            {/* List */}
+                            <div className="space-y-4 mb-4 max-h-[300px] overflow-y-auto custom-scrollbar pr-1">
+                                {comments.length === 0 && (
+                                    <div className="text-center py-6">
+                                        <p className="text-xs text-slate-500 italic">No comments yet. Be the first!</p>
+                                    </div>
+                                )}
+                                {comments.map(comment => {
+                                    const commenter = employees ? employees.find(e => e.id === comment.userId) : null;
+                                    const displayName = commenter ? commenter.name : comment.userName;
+                                    const displayPhoto = commenter ? commenter.photo : null;
+                                    const isMyComment = comment.userId === userProfile.id;
+
+                                    return (
+                                        <div key={comment.id} className="flex gap-3 group">
+                                            <div className="w-8 h-8 rounded-full bg-slate-700 flex-shrink-0 overflow-hidden border border-slate-600 shadow-sm mt-0.5">
+                                                {displayPhoto ? (
+                                                    <img src={displayPhoto} alt={displayName} className="w-full h-full object-cover" />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center text-[10px] text-slate-300 font-bold">{displayName ? displayName.charAt(0) : '?'}</div>
+                                                )}
+                                            </div>
+                                            
+                                            <div className="flex-1 min-w-0">
+                                                {/* Bubble */}
+                                                <div className={`rounded-2xl px-3.5 py-2.5 relative border ${isMyComment ? 'bg-blue-900/20 border-blue-500/20 rounded-tr-none' : 'bg-slate-700/40 border-slate-600/50 rounded-tl-none'}`}>
                                                     {editingCommentId === comment.id ? (
                                                         <div className="flex flex-col gap-2">
                                                             <input 
                                                                 type="text" 
                                                                 value={editText} 
                                                                 onChange={(e) => setEditText(e.target.value)} 
-                                                                className="input text-xs py-1"
+                                                                className="input text-xs py-1.5 bg-slate-900 border-slate-600 rounded-lg"
                                                                 autoFocus
                                                             />
                                                             <div className="flex gap-2 justify-end">
-                                                                <button onClick={() => setEditingCommentId(null)} className="text-xs text-slate-400 hover:text-white">Cancel</button>
-                                                                <button onClick={() => handleSaveEdit(comment.id)} className="text-xs text-blue-400 hover:text-blue-300 font-bold">Save</button>
+                                                                <button onClick={() => setEditingCommentId(null)} className="text-[10px] font-bold text-slate-400 hover:text-white uppercase">Cancel</button>
+                                                                <button onClick={() => handleSaveEdit(comment.id)} className="text-[10px] font-bold text-blue-400 hover:text-blue-300 uppercase">Save</button>
                                                             </div>
                                                         </div>
                                                     ) : (
-                                                        <div className="pr-2">
-                                                            <p className="text-slate-300 leading-relaxed pr-6">{comment.text}</p>
+                                                        <>
+                                                            <div className="flex justify-between items-baseline mb-0.5">
+                                                                <span className={`text-xs font-bold ${isMyComment ? 'text-blue-300' : 'text-slate-200'}`}>{displayName}</span>
+                                                            </div>
+                                                            <p className="text-sm text-slate-300 leading-snug break-words whitespace-pre-wrap">{comment.text}</p>
+                                                            
+                                                            {/* Context Actions (Hover Only on Desktop / Visible for Owner) */}
                                                             {isMyComment && (
-                                                                <div className="absolute top-1 right-1 flex gap-2 bg-slate-900/50 rounded px-1 backdrop-blur-sm border border-slate-600/50">
-                                                                    <button onClick={(e) => handleStartEdit(comment, e)} className="text-slate-400 hover:text-blue-400 p-1" title="Edit"><i className="fas fa-pencil-alt text-[10px]"></i></button>
-                                                                    <button onClick={(e) => handleDeleteComment(e, comment.id)} className="text-slate-400 hover:text-red-400 p-1" title="Delete"><i className="fas fa-trash text-[10px]"></i></button>
+                                                                <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex bg-slate-800 rounded-lg shadow-sm border border-slate-700">
+                                                                    <button onClick={(e) => handleStartEdit(comment, e)} className="text-slate-400 hover:text-blue-400 p-1.5" title="Edit"><i className="fas fa-pencil-alt text-[10px]"></i></button>
+                                                                    <button onClick={(e) => handleDeleteComment(e, comment.id)} className="text-slate-400 hover:text-red-400 p-1.5" title="Delete"><i className="fas fa-trash text-[10px]"></i></button>
                                                                 </div>
                                                             )}
-                                                        </div>
+                                                        </>
                                                     )}
                                                 </div>
+                                                <div className="ml-2 mt-1 text-[10px] text-slate-500 font-medium">{formatCommentTime(comment.createdAt)}</div>
                                             </div>
-                                        );
-                                    })}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                            
+                            {/* Input Area */}
+                            <form onSubmit={handleAddComment} className="flex items-end gap-2">
+                                <div className="w-8 h-8 rounded-full bg-slate-700 flex-shrink-0 overflow-hidden border border-slate-600 hidden sm:block shadow-sm">
+                                    {userProfile.photo ? (
+                                        <img src={userProfile.photo} alt="Me" className="w-full h-full object-cover" />
+                                    ) : (
+                                        <div className="w-full h-full flex items-center justify-center text-xs text-slate-300 font-bold">{userProfile.name.charAt(0)}</div>
+                                    )}
                                 </div>
-                                <form onSubmit={handleAddComment} className="flex gap-2">
-                                    <input 
-                                        type="text" 
+                                <div className="flex-1 relative">
+                                    <textarea 
                                         value={newComment}
                                         onChange={(e) => setNewComment(e.target.value)}
-                                        className="input text-base sm:text-sm py-2" 
+                                        className="w-full bg-slate-800 border border-slate-700 rounded-2xl py-2.5 pl-4 pr-10 text-sm text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 placeholder-slate-500 transition-all resize-none overflow-hidden min-h-[42px]"
                                         placeholder="Write a comment..." 
+                                        rows="1"
+                                        onInput={(e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; }}
                                         disabled={isSubmittingComment}
                                     />
                                     <button 
                                         type="submit" 
                                         disabled={!newComment.trim() || isSubmittingComment}
-                                        className="bg-blue-600 hover:bg-blue-500 text-white rounded-lg px-3 py-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        className="absolute right-2 bottom-2 w-8 h-8 flex items-center justify-center rounded-full text-blue-500 hover:bg-blue-500/10 transition-all disabled:opacity-30 disabled:hover:bg-transparent"
                                     >
-                                        <i className="fas fa-paper-plane text-xs"></i>
+                                        <i className={`fas ${isSubmittingComment ? 'fa-spinner fa-spin' : 'fa-paper-plane'}`}></i>
                                     </button>
-                                </form>
-                            </div>
-                        )}
-                    </div>
+                                </div>
+                            </form>
+                        </div>
+                    )}
 
-                    {/* NEW: Updated Likers Modal with Photos (Code same as previously provided, omitted for brevity) */}
+                    {/* Likes Modal */}
                     {showLikesModal && (
                         <Modal isOpen={showLikesModal} onClose={() => setShowLikesModal(false)} maxWidth="max-w-sm">
-                            <ModalHeader title="Liked By" onClose={() => setShowLikesModal(false)} />
+                            <ModalHeader title="People who liked this" onClose={() => setShowLikesModal(false)} />
                             <ModalBody>
                                 <div className="flex flex-col gap-2 max-h-60 overflow-y-auto custom-scrollbar">
                                     {likers.length > 0 ? (
                                         likers.map((person, idx) => (
-                                            <div key={idx} className="flex items-center gap-3 p-2 rounded bg-slate-700/30 border border-slate-600/30">
-                                                <div className="w-8 h-8 rounded-full bg-slate-600 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden border border-slate-500">
+                                            <div key={idx} className="flex items-center gap-3 p-2 hover:bg-slate-700/30 rounded-lg transition-colors">
+                                                <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 overflow-hidden border border-slate-600">
                                                     {person.photo ? (
                                                         <img src={person.photo} alt={person.name} className="w-full h-full object-cover" />
                                                     ) : (
                                                         person.name.charAt(0)
                                                     )}
                                                 </div>
-                                                <span className="text-sm text-slate-200">{person.name}</span>
+                                                <span className="text-sm font-semibold text-slate-200">{person.name}</span>
                                             </div>
                                         ))
                                     ) : (
-                                        <p className="text-slate-500 text-sm text-center">No likes yet.</p>
+                                        <p className="text-slate-500 text-sm text-center py-4">No likes yet.</p>
                                     )}
                                 </div>
                             </ModalBody>
@@ -17540,9 +17899,9 @@
         });
 
         // UPDATED: Added Memo Management (Create/Edit/Delete) directly here
-        const NoticeBoardTab = ({ userProfile }) => {
+        const NoticeBoardTab = ({ userProfile, pageParams }) => { // Added pageParams
             const { db } = useFirebase();
-            const { collection, addDoc, updateDoc, doc, deleteDoc, serverTimestamp, orderBy, query, onSnapshot, arrayUnion } = window.firebaseSDK; // Destructure all needed
+            const { collection, addDoc, updateDoc, doc, deleteDoc, serverTimestamp, orderBy, query, onSnapshot, arrayUnion } = window.firebaseSDK; 
             const { employees } = useAppData(); 
             
             const [allNotices, setAllNotices] = useState([]);
@@ -17556,8 +17915,7 @@
             const [editingMemo, setEditingMemo] = useState(null);
             const [memoToDelete, setMemoToDelete] = useState(null);
 
-            // OPTIMIZATION: Separated data fetching from filtering
-            // 1. Fetch ALL memos ordered by date (Data Layer)
+            // Fetch Data
             useEffect(() => {
                 if (!db) return;
                 setLoading(true);
@@ -17574,21 +17932,15 @@
                 });
 
                 return () => unsubscribe();
-            }, [db]); // Only re-run if DB changes (init), not on user profile changes
+            }, [db]);
 
-            // 2. Filter notices based on User Profile (Presentation Layer)
-            // This runs efficiently in memory when userProfile changes, without re-fetching from DB
+            // Filter notices
             const visibleNotices = useMemo(() => {
                 if (!userProfile) return [];
                 
                 return allNotices.filter(n => {
-                    // Admin/CEO/Manager sees everything so they can manage them
                     if (userProfile.role !== 'Staff') return true;
-
-                    // Staff: Only show Active
                     if (n.status !== 'Active') return false;
-
-                    // Staff: Shop Targeting Check
                     if (!n.targetShops || n.targetShops.length === 0) return true;
                     
                     const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
@@ -17596,88 +17948,95 @@
                 });
             }, [allNotices, userProfile]);
 
-            // Handler: Mark as Read
+            // Handlers (Mark Read, Save, Delete) - Kept same as before
             const handleMarkAsRead = useCallback(async (notice) => {
                 if (!userProfile?.id) return;
                 try {
                     const noticeRef = doc(db, 'memoAlerts', notice.id);
-                    await updateDoc(noticeRef, {
-                        readBy: arrayUnion(userProfile.id)
-                    });
-                } catch (error) {
-                    console.error("Error marking notice as read:", error);
-                    alert("Failed to acknowledge. Please try again.");
-                }
+                    await updateDoc(noticeRef, { readBy: arrayUnion(userProfile.id) });
+                } catch (error) { console.error("Error marking read:", error); }
             }, [db, userProfile?.id]);
 
-            // NEW: Handler to Save Memo (Create/Update)
             const handleSaveMemo = async (formData) => {
                 const { id, ...dataToSave } = formData;
-                // Add author info if new
                 if (!id) {
                     dataToSave.authorId = userProfile.id;
                     dataToSave.authorName = userProfile.name;
-                    dataToSave.readBy = []; // Reset read stats for new memo
-                    dataToSave.likes = []; // Initialize likes
+                    dataToSave.readBy = [];
+                    dataToSave.likes = [];
+                    dataToSave.commentCount = 0; // Initialize comment count
                 }
 
                 try {
-                    if (id) {
-                        await updateDoc(doc(db, 'memoAlerts', id), { ...dataToSave, updatedAt: serverTimestamp() });
-                    } else {
-                        await addDoc(collection(db, 'memoAlerts'), { ...dataToSave, createdAt: serverTimestamp() });
-                    }
+                    if (id) await updateDoc(doc(db, 'memoAlerts', id), { ...dataToSave, updatedAt: serverTimestamp() });
+                    else await addDoc(collection(db, 'memoAlerts'), { ...dataToSave, createdAt: serverTimestamp() });
                     setIsCreateModalOpen(false);
                     setEditingMemo(null);
-                } catch (error) {
-                    console.error("Error saving memo:", error);
-                    alert("Failed to save memo.");
-                }
+                } catch (error) { console.error("Error saving memo:", error); alert("Failed to save memo."); }
             };
 
-            // NEW: Handler to Delete Memo
             const handleDeleteMemo = async () => {
                 if (!memoToDelete) return;
                 try {
                     await deleteDoc(doc(db, 'memoAlerts', memoToDelete.id));
                     setMemoToDelete(null);
-                } catch (error) {
-                    console.error("Error deleting memo:", error);
-                    alert("Failed to delete memo.");
-                }
+                } catch (error) { console.error("Error deleting memo:", error); alert("Failed to delete memo."); }
             };
 
             const canManage = userProfile.role === 'Admin' || userProfile.role === 'CEO' || userProfile.role === 'Shop Manager';
 
+            // OPTIMIZED LAYOUT: Responsive Width (max-w-2xl) and Sticky Header
             return (
-                <div className="space-y-6 animate-fade-in pb-10">
-                    <PageHeader title="Company Notice Board">
+                <div className="animate-fade-in pb-24 w-full max-w-2xl mx-auto px-0 sm:px-4">
+                    {/* MODIFIED: Header Area - Static (Scrolls with content instead of sticky) */}
+                    <div className="flex items-center justify-between py-3 sm:py-4 px-3 sm:px-0 mb-4">
                         <div className="flex items-center gap-3">
-                            <span className="text-xs text-slate-500 hidden sm:inline">
-                                <i className="fas fa-info-circle mr-1"></i> Announcements & Updates
-                            </span>
-                            {/* NEW: Add Memo Button as Icon Logo */}
-                            {canManage && (
-                                <button 
-                                    onClick={() => { setEditingMemo(null); setIsCreateModalOpen(true); }}
-                                    className="bg-yellow-500 hover:bg-yellow-400 text-slate-900 w-8 h-8 rounded-full flex items-center justify-center shadow-lg transition-transform hover:scale-110"
-                                    title="Add New Memo"
-                                >
-                                    <i className="fas fa-plus text-sm font-bold"></i>
-                                </button>
-                            )}
+                            <div className="p-2 bg-gradient-to-br from-blue-500/20 to-purple-500/20 rounded-lg border border-white/5 shadow-sm">
+                                <i className="fas fa-bullhorn text-blue-400"></i>
+                            </div>
+                            <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">Notice Feed</h2>
                         </div>
-                    </PageHeader>
+                        {canManage && (
+                            <Button 
+                                onClick={() => { setEditingMemo(null); setIsCreateModalOpen(true); }}
+                                variant="primary"
+                                className="shadow-lg shadow-blue-500/20 text-xs sm:text-sm py-2 px-4 rounded-xl font-bold tracking-wide transform active:scale-95 transition-transform"
+                            >
+                                <i className="fas fa-plus mr-1.5"></i> Post
+                            </Button>
+                        )}
+                    </div>
+
+                    {/* OPTIMIZED: Create Post Prompt */}
+                    {canManage && (
+                        <div 
+                            onClick={() => { setEditingMemo(null); setIsCreateModalOpen(true); }}
+                            className="bg-slate-800 rounded-2xl p-4 flex gap-3 items-center cursor-pointer border border-slate-700 hover:border-slate-600 hover:bg-slate-750 transition-all shadow-md active:scale-[0.99] group mx-3 sm:mx-0 mb-6"
+                        >
+                            <div className="w-10 h-10 rounded-full bg-slate-700 overflow-hidden border-2 border-slate-600 group-hover:border-slate-500 transition-colors">
+                                {userProfile.photo ? (
+                                    <img src={userProfile.photo} alt={userProfile.name} className="w-full h-full object-cover" />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center font-bold text-slate-400">{userProfile.name.charAt(0)}</div>
+                                )}
+                            </div>
+                            <div className="flex-1 bg-slate-900/60 rounded-full px-5 py-2.5 text-sm text-slate-500 hover:bg-slate-900 transition-colors border border-transparent hover:border-slate-700 truncate">
+                                What's on your mind, {userProfile.name}?
+                            </div>
+                        </div>
+                    )}
 
                     {loading ? (
                         <div className="text-center py-20"><i className="fas fa-spinner fa-spin text-3xl text-blue-500"></i></div>
                     ) : (
-                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div className="space-y-4 px-2 sm:px-0">
                             {visibleNotices.length === 0 ? (
-                                <div className="col-span-full text-center py-20 opacity-50 bg-slate-800/50 rounded-xl border border-slate-700 border-dashed">
-                                    <i className="fas fa-bullhorn text-4xl text-slate-600 mb-4"></i>
-                                    <p className="text-lg text-slate-300">No notices at this time.</p>
-                                    {canManage && <p className="text-sm text-slate-500 mt-2">Click the + button to create one.</p>}
+                                <div className="text-center py-20 opacity-60 bg-slate-800/30 rounded-2xl border border-slate-700 border-dashed mx-4 sm:mx-0">
+                                    <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4 shadow-inner">
+                                        <i className="fas fa-newspaper text-3xl text-slate-600"></i>
+                                    </div>
+                                    <p className="text-lg font-medium text-slate-300">No updates yet.</p>
+                                    <p className="text-sm text-slate-500 mt-1">Check back later for company news.</p>
                                 </div>
                             ) : (
                                 visibleNotices.map(notice => (
@@ -17698,26 +18057,9 @@
                     )}
                     
                     {/* Modals */}
-                    <ReadStatsModal 
-                        isOpen={!!statsNotice} 
-                        onClose={() => setStatsNotice(null)} 
-                        notice={statsNotice} 
-                    />
-                    
-                    <MemoAlertModal 
-                        isOpen={isCreateModalOpen} 
-                        onClose={() => { setIsCreateModalOpen(false); setEditingMemo(null); }} 
-                        onSave={handleSaveMemo} 
-                        memo={editingMemo} 
-                    />
-
-                    <ConfirmationModal 
-                        isOpen={!!memoToDelete} 
-                        onClose={() => setMemoToDelete(null)} 
-                        onConfirm={handleDeleteMemo} 
-                        title="Delete Memo" 
-                        message={`Are you sure you want to delete "${memoToDelete?.title}"?`} 
-                    />
+                    <ReadStatsModal isOpen={!!statsNotice} onClose={() => setStatsNotice(null)} notice={statsNotice} />
+                    <MemoAlertModal isOpen={isCreateModalOpen} onClose={() => { setIsCreateModalOpen(false); setEditingMemo(null); }} onSave={handleSaveMemo} memo={editingMemo} />
+                    <ConfirmationModal isOpen={!!memoToDelete} onClose={() => setMemoToDelete(null)} onConfirm={handleDeleteMemo} title="Delete Post" message="Are you sure you want to delete this post?" />
                 </div>
             );
         };
