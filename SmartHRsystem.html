@@ -5235,7 +5235,10 @@
                         let tasks = snapshot.docs.map(d => d.data());
 
                         // 3. Client-Side Filtering (Robustness Fix)
-                        if (selectedShop) {
+                        if (userProfile.role === 'Staff') {
+                            // STRICT: Staff only see their own data, regardless of shop filter
+                            tasks = tasks.filter(t => t.staffId === userProfile.id);
+                        } else if (selectedShop) {
                             tasks = tasks.filter(t => t.shopName === selectedShop);
                         } else if (userProfile.role === 'Shop Manager') {
                             const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
@@ -5245,8 +5248,6 @@
                             } else {
                                 tasks = []; // Manager with no shops sees nothing
                             }
-                        } else if (userProfile.role === 'Staff') {
-                            tasks = tasks.filter(t => t.staffId === userProfile.id);
                         }
 
                         // 4. Process Data: Group by Staff -> Group by KPI
@@ -5447,7 +5448,11 @@
                                                             'bg-red-500/10 border-red-500/20 text-red-300'
                                                         }`}>
                                                             <span className="font-medium">{kpi.name}</span>
-                                                            <span className="font-bold bg-black/20 px-1.5 rounded">{kpi.avg}%</span>
+                                                            {/* MODIFIED: Added Task Count next to Score */}
+                                                            <div className="flex items-center gap-1 bg-black/20 px-1.5 rounded">
+                                                                <span className="font-bold">{kpi.avg}%</span>
+                                                                <span className="text-[10px] opacity-80" title="Total Tasks">({kpi.count})</span>
+                                                            </div>
                                                         </div>
                                                     ))}
                                                 </div>
@@ -13428,11 +13433,14 @@
                 const calculate = () => {
                     const start = task.progressTimestamp.toDate ? task.progressTimestamp.toDate() : new Date(task.progressTimestamp);
                     const now = new Date();
-                    const diffMs = Math.max(0, now - start); // Ensure no negative time
+                    const diffMs = Math.max(0, now - start); // Current session duration
                     
-                    const seconds = Math.floor((diffMs / 1000) % 60);
-                    const minutes = Math.floor((diffMs / (1000 * 60)) % 60);
-                    const hours = Math.floor((diffMs / (1000 * 60 * 60)));
+                    // NEW: Add previously accumulated time (if any)
+                    const totalMs = diffMs + (task.accumulatedTime || 0);
+                    
+                    const seconds = Math.floor((totalMs / 1000) % 60);
+                    const minutes = Math.floor((totalMs / (1000 * 60)) % 60);
+                    const hours = Math.floor((totalMs / (1000 * 60 * 60)));
 
                     // Format with leading zeros (HH:MM:SS)
                     const formatted = [
@@ -13454,13 +13462,23 @@
 
         // Helper Hook: Static duration for completed phases
         const useTaskDuration = (task) => {
+            // MODIFIED: Use accumulatedTime if available (Source of Truth for Multi-session tasks)
+            if (task.accumulatedTime) {
+                const totalMs = task.accumulatedTime;
+                const diffMins = Math.floor(totalMs / 60000);
+                const hours = Math.floor(diffMins / 60);
+                const mins = diffMins % 60;
+                return `${hours}h ${mins}m`;
+            }
+
+            // Fallback for legacy tasks without accumulatedTime
             if (task.status === KANBAN_STATUS.AUDITING && task.progressTimestamp && task.workCompletedTimestamp) {
-                const start = task.progressTimestamp.toDate();
-                const end = task.workCompletedTimestamp.toDate();
+                const start = task.progressTimestamp.toDate ? task.progressTimestamp.toDate() : new Date(task.progressTimestamp);
+                const end = task.workCompletedTimestamp.toDate ? task.workCompletedTimestamp.toDate() : new Date(task.workCompletedTimestamp);
                 const diffMins = Math.floor((end - start) / 60000);
                 const hours = Math.floor(diffMins / 60);
                 const mins = diffMins % 60;
-                return `${hours}h ${mins}m`; // MODIFIED: Removed "(Work Time)" suffix
+                return `${hours}h ${mins}m`; 
             }
             return null;
         };
@@ -13874,19 +13892,22 @@
                     const now = new Date();
                     const { updateDoc, doc, serverTimestamp } = window.firebaseSDK;
 
-                    // Filter for tasks that are IN_PROGRESS and started > 10 hours ago
+                    // Filter for tasks that are IN_PROGRESS and Total Time > 10 hours
                     const overdueTasks = tasks.filter(t => {
                         if (t.status !== KANBAN_STATUS.IN_PROGRESS || !t.progressTimestamp) return false;
                         
                         const start = t.progressTimestamp.toDate ? t.progressTimestamp.toDate() : new Date(t.progressTimestamp);
-                        const diffMs = now - start;
-                        const diffHours = diffMs / (1000 * 60 * 60);
+                        const currentSessionMs = Math.max(0, now - start);
                         
-                        return diffHours > 10;
+                        // MODIFIED: Calculate TOTAL accumulated time
+                        const totalMs = currentSessionMs + (t.accumulatedTime || 0);
+                        const totalHours = totalMs / (1000 * 60 * 60);
+                        
+                        return totalHours > 10;
                     });
 
                     if (overdueTasks.length > 0) {
-                        console.log(`[Auto-Bot] Rejecting ${overdueTasks.length} overdue tasks (>10h)...`);
+                        console.log(`[Auto-Bot] Rejecting ${overdueTasks.length} overdue tasks (>10h Total Work Time)...`);
                         
                         // Process rejections
                         await Promise.all(overdueTasks.map(t => 
@@ -13894,8 +13915,8 @@
                                 status: KANBAN_STATUS.DONE, // Move to Done/History
                                 completedTimestamp: serverTimestamp(),
                                 auditScore: 'Rejected',
-                                // MODIFIED: Simplified comment as requested
-                                auditComment: 'Task over Due Time!',
+                                // MODIFIED: More specific comment
+                                auditComment: 'Auto-Rejected: Total Work Time exceeded 10 hours limit.',
                                 auditorName: 'System Auto-Bot'
                             }).catch(err => console.error("Failed to auto-reject task:", t.id, err))
                         ));
@@ -14024,8 +14045,27 @@
 
                     if (action === 'move') {
                         updateData.status = payload.newStatus;
-                        if (payload.newStatus === KANBAN_STATUS.IN_PROGRESS) updateData.progressTimestamp = serverTimestamp();
-                        if (payload.newStatus === KANBAN_STATUS.AUDITING) updateData.workCompletedTimestamp = serverTimestamp();
+                        
+                        // NEW LOGIC: Time Accumulation
+                        if (payload.newStatus === KANBAN_STATUS.IN_PROGRESS) {
+                            // Starting or Resuming work
+                            updateData.progressTimestamp = serverTimestamp();
+                            // Note: We DO NOT reset accumulatedTime here. We keep it to add to the new session.
+                        }
+                        
+                        if (payload.newStatus === KANBAN_STATUS.AUDITING) {
+                            // Stopping work (Submitting)
+                            updateData.workCompletedTimestamp = serverTimestamp();
+                            
+                            // Calculate session duration and add to total
+                            if (task.progressTimestamp) {
+                                const start = task.progressTimestamp.toDate ? task.progressTimestamp.toDate() : new Date(task.progressTimestamp);
+                                const sessionDuration = Date.now() - start.getTime();
+                                const previousAccumulated = task.accumulatedTime || 0;
+                                updateData.accumulatedTime = previousAccumulated + sessionDuration;
+                            }
+                        }
+
                         if (payload.comment) updateData.auditComment = payload.comment; 
                     } 
                     else if (action === 'approve') {
@@ -15924,6 +15964,78 @@
             );
         };
 
+        // --- NEW WIDGET: MY PROFILE (Staff Personal Info) ---
+        const MyProfileWidget = memo(({ userProfile, currentSalary }) => {
+            const joinedDate = userProfile.joinedDate;
+            const duration = Utils.calculateWorkedDuration(joinedDate);
+            const shopName = Array.isArray(userProfile.shop) ? userProfile.shop[0] : userProfile.shop;
+
+            return (
+                <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg p-5 relative overflow-hidden group">
+                    {/* Background Decor */}
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 rounded-full blur-2xl -mr-10 -mt-10 pointer-events-none"></div>
+                    
+                    <div className="flex flex-col sm:flex-row gap-6 items-center sm:items-start relative z-10">
+                        {/* Avatar & Basic Info */}
+                        <div className="flex items-center gap-4 w-full sm:w-auto border-b sm:border-b-0 sm:border-r border-slate-800 pb-4 sm:pb-0 sm:pr-6">
+                            <div className="w-16 h-16 rounded-full bg-slate-800 p-1 border border-slate-700 shadow-sm shrink-0">
+                                <div className="w-full h-full rounded-full overflow-hidden bg-slate-700 flex items-center justify-center">
+                                    {userProfile.photo ? (
+                                        <img src={userProfile.photo} alt={userProfile.name} className="w-full h-full object-cover" />
+                                    ) : (
+                                        <span className="text-xl font-bold text-slate-500">{userProfile.name.charAt(0)}</span>
+                                    )}
+                                </div>
+                            </div>
+                            <div>
+                                <h3 className="text-lg font-bold text-white leading-tight">{userProfile.name}</h3>
+                                <p className="text-sm text-blue-400 font-medium mb-0.5">{userProfile.position}</p>
+                                <div className="flex items-center gap-2 text-xs text-slate-500">
+                                    <i className="fas fa-store"></i> {shopName}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Details Grid */}
+                        <div className="flex-1 grid grid-cols-2 lg:grid-cols-4 gap-4 w-full">
+                            {/* Salary */}
+                            <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
+                                <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1">Current Salary</p>
+                                <p className="text-lg font-bold text-green-400">{Utils.formatCurrency(currentSalary)}</p>
+                            </div>
+
+                            {/* Shift */}
+                            <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
+                                <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1">Shift</p>
+                                <div className="flex items-center gap-2">
+                                    <i className="fas fa-clock text-purple-400 text-xs"></i>
+                                    <p className="text-base font-bold text-slate-200">{userProfile.shift || 'N/A'}</p>
+                                </div>
+                            </div>
+
+                            {/* Joined Date */}
+                            <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
+                                <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1">Joined Date</p>
+                                <div className="flex items-center gap-2">
+                                    <i className="fas fa-calendar-check text-blue-400 text-xs"></i>
+                                    <p className="text-sm font-semibold text-slate-200">{Utils.formatISOToDisplay(joinedDate)}</p>
+                                </div>
+                            </div>
+
+                            {/* Worked Duration */}
+                            <div className="bg-slate-800/50 p-3 rounded-xl border border-slate-700/50">
+                                <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-1">Tenure</p>
+                                <div className="flex items-center gap-2">
+                                    <i className="fas fa-hourglass-half text-orange-400 text-xs"></i>
+                                    <p className="text-xs font-semibold text-slate-200">{duration}</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        });
+
         // --- NEW WIDGET: Staff Performance Breakdown (Redesigned) ---
         const StaffPerformanceWidget = ({ stats, loading, onNavigate }) => {
             // ... (keep existing code) ...
@@ -16239,6 +16351,9 @@
             
             // --- NEW: Upcoming Meetings State (Initialized from Cache) ---
             const [upcomingMeetings, setUpcomingMeetings] = useState(() => getCachedState('upcomingMeetings', []));
+            
+            // --- NEW: Current Salary State (For Staff Dashboard) ---
+            const [currentSalary, setCurrentSalary] = useState(0);
 
             // FIX: Create stable handler for KPI navigation to prevent widget re-renders
             const handleScorecardNav = useCallback(() => {
@@ -16604,9 +16719,12 @@
                             // C. Fetch Active Memos
                             const memosQ = query(collection(db, 'memoAlerts'), where('status', '==', 'Active'));
 
+                            // D. Fetch Salary Revisions (For Current Salary Display)
+                            const revQ = query(collection(db, 'salaryRevisions'), where('staffId', '==', userProfile.id), where('status', '==', 'Approved'));
+
                             // Execute all queries
-                            const [attSnap, stateSnap, otSnap, rLeaveSnap, rOtSnap, memoSnap] = await Promise.all([
-                                getDocs(attQ), getDocs(stateQ), getDocs(otQ), getDocs(recentLeaveQ), getDocs(recentOtQ), getDocs(memosQ)
+                            const [attSnap, stateSnap, otSnap, rLeaveSnap, rOtSnap, memoSnap, revSnap] = await Promise.all([
+                                getDocs(attQ), getDocs(stateQ), getDocs(otQ), getDocs(recentLeaveQ), getDocs(recentOtQ), getDocs(memosQ), getDocs(revQ)
                             ]);
 
                             // Process Stats
@@ -16627,6 +16745,19 @@
                             const myStatsData = { workDays: uniqueDays.size, lateCount: lates, otDays: otTotal, engagementAmount: totalEngagementAmount };
                             setMyStats(myStatsData);
                             setCachedState('myStats', myStatsData); // Update Cache
+
+                            // Process Salary Revisions
+                            const todayStr = new Date().toISOString().slice(0, 10);
+                            const revisions = revSnap.docs.map(d => d.data())
+                                .filter(r => r.effectiveDate <= todayStr) // Only effective revisions
+                                .sort((a,b) => b.effectiveDate.localeCompare(a.effectiveDate)); // Latest first
+                            
+                            // Use latest revision or base salary
+                            const calculatedSalary = revisions.length > 0 
+                                ? revisions[0].updatedSalary 
+                                : (parseFloat(String(userProfile.salary).replace(/[^0-9.-]/g, '')) || 0);
+                            
+                            setCurrentSalary(calculatedSalary);
 
                             // Process Requests (Sort & Limit in JavaScript)
                             const leaveReqs = rLeaveSnap.docs.map(d => ({ ...d.data(), type: 'Leave', date: d.data().requestDate }));
@@ -16970,6 +17101,9 @@
             // --- VIEW 2: EMPLOYEE (STAFF) DASHBOARD ---
             return (
                 <div className="space-y-6 animate-fade-in pb-10">
+                    {/* NEW: My Profile Widget */}
+                    <MyProfileWidget userProfile={userProfile} currentSalary={currentSalary} />
+
                     {/* MODIFIED: Changed to grid-cols-2 (2 columns) on mobile with smaller gap (gap-3) */}
                     <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
                         <DashboardMetricCard title="Work Days" value={myStats.workDays} subtitle="This Month" icon="fa-calendar-check" color="blue" />
