@@ -1870,6 +1870,9 @@
         }, 0);
         }, [auditedItems, exchangeRate]);
 
+        const totalColumnKHR = useMemo(() => auditedItems.reduce((sum, item) => sum + (parseFloat(item.auditedTotalKHR) || 0), 0), [auditedItems]);
+        const totalColumnUSD = useMemo(() => auditedItems.reduce((sum, item) => sum + (parseFloat(item.auditedTotalUSD) || 0), 0), [auditedItems]);
+
         const handleSaveAudit = async () => {
             if (!exchangeRate || !auditedByName) {
                 setModalInfo({ show: true, title: 'Validation Error', message: 'Please enter exchange rate and auditor name.', isError: true });
@@ -2064,6 +2067,7 @@
                             <tr>
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No</th>
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Product Code</th>
+                                <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Barcode</th>
                                 <th className="px-2 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Name</th>
                                 <th className="px-2 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Selling Price</th>
                                 <th className="px-2 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Total QTY</th>
@@ -2096,6 +2100,7 @@
                                 <tr key={index} className="hover:bg-slate-700/50">
                                     <td className="px-2 py-2 text-slate-400">{index + 1}</td>
                                     <td className="px-2 py-2 text-slate-300">{item.code}</td>
+                                    <td className="px-2 py-2 text-slate-300">{item.barcode || ''}</td>
                                     <td className="px-2 py-2 text-slate-300">{item.name}</td>
                                     <td className="px-2 py-2 text-slate-300 text-right">{khrFormatter.format(item.price)}</td>
                                     <td className="px-2 py-2 text-slate-400 text-center">{item.originalQuantity}</td>
@@ -2119,8 +2124,14 @@
                             )})}
                         </tbody>
                         <tfoot className="bg-slate-900/50">
+                            <tr className="border-t border-slate-700">
+                                <td colSpan="8" className="px-2 py-3 text-right font-bold text-slate-400 uppercase">Totals</td>
+                                <td className="px-2 py-3 text-right font-bold text-slate-300">{khrFormatter.format(totalColumnKHR)}</td>
+                                <td className="px-2 py-3 text-right font-bold text-slate-300">{usdFormatter.format(totalColumnUSD)}</td>
+                                <td colSpan="2"></td>
+                            </tr>
                             <tr>
-                                <td colSpan="10" className="px-2 py-3 text-right font-bold text-slate-300 uppercase">Audited Grand Total (KHR)</td>
+                                <td colSpan="11" className="px-2 py-3 text-right font-bold text-slate-300 uppercase">Audited Grand Total (KHR)</td>
                                 <td className="px-2 py-3 text-right font-bold text-slate-200">៛{khrFormatter.format(totalAuditedAmountKHR.toFixed(2))}</td>
                             </tr>
                         </tfoot>
@@ -4208,30 +4219,106 @@
                         if (json.length === 0) throw new Error("File is empty or wrong format.");
                         
                         let created = 0, updated = 0, errors = 0;
+                        const managedShops = shops.filter(s => s.manageStock); // Get managed shops to check for columns
+
                         for (const row of json) {
                             try {
-                                if (!row.code || !row.vendorName) { errors++; continue; }
-                                const vendor = vendors.find(v => v.name === row.vendorName);
-                                if (!vendor) { errors++; continue; }
-                                const productData = {
-                                    code: row.code, barcode: row.barcode || '', name: row.name || '',
-                                    vendorId: vendor.id, vendorName: vendor.name, cost: parseFloat(row.cost) || 0,
-                                    price: parseFloat(row.price) || 0, note: row.note || '', stockByShop: {}
-                                };
+                                if (!row.code) { errors++; continue; } // Code is mandatory
+
+                                // Helper to find vendor if provided
+                                let vendorId = '';
+                                let vendorName = '';
+                                if (row.vendorName) {
+                                    const vendor = vendors.find(v => v.name === row.vendorName);
+                                    if (vendor) {
+                                        vendorId = vendor.id;
+                                        vendorName = vendor.name;
+                                    }
+                                }
+
                                 const productQuery = await db.collection("products").where("code", "==", row.code).limit(1).get();
+                                
                                 if (!productQuery.empty) {
-                                    await db.collection("products").doc(productQuery.docs[0].id).update(productData);
+                                    // --- UPDATE LOGIC (FIXED) ---
+                                    const docId = productQuery.docs[0].id;
+                                    const existingData = productQuery.docs[0].data();
+                                    const updateData = {};
+
+                                    // Only update basic fields if they exist in the Excel row
+                                    if (row.barcode !== undefined) updateData.barcode = row.barcode;
+                                    if (row.name !== undefined) updateData.name = row.name;
+                                    if (row.cost !== undefined) updateData.cost = parseFloat(row.cost) || 0;
+                                    if (row.price !== undefined) updateData.price = parseFloat(row.price) || 0;
+                                    if (row.note !== undefined) updateData.note = row.note;
+                                    
+                                    // Update vendor only if a valid new vendor is provided
+                                    if (vendorId) {
+                                        updateData.vendorId = vendorId;
+                                        updateData.vendorName = vendorName;
+                                    }
+
+                                    // --- CRITICAL STOCK FIX ---
+                                    // Merge existing stock with any new stock values found in the Excel columns.
+                                    // If the Excel does not have a column for a shop, keep the existing stock.
+                                    let newStockByShop = { ...(existingData.stockByShop || {}) };
+                                    let hasStockUpdate = false;
+
+                                    managedShops.forEach(shop => {
+                                        // Check if the shop name exists as a column in the row
+                                        if (row[shop.name] !== undefined && row[shop.name] !== null && row[shop.name] !== '') {
+                                            newStockByShop[shop.id] = parseInt(row[shop.name]) || 0;
+                                            hasStockUpdate = true;
+                                        }
+                                    });
+
+                                    // Only include stockByShop in the update if we actually found stock columns to update.
+                                    // Otherwise, we leave the existing stockByShop field entirely alone.
+                                    if (hasStockUpdate) {
+                                        updateData.stockByShop = newStockByShop;
+                                    }
+
+                                    await db.collection("products").doc(docId).update(updateData);
                                     updated++;
                                 } else {
-                                    // --- FIX START: Add creator info for imported new products ---
-                                    productData.createdByName = userProfile.name;
-                                    productData.createdByUID = userProfile.uid;
-                                    productData.createdAt = firebase.firestore.FieldValue.serverTimestamp();
-                                    // --- FIX END ---
+                                    // --- CREATE LOGIC ---
+                                    // For new products, vendor is required
+                                    if (!vendorId && row.vendorName) { 
+                                        // Try to find vendor again or skip if missing
+                                        const v = vendors.find(v => v.name === row.vendorName);
+                                        if (!v) { errors++; continue; }
+                                        vendorId = v.id; vendorName = v.name;
+                                    } else if (!vendorId) {
+                                        errors++; continue;
+                                    }
+
+                                    const initialStock = {};
+                                    managedShops.forEach(shop => {
+                                        if (row[shop.name] !== undefined) {
+                                            initialStock[shop.id] = parseInt(row[shop.name]) || 0;
+                                        }
+                                    });
+
+                                    const productData = {
+                                        code: row.code, 
+                                        barcode: row.barcode || '', 
+                                        name: row.name || '',
+                                        vendorId: vendorId, 
+                                        vendorName: vendorName, 
+                                        cost: parseFloat(row.cost) || 0,
+                                        price: parseFloat(row.price) || 0, 
+                                        note: row.note || '', 
+                                        stockByShop: initialStock,
+                                        createdByName: userProfile.name,
+                                        createdByUID: userProfile.uid,
+                                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                                    };
                                     await db.collection("products").add(productData);
                                     created++;
                                 }
-                            } catch { errors++; }
+                            } catch (e) { 
+                                console.error("Error processing row", e);
+                                errors++; 
+                            }
                         }
                         handleAction('show-message', { title: 'Import Complete', message: `${created} created, ${updated} updated, ${errors} failed.` });
                         resolve();
@@ -4262,7 +4349,42 @@
         };
 
         const handleDownloadTemplate = () => {
-            const ws = XLSX.utils.json_to_sheet([{ code: 'P001', barcode: '885000000001', name: 'Sample Product', vendorName: 'Sample Vendor', cost: 10000, price: 15000, note: 'Sample' }]);
+            // Get shops that manage stock
+            const managedShops = shops.filter(s => s.manageStock);
+            
+            // Create a sample row with basic fields
+            const sampleRow = { 
+                code: 'P001', 
+                barcode: '885000000001', 
+                name: 'Sample Product', 
+                vendorName: 'Sample Vendor', 
+                cost: 10000, 
+                price: 15000, 
+                note: 'Sample' 
+            };
+
+            // Dynamically add a column for each managed shop with a sample value of 0
+            managedShops.forEach(shop => {
+                sampleRow[shop.name] = 0;
+            });
+
+            const ws = XLSX.utils.json_to_sheet([sampleRow]);
+            
+            // Set nice column widths
+            const wscols = [
+                {wch: 15}, // Code
+                {wch: 15}, // Barcode
+                {wch: 30}, // Name
+                {wch: 20}, // Vendor
+                {wch: 10}, // Cost
+                {wch: 10}, // Price
+                {wch: 20}  // Note
+            ];
+            // Add width for each shop column
+            managedShops.forEach(() => wscols.push({wch: 15}));
+            
+            ws['!cols'] = wscols;
+
             const wb = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wb, ws, "Products");
             XLSX.writeFile(wb, "product_import_template.xlsx");
