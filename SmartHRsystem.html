@@ -1022,13 +1022,17 @@
         // NEW: Centralized Payroll Calculator Hook
         // MODIFIED: Added 'savingsWithdrawals' as a new argument and to the dependency array
         // MODIFIED (STEP 5): Added 'savingsData' as a new argument
-        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData) => {
+        // MODIFIED (Optimization): Added 'isEnabled' to prevent calculation when hidden
+        const usePayrollCalculator = (employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData, isEnabled = true) => {
             return useMemo(() => {
+                // Optimization: Skip calculation if explicitly disabled
+                if (!isEnabled) return { inputs: {}, calculations: {} };
+
                 // The complex logic is now in a separate function.
                 // MODIFIED: Pass 'savingsWithdrawals' to the core function
                 // MODIFIED (STEP 5): Pass 'savingsData' to the core function
                 return calculatePayrollForEmployee(employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData);
-            }, [employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData]); // MODIFIED (STEP 5): Added 'savingsData'
+            }, [employee, selectedMonth, allData, manualLoanDeduction, savingsWithdrawals, savingsData, isEnabled]); // MODIFIED (STEP 5): Added 'savingsData'
         };
 
         // NEW: Phase 3 - App Data Context for centralizing common data
@@ -7435,12 +7439,20 @@
             const [checkInMethod, setCheckInMethod] = useState('gps'); // 'gps' or 'qr'
             const [isScannerOpen, setIsScannerOpen] = useState(false);
             
+            // NEW: State to control Payroll Calculation (Saves DB Reads)
+            const [showPayroll, setShowPayroll] = useState(false);
+
             const [selectedMonth, setSelectedMonth] = useState(() => {
                 const now = new Date();
                 const year = now.getFullYear();
                 const month = String(now.getMonth() + 1).padStart(2, '0');
                 return `${year}-${month}`;
             });
+
+            // NEW: Reset payroll view when month changes
+            useEffect(() => {
+                setShowPayroll(false);
+            }, [selectedMonth]);
 
             const { where } = window.firebaseSDK;
             const { shops, shifts, systemSettings } = useAppData(); // MODIFIED: Get systemSettings
@@ -7467,12 +7479,27 @@
                 const startStr = `${selectedMonth}-01`;
                 const endStr = `${selectedMonth}-31`; // Loose upper bound covers all months
 
+                // Always fetch attendance for Check-In status (Lightweight query)
+                const attendanceConstraints = [
+                    where("employeeId", "==", userProfile.id),
+                    where("timestamp", ">=", startOfMonth),
+                    where("timestamp", "<=", endOfMonth)
+                ];
+
+                // OPTIMIZATION: If payroll not requested, block heavy queries
+                if (!showPayroll) {
+                    return {
+                        attendance: attendanceConstraints,
+                        leave: blocker,
+                        ot: blocker,
+                        loan: blocker,
+                        state: blocker,
+                        salary: blocker
+                    };
+                }
+
                 return {
-                    attendance: [
-                        where("employeeId", "==", userProfile.id),
-                        where("timestamp", ">=", startOfMonth),
-                        where("timestamp", "<=", endOfMonth)
-                    ],
+                    attendance: attendanceConstraints,
                     // Leaves: Fetch if return date is after start of month (catches overlapping leaves)
                     leave: [
                         where("staffId", "==", userProfile.id),
@@ -7499,7 +7526,7 @@
                         // but strictly we could limit. Leaving all for safety as history is rare.
                     ]
                 };
-            }, [userProfile?.id, selectedMonth]);
+            }, [userProfile?.id, selectedMonth, showPayroll]); // Added showPayroll dependency
 
             // Apply the optimized constraints
             const { data: attendanceData } = useCollection('attendance', dataConstraints.attendance);
@@ -7540,7 +7567,8 @@
             }, [db, userProfile?.id]);
             
             useEffect(() => {
-                if (!db || !userProfile?.id || !selectedMonth) {
+                // OPTIMIZATION: Don't fetch withdrawals unless payroll is requested
+                if (!db || !userProfile?.id || !selectedMonth || !showPayroll) {
                     setSavingsWithdrawals([]);
                     return;
                 }
@@ -7570,7 +7598,7 @@
                 };
 
                 fetchWithdrawals();
-            }, [db, userProfile?.id, selectedMonth]);
+            }, [db, userProfile?.id, selectedMonth, showPayroll]); // Added showPayroll
             
             const isMultiShopManager = userProfile.role === 'Shop Manager' && Array.isArray(userProfile.shop);
 
@@ -7607,6 +7635,11 @@
             }, [userProfile, allData.attendance, userShop, todayInShopTimezone]);
             
             const lastAction = userAttendanceToday[0] || null;
+
+            // NEW: Phase 2 - Break Time State Logic
+            const isOnBreak = lastAction?.type === 'break_start';
+            // Treat 'break_end' as checked in. 'break_start' is technically checked in but paused.
+            const isCheckedIn = lastAction?.type === 'in' || lastAction?.type === 'break_end' || lastAction?.type === 'break_start';
 
             useEffect(() => { const timerId = setInterval(() => setCurrentTime(new Date()), 1000); return () => clearInterval(timerId); }, []);
             
@@ -7657,8 +7690,48 @@
                 });
             }, [userShop, isMultiShopManager, checkInMethod]);
 
-            // ... (keep handleScanSuccess and handleCheckAction exactly as they were) ...
-            // [Abbreviated to save space, assuming they are unchanged from previous full context]
+            // --- NEW: Phase 2 - Handle Break Action Logic ---
+            const handleBreakAction = useCallback(async (actionType) => {
+                setLoading(true);
+                setStatus(actionType === 'break_start' ? "Starting Break..." : "Ending Break...");
+
+                try {
+                    const { location: freshLocation, distance: freshDistance, shop } = await getLocation(true);
+                    
+                    if (freshDistance > (parseFloat(shop.radius) || 500)) {
+                        setStatus(`Too far (${Math.round(freshDistance)}m).`); 
+                        setLoading(false); 
+                        return;
+                    }
+
+                    const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
+                    const deviceInfo = await Utils.getDeviceInfo();
+
+                    await addDoc(collection(db, 'attendance'), { 
+                        employeeId: userProfile.id, 
+                        employeeName: userProfile.name, 
+                        shop: selectedShopForCheckIn, 
+                        timestamp: serverTimestamp(), 
+                        type: actionType, // 'break_start' or 'break_end'
+                        location: freshLocation, 
+                        verificationMethod: 'gps', // Assuming GPS for break controls
+                        deviceInfo: deviceInfo 
+                    });
+
+                    setAlertModal({ 
+                        isOpen: true, 
+                        message: `Successfully ${actionType === 'break_start' ? 'started break' : 'ended break'}.` 
+                    });
+                    setStatus(`Break action logged.`);
+
+                } catch (error) {
+                    setStatus("Failed.");
+                    console.error("Break action error:", error);
+                } finally {
+                    setLoading(false);
+                }
+            }, [db, userProfile, selectedShopForCheckIn, getLocation]);
+
             const handleScanSuccess = async (qrText) => {
                 setIsScannerOpen(false);
                 setLoading(true);
@@ -7701,31 +7774,56 @@
                     });
                     setSelectedShopForCheckIn(qrText);
 
-                    // Late Logic (Simplified copy for brevity)
+                    // Late Logic (Updated for OT Late Check)
                     if (nextActionType === 'in') {
-                        const shiftDetails = (allData.shifts || []).find(s => s.name === userProfile.shift && s.shopName === qrText);
-                        if (shiftDetails && shiftDetails.lateThreshold && scannedShop.timezone) {
-                            const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: scannedShop.timezone, hour: '2-digit', minute: '2-digit' });
-                            const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
+                        // 1. Prepare Date/Time in Shop Timezone
+                        const shopTz = scannedShop.timezone || 'Asia/Phnom_Penh';
+                        const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => checkInTimestamp }, shopTz);
+                        const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
+                        const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
+
+                        // 2. Determine Effective Shift (Handle OT Override)
+                        let effectiveShiftName = userProfile.shift;
+                        
+                        const todayOT = (allData.otRequests || []).find(ot => 
+                            ot.staffId === userProfile.id && 
+                            ot.reqDate === todayStr && 
+                            ot.status === 'Approved'
+                        );
+
+                        // If user has AM/FullDay OT and checks in morning (<11am), enforce AM rules
+                        if (todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
+                            effectiveShiftName = 'AM';
+                        }
+
+                        // 3. Get Shift Rules
+                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === qrText);
+                        
+                        if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour] = (shiftDetails.startTime || '00:00').split(':').map(Number);
-                            if (checkInHour - startHour < 3) {
+                            
+                            // Check if check-in is relevant to this shift start (within 4 hours)
+                            if (checkInHour >= startHour && (checkInHour - startHour < 4)) {
                                 if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
-                                    const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => checkInTimestamp }, scannedShop.timezone);
+                                    
                                     const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
                                     const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
                                     const snap = await getDocs(q);
-                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late @'))) {
-                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: scannedShop.timezone, hour: '2-digit', minute: '2-digit', hour12: true });
+                                    
+                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late @') || doc.data().note?.includes('OT'))) {
+                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // MODIFIED: Use configured amount or default to 5000
+                                        // Use configured amount
                                         penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000;
                                         
+                                        // Custom note for OT Late vs Normal Late
+                                        const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late` : `CheckIn Late`;
+
                                         await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
-                                            staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `CheckIn Late @${formattedTime}`, status: 'Approved' 
+                                            staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
                                         });
                                         
-                                        // NEW: Flag penalty application
                                         penaltyApplied = true;
                                     }
                                 }
@@ -7784,30 +7882,54 @@
                     });
                     
                     if (nextActionType === 'in') {
-                        const shiftDetails = (allData.shifts || []).find(s => s.name === userProfile.shift && s.shopName === selectedShopForCheckIn);
-                        if (shiftDetails && shiftDetails.lateThreshold && shop.timezone) {
+                        // 1. Prepare Date/Time in Shop Timezone
+                        const shopTz = shop.timezone || 'Asia/Phnom_Penh';
+                        const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => checkInTimestamp }, shopTz);
+                        const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
+                        const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
+
+                        // 2. Determine Effective Shift (Handle OT Override)
+                        let effectiveShiftName = userProfile.shift;
+                        
+                        const todayOT = (allData.otRequests || []).find(ot => 
+                            ot.staffId === userProfile.id && 
+                            ot.reqDate === todayStr && 
+                            ot.status === 'Approved'
+                        );
+
+                        // If user has AM/FullDay OT and checks in morning (<11am), enforce AM rules
+                        if (todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
+                            effectiveShiftName = 'AM';
+                        }
+
+                        // 3. Get Shift Rules
+                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === selectedShopForCheckIn);
+                        
+                        if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour] = (shiftDetails.startTime || '00:00').split(':').map(Number);
-                            const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shop.timezone, hour: '2-digit', minute: '2-digit' });
-                            const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
                             
-                            if (checkInHour - startHour < 3) {
+                            // Check if check-in is relevant to this shift start (within 4 hours)
+                            if (checkInHour >= startHour && (checkInHour - startHour < 4)) {
                                 if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
-                                    const { localDate: todayStr } = Utils.formatDateInTimezone({ toDate: () => checkInTimestamp }, shop.timezone);
+                                    
                                     const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
                                     const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
                                     const snap = await getDocs(q);
-                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late @'))) {
-                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shop.timezone, hour: '2-digit', minute: '2-digit', hour12: true });
+                                    
+                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late @') || doc.data().note?.includes('OT'))) {
+                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // MODIFIED: Use configured amount or default to 5000
+                                        // Use configured amount
                                         penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000;
+                                        
+                                        // Custom note for OT Late vs Normal Late
+                                        const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late` : `CheckIn Late`;
 
                                         await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
-                                            staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `CheckIn Late @${formattedTime}`, status: 'Approved'
+                                            staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
                                         });
                                         
-                                        // NEW: Flag penalty
                                         penaltyApplied = true;
                                     }
                                 }
@@ -7833,10 +7955,17 @@
             }, [db, lastAction, userProfile, selectedShopForCheckIn, allData.leaveRequests, getLocation, systemSettings]); // Added systemSettings dependency
 
             const canCheck = distance !== null && userShop && distance <= (parseFloat(userShop.radius) || 500);
-            const { inputs, calculations } = usePayrollCalculator(userProfile, selectedMonth, allData, undefined, savingsWithdrawals, savingsData);
-
-            // Determine if checked in
-            const isCheckedIn = lastAction?.type === 'in';
+            
+            // FIX: Pass 'showPayroll' (isEnabled) to the hook to prevent calculation when hidden
+            const { inputs, calculations } = usePayrollCalculator(
+                userProfile, 
+                selectedMonth, 
+                allData, 
+                undefined, 
+                savingsWithdrawals, 
+                savingsData,
+                showPayroll // NEW: Only calculate if requested
+            );
 
             return (
                 <Card className="max-w-2xl mx-auto">
@@ -7920,23 +8049,59 @@
                                 {/* Check OUT Button */}
                                 <button 
                                     onClick={handleCheckAction} 
-                                    disabled={!isCheckedIn || loading} 
+                                    // Phase 2 Logic: Disable Check Out if currently on break (must end break first)
+                                    disabled={!isCheckedIn || isOnBreak || loading} 
                                     className={`relative p-4 rounded-2xl flex flex-col items-center justify-center gap-2 border-2 transition-all transform active:scale-95 ${
-                                        !isCheckedIn 
+                                        !isCheckedIn || isOnBreak 
                                             ? 'bg-slate-800/50 border-slate-700 text-slate-500 cursor-not-allowed opacity-50' 
                                             : 'bg-gradient-to-br from-red-600 to-rose-700 border-red-500 text-white shadow-lg shadow-red-900/30 hover:-translate-y-1'
                                     }`}
                                 >
                                     <i className="fas fa-sign-out-alt text-2xl mb-1"></i>
                                     <span className="text-lg font-bold">Check OUT</span>
-                                    {isCheckedIn && !loading && canCheck && (
-                                        <span className="absolute top-2 right-2 w-3 h-3 bg-white rounded-full animate-ping"></span>
-                                    )}
                                 </button>
                             </div>
                             
                             {/* 3. Small Status Text */}
                             <p className="text-center text-xs text-slate-500 mt-2">{status}</p>
+
+                            {/* --- FIX: Added Missing Break Time Buttons --- */}
+                            {isCheckedIn && (
+                                <div className="pt-4 border-t border-slate-700/50 mt-4 animate-fade-in">
+                                    <p className="text-xs text-slate-500 uppercase font-bold tracking-wider mb-2 text-center">Break Time Controls</p>
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <button 
+                                            onClick={() => handleBreakAction('break_start')}
+                                            disabled={isOnBreak || loading}
+                                            className={`py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-all ${
+                                                isOnBreak 
+                                                    ? 'bg-slate-800 text-slate-600 cursor-not-allowed border border-slate-700' 
+                                                    : 'bg-orange-900/30 text-orange-400 border border-orange-500/50 hover:bg-orange-900/50'
+                                            }`}
+                                        >
+                                            <i className="fas fa-mug-hot"></i> Start Break
+                                        </button>
+                                        <button 
+                                            onClick={() => handleBreakAction('break_end')}
+                                            disabled={!isOnBreak || loading}
+                                            className={`py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-bold transition-all ${
+                                                !isOnBreak 
+                                                    ? 'bg-slate-800 text-slate-600 cursor-not-allowed border border-slate-700' 
+                                                    : 'bg-blue-900/30 text-blue-400 border border-blue-500/50 hover:bg-blue-900/50 animate-pulse'
+                                            }`}
+                                        >
+                                            <i className="fas fa-play"></i> End Break
+                                        </button>
+                                    </div>
+                                    {isOnBreak && (
+                                        <div className="mt-2 text-center">
+                                            <span className="text-xs text-orange-400 font-medium bg-orange-900/20 px-3 py-1 rounded-full animate-pulse">
+                                                <i className="fas fa-clock mr-1"></i> You are currently on break
+                                            </span>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
 
                             {/* --- REDESIGNED GPS UI END --- */}
                         </div>
@@ -7974,47 +8139,64 @@
                              <h4 className="text-lg font-semibold text-slate-100">ប្រាក់ខែរកបាន</h4>
                              <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input !mt-0 w-auto" />
                         </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                            <div className="space-y-2">
-                                <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">ប្រាក់ចំណូល :</h5>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថ្ងៃធ្វើការ :</span><span className="font-semibold text-slate-200">{inputs.workDays || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ផ្តល់ជូន :</span><span className="font-semibold text-slate-200">{inputs.givenOffDays || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថែមម៉ោង :</span><span className="font-semibold text-slate-200">{inputs.otDays || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់បន្ថែម :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.engagements)}</span></div>
-                                {calculations.totalSavingsWithdrawal > 0 && (
-                                    <div className="flex justify-between items-center text-sm" title="Savings Program Payback">
-                                        <span className="text-slate-400">ការទូទាត់សងប្រាក់សន្សំ :</span>
-                                        <span className="font-semibold text-indigo-400">{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</span>
-                                    </div>
-                                )}
-                                <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-green-400">ប្រាក់ចំណូលសរុប :</span><span className="font-bold text-green-400">{Utils.formatCurrency(calculations.grossSalary)}</span></div>
+                        
+                        {/* NEW: Manual Calculation Trigger to Save DB Reads */}
+                        {!showPayroll ? (
+                            <div className="text-center py-6 animate-fade-in">
+                                <button 
+                                    onClick={() => setShowPayroll(true)}
+                                    className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-6 rounded-xl shadow-lg transition-all transform active:scale-95 flex items-center gap-2 mx-auto border border-blue-400/30"
+                                >
+                                    <i className="fas fa-calculator"></i>
+                                    <span>Calculate Salary</span>
+                                </button>
+                                <p className="text-xs text-slate-400 mt-3">Click to load payroll data for {selectedMonth}</p>
                             </div>
-                            <div className="space-y-2">
-                                <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">ការកាត់ប្រាក់ :</h5>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ច្បាប់សម្រាក :</span><span className="font-semibold text-slate-200">{inputs.leaveDays || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">មកយឺតសរុប :</span><span className="font-semibold text-slate-200">{inputs.totalLateDays || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm" title="អវត្តមាន + ភ្លេចចុចចេញ"><span className="text-slate-400">អវត្តមាន :</span><span className="font-semibold text-slate-200">{inputs.noAttendance || 0}</span></div>
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">បំណុលរំលួស :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(inputs.loanDeduction)}</span></div>
-                                {calculations.savingsDeduction > 0 && (
-                                    <div className="flex justify-between items-center text-sm">
-                                        <span className="text-slate-400">ការកាត់សន្សំ :</span>
-                                        <span className="font-semibold text-blue-400">{Utils.formatCurrency(calculations.savingsDeduction)}</span>
+                        ) : (
+                            <div className="animate-fade-in">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div className="space-y-2">
+                                        <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">ប្រាក់ចំណូល :</h5>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថ្ងៃធ្វើការ :</span><span className="font-semibold text-slate-200">{inputs.workDays || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ផ្តល់ជូន :</span><span className="font-semibold text-slate-200">{inputs.givenOffDays || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថែមម៉ោង :</span><span className="font-semibold text-slate-200">{inputs.otDays || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់បន្ថែម :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.engagements)}</span></div>
+                                        {calculations.totalSavingsWithdrawal > 0 && (
+                                            <div className="flex justify-between items-center text-sm" title="Savings Program Payback">
+                                                <span className="text-slate-400">ការទូទាត់សងប្រាក់សន្សំ :</span>
+                                                <span className="font-semibold text-indigo-400">{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</span>
+                                            </div>
+                                        )}
+                                        <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-green-400">ប្រាក់ចំណូលសរុប :</span><span className="font-bold text-green-400">{Utils.formatCurrency(calculations.grossSalary)}</span></div>
                                     </div>
-                                )}
-                                {calculations.rejectedLeavePenaltyAmount > 0 && (
-                                    <div className="flex justify-between items-center text-sm" title="Penalty for absence on a day with a rejected leave request">
-                                        <span className="text-slate-400">ច្បាប់សម្រាកបដិសេធ :</span>
-                                        <span className="font-semibold text-red-400">{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</span>
+                                    <div className="space-y-2">
+                                        <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">ការកាត់ប្រាក់ :</h5>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ច្បាប់សម្រាក :</span><span className="font-semibold text-slate-200">{inputs.leaveDays || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">មកយឺតសរុប :</span><span className="font-semibold text-slate-200">{inputs.totalLateDays || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm" title="អវត្តមាន + ភ្លេចចុចចេញ"><span className="text-slate-400">អវត្តមាន :</span><span className="font-semibold text-slate-200">{inputs.noAttendance || 0}</span></div>
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">បំណុលរំលួស :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(inputs.loanDeduction)}</span></div>
+                                        {calculations.savingsDeduction > 0 && (
+                                            <div className="flex justify-between items-center text-sm">
+                                                <span className="text-slate-400">ការកាត់សន្សំ :</span>
+                                                <span className="font-semibold text-blue-400">{Utils.formatCurrency(calculations.savingsDeduction)}</span>
+                                            </div>
+                                        )}
+                                        {calculations.rejectedLeavePenaltyAmount > 0 && (
+                                            <div className="flex justify-between items-center text-sm" title="Penalty for absence on a day with a rejected leave request">
+                                                <span className="text-slate-400">ច្បាប់សម្រាកបដិសេធ :</span>
+                                                <span className="font-semibold text-red-400">{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</span>
+                                            </div>
+                                        )}
+                                        <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ការកាត់ផ្សេងៗ :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.otherDeductions)}</span></div>
+                                        <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-red-400">ការកាត់ប្រាក់សរុប :</span><span className="font-bold text-red-400">{Utils.formatCurrency(calculations.totalDeductions)}</span></div>
                                     </div>
-                                )}
-                                <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ការកាត់ផ្សេងៗ :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.otherDeductions)}</span></div>
-                                <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-red-400">ការកាត់ប្រាក់សរុប :</span><span className="font-bold text-red-400">{Utils.formatCurrency(calculations.totalDeductions)}</span></div>
+                                </div>
+                                <div className="mt-4 pt-4 border-t border-slate-600 flex justify-between items-center">
+                                    <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន :</span>
+                                    <span className="text-xl font-bold text-blue-400">{Utils.formatCurrency(calculations.netSalary)}</span>
+                                </div>
                             </div>
-                        </div>
-                        <div className="mt-4 pt-4 border-t border-slate-600 flex justify-between items-center">
-                            <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន :</span>
-                            <span className="text-xl font-bold text-blue-400">{Utils.formatCurrency(calculations.netSalary)}</span>
-                        </div>
+                        )}
                     </div>
                 </div>
                 <Modal isOpen={alertModal.isOpen} onClose={() => setAlertModal({ isOpen: false, message: '' })} maxWidth="max-w-sm">
@@ -9330,6 +9512,9 @@
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shift</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check In</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Break Start</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Break End</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Break</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Check Out</th>
                                 <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Leave Status</th>
                                 <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">OT Status</th>
@@ -9348,6 +9533,9 @@
                                     <td className="px-4 py-4 text-sm text-slate-200">{report.employeeName}</td>
                                     <td className="px-4 py-4 text-sm text-slate-300">{report.shift}</td>
                                     <td className={`px-4 py-4 text-sm ${report.isLate ? 'bg-red-900/60 text-red-300 font-semibold' : 'text-slate-300'}`}>{report.checkIn}</td>
+                                    <td className="px-4 py-4 text-sm text-orange-300">{report.breakStart || '-'}</td>
+                                    <td className="px-4 py-4 text-sm text-orange-300">{report.breakEnd || '-'}</td>
+                                    <td className="px-4 py-4 text-sm text-blue-300 font-medium">{report.totalBreak}</td>
                                     <td className="px-4 py-4 text-sm text-slate-300">{report.checkOut}</td>
                                     <td className={`px-4 py-4 text-sm text-center ${report.isOnLeave === 'Absent' ? 'text-red-400 font-semibold' : 'text-slate-300'}`}>{report.isOnLeave}</td>
                                     <td className="px-4 py-4 text-sm text-center text-slate-300">{report.otStatus}</td>
@@ -9855,6 +10043,8 @@
                             employeeId: record.employeeId,
                             checkInRecords: [],
                             checkOutRecords: [],
+                            breakStartRecords: [], // NEW
+                            breakEndRecords: [],   // NEW
                             docIds: []
                         });
                     }
@@ -9870,6 +10060,10 @@
                     
                     if (record.type === 'in') entry.checkInRecords.push(recordData);
                     if (record.type === 'out') entry.checkOutRecords.push(recordData);
+                    // NEW: Collect break records
+                    if (record.type === 'break_start') entry.breakStartRecords.push(recordData);
+                    if (record.type === 'break_end') entry.breakEndRecords.push(recordData);
+
                     entry.docIds.push(record.id);
                 });
 
@@ -9903,7 +10097,10 @@
                          if (!reportMap.has(reportKey)) {
                             reportMap.set(reportKey, {
                                 date: curr, employeeId: employee.id,
-                                checkInRecords: [], checkOutRecords: [], docIds: []
+                                checkInRecords: [], checkOutRecords: [], docIds: [],
+                                // FIX: Initialize break arrays for absent days to prevent crash
+                                breakStartRecords: [], 
+                                breakEndRecords: []
                             });
                          }
                     }
@@ -9921,9 +10118,41 @@
                     const lastCheckOutRecord = entry.checkOutRecords.length > 0
                         ? entry.checkOutRecords.reduce((latest, current) => current.date > latest.date ? current : latest)
                         : null;
+                    
+                    // NEW: Determine First Break Start and Last Break End
+                    const firstBreakStartRecord = entry.breakStartRecords.length > 0
+                        ? entry.breakStartRecords.reduce((earliest, current) => current.date < earliest.date ? current : earliest)
+                        : null;
+                    const lastBreakEndRecord = entry.breakEndRecords.length > 0
+                        ? entry.breakEndRecords.reduce((latest, current) => current.date > latest.date ? current : latest)
+                        : null;
 
                     const checkIn = firstCheckInRecord ? firstCheckInRecord.date : null;
                     const checkOut = lastCheckOutRecord ? lastCheckOutRecord.date : null;
+                    const breakStart = firstBreakStartRecord ? firstBreakStartRecord.date : null;
+                    const breakEnd = lastBreakEndRecord ? lastBreakEndRecord.date : null;
+                    
+                    // NEW: Calculate Total Break Duration (Sum of all sessions)
+                    let totalBreakMs = 0;
+                    const sortedStarts = (entry.breakStartRecords || []).sort((a,b) => a.date - b.date);
+                    const sortedEnds = (entry.breakEndRecords || []).sort((a,b) => a.date - b.date);
+                    const usedEndIndices = new Set();
+
+                    sortedStarts.forEach(start => {
+                        // Find the first end record that is AFTER this start and NOT used
+                        const endIdx = sortedEnds.findIndex((end, idx) => !usedEndIndices.has(idx) && end.date > start.date);
+                        if (endIdx !== -1) {
+                            totalBreakMs += (sortedEnds[endIdx].date - start.date);
+                            usedEndIndices.add(endIdx);
+                        }
+                    });
+
+                    let totalBreakStr = '-';
+                    if (totalBreakMs > 0) {
+                        const hours = Math.floor(totalBreakMs / 3600000);
+                        const minutes = Math.floor((totalBreakMs % 3600000) / 60000);
+                        totalBreakStr = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+                    }
                     
                     // --- NEW: Extract Device Model from the first check-in record ---
                     const deviceModel = firstCheckInRecord?.deviceInfo?.model || 'Unknown';
@@ -9967,6 +10196,10 @@
                     const { localTime: checkInTimeStr } = checkIn ? Utils.formatDateInTimezone({ toDate: () => checkIn }, shopTimezone) : { localTime: '' };
                     const { localTime: checkOutTimeStr } = checkOut ? Utils.formatDateInTimezone({ toDate: () => checkOut }, shopTimezone) : { localTime: '' };
                     
+                    // NEW: Format Break Times
+                    const { localTime: breakStartTimeStr } = breakStart ? Utils.formatDateInTimezone({ toDate: () => breakStart }, shopTimezone) : { localTime: '' };
+                    const { localTime: breakEndTimeStr } = breakEnd ? Utils.formatDateInTimezone({ toDate: () => breakEnd }, shopTimezone) : { localTime: '' };
+
                     let shopDisplay = Array.isArray(employee.shop) ? employee.shop.join(', ') : employee.shop;
                     if (firstCheckInRecord && lastCheckOutRecord) {
                         shopDisplay = firstCheckInRecord.shop === lastCheckOutRecord.shop ? firstCheckInRecord.shop : `${firstCheckInRecord.shop} (In) → ${lastCheckOutRecord.shop} (Out)`;
@@ -9982,6 +10215,9 @@
                         shift: employee.shift,
                         checkIn: checkInTimeStr,
                         checkOut: checkOutTimeStr,
+                        breakStart: breakStartTimeStr, 
+                        breakEnd: breakEndTimeStr,
+                        totalBreak: totalBreakStr, // NEW: Include calculated duration
                         isLate, isOnLeave, otStatus, docIds: entry.docIds,
                         deviceModel, devicePlatform // Pass to row
                     };
@@ -10051,10 +10287,13 @@
                     'Shift': report.shift,
                     'Check In': report.checkIn,
                     'Check Out': report.checkOut,
+                    'Break Start': report.breakStart || '-', 
+                    'Break End': report.breakEnd || '-',     
+                    'Total Break': report.totalBreak || '-', // NEW: Export Total Break
                     'On Leave': report.isOnLeave,
                     'OT Status': report.otStatus,
                     'Late Check-In': report.isLate ? 'Yes' : 'No',
-                    'Device Used': report.deviceModel !== 'Unknown' ? report.deviceModel : '-' // NEW: Add to Excel Export
+                    'Device Used': report.deviceModel !== 'Unknown' ? report.deviceModel : '-' 
                 }));
 
                 const getReportFilename = () => {
@@ -12451,6 +12690,18 @@
                     ]
                 },
 
+                // --- NEW: PAYROLL ---
+                {
+                    title: "Payroll History: Shop Filter",
+                    description: "Required for Managers to view payroll history filtered by Shop.",
+                    collection: "payrollHistory",
+                    scope: "COLLECTION",
+                    fields: [
+                        { name: "shop", mode: "ASCENDING" },
+                        { name: "month", mode: "DESCENDING" }
+                    ]
+                },
+
                 // --- EXPENSES ---
                 {
                     title: "Shop Expenses: Manager View",
@@ -12527,6 +12778,17 @@
                     fields: [
                         { name: "shop", mode: "ASCENDING" },
                         { name: "createdAt", mode: "DESCENDING" }
+                    ]
+                },
+                // --- NEW: Added based on user request ---
+                {
+                    title: "Payroll History: Manager View",
+                    description: "Required for Shop Managers to view Payroll History (Filter by Shop + Sort Month).",
+                    collection: "payrollHistory",
+                    scope: "COLLECTION",
+                    fields: [
+                        { name: "shop", mode: "ASCENDING" },
+                        { name: "month", mode: "DESCENDING" }
                     ]
                 }
             ];
@@ -17399,11 +17661,16 @@ service cloud.firestore {
                                     infoStr += ` Out:${outStr}`;
                                 }
                                 
+                                // NEW: Phase 2 - Status Display Logic
+                                let statusLabel = 'Online';
+                                if (rec.latestType === 'out') statusLabel = 'Offline';
+                                else if (rec.latestType === 'break_start') statusLabel = 'On Break';
+                                
                                 return {
                                     id: rec.id,
                                     name: rec.name, // Display Name only (Shop moved to info)
                                     info: infoStr,
-                                    status: rec.latestType === 'in' ? 'Online' : 'Offline',
+                                    status: statusLabel,
                                     photo: getEmployeePhoto(rec.id)
                                 };
                             });
