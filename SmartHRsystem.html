@@ -14,7 +14,7 @@
     <meta name="apple-mobile-web-app-title" content="HR System">
     
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <link rel="apple-touch-icon" href="https://i.imgur.com/EvYU0AK.jpeg">
+    <link rel="apple-touch-icon" href="https://i.imgur.com/dP8TQ0L.jpeg">
 
     <!-- NEW: Google Fonts (Khmer) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -227,9 +227,8 @@
     <script type="module">
         // Firebase SDK imports
         import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        // MODIFIED (STEP 6.C): Added 'collectionGroup'
-        // FIX: Added 'increment' to imports to fix Payroll Delete crash
+        // MODIFIED: Added sendPasswordResetEmail
+        import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, onSnapshot, doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, getDocs, writeBatch, enableIndexedDbPersistence, setDoc, orderBy, limit, startAfter, runTransaction, deleteField, collectionGroup, arrayUnion, arrayRemove, increment } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Make Firebase SDK available globally for the Babel script
@@ -238,8 +237,8 @@
             doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp,
             signInWithEmailAndPassword, onAuthStateChanged, signOut, getDocs, writeBatch,
             enableIndexedDbPersistence, setDoc,
-            // FIX: Added 'increment' to exports
-            orderBy, limit, startAfter, createUserWithEmailAndPassword, runTransaction, deleteField, collectionGroup, arrayUnion, arrayRemove, increment
+            orderBy, limit, startAfter, createUserWithEmailAndPassword, sendPasswordResetEmail, // Exported here
+            runTransaction, deleteField, collectionGroup, arrayUnion, arrayRemove, increment
         };
     </script>
     
@@ -1080,6 +1079,9 @@
             // NEW: Fetch Expense Categories in real-time
             const { data: expenseCategories, loading: categoriesLoading } = useCollection('expenseCategories', [], 'hr_cache_expense_cats');
 
+            // NEW: Fetch Banks globally (Fix for undefined map error)
+            const { data: banks, loading: banksLoading } = useCollection('banks', [], 'hr_cache_banks');
+
             // NEW: Fetch KPIs globally
             const { data: kpis, loading: kpisLoading } = useCollection('kpis', [], 'hr_cache_kpis');
 
@@ -1116,7 +1118,7 @@
 
             // Combine all loading states into a single flag.
             // If forceShow is true, we ignore individual loading states.
-            const isLoading = !forceShow && (employeesLoading || shopsLoading || shiftsLoading || positionsLoading || categoriesLoading || kpisLoading || configLoading);
+            const isLoading = !forceShow && (employeesLoading || shopsLoading || shiftsLoading || positionsLoading || categoriesLoading || kpisLoading || configLoading || banksLoading);
 
             const value = useMemo(() => ({
                 employees,
@@ -1125,10 +1127,11 @@
                 positions,
                 expenseCategories, 
                 kpis,              
+                banks, // NEW: Expose banks to context
                 moduleConfig, // Expose the correct config object
                 systemSettings, // NEW: Expose global settings
                 isLoading
-            }), [employees, shops, shifts, positions, expenseCategories, kpis, moduleConfig, systemSettings, isLoading]);
+            }), [employees, shops, shifts, positions, expenseCategories, kpis, banks, moduleConfig, systemSettings, isLoading]);
 
             return (
                 <AppDataContext.Provider value={value}>
@@ -2821,6 +2824,9 @@
             const [password, setPassword] = useState(''); 
             const [showPassword, setShowPassword] = useState(false); 
             const [authError, setAuthError] = useState(''); 
+            
+            // NEW: State for reset email feedback
+            const [resetSent, setResetSent] = useState(false);
 
             // --- NEW: Documentary Tab State (Renamed from Disciplinary) ---
             const [activeTab, setActiveTab] = useState('details');
@@ -2836,7 +2842,7 @@
             const [isCropModalOpen, setIsCropModalOpen] = useState(false);
 
             const { db } = useFirebase(); 
-            const { positions, shifts, shops, systemSettings } = useAppData(); 
+            const { positions, shifts, shops, systemSettings, banks } = useAppData(); 
 
             // Determine available shops for the modal dropdown based on user role
             const availableShopsForModal = useAllowedShops(userProfile, shops);
@@ -2881,12 +2887,15 @@
             }, [shifts, formData.shop]);
 
             const initialData = useMemo(() => employee ? { ...employee } : {
-                name: '', sex: 'M', dob: '', nationId: '', tel: '', shop: '', primaryShop: '', joinedDate: new Date().toISOString().slice(0, 10), salary: '', position: '', shift: '', supervisor: '', role: 'Staff', email: '', address: '', status: 'Active', permissions: ['checkinme'], photo: null, enrollInSavings: true
+                name: '', sex: 'M', dob: '', nationId: '', tel: '', bankName: '', bankAccount: '', shop: '', primaryShop: '', joinedDate: new Date().toISOString().slice(0, 10), salary: '', position: '', shift: '', supervisor: '', role: 'Staff', email: '', address: '', status: 'Active', permissions: ['checkinme'], photo: null, enrollInSavings: true
             }, [employee]);
 
             useEffect(() => {
                 setFormData(initialData);
-                setPassword(''); setAuthError(''); setActiveTab('details');
+                setPassword(''); 
+                setAuthError(''); 
+                setResetSent(false); // Reset feedback
+                setActiveTab('details');
             }, [initialData, isOpen]);
             
             // --- NEW: Fetch Documents & Documentary Logic ---
@@ -2970,16 +2979,20 @@
                     return;
                 }
 
-                // Password Validation for New Users
-                if (!employee && formData.email && (!password || password.length < 6)) {
+                // Password Validation for New Users OR Existing Users getting a login
+                // MODIFIED: Check if creating a new login for existing user
+                const isCreatingLogin = (!employee || (employee && !employee.uid)) && formData.email;
+                
+                if (isCreatingLogin && (!password || password.length < 6)) {
                     setAuthError("Password must be at least 6 characters.");
                     return;
                 }
 
                 const dataToSave = { ...formData };
 
-                // Create Auth User if needed
-                if (!employee && formData.email && password) {
+                // Create Auth User if needed (New Employee OR Existing Employee without Login)
+                // MODIFIED: Logic to allow creating login for existing staff
+                if (isCreatingLogin && password) {
                     try {
                         const { initializeApp, getAuth, createUserWithEmailAndPassword, deleteApp } = window.firebaseSDK;
                         // Use temp app to avoid logging out admin
@@ -3264,6 +3277,21 @@
                                         <div><label className="text-sm text-slate-400">Join Date</label><input type="date" name="joinedDate" value={formData.joinedDate} onChange={handleChange} className="input" required disabled={isViewOnly} /></div>
                                         <div><label className="text-sm text-slate-400">Base Salary ($)</label><input name="salary" value={formData.salary} onChange={handleSalaryChange} onBlur={handleSalaryBlur} className="input" disabled={isViewOnly} /></div>
                                         
+                                        {/* MODIFIED: Bank Details Section (Name & Account) */}
+                                        <div className="md:col-span-2 grid grid-cols-2 gap-4 bg-slate-800/50 p-3 rounded border border-slate-700/50">
+                                            <div>
+                                                <label className="text-sm text-slate-400">Bank Name</label>
+                                                <select name="bankName" value={formData.bankName || ''} onChange={handleChange} className="select" disabled={isViewOnly}>
+                                                    <option value="">Select Bank</option>
+                                                    {banks && banks.map(b => <option key={b.id} value={b.name}>{b.name}</option>)}
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="text-sm text-slate-400">Account Number</label>
+                                                <input name="bankAccount" value={formData.bankAccount || ''} onChange={handleChange} className="input" disabled={isViewOnly} placeholder="e.g. 000 111 222" />
+                                            </div>
+                                        </div>
+                                        
                                         <div>
                                             <label className="text-sm text-slate-400">Position</label>
                                             <select name="position" value={formData.position} onChange={handleChange} className="select" disabled={isViewOnly}>
@@ -3292,8 +3320,110 @@
 
                                         {/* ... (Role, Email, Address, etc. same as before) ... */}
                                         <div><label className="text-sm text-slate-400">Role</label><select name="role" value={formData.role} onChange={handleChange} className="select" disabled={isViewOnly || (userProfile.role !== 'Admin' && userProfile.role !== 'CEO')}><option value="Staff">Staff</option><option value="Shop Manager">Shop Manager</option><option value="Admin">Admin</option><option value="CEO">CEO</option></select></div>
-                                        <div><label className="text-sm text-slate-400">Email (Login)</label><input type="email" name="email" value={formData.email} onChange={handleChange} className="input" disabled={isViewOnly || !!employee} placeholder="Optional" /></div>
-                                        {!employee && formData.email && (<div><label className="text-sm text-slate-400">Password</label><div className="relative"><input type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} className="input pr-10" disabled={isViewOnly} placeholder="Min 6 chars" required={!!formData.email}/><button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-2.5 text-slate-400 hover:text-white"><i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'}`}></i></button></div></div>)}
+                                        
+                                        {/* MODIFIED: Email Field - Editable only by Admin */}
+                                        <div>
+                                            <label className="text-sm text-slate-400">Email (Login)</label>
+                                            <input 
+                                                type="email" 
+                                                name="email" 
+                                                value={formData.email} 
+                                                onChange={handleChange} 
+                                                className="input" 
+                                                disabled={isViewOnly || (!!employee && userProfile.role !== 'Admin')} 
+                                                placeholder="Optional" 
+                                            />
+                                        </div>
+
+                                        {/* MODIFIED: Password Section Logic */}
+                                        {/* Case 1: Creating New Login (New Staff OR Existing Staff w/o Login) - Admin Only if existing */}
+                                        {((!employee) || (employee && !employee.uid && userProfile.role === 'Admin')) && formData.email && (
+                                            <div>
+                                                <label className="text-sm text-slate-400">
+                                                    {employee ? 'Set Password (Create Login)' : 'Password'}
+                                                </label>
+                                                <div className="relative">
+                                                    <input 
+                                                        type={showPassword ? "text" : "password"} 
+                                                        value={password} 
+                                                        onChange={(e) => setPassword(e.target.value)} 
+                                                        className="input pr-10" 
+                                                        disabled={isViewOnly} 
+                                                        placeholder="Min 6 chars" 
+                                                        required={!!formData.email && (!employee || !employee.uid)}
+                                                    />
+                                                    <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-2.5 text-slate-400 hover:text-white">
+                                                        <i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Case 2: Existing Login - Password Reset Option (Admin Only) */}
+                                        {employee && employee.uid && userProfile.role === 'Admin' && (
+                                            <div className="md:col-span-2 p-3 bg-slate-800 rounded border border-slate-700 mt-2">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div>
+                                                        <label className="text-sm font-bold text-slate-300">Password Management</label>
+                                                        <p className="text-xs text-slate-500">User has an active login.</p>
+                                                    </div>
+                                                    {resetSent ? (
+                                                        <span className="text-green-400 text-sm font-medium animate-pulse"><i className="fas fa-check mr-1"></i> Reset Email Sent</span>
+                                                    ) : (
+                                                        <Button 
+                                                            variant="secondary" 
+                                                            className="text-xs" 
+                                                            onClick={async () => {
+                                                                if(!formData.email) return alert("No email address found.");
+                                                                if(!confirm(`Send password reset email to ${formData.email}?`)) return;
+                                                                try {
+                                                                    await window.firebaseSDK.sendPasswordResetEmail(window.firebaseSDK.getAuth(), formData.email);
+                                                                    setResetSent(true);
+                                                                    alert("Link sent! Google sends this automatically (no domain required).");
+                                                                } catch(e) {
+                                                                    alert("Error sending reset email: " + e.message);
+                                                                }
+                                                            }}
+                                                        >
+                                                            <i className="fas fa-envelope mr-2"></i> Send Reset Link
+                                                        </Button>
+                                                    )}
+                                                </div>
+                                                
+                                                {/* NEW: Corrected Manual Reset Instructions & Tool */}
+                                                <div className="pt-2 border-t border-slate-700/50">
+                                                    <details className="group">
+                                                        <summary className="text-[10px] text-blue-400 cursor-pointer hover:text-blue-300 flex items-center gap-1 list-none select-none">
+                                                            <i className="fas fa-info-circle"></i> Manual Reset (for fake emails)
+                                                        </summary>
+                                                        <div className="mt-2 text-xs text-slate-400 bg-slate-900/50 p-2 rounded border border-slate-700 leading-relaxed">
+                                                            <strong>To type a new password manually:</strong>
+                                                            <ol className="list-decimal ml-4 mt-1 space-y-1 mb-2">
+                                                                <li>Go to <strong>Firebase Console &gt; Authentication</strong>.</li>
+                                                                <li><strong>Delete</strong> the user row for <strong>{formData.email}</strong>.</li>
+                                                                <li>Click the button below to disconnect the old login from this profile.</li>
+                                                                <li>The password field will reappear for you to type a new one.</li>
+                                                            </ol>
+                                                            <button 
+                                                                type="button"
+                                                                onClick={async () => {
+                                                                    if(confirm("Did you DELETE the user in Firebase Console first?\n\nIf yes, proceed to disconnect this profile so you can set a new password.")) {
+                                                                        const { doc, updateDoc } = window.firebaseSDK;
+                                                                        await updateDoc(doc(db, 'employees', employee.id), { uid: null });
+                                                                        // Close modal to force refresh of state
+                                                                        onClose();
+                                                                    }
+                                                                }}
+                                                                className="w-full py-1.5 bg-red-900/30 text-red-300 border border-red-800/50 rounded hover:bg-red-900/50 transition-colors font-bold"
+                                                            >
+                                                                Disconnect & Set New Password
+                                                            </button>
+                                                        </div>
+                                                    </details>
+                                                </div>
+                                            </div>
+                                        )}
+
                                         <div className="md:col-span-2"><label className="text-sm text-slate-400">Address</label><textarea name="address" value={formData.address} onChange={handleChange} className="input" rows="2" disabled={isViewOnly}></textarea></div>
                                         
                                         {(userProfile.role === 'Admin' || userProfile.role === 'CEO' || userProfile.role === 'Shop Manager') && (
@@ -3737,6 +3867,7 @@
                         'DOB': '1995-12-31', 
                         'Nation ID': '123456789', 
                         'Tel': '099887766', 
+                        'Bank Account': '000-000-000',
                         'Shop': 'Head Office', 
                         'Primary Shop': '', 
                         'Joined Date': '2024-01-01', 
@@ -3844,6 +3975,7 @@
                             dob: row['DOB'] || '',
                             nationId: String(row['Nation ID'] || ''),
                             tel: String(row['Tel'] || ''),
+                            bankAccount: String(row['Bank Account'] || ''),
                             shop: row['Shop'] || '',
                             primaryShop: row['Primary Shop'] || '', 
                             joinedDate: row['Joined Date'] || new Date().toISOString().slice(0,10),
@@ -3977,6 +4109,8 @@
                     'Worked Duration': Utils.calculateWorkedDuration(emp.joinedDate),
                     'Shift': emp.shift,
                     'Telephone': emp.tel,
+                    'Bank Name': emp.bankName || '',
+                    'Bank Account': emp.bankAccount || '',
                     'Salary (KHR)': parseFloat(String(emp.salary).replace(/[^0-9.-]/g, '')) || 0
                 }));
 
@@ -3994,6 +4128,8 @@
                     { wch: 18 }, // Worked Duration
                     { wch: 10 }, // Shift
                     { wch: 15 }, // Telephone
+                    { wch: 15 }, // Bank Name
+                    { wch: 20 }, // Bank Account
                     { wch: 18 }  // Salary
                 ];
                 
@@ -13091,6 +13227,7 @@ service cloud.firestore {
     match /shifts/{shiftId} { allow read, write: if isAuthenticated(); }
     match /positions/{posId} { allow read, write: if isAuthenticated(); }
     match /expenseCategories/{catId} { allow read, write: if isAuthenticated(); }
+    match /banks/{bankId} { allow read, write: if isAuthenticated(); }
     match /kpis/{kpiId} { allow read, write: if isAuthenticated(); }
     match /assets/{assetId} { allow read, write: if isAuthenticated(); }
     
@@ -13950,7 +14087,7 @@ service cloud.firestore {
 
         const SettingsPage = ({ initialTab = 'shop' }) => {
             // REDUNDANCY FIX: Use global context data instead of fetching collections again
-            const { shops, positions, shifts, expenseCategories } = useAppData();
+            const { shops, positions, shifts, expenseCategories, banks } = useAppData();
             
             const [activeTab, setActiveTab] = useState(initialTab);
             const { userProfile } = useFirebase(); 
@@ -13965,6 +14102,7 @@ service cloud.firestore {
                     shop: <span><i className="fas fa-building mr-2 text-blue-400"></i>Shop & Shift Management</span>, 
                     position: <span><i className="fas fa-id-badge mr-2 text-purple-400"></i>Position & KPI</span>,
                     expenses: <span><i className="fas fa-tags mr-2 text-green-400"></i>Expense Categories</span>, 
+                    banks: <span><i className="fas fa-university mr-2 text-indigo-400"></i>Bank List</span>, // NEW TAB
                     memo: <span><i className="fas fa-bell mr-2 text-yellow-400"></i>Memo Alert</span> 
                 };
 
@@ -14050,6 +14188,17 @@ service cloud.firestore {
                 { header: 'Category Name', accessor: 'name' }
             ];
 
+            // NEW: Bank Settings Configuration
+            const bankFormFields = [
+                { name: 'name', label: 'Bank Name', required: true, icon: 'fa-university', placeholder: 'e.g. ABA Bank' },
+                { name: 'shortName', label: 'Short Name / Code', icon: 'fa-tag', placeholder: 'e.g. ABA' }
+            ];
+
+            const bankListColumns = [
+                { header: 'Bank Name', accessor: 'name' },
+                { header: 'Short Name', accessor: 'shortName' }
+            ];
+
             return (
                 <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop">
@@ -14074,6 +14223,15 @@ service cloud.firestore {
                             items={expenseCategories} 
                             formFields={expenseCategoryFormFields} 
                             listColumns={expenseCategoryListColumns} 
+                        />
+                    </div>
+                    <div id="banks">
+                        <SettingsCRUD 
+                            title="Bank" 
+                            collectionName="banks" 
+                            items={banks} 
+                            formFields={bankFormFields} 
+                            listColumns={bankListColumns} 
                         />
                     </div>
                     <div id="memo"><MemoAlertTab /></div>
@@ -14442,7 +14600,8 @@ service cloud.firestore {
         };
 
         // Generic component for CRUD operations (Create, Read, Update, Delete)
-        function SettingsCRUD({ title, collectionName, items, formFields, listColumns }) {
+        // FIX: Added default empty array for items to prevent map error
+        function SettingsCRUD({ title, collectionName, items = [], formFields, listColumns }) {
             const { db } = useFirebase();
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [editingItem, setEditingItem] = useState(null);
@@ -20251,7 +20410,13 @@ service cloud.firestore {
                     <div className="p-4 flex justify-between items-start">
                         <div className="flex gap-3 items-center">
                             <div className="w-10 h-10 rounded-full bg-slate-700 border border-slate-600 flex items-center justify-center overflow-hidden shrink-0 shadow-inner">
-                                {authorPhoto ? <img src={authorPhoto} alt={authorName} className="w-full h-full object-cover" /> : <span className="text-sm font-bold text-slate-400">{authorName.charAt(0)}</span>}
+                                {notice.authorId === 'system' ? (
+                                    <img src="https://i.imgur.com/U9xYSwA.jpeg" alt="System" className="w-full h-full object-cover" />
+                                ) : authorPhoto ? (
+                                    <img src={authorPhoto} alt={authorName} className="w-full h-full object-cover" />
+                                ) : (
+                                    <span className="text-sm font-bold text-slate-400">{authorName.charAt(0)}</span>
+                                )}
                             </div>
                             <div className="flex flex-col min-w-0">
                                 <h4 className="font-bold text-white text-sm leading-tight truncate pr-4">{authorName}</h4>
