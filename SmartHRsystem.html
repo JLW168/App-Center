@@ -7614,6 +7614,10 @@
             const [checkInMethod, setCheckInMethod] = useState('gps'); // 'gps' or 'qr'
             const [isScannerOpen, setIsScannerOpen] = useState(false);
             
+            // NEW: Optimistic State to fix the "Double Click" issue
+            // This holds the latest action in memory instantly while waiting for DB to sync
+            const [optimisticAction, setOptimisticAction] = useState(null);
+            
             // NEW: State to control Payroll Calculation (Saves DB Reads)
             const [showPayroll, setShowPayroll] = useState(false);
 
@@ -7813,23 +7817,46 @@
             }, [allData.attendance, userProfile]);
 
             // The absolute last action (Source of Truth for Check-In status)
-            // REMOVED: Duplicate declaration of lastAction (it was declared here and below)
-            const lastAction = allUserRecords[0] || null;
+            // MODIFIED: Merge Database Data with Optimistic Local Data
+            const lastAction = useMemo(() => {
+                const dbLast = allUserRecords[0] || null;
+                
+                // If we have a local action that is newer than the DB one (or if DB is empty), use local
+                if (optimisticAction) {
+                    const dbTime = dbLast?.timestamp?.toDate ? dbLast.timestamp.toDate().getTime() : 0;
+                    const localTime = optimisticAction.timestamp.getTime();
+                    
+                    if (localTime >= dbTime) {
+                        return optimisticAction;
+                    }
+                }
+                return dbLast;
+            }, [allUserRecords, optimisticAction]);
 
             // 2. Get records for the Visual List (Strictly matching the Shop's "Today")
             const visualAttendanceList = useMemo(() => {
-                 return allUserRecords.filter(a => {
+                 // Merge optimistic record into the visual list if it matches the day
+                 const list = [...allUserRecords];
+                 
+                 // If optimistic action exists and isn't in the DB list yet, add it
+                 if (optimisticAction && !list.find(r => r.timestamp.getTime() === optimisticAction.timestamp.getTime())) {
+                     list.unshift(optimisticAction);
+                 }
+
+                 return list.filter(a => {
                     // Convert record timestamp to the SELECTED SHOP's timezone
-                    const { localDate: recordDate } = Utils.formatDateInTimezone(a.timestamp, userShop?.timezone);
+                    // Handle raw Date (optimistic) vs Firestore Timestamp
+                    const dateObj = a.timestamp.toDate ? a.timestamp : a.timestamp;
+                    
+                    const { localDate: recordDate } = Utils.formatDateInTimezone({ toDate: () => dateObj }, userShop?.timezone);
                     // Only show records that belong to "Today" in that shop
                     return recordDate === todayInShopTimezone;
                 });
-            }, [allUserRecords, userShop, todayInShopTimezone]);
+            }, [allUserRecords, userShop, todayInShopTimezone, optimisticAction]);
             
             // FIX: Restore userAttendanceToday reference (Alias for break logic)
             const userAttendanceToday = visualAttendanceList;
 
-            // REMOVED: Duplicate declaration of lastAction (it is already declared above)
             const isOnBreak = lastAction?.type === 'break_start';
             const isCheckedIn = lastAction?.type === 'in' || lastAction?.type === 'break_end' || lastAction?.type === 'break_start';
 
@@ -7922,16 +7949,29 @@
 
                     const { addDoc, collection, serverTimestamp } = window.firebaseSDK;
                     const deviceInfo = await Utils.getDeviceInfo();
+                    const now = new Date(); // Capture instant time
 
                     await addDoc(collection(db, 'attendance'), { 
                         employeeId: userProfile.id, 
                         employeeName: userProfile.name, 
                         shop: selectedShopForCheckIn, 
                         timestamp: serverTimestamp(), 
-                        type: actionType, // 'break_start' or 'break_end'
+                        type: actionType, 
                         location: freshLocation, 
-                        verificationMethod: 'gps', // Assuming GPS for break controls
+                        verificationMethod: 'gps',
                         deviceInfo: deviceInfo 
+                    });
+
+                    // --- NEW: Set Optimistic State Immediately ---
+                    setOptimisticAction({
+                        type: actionType,
+                        shop: selectedShopForCheckIn,
+                        timestamp: now,
+                        employeeId: userProfile.id,
+                        location: freshLocation,
+                        verificationMethod: 'gps',
+                        deviceInfo: deviceInfo,
+                        isOptimistic: true
                     });
 
                     // --- NEW: Custom Alert Message with Duration ---
@@ -8036,6 +8076,19 @@
                         location: gpsLocation,
                         deviceInfo: deviceInfo
                     });
+                    
+                    // --- NEW: Set Optimistic State Immediately ---
+                    setOptimisticAction({
+                        type: nextActionType,
+                        shop: qrText,
+                        timestamp: checkInTimestamp,
+                        employeeId: userProfile.id,
+                        location: gpsLocation,
+                        verificationMethod: 'qr',
+                        deviceInfo: deviceInfo,
+                        isOptimistic: true
+                    });
+                    
                     setSelectedShopForCheckIn(qrText);
 
                     // Late Logic ... (keep existing) ...
@@ -8118,6 +8171,18 @@
                         location: freshLocation, 
                         verificationMethod: 'gps',
                         deviceInfo: deviceInfo 
+                    });
+
+                    // --- NEW: Set Optimistic State Immediately ---
+                    setOptimisticAction({
+                        type: nextActionType,
+                        shop: selectedShopForCheckIn,
+                        timestamp: checkInTimestamp,
+                        employeeId: userProfile.id,
+                        location: freshLocation,
+                        verificationMethod: 'gps',
+                        deviceInfo: deviceInfo,
+                        isOptimistic: true
                     });
                     
                     // ... (keep Late Logic GPS same as before) ...
