@@ -1218,15 +1218,44 @@
             },
             // NEW: Timezone-aware date formatting utility
             formatDateInTimezone: (timestamp, timezone) => {
-                // Return defaults if the timestamp is invalid
-                if (!timestamp || !timestamp.toDate) {
+                // 1. Safety Check: If null/undefined
+                if (!timestamp) {
                     return { localDate: 'N/A', displayDate: 'N/A', localTime: 'N/A' };
                 }
 
-                const date = timestamp.toDate();
-                // Use the provided timezone, but fall back to the user's browser timezone if it's missing.
+                let date;
+                try {
+                    // 2. Determine Type & Convert to JS Date Object
+                    if (typeof timestamp.toDate === 'function') {
+                        // Firestore Timestamp
+                        date = timestamp.toDate();
+                    } else if (timestamp instanceof Date) {
+                        // Native JS Date
+                        date = timestamp;
+                    } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+                        // ISO String or Epoch MS
+                        date = new Date(timestamp);
+                    } else if (timestamp.seconds) {
+                        // Raw object with seconds (Firestore-like but not class)
+                        date = new Date(timestamp.seconds * 1000);
+                    } else {
+                        // Unrecognized format
+                        return { localDate: 'N/A', displayDate: 'N/A', localTime: 'N/A' };
+                    }
+                    
+                    // 3. Validation: Check if Date is Valid (not "Invalid Date")
+                    if (isNaN(date.getTime())) {
+                         return { localDate: 'N/A', displayDate: 'N/A', localTime: 'N/A' };
+                    }
+                } catch (e) {
+                    console.error("Date parsing error in Utils:", e);
+                    return { localDate: 'N/A', displayDate: 'N/A', localTime: 'N/A' };
+                }
+
+                // 4. Timezone Selection
                 const tz = timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+                // 5. Formatting with Fallback
                 try {
                     // 'sv-SE' (Swedish) locale reliably gives the YYYY-MM-DD format.
                     const localDate = date.toLocaleDateString('sv-SE', { timeZone: tz });
@@ -1240,10 +1269,14 @@
 
                     return { localDate, displayDate, localTime };
                 } catch (error) {
-                    console.error("Invalid timezone provided to formatter:", timezone, error);
-                    // If the provided timezone is invalid, fall back to basic UTC conversion to prevent crashes.
-                    const localDate = date.toISOString().split('T')[0];
-                    return { localDate, displayDate: localDate, localTime: date.toUTCString() };
+                    console.error("Timezone formatting error:", timezone, error);
+                    // Fallback to basic UTC/ISO if Intl fails (e.g. invalid timezone string)
+                    try {
+                        const iso = date.toISOString();
+                        return { localDate: iso.split('T')[0], displayDate: iso.split('T')[0], localTime: date.toUTCString().split(' ')[4] };
+                    } catch (finalErr) {
+                         return { localDate: 'Error', displayDate: 'Error', localTime: 'Error' };
+                    }
                 }
             },
             // Haversine formula to calculate distance between two lat/lon points
@@ -7632,7 +7665,6 @@
             const [isScannerOpen, setIsScannerOpen] = useState(false);
             
             // NEW: Optimistic State to fix the "Double Click" issue
-            // This holds the latest action in memory instantly while waiting for DB to sync
             const [optimisticAction, setOptimisticAction] = useState(null);
             
             // NEW: State to control Payroll Calculation (Saves DB Reads)
@@ -7828,48 +7860,38 @@
             // --- CROSS-SHOP WORKFLOW LOGIC ---
             // 1. Get ALL recent records for this user (Used for determining button state: In/Out)
             const allUserRecords = useMemo(() => {
-                return (allData.attendance || [])
+                const records = (allData.attendance || [])
                     .filter(a => a.employeeId === userProfile.id)
                     .sort((a, b) => (b.timestamp?.toDate() || 0) - (a.timestamp?.toDate() || 0));
-            }, [allData.attendance, userProfile]);
-
-            // The absolute last action (Source of Truth for Check-In status)
-            // MODIFIED: Merge Database Data with Optimistic Local Data
-            const lastAction = useMemo(() => {
-                const dbLast = allUserRecords[0] || null;
                 
-                // If we have a local action that is newer than the DB one (or if DB is empty), use local
+                // Merge Optimistic Record if it's newer than the latest DB record
                 if (optimisticAction) {
-                    const dbTime = dbLast?.timestamp?.toDate ? dbLast.timestamp.toDate().getTime() : 0;
-                    const localTime = optimisticAction.timestamp.getTime();
+                    const latestDb = records[0];
+                    const dbTime = latestDb?.timestamp?.toDate ? latestDb.timestamp.toDate().getTime() : 0;
+                    const optTime = optimisticAction.timestamp.getTime();
                     
-                    if (localTime >= dbTime) {
-                        return optimisticAction;
+                    // Only add if it's actually newer (avoids duplicates if DB catches up)
+                    if (optTime > dbTime) {
+                        return [optimisticAction, ...records];
                     }
                 }
-                return dbLast;
-            }, [allUserRecords, optimisticAction]);
+                return records;
+            }, [allData.attendance, userProfile, optimisticAction]);
+
+            // The absolute last action (Source of Truth for Check-In status)
+            const lastAction = allUserRecords[0] || null;
 
             // 2. Get records for the Visual List (Strictly matching the Shop's "Today")
             const visualAttendanceList = useMemo(() => {
-                 // Merge optimistic record into the visual list if it matches the day
-                 const list = [...allUserRecords];
-                 
-                 // If optimistic action exists and isn't in the DB list yet, add it
-                 if (optimisticAction && !list.find(r => r.timestamp.getTime() === optimisticAction.timestamp.getTime())) {
-                     list.unshift(optimisticAction);
-                 }
-
-                 return list.filter(a => {
+                 return allUserRecords.filter(a => {
                     // Convert record timestamp to the SELECTED SHOP's timezone
-                    // Handle raw Date (optimistic) vs Firestore Timestamp
-                    const dateObj = a.timestamp.toDate ? a.timestamp : a.timestamp;
+                    // FIX: Pass timestamp directly. The Util handles Firestore Timestamp vs Date vs String.
+                    const { localDate: recordDate } = Utils.formatDateInTimezone(a.timestamp, userShop?.timezone);
                     
-                    const { localDate: recordDate } = Utils.formatDateInTimezone({ toDate: () => dateObj }, userShop?.timezone);
                     // Only show records that belong to "Today" in that shop
                     return recordDate === todayInShopTimezone;
                 });
-            }, [allUserRecords, userShop, todayInShopTimezone, optimisticAction]);
+            }, [allUserRecords, userShop, todayInShopTimezone]);
             
             // FIX: Restore userAttendanceToday reference (Alias for break logic)
             const userAttendanceToday = visualAttendanceList;
@@ -8003,21 +8025,25 @@
                         const breakRecords = userAttendanceToday.filter(r => r.type === 'break_start' || r.type === 'break_end');
                         
                         // 2. Sort chronologically (Oldest first)
-                        const sortedBreaks = [...breakRecords].sort((a,b) => a.timestamp.toDate() - b.timestamp.toDate());
+                        const sortedBreaks = [...breakRecords].sort((a,b) => {
+                             const ta = a.timestamp.toDate ? a.timestamp.toDate() : new Date(a.timestamp);
+                             const tb = b.timestamp.toDate ? b.timestamp.toDate() : new Date(b.timestamp);
+                             return ta - tb;
+                        });
                         
                         // 3. Sum up completed sessions from history
                         let tempStart = null;
                         sortedBreaks.forEach(r => {
+                            const ts = r.timestamp.toDate ? r.timestamp.toDate() : new Date(r.timestamp);
                             if (r.type === 'break_start') {
-                                tempStart = r.timestamp.toDate();
+                                tempStart = ts;
                             } else if (r.type === 'break_end' && tempStart) {
-                                totalBreakMs += (r.timestamp.toDate() - tempStart);
+                                totalBreakMs += (ts - tempStart);
                                 tempStart = null;
                             }
                         });
                         
                         // 4. Add the current session (Now - Last Start)
-                        // Note: The 'break_end' we just added is not in userAttendanceToday yet, so tempStart will be populated with the current session's start
                         if (tempStart) {
                             totalBreakMs += (now - tempStart);
                         }
@@ -8054,7 +8080,7 @@
                 } finally {
                     setLoading(false);
                 }
-            }, [db, userProfile, selectedShopForCheckIn, getLocation, userAttendanceToday]); // Added userAttendanceToday dependency
+            }, [db, userProfile, selectedShopForCheckIn, getLocation, userAttendanceToday]); 
 
             const handleScanSuccess = async (qrText) => {
                 setIsScannerOpen(false);
