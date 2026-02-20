@@ -612,12 +612,15 @@
             useEffect(() => {
                 // If we have cache, we don't block. If no cache, set loading true.
                 if ((!db || !currentUser)) { 
-                    if (!persistKey || data.length === 0) setLoading(true);
+                    // MODIFIED PERFORMANCE FIX: Only set loading if we have NO data AND no cache key.
+                    // If we have a persistKey (even if data is empty array from cache), don't show loading spinner.
+                    if (!persistKey && data.length === 0) setLoading(true);
                     return;
                 }
 
                 // Only set loading to true if we don't have cached data to show
-                if ((!persistKey || data.length === 0)) setLoading(true);
+                // MODIFIED: Stronger check to prevent skeleton flash
+                if (!persistKey && data.length === 0) setLoading(true);
                 
                 const { collection, onSnapshot, query } = window.firebaseSDK;
                 
@@ -7860,20 +7863,42 @@
             // --- CROSS-SHOP WORKFLOW LOGIC ---
             // 1. Get ALL recent records for this user (Used for determining button state: In/Out)
             const allUserRecords = useMemo(() => {
+                // BUG FIX: Robust timestamp parser to safely handle pending writes (null), native Dates, and Firestore Timestamps
+                const getTs = (ts) => {
+                    if (!ts) return 0;
+                    if (typeof ts.toDate === 'function') {
+                        const date = ts.toDate();
+                        return date ? date.getTime() : 0;
+                    }
+                    if (ts instanceof Date) return ts.getTime();
+                    return new Date(ts).getTime() || 0;
+                };
+
                 const records = (allData.attendance || [])
                     .filter(a => a.employeeId === userProfile.id)
-                    .sort((a, b) => (b.timestamp?.toDate() || 0) - (a.timestamp?.toDate() || 0));
+                    .sort((a, b) => getTs(b.timestamp) - getTs(a.timestamp));
                 
-                // Merge Optimistic Record if it's newer than the latest DB record
+                // Merge Optimistic Record instantly to update UI without waiting for DB sync
                 if (optimisticAction) {
                     const latestDb = records[0];
-                    const dbTime = latestDb?.timestamp?.toDate ? latestDb.timestamp.toDate().getTime() : 0;
-                    const optTime = optimisticAction.timestamp.getTime();
-                    
-                    // Only add if it's actually newer (avoids duplicates if DB catches up)
-                    if (optTime > dbTime) {
-                        return [optimisticAction, ...records];
+                    if (!latestDb) return [optimisticAction, ...records];
+
+                    const dbTime = getTs(latestDb.timestamp);
+                    const optTime = getTs(optimisticAction.timestamp);
+
+                    // If DB has caught up (same action type) AND it's recent (within 2 mins)
+                    // Or if it's a pending local write (dbTime === 0 but type matches)
+                    if (latestDb.type === optimisticAction.type && (Math.abs(dbTime - optTime) < 120000 || dbTime === 0)) {
+                        return records;
                     }
+
+                    // If server time is ahead of device time, trust optimistic action immediately after click.
+                    // Only drop optimistic if DB has a NEWER record of a DIFFERENT type.
+                    if (dbTime > optTime + 60000 && latestDb.type !== optimisticAction.type) {
+                        return records;
+                    }
+
+                    return [optimisticAction, ...records];
                 }
                 return records;
             }, [allData.attendance, userProfile, optimisticAction]);
@@ -8091,6 +8116,13 @@
                 let penaltyAmount = 0;
 
                 try {
+                    // --- FIX: Block Check OUT via QR if currently on break ---
+                    if (lastAction?.type === 'break_start') {
+                        alert("You are currently on break. Please end your break before checking out.");
+                        setLoading(false);
+                        return;
+                    }
+
                     const { location: gpsLocation } = await getLocation(true);
                     const scannedShop = allData.shops.find(s => s.name === qrText);
                     if (!scannedShop) { alert("Invalid QR Code."); setLoading(false); return; }
@@ -8104,7 +8136,9 @@
                     const radius = parseFloat(scannedShop.radius) || 500;
                     if (dist > radius) { alert(`Too far from ${qrText} (${Math.round(dist)}m).`); setLoading(false); return; }
 
-                    const nextActionType = lastAction?.type === 'in' ? 'out' : 'in';
+                    // --- FIX: Correctly determine Next Action handling the Break End state ---
+                    const isCurrentlyWorking = lastAction?.type === 'in' || lastAction?.type === 'break_end';
+                    const nextActionType = isCurrentlyWorking ? 'out' : 'in';
                     const checkInTimestamp = new Date();
                     const { addDoc, collection, serverTimestamp, setDoc, doc, query, getDocs, where } = window.firebaseSDK;
                     const deviceInfo = await Utils.getDeviceInfo();
@@ -8201,7 +8235,11 @@
                     }
                     
                     const { addDoc, collection, serverTimestamp, getDocs, query, where, setDoc, doc } = window.firebaseSDK;
-                    const nextActionType = lastAction?.type === 'in' ? 'out' : 'in';
+                    
+                    // --- FIX: Correctly determine Next Action handling the Break End state ---
+                    const isCurrentlyWorking = lastAction?.type === 'in' || lastAction?.type === 'break_end';
+                    const nextActionType = isCurrentlyWorking ? 'out' : 'in';
+                    
                     const checkInTimestamp = new Date();
                     const deviceInfo = await Utils.getDeviceInfo();
 
@@ -9515,6 +9553,7 @@
                                     <tr>
                                         <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
                                         <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
                                         <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Type</th>
                                         <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
                                         <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note</th>
@@ -9527,6 +9566,7 @@
                                         <tr key={rec.id} className="hover:bg-slate-700/50">
                                             <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(rec.date)}</td>
                                             <td className="px-4 py-4 text-sm text-slate-200">{rec.staffName}</td>
+                                            <td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td>
                                             <td className="px-4 py-4 text-sm"><span className={`px-2 py-1 text-xs rounded-full ${rec.statusState === 'Engagement' ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'}`}>{rec.statusState}</span></td>
                                             <td className="px-4 py-4 text-sm text-right font-bold text-orange-300">{Utils.formatCurrency(rec.amount)}</td>
                                             <td className="px-4 py-4 text-sm text-slate-300">{rec.note}</td>
@@ -21982,8 +22022,9 @@ service cloud.firestore {
             const { isOnline } = useConnectivity();
 
             // 7. Data Fetching Hooks (Must be unconditional)
-            const { data: allNotices } = useCollection('memoAlerts');
-            const { data: allPolicies } = useCollection('policies');
+            // PERFORMANCE FIX: Added cache keys to prevent blocking load on every refresh
+            const { data: allNotices } = useCollection('memoAlerts', [], 'hr_cache_notices');
+            const { data: allPolicies } = useCollection('policies', [], 'hr_cache_policies');
 
             // --- NEW: Global Chat Listener for Notification Badge ---
             const [unreadChatCount, setUnreadChatCount] = useState(0);
@@ -22101,10 +22142,14 @@ service cloud.firestore {
                 if (!loading) {
                     const splash = document.getElementById('splash-screen');
                     if (splash) {
-                        setTimeout(() => {
-                            splash.style.opacity = '0';
-                            setTimeout(() => splash.remove(), 500);
-                        }, 300);
+                        // PERFORMANCE FIX: Use requestAnimationFrame to ensure React has painted 
+                        // the initial UI frame (Skeleton or Login) before fading out the splash.
+                        requestAnimationFrame(() => {
+                            setTimeout(() => {
+                                splash.style.opacity = '0';
+                                setTimeout(() => splash.remove(), 500);
+                            }, 100); // Small buffer for visual smoothness
+                        });
                     }
                 }
             }, [loading]);
