@@ -1358,88 +1358,48 @@
             // This function transactionally processes a savings withdrawal.
             // MODIFIED (STEP 3): Added 'employeeName' and 'shop' parameters for denormalization.
             manageSavingsWithdrawal: async (db, employeeId, employeeName, shop, amount, note) => {
-                const { doc, collection, serverTimestamp, runTransaction } = window.firebaseSDK;
-                // MODIFIED (STEP 3): Path changed to new '/savingprogram' collection.
+                // OPTIMIZED: Switched from runTransaction to writeBatch + increment to avoid Read Quota errors.
+                const { doc, collection, serverTimestamp, writeBatch, increment } = window.firebaseSDK;
                 const savingsRef = doc(db, 'savingprogram', employeeId);
-                // MODIFIED (STEP 3): Path changed to new '/savingprogram/{id}/transactions' subcollection.
                 const transactionRef = doc(collection(db, 'savingprogram', employeeId, 'transactions'));
         
                 try {
-                    await runTransaction(db, async (transaction) => {
-                        const savingsDoc = await transaction.get(savingsRef);
-        
-                        if (!savingsDoc.exists()) {
-                            throw new Error("Employee has no savings record to withdraw from.");
-                        }
-        
-                        // --- BUG FIX: Correctly parse floats, handling NaN/undefined/null ---
-                        const parseSafeFloat = (val) => {
-                            if (val === null || val === undefined) return 0;
-                            const num = parseFloat(val);
-                            return isNaN(num) ? 0 : num;
-                        };
+                    const batch = writeBatch(db);
 
-                        const currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
-                        let currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
-                        const currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
-                        // --- END BUG FIX ---
-
-                        // --- NEW: Data-Integrity Patch (as requested) ---
-                        // This patch detects and fixes legacy data where mySavingCredit was 0
-                        // (or null) but currentBalance was correct.
-                        if ((currentCredit === 0 || currentCredit === null) && currentBalance > 0) {
-                            console.warn(`[Savings Patch: Withdrawal] Fixing inconsistent data for ${employeeId}.`);
-                            // Back-calculate the correct total credit.
-                            currentCredit = currentBalance + currentWithdrawals;
-                            
-                            // We also update the database field immediately to fix it permanently.
-                            // This is safe because we are already in a transaction.
-                            transaction.update(savingsRef, { mySavingCredit: currentCredit });
-                        }
-                        // --- END: Data-Integrity Patch ---
-                        
-                        if (amount > currentBalance) {
-                            throw new Error("Withdrawal amount cannot exceed the current balance.");
-                        }
-        
-                        // MODIFIED: Implement new logic
-                        const newWithdrawals = currentWithdrawals + amount;
-                        
-                        // --- REVERTING PREVIOUS FIX ---
-                        // Now that 'currentCredit' is patched and correct, we can
-                        // safely use the original "source of truth" formula.
-                        const newBalance = currentCredit - newWithdrawals;
-        
-                        // Operation 1: Update the employee's total savings balance.
-                        transaction.update(savingsRef, { 
-                            currentBalance: newBalance, 
-                            mySavingWithdrawalTotal: newWithdrawals, // NEW: Set the new withdrawal total
-                            lastUpdated: serverTimestamp() 
-                        });
-        
-                        // Operation 2: Create a new transaction log for this withdrawal.
-                        // MODIFIED (STEP 3): Added 'staffName' and 'shop' for denormalization.
-                        transaction.set(transactionRef, {
-                            employeeId: employeeId,
-                            staffName: employeeName, // Denormalized field
-                            shop: shop, // Denormalized field
-                            date: serverTimestamp(),
-                            amountWithdrawn: amount,
-                            type: 'withdrawal',
-                            note: note || 'Manual payback'
-                        });
+                    // Operation 1: Atomic Update (0 Reads). Decrement balance, increment total withdrawals.
+                    batch.set(savingsRef, { 
+                        currentBalance: increment(-amount), 
+                        mySavingWithdrawalTotal: increment(amount), 
+                        lastUpdated: serverTimestamp() 
+                    }, { merge: true });
+    
+                    // Operation 2: Create transaction log
+                    batch.set(transactionRef, {
+                        employeeId: employeeId,
+                        staffName: employeeName,
+                        shop: shop,
+                        date: serverTimestamp(),
+                        amountWithdrawn: amount,
+                        type: 'withdrawal',
+                        note: note || 'Manual payback'
                     });
-                    console.log(`Savings withdrawal of ${amount} for ${employeeId} processed successfully.`);
+
+                    await batch.commit();
+                    console.log(`[Savings OPTIMIZED] Savings withdrawal of ${amount} for ${employeeId} processed successfully.`);
                     return { success: true };
                 } catch (error) {
-                    console.error("Error within manageSavingsWithdrawal transaction: ", error);
+                    console.error("Error within manageSavingsWithdrawal batch: ", error);
+                    if (error.code === 'resource-exhausted') {
+                        return { success: false, error: { message: "Daily Quota Exceeded. Writes failed. Please try again tomorrow." } };
+                    }
                     return { success: false, error: error };
                 }
             },
             
             // --- NEW: Function to REVERSE a savings withdrawal transactionally ---
             reverseSavingsWithdrawal: async (db, txToReverse) => {
-                const { doc, serverTimestamp, runTransaction } = window.firebaseSDK;
+                // OPTIMIZED: Switched from runTransaction to writeBatch + increment to avoid Read Quota errors.
+                const { doc, serverTimestamp, writeBatch, increment } = window.firebaseSDK;
                 
                 // Ensure we have the necessary IDs to build document references
                 if (!txToReverse || !txToReverse.employeeId || !txToReverse.id) {
@@ -1450,55 +1410,27 @@
                 const transactionRef = doc(db, 'savingprogram', txToReverse.employeeId, 'transactions', txToReverse.id);
 
                 try {
-                    await runTransaction(db, async (transaction) => {
-                        const savingsDoc = await transaction.get(savingsRef);
+                    const batch = writeBatch(db);
+                    const amountToReverse = parseFloat(txToReverse.amountWithdrawn) || 0;
 
-                        if (!savingsDoc.exists()) {
-                            throw new Error("Employee has no savings record. Cannot reverse.");
-                        }
-
-                        // Helper to safely parse floats
-                        const parseSafeFloat = (val) => {
-                            if (val === null || val === undefined) return 0;
-                            const num = parseFloat(val);
-                            return isNaN(num) ? 0 : num;
-                        };
-
-                        const currentBalance = parseSafeFloat(savingsDoc.data().currentBalance);
-                        let currentCredit = parseSafeFloat(savingsDoc.data().mySavingCredit);
-                        const currentWithdrawals = parseSafeFloat(savingsDoc.data().mySavingWithdrawalTotal);
-                        const amountToReverse = parseSafeFloat(txToReverse.amountWithdrawn);
-
-                        // --- Data-Integrity Patch (same as in other functions) ---
-                        if ((currentCredit === 0 || currentCredit === null) && (currentBalance > 0 || currentWithdrawals > 0)) {
-                            console.warn(`[Savings Patch: Reversal] Fixing inconsistent data for ${txToReverse.employeeId}.`);
-                            currentCredit = currentBalance + currentWithdrawals;
-                            // Update the main doc immediately since we're in a transaction
-                            transaction.update(savingsRef, { mySavingCredit: currentCredit });
-                        }
-                        // --- END: Data-Integrity Patch ---
-                        
-                        // Calculate new totals
-                        const newWithdrawalTotal = currentWithdrawals - amountToReverse;
-                        
-                        // Use the "source of truth" formula to recalculate the balance
-                        const newBalance = currentCredit - newWithdrawalTotal;
-
-                        // Operation 1: Update the main savings document
-                        transaction.update(savingsRef, {
-                            currentBalance: newBalance,
-                            mySavingWithdrawalTotal: newWithdrawalTotal,
-                            lastUpdated: serverTimestamp()
-                        });
-                        
-                        // Operation 2: Delete the withdrawal transaction log
-                        transaction.delete(transactionRef);
-                    });
+                    // Operation 1: Atomic Reversal (0 Reads). Add back to balance, remove from withdrawal total.
+                    batch.set(savingsRef, {
+                        currentBalance: increment(amountToReverse),
+                        mySavingWithdrawalTotal: increment(-amountToReverse),
+                        lastUpdated: serverTimestamp()
+                    }, { merge: true });
                     
-                    console.log(`Savings withdrawal ${txToReverse.id} of ${amountToReverse} for ${txToReverse.employeeId} reversed successfully.`);
+                    // Operation 2: Delete the withdrawal log
+                    batch.delete(transactionRef);
+
+                    await batch.commit();
+                    console.log(`[Savings OPTIMIZED] Savings withdrawal ${txToReverse.id} of ${amountToReverse} reversed successfully.`);
                     return { success: true };
                 } catch (error) {
-                    console.error("Error within reverseSavingsWithdrawal transaction: ", error);
+                    console.error("Error within reverseSavingsWithdrawal batch: ", error);
+                    if (error.code === 'resource-exhausted') {
+                        return { success: false, error: { message: "Daily Quota Exceeded. Writes failed. Please try again tomorrow." } };
+                    }
                     return { success: false, error: error };
                 }
             },
