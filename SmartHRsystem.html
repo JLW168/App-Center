@@ -4556,7 +4556,8 @@
         });
 
         // NEW: Modal for adding/editing salary revisions
-        const SalaryRevisionModal = ({ isOpen, onClose, onSave, revision, userProfile }) => {
+        // MODIFIED: Added allRevisions to props so the modal can read history
+        const SalaryRevisionModal = ({ isOpen, onClose, onSave, revision, userProfile, allRevisions = [] }) => {
             // Get global data from context
             const { shops, employees } = useAppData();
             const [formData, setFormData] = useState({});
@@ -4609,18 +4610,42 @@
                         newFormData.updatedSalary = 0;
                     }
 
-                    // When the staff selection changes...
-                    if (name === 'staffId') {
-                        const selectedEmployee = employees.find(emp => emp.id === value);
-                        if (selectedEmployee) {
-                            // ...update the staff name and recalculate salaries from scratch.
-                            newFormData.staffName = selectedEmployee.name;
-                            const currentSalary = parseFloat(String(selectedEmployee.salary).replace(/[^0-9.-]/g, '')) || 0;
-                            const revisedAmount = parseFloat(newFormData.reviseAmount) || 0;
-                            newFormData.baseSalary = currentSalary;
-                            newFormData.updatedSalary = currentSalary + revisedAmount;
+                    // --- NEW: Helper to dynamically find the true current active salary ---
+                    const getLatestSalary = (staffId, effectiveDate) => {
+                        const emp = employees.find(e => e.id === staffId);
+                        if (!emp) return 0;
+                        
+                        const defaultBase = parseFloat(String(emp.salary).replace(/[^0-9.-]/g, '')) || 0;
+                        
+                        // Find all approved revisions that take effect on or before the target date
+                        const applicable = allRevisions
+                            .filter(r => r.staffId === staffId && r.status === 'Approved' && r.effectiveDate <= effectiveDate)
+                            .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate)); // Sort latest first
+                            
+                        if (applicable.length > 0) {
+                            return parseFloat(String(applicable[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0;
+                        }
+                        return defaultBase;
+                    };
+
+                    // When the staff selection changes OR effective date changes...
+                    if (name === 'staffId' || name === 'effectiveDate') {
+                        const targetStaffId = name === 'staffId' ? value : newFormData.staffId;
+                        const targetDate = name === 'effectiveDate' ? value : newFormData.effectiveDate;
+
+                        if (targetStaffId) {
+                            const selectedEmployee = employees.find(emp => emp.id === targetStaffId);
+                            if (selectedEmployee) {
+                                newFormData.staffName = selectedEmployee.name;
+                                
+                                // FIX: Use the dynamic active salary instead of the stale profile base
+                                const currentSalary = getLatestSalary(targetStaffId, targetDate);
+                                
+                                const revisedAmount = parseFloat(newFormData.reviseAmount) || 0;
+                                newFormData.baseSalary = currentSalary;
+                                newFormData.updatedSalary = currentSalary + revisedAmount;
+                            }
                         } else {
-                            // ...or reset if the staff is deselected.
                             newFormData.staffName = '';
                             newFormData.baseSalary = 0;
                             newFormData.updatedSalary = parseFloat(newFormData.reviseAmount) || 0;
@@ -4637,7 +4662,7 @@
 
                     return newFormData;
                 });
-            }, [employees]); // Dependency on employees is needed to find staff details.
+            }, [employees, allRevisions]); // MODIFIED: Added allRevisions to dependencies so it stays up to date
             
             const handleSubmit = (e) => {
                 e.preventDefault();
@@ -4878,7 +4903,8 @@
                             )}
                         </>
                     )}
-                    <SalaryRevisionModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveRevision} revision={editingRevision} userProfile={userProfile} />
+                    {/* MODIFIED: Pass the 'revisions' array down into the modal */}
+                    <SalaryRevisionModal isOpen={isModalOpen} onClose={handleCloseModal} onSave={handleSaveRevision} revision={editingRevision} userProfile={userProfile} allRevisions={revisions} />
                     <ConfirmationModal isOpen={!!revisionToDelete} onClose={() => setRevisionToDelete(null)} onConfirm={handleDeleteConfirm} title="Delete Revision" message="Are you sure you want to delete this salary revision record?" />
                 </Card>
             );
@@ -8233,21 +8259,32 @@
                         if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
-                            if (checkInHour >= startHour && (checkInHour - startHour < 4)) {
-                                if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
+                            
+                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE ---
+                            let startMins = startHour * 60 + (startMinute || 0);
+                            let lateLimitMins = lateHour * 60 + lateMinute;
+                            let checkInMins = checkInHour * 60 + checkInMinute;
+
+                            // Handle overnight shifts wrapping past midnight
+                            if (checkInMins < startMins - 720) checkInMins += 1440;
+                            if (lateLimitMins < startMins) lateLimitMins += 1440;
+
+                            // Evaluate window: Check-in is AFTER start time, but within 14 hours
+                            if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
+                                if (checkInMins > lateLimitMins) {
                                     
-                                    // --- NEW: Calculate EXACT minutes late from START TIME ---
-                                    const startMins = startHour * 60 + (startMinute || 0);
-                                    const checkInMins = checkInHour * 60 + checkInMinute;
+                                    // Calculate EXACT minutes late from START TIME
                                     const lateMinutes = checkInMins - startMins;
 
                                     const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
                                     const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
                                     const snap = await getDocs(q);
-                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late') || doc.data().note?.includes('OT'))) {
+                                    
+                                    // Strict check to prevent duplicate late penalties on the same day
+                                    if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
                                         const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // --- NEW: Dynamic Tiered Penalty Logic ---
+                                        // --- Dynamic Tiered Penalty Logic ---
                                         penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
                                         if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
                                             const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
@@ -8352,23 +8389,31 @@
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
                             
-                            // Check if check-in is relevant to this shift start (within 4 hours)
-                            if (checkInHour >= startHour && (checkInHour - startHour < 4)) {
-                                if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
+                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE ---
+                            let startMins = startHour * 60 + (startMinute || 0);
+                            let lateLimitMins = lateHour * 60 + lateMinute;
+                            let checkInMins = checkInHour * 60 + checkInMinute;
+
+                            // Handle overnight shifts wrapping past midnight
+                            if (checkInMins < startMins - 720) checkInMins += 1440;
+                            if (lateLimitMins < startMins) lateLimitMins += 1440;
+                            
+                            // Evaluate window: Check-in is AFTER start time, but within 14 hours
+                            if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
+                                if (checkInMins > lateLimitMins) {
                                     
-                                    // --- NEW: Calculate EXACT minutes late from START TIME ---
-                                    const startMins = startHour * 60 + (startMinute || 0);
-                                    const checkInMins = checkInHour * 60 + checkInMinute;
+                                    // Calculate EXACT minutes late from START TIME
                                     const lateMinutes = checkInMins - startMins;
 
                                     const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
                                     const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
                                     const snap = await getDocs(q);
                                     
-                                    if (!snap.docs.some(doc => doc.data().note?.startsWith('CheckIn Late') || doc.data().note?.includes('OT'))) {
+                                    // Strict check to prevent duplicate late penalties on the same day
+                                    if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
                                         const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // --- NEW: Dynamic Tiered Penalty Logic ---
+                                        // --- Dynamic Tiered Penalty Logic ---
                                         penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
                                         if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
                                             const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
@@ -13667,7 +13712,31 @@ service cloud.firestore {
                 setIsRuleModalOpen(true);
             };
 
-            const handleSaveRule = (e) => {
+            // NEW: Unified helper to instantly save any global setting changes to DB and Cache
+            const persistGlobalSettings = async (updates) => {
+                const { doc, setDoc, serverTimestamp } = window.firebaseSDK;
+                try {
+                    await setDoc(doc(db, 'systemConfig', 'global'), {
+                        ...updates,
+                        updatedAt: serverTimestamp()
+                    }, { merge: true });
+                    
+                    // Update cache instantly to prevent visual flickers on reload
+                    const cached = JSON.parse(localStorage.getItem('hr_cache_sys_config') || '[]');
+                    const globalIdx = cached.findIndex(d => d.id === 'global');
+                    if (globalIdx >= 0) {
+                        cached[globalIdx] = { ...cached[globalIdx], ...updates };
+                    } else {
+                        cached.push({ id: 'global', ...updates });
+                    }
+                    localStorage.setItem('hr_cache_sys_config', JSON.stringify(cached));
+                } catch (error) {
+                    console.error("Persistence error:", error);
+                    throw error;
+                }
+            };
+
+            const handleSaveRule = async (e) => {
                 e.preventDefault();
                 const limit = parseInt(ruleFormData.limit) || 0;
                 const amount = parseFloat(ruleFormData.amount) || 0;
@@ -13677,27 +13746,43 @@ service cloud.firestore {
                     return;
                 }
 
-                setLateRules(prev => {
-                    const newRules = [...prev];
-                    if (editingRuleIndex !== null) {
-                        newRules[editingRuleIndex] = { limit, amount };
-                    } else {
-                        newRules.push({ limit, amount });
-                    }
-                    // Sort by limit ascending
-                    return newRules.sort((a, b) => a.limit - b.limit);
-                });
+                let newRules = [...lateRules];
+                if (editingRuleIndex !== null) {
+                    newRules[editingRuleIndex] = { limit, amount };
+                } else {
+                    newRules.push({ limit, amount });
+                }
+                
+                // Sort by limit ascending
+                newRules.sort((a, b) => a.limit - b.limit);
+                
+                setLateRules(newRules);
                 setIsRuleModalOpen(false);
+
+                // FIX: Auto-save to DB immediately so it isn't lost on refresh
+                try {
+                    await persistGlobalSettings({ latePenaltyRules: newRules });
+                } catch (error) {
+                    alert("Warning: Rule added but failed to save to database.");
+                }
             };
 
-            const handleRemoveRule = (index) => {
-                setLateRules(prev => prev.filter((_, i) => i !== index));
+            const handleRemoveRule = async (index) => {
+                if (!confirm("Are you sure you want to remove this penalty tier?")) return;
+                const newRules = lateRules.filter((_, i) => i !== index);
+                setLateRules(newRules);
+                
+                // FIX: Auto-save immediately to database
+                try {
+                    await persistGlobalSettings({ latePenaltyRules: newRules });
+                } catch (error) {
+                    console.error("Failed to delete from DB", error);
+                }
             };
 
             const handleSaveSettings = async (e) => {
                 e.preventDefault();
                 setIsSavingSettings(true);
-                const { doc, setDoc, serverTimestamp } = window.firebaseSDK;
                 
                 // Cleanup empty or invalid rules before saving
                 const processedRules = lateRules
@@ -13705,30 +13790,14 @@ service cloud.firestore {
                     .filter(r => r.limit > 0 && r.amount >= 0);
 
                 try {
-                    await setDoc(doc(db, 'systemConfig', 'global'), {
+                    await persistGlobalSettings({
                         lateDeductionAmount: parseFloat(lateFee), // Kept for legacy fallback
                         latePenaltyRules: processedRules,
                         maxLatePenalty: parseFloat(maxLatePenalty) || 0,
-                        appName: systemName, 
-                        updatedAt: serverTimestamp()
-                    }, { merge: true });
-                    
-                    // Update cache immediately for title reflection
-                    const cached = JSON.parse(localStorage.getItem('hr_cache_sys_config') || '[]');
-                    const globalIdx = cached.findIndex(d => d.id === 'global');
-                    if(globalIdx >= 0) {
-                        cached[globalIdx].appName = systemName;
-                        cached[globalIdx].lateDeductionAmount = parseFloat(lateFee);
-                        cached[globalIdx].latePenaltyRules = processedRules;
-                        cached[globalIdx].maxLatePenalty = parseFloat(maxLatePenalty) || 0;
-                    } else {
-                        cached.push({ id: 'global', appName: systemName, lateDeductionAmount: parseFloat(lateFee), latePenaltyRules: processedRules, maxLatePenalty: parseFloat(maxLatePenalty) || 0 });
-                    }
-                    localStorage.setItem('hr_cache_sys_config', JSON.stringify(cached));
-
+                        appName: systemName 
+                    });
                     alert("System settings updated successfully. The page title will update momentarily.");
                 } catch (error) {
-                    console.error("Error saving settings:", error);
                     alert("Failed to save settings.");
                 } finally {
                     setIsSavingSettings(false);
