@@ -105,8 +105,8 @@
         // --- UPDATED: Added getApp and getApps imports ---
         import { initializeApp, deleteApp, getApp, getApps } from "https://www.gstatic.com/firebasejs/9.6.10/firebase-app.js";
         // -------------------------------------------------
-        // --- UPDATED: Added arrayUnion and arrayRemove imports ---
-        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, Timestamp, setDoc, getDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/9.6.10/firebase-firestore.js";
+        // --- UPDATED: Added enableIndexedDbPersistence import ---
+        import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, Timestamp, setDoc, getDoc, arrayUnion, arrayRemove, query, where, orderBy, limit, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/9.6.10/firebase-firestore.js";
         // ---------------------------------------------------------
         // --- UPDATED: Added signInAnonymously import ---
         import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut, setPersistence, browserSessionPersistence, browserLocalPersistence, createUserWithEmailAndPassword, signInAnonymously } from "https://www.gstatic.com/firebasejs/9.6.10/firebase-auth.js";
@@ -124,11 +124,22 @@
         // Initialize Firebase and make services globally available for Babel
         const app = initializeApp(firebaseConfig);
         window.db = getFirestore(app);
+        
+        // --- NEW: Enable Offline Persistence ---
+        enableIndexedDbPersistence(window.db).catch((err) => {
+            if (err.code == 'failed-precondition') {
+                console.warn('Offline Persistence: Multiple tabs open, persistence can only be enabled in one tab at a time.');
+            } else if (err.code == 'unimplemented') {
+                console.warn('Offline Persistence: The current browser does not support local caching.');
+            }
+        });
+        // ---------------------------------------
+
         window.auth = getAuth(app);
         window.Firebase = {
             Timestamp, onAuthStateChanged, signInWithEmailAndPassword, signOut,
             collection, onSnapshot, doc, addDoc, updateDoc, deleteDoc, setDoc, getDoc,
-            arrayUnion, arrayRemove, 
+            arrayUnion, arrayRemove, query, where, orderBy, limit, // <-- ADDED to global object
             setPersistence, browserSessionPersistence, browserLocalPersistence,
             createUserWithEmailAndPassword, signInAnonymously, // <-- ADDED to global object
             initializeApp, deleteApp, getApp, getApps,
@@ -358,22 +369,50 @@
         const DataProvider = ({ children }) => {
             const { user, userData } = useAuth();
             
-            const useCollection = (collectionName) => {
+            // --- UPDATED: Optimized Dynamic Collection Hook ---
+            const useCollection = (collectionName, queryConstraints = []) => {
                 const [data, setData] = useState([]);
+                
+                // Deep compare constraints to avoid infinite loops
+                const constraintsKey = JSON.stringify(
+                    queryConstraints.map(c => {
+                        let val = c.val;
+                        if (val && typeof val.toMillis === 'function') val = val.toMillis();
+                        else if (val instanceof Date) val = val.getTime();
+                        return { type: c.type, field: c.field, op: c.op, dir: c.dir, val };
+                    })
+                );
+
                 useEffect(() => {
                     if (!user) {
                         setData([]);
                         return;
                     };
-                    const { collection, onSnapshot } = window.Firebase;
-                    const unsubscribe = onSnapshot(collection(window.db, collectionName), (snapshot) => {
+                    const { collection, onSnapshot, query, where, orderBy, limit } = window.Firebase;
+                    
+                    let colRef = collection(window.db, collectionName);
+                    let q = colRef;
+
+                    if (queryConstraints && queryConstraints.length > 0) {
+                        const firestoreConstraints = queryConstraints.map(c => {
+                            if (c.type === 'where') return where(c.field, c.op, c.val);
+                            if (c.type === 'orderBy') return orderBy(c.field, c.dir);
+                            if (c.type === 'limit') return limit(c.val);
+                            return null;
+                        }).filter(Boolean);
+                        q = query(colRef, ...firestoreConstraints);
+                    }
+
+                    const unsubscribe = onSnapshot(q, (snapshot) => {
                         const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                         setData(items);
                     }, (error) => console.error(`Error fetching ${collectionName}:`, error));
+                    
                     return () => unsubscribe();
-                }, [user, collectionName]);
+                }, [user, collectionName, constraintsKey]); 
                 return data;
             };
+            // --------------------------------------------------
             
             const useDocument = (collectionName, docId) => {
                 const [data, setData] = useState(null);
@@ -392,32 +431,76 @@
                 return data;
             }
 
+            // --- NEW: Query Definitions to Prevent Database Read Bloat ---
+            // Fetches data from Jan 1st of the previous year to drastically limit read volume on scaling
+            const twoYearsAgo = new Date(new Date().getFullYear() - 1, 0, 1);
+            const tsTwoYearsAgo = window.Firebase?.Timestamp ? window.Firebase.Timestamp.fromDate(twoYearsAgo) : null;
+            const strTwoYearsAgo = twoYearsAgo.toISOString().split('T')[0];
+
+            const financialDateQuery = tsTwoYearsAgo ? [{ type: 'where', field: 'date', op: '>=', val: tsTwoYearsAgo }] : [];
+            const financialCreatedAtQuery = tsTwoYearsAgo ? [{ type: 'where', field: 'createdAt', op: '>=', val: tsTwoYearsAgo }] : [];
+            const stringDateQuery = [{ type: 'where', field: 'date', op: '>=', val: strTwoYearsAgo }];
+            
+            // Limit social feed to last 50 posts (huge read saving!)
+            const socialFeedQuery = [
+                { type: 'orderBy', field: 'createdAt', dir: 'desc' },
+                { type: 'limit', val: 50 } 
+            ];
+            
+            // --- NEW: Audit Log Query (Limit 100 recent) ---
+            const auditLogQuery = [
+                { type: 'orderBy', field: 'timestamp', dir: 'desc' },
+                { type: 'limit', val: 100 }
+            ];
+            // -----------------------------------------------
+
             const collections = {
                 shops: useCollection('shops'),
                 employees: useCollection('employees'),
                 vendors: useCollection('vendors'),
                 businessExpenseCategories: useCollection('businessExpenseCategories'),
                 familyExpenseCategories: useCollection('familyExpenseCategories'),
-                cashDrops: useCollection('cashDrops'),
-                purchaseOrders: useCollection('purchaseOrders'),
-                internalTransfers: useCollection('internalTransfers'),
-                businessExpenses: useCollection('businessExpenses'),
-                familyExpenses: useCollection('familyExpenses'),
-                bankStatements: useCollection('bankStatements'),
-                personalCashflowStatements: useCollection('personalCashflowStatements'),
+                cashDrops: useCollection('cashDrops', financialCreatedAtQuery),
+                purchaseOrders: useCollection('purchaseOrders', financialDateQuery),
+                internalTransfers: useCollection('internalTransfers', financialDateQuery),
+                businessExpenses: useCollection('businessExpenses', financialDateQuery),
+                familyExpenses: useCollection('familyExpenses', financialDateQuery),
+                bankStatements: useCollection('bankStatements', financialDateQuery),
+                personalCashflowStatements: useCollection('personalCashflowStatements', financialDateQuery),
                 saleMarginHistory: useCollection('saleMarginHistory'),
-                shopTargetHistory: useCollection('shopTargetHistory'), // Added Target History
-                socialPosts: useCollection('socialPosts'),
-                dailySOPs: useCollection('dailySOPs'),
-                maintenanceIssues: useCollection('maintenanceIssues'),
+                shopTargetHistory: useCollection('shopTargetHistory'), 
+                socialPosts: useCollection('socialPosts', socialFeedQuery),
+                dailySOPs: useCollection('dailySOPs', stringDateQuery),
+                maintenanceIssues: useCollection('maintenanceIssues'), 
                 familyWallet: useCollection('familyWallet'), 
                 deposits: useCollection('weeklyDeposits'), 
                 gcaAdjustments: useCollection('gcaAdjustments'),
-                banks: useCollection('banks'), // <-- ADDED: Banks Collection
+                banks: useCollection('banks'), 
+                auditLogs: useCollection('auditLogs', auditLogQuery), // <-- ADDED
             };
 
             const appSettings = useDocument("settings", "app") || { exchangeRate: 4000 };
             const sopSettings = useDocument("settings", "sop");
+
+            // --- NEW: Centralized Activity Logger ---
+            const logActivity = useCallback(async (action, module, targetName, details = '') => {
+                if (!userData) return;
+                try {
+                    const { addDoc, collection, Timestamp } = window.Firebase;
+                    await addDoc(collection(window.db, "auditLogs"), {
+                        action, // 'CREATE', 'UPDATE', 'DELETE'
+                        module, // e.g., 'Shops', 'Employees'
+                        targetName, // e.g., 'JLW KTL', 'John Doe'
+                        details, 
+                        performedBy: userData.name,
+                        performedByUid: userData.uid,
+                        timestamp: Timestamp.now()
+                    });
+                } catch (err) {
+                    console.error("Audit log error:", err);
+                }
+            }, [userData]);
+            // ----------------------------------------
 
             const value = { 
                 ...collections, 
@@ -434,7 +517,8 @@
                 issues: collections.maintenanceIssues,
                 familyWallet: collections.familyWallet,
                 gcaHistory: collections.gcaAdjustments,
-                banks: collections.banks, // <-- ADDED to context
+                banks: collections.banks, 
+                logActivity, // <-- ADDED to context
             };
             return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
         };
@@ -5611,8 +5695,13 @@
                 
                 // --- UPDATED: Allow Shop Manager to Edit & Delete ---
                 const userRole = userData?.role ? String(userData.role).trim() : '';
-                const canModify = ['Admin', 'Management', 'Shop Manager'].includes(userRole);
+                const canModifyGeneral = ['Admin', 'Management', 'Shop Manager'].includes(userRole);
                 // ----------------------------------------------------
+                
+                // --- NEW: Helper for checking today's date ---
+                const timeZone = 'Asia/Phnom_Penh';
+                const todayStr = new Date().toLocaleDateString('en-CA', { timeZone });
+                // ---------------------------------------------
 
                 return (
                     <div className="overflow-x-auto">
@@ -5630,37 +5719,45 @@
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-slate-700">
-                                    {reports.map(r => (
-                                        <tr key={r.id} className={`${shopColorMap[r.shop]?.base || 'bg-transparent'} ${shopColorMap[r.shop]?.hover || 'hover:bg-slate-700/50'}`}>
-                                            <td className="p-3 whitespace-nowrap text-slate-400">{formatInCambodiaTime(r.createdAt)}</td>
-                                            <td className="p-3 text-slate-300">{r.shop}</td>
-                                            <td className="p-3 text-slate-300">{r.staff}</td>
-                                            {['Today', 'Yesterday', 'Custom'].includes(viewType) && <td className="p-3 text-slate-300">{r.shift}</td>}
-                                            <td className="p-3 text-right font-bold text-blue-400">{formatCurrency(r.grandTotalKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankKhr, 'KHR')}</td>
-                                            <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashExchange, 'KHR')}</td>
-                                            <td className="p-3 flex gap-2 justify-center">
-                                                {r.note && <Button variant="ghost" onClick={() => onViewNote(r.note)} className="p-1 text-yellow-400 hover:text-yellow-300" title="View Note" icon="FileText"/>}
-                                                <Button 
-                                                    variant="ghost" 
-                                                    onClick={() => canModify && onEdit(r)} 
-                                                    disabled={!canModify} 
-                                                    className={`p-1 ${canModify ? 'text-blue-400 hover:text-blue-300' : 'text-slate-600 cursor-not-allowed opacity-50'}`} 
-                                                    title={canModify ? "Edit" : "Permission Required"} 
-                                                    icon="PenSquare" 
-                                                />
-                                                <Button 
-                                                    variant="ghost" 
-                                                    onClick={() => canModify && onDelete(r)} 
-                                                    disabled={!canModify} 
-                                                    className={`p-1 ${canModify ? 'text-red-500 hover:text-red-400' : 'text-slate-600 cursor-not-allowed opacity-50'}`} 
-                                                    title={canModify ? "Delete" : "Permission Required"} 
-                                                    icon="Trash2" 
-                                                />
-                                            </td>
-                                        </tr>
-                                    ))}
+                                    {reports.map(r => {
+                                        // --- NEW: Restrict Shop Manager from editing today's reports ---
+                                        const rDateStr = r.createdAt?.toDate ? r.createdAt.toDate().toLocaleDateString('en-CA', { timeZone }) : '';
+                                        const isTodayReport = rDateStr === todayStr;
+                                        const canModifyThisReport = canModifyGeneral && !(userRole === 'Shop Manager' && isTodayReport);
+                                        // ---------------------------------------------------------------
+
+                                        return (
+                                            <tr key={r.id} className={`${shopColorMap[r.shop]?.base || 'bg-transparent'} ${shopColorMap[r.shop]?.hover || 'hover:bg-slate-700/50'}`}>
+                                                <td className="p-3 whitespace-nowrap text-slate-400">{formatInCambodiaTime(r.createdAt)}</td>
+                                                <td className="p-3 text-slate-300">{r.shop}</td>
+                                                <td className="p-3 text-slate-300">{r.staff}</td>
+                                                {['Today', 'Yesterday', 'Custom'].includes(viewType) && <td className="p-3 text-slate-300">{r.shift}</td>}
+                                                <td className="p-3 text-right font-bold text-blue-400">{formatCurrency(r.grandTotalKhr, 'KHR')}</td>
+                                                <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashKhr, 'KHR')}</td>
+                                                <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankUsd, 'USD')}</td><td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.bankKhr, 'KHR')}</td>
+                                                <td className="p-3 text-right font-mono text-slate-300">{formatCurrency(r.cashExchange, 'KHR')}</td>
+                                                <td className="p-3 flex gap-2 justify-center">
+                                                    {r.note && <Button variant="ghost" onClick={() => onViewNote(r.note)} className="p-1 text-yellow-400 hover:text-yellow-300" title="View Note" icon="FileText"/>}
+                                                    <Button 
+                                                        variant="ghost" 
+                                                        onClick={() => canModifyThisReport && onEdit(r)} 
+                                                        disabled={!canModifyThisReport} 
+                                                        className={`p-1 ${canModifyThisReport ? 'text-blue-400 hover:text-blue-300' : 'text-slate-600 cursor-not-allowed opacity-50'}`} 
+                                                        title={canModifyThisReport ? "Edit" : "Locked: Shop Managers cannot edit Today's reports."} 
+                                                        icon="PenSquare" 
+                                                    />
+                                                    <Button 
+                                                        variant="ghost" 
+                                                        onClick={() => canModifyThisReport && onDelete(r)} 
+                                                        disabled={!canModifyThisReport} 
+                                                        className={`p-1 ${canModifyThisReport ? 'text-red-500 hover:text-red-400' : 'text-slate-600 cursor-not-allowed opacity-50'}`} 
+                                                        title={canModifyThisReport ? "Delete" : "Locked: Shop Managers cannot delete Today's reports."} 
+                                                        icon="Trash2" 
+                                                    />
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
                                 </tbody>
                                 <tfoot className="bg-slate-800 font-bold"><tr>
                                     <td colSpan={['Today', 'Yesterday', 'Custom'].includes(viewType) ? 4 : 3} className="p-3 text-right text-slate-300">Sub-Total</td>
@@ -8145,6 +8242,7 @@
 
         // --- START: Settings Page ---
         const SettingsPage = () => {
+            const { userData } = useAuth();
             const [activeTab, setActiveTab] = useState('shops');
 
             const TabButton = ({ tabName, label, icon, isActive, onClick }) => (
@@ -8160,18 +8258,26 @@
                     <div className="border-b border-slate-700 flex space-x-1 sm:space-x-2 flex-wrap">
                         <TabButton tabName="shops" label="Shops" icon="Landmark" isActive={activeTab === 'shops'} onClick={setActiveTab} />
                         <TabButton tabName="employees" label="Employees" icon="Users" isActive={activeTab === 'employees'} onClick={setActiveTab} />
-                        {/* --- NEW: Bank Info Tab --- */}
                         <TabButton tabName="banks" label="Bank Info" icon="CreditCard" isActive={activeTab === 'banks'} onClick={setActiveTab} />
-                        {/* -------------------------- */}
                         <TabButton tabName="expenses" label="Categories" icon="List" isActive={activeTab === 'expenses'} onClick={setActiveTab} />
+                        
+                        {/* --- NEW: Audit Log Tab (Admin Only) --- */}
+                        {userData?.role === 'Admin' && (
+                            <TabButton tabName="audit" label="Audit Log" icon="FileText" isActive={activeTab === 'audit'} onClick={setActiveTab} />
+                        )}
+                        {/* --------------------------------------- */}
                     </div>
                     <div className="mt-6">
                         <div className={activeTab === 'shops' ? '' : 'hidden'}><ManageShopsSection /></div>
                         <div className={activeTab === 'employees' ? '' : 'hidden'}><ManageEmployeesSection /></div>
-                        {/* --- NEW: Manage Banks Section --- */}
                         <div className={activeTab === 'banks' ? '' : 'hidden'}><ManageBanksSection /></div>
-                        {/* --------------------------------- */}
                         <div className={activeTab === 'expenses' ? '' : 'hidden'}><ManageExpenseCategoriesSection /></div>
+                        
+                        {/* --- NEW: Render Audit Log Section --- */}
+                        {userData?.role === 'Admin' && (
+                            <div className={activeTab === 'audit' ? '' : 'hidden'}><ManageAuditLogSection /></div>
+                        )}
+                        {/* ------------------------------------- */}
                     </div>
                 </div>
             );
@@ -8183,8 +8289,70 @@
             </Card>
         );
 
+        // --- NEW COMPONENT: ManageAuditLogSection ---
+        const ManageAuditLogSection = () => {
+            const { auditLogs } = useData();
+
+            return (
+                <SettingsSection>
+                    <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
+                        <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                            <Icon name="List" className="text-blue-400" />
+                            System Activity & Audit Log
+                        </h2>
+                    </div>
+                    <div className="overflow-x-auto max-h-[600px] custom-scrollbar">
+                        <table className="w-full text-left text-sm">
+                            <thead className="text-xs text-slate-400 uppercase bg-slate-900/50 sticky top-0 z-10 shadow-sm">
+                                <tr>
+                                    <th className="p-3">Time</th>
+                                    <th className="p-3">User</th>
+                                    <th className="p-3">Action</th>
+                                    <th className="p-3">Module</th>
+                                    <th className="p-3">Target Name</th>
+                                    <th className="p-3">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody className="text-sm text-slate-300 divide-y divide-slate-700">
+                                {(!auditLogs || auditLogs.length === 0) ? (
+                                    <tr><td colSpan="6" className="p-8 text-center text-slate-500 italic">No system activity logged yet.</td></tr>
+                                ) : (
+                                    auditLogs.map(log => (
+                                        <tr key={log.id} className="hover:bg-slate-800 transition-colors">
+                                            <td className="p-3 font-mono text-[11px] whitespace-nowrap text-slate-400">
+                                                {formatInCambodiaTime(log.timestamp)}
+                                            </td>
+                                            <td className="p-3 font-semibold text-blue-300">
+                                                <div className="flex items-center gap-1.5"><Icon name="Users" size={12}/>{log.performedBy}</div>
+                                            </td>
+                                            <td className="p-3">
+                                                <span className={`px-2 py-1 text-[10px] uppercase font-bold rounded border ${
+                                                    log.action === 'CREATE' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                                                    log.action === 'UPDATE' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' :
+                                                    log.action === 'DELETE' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                                                    'bg-slate-500/10 text-slate-400 border-slate-500/20'
+                                                }`}>
+                                                    {log.action}
+                                                </span>
+                                            </td>
+                                            <td className="p-3 text-slate-400 text-xs font-bold uppercase tracking-wider">{log.module}</td>
+                                            <td className="p-3 font-medium text-slate-200">{log.targetName}</td>
+                                            <td className="p-3 text-xs text-slate-400">
+                                                <div className="max-w-sm truncate" title={log.details}>{log.details || '-'}</div>
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </SettingsSection>
+            );
+        };
+        // --------------------------------------------
+
         const ManageShopsSection = () => {
-            const { shops, appSettings, gcaHistory } = useData(); // <-- Get gcaHistory
+            const { shops, appSettings, gcaHistory, logActivity } = useData(); // <-- ADDED logActivity
             const { showNotification } = useNotification();
             const { doc, updateDoc, deleteDoc } = window.Firebase;
             
@@ -8231,6 +8399,7 @@
                 setIsDeleting(true);
                 try {
                     await deleteDoc(doc(window.db, "shops", deletingShop.id));
+                    logActivity('DELETE', 'Shops', deletingShop.name, 'Shop removed from system'); // <-- ADDED LOG
                     showNotification("Shop deleted.", "success");
                 } catch (error) {
                     showNotification("Failed to delete shop.", "error");
@@ -8302,42 +8471,22 @@
             
             return (
                 <div>
-                    {/* --- Sub-Tabs Navigation --- */}
-                    <div className="flex gap-6 border-b border-slate-700 mb-6 overflow-x-auto">
-                        <button 
-                            onClick={() => setActiveSubTab('list')} 
-                            className={`pb-3 text-sm font-bold transition-colors border-b-2 whitespace-nowrap ${activeSubTab === 'list' ? 'border-blue-500 text-blue-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-                        >
-                            Shops List
-                        </button>
-                        <button 
-                            onClick={() => setActiveSubTab('history')} 
-                            className={`pb-3 text-sm font-bold transition-colors border-b-2 whitespace-nowrap ${activeSubTab === 'history' ? 'border-orange-500 text-orange-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-                        >
-                            GCA Adjustment History
-                        </button>
-                        <button 
-                            onClick={() => setActiveSubTab('margins')} 
-                            className={`pb-3 text-sm font-bold transition-colors border-b-2 whitespace-nowrap ${activeSubTab === 'margins' ? 'border-purple-500 text-purple-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-                        >
-                            Sale Margin History
-                        </button>
-                        {/* --- NEW: Target History Tab --- */}
-                        <button 
-                            onClick={() => setActiveSubTab('targets')} 
-                            className={`pb-3 text-sm font-bold transition-colors border-b-2 whitespace-nowrap ${activeSubTab === 'targets' ? 'border-pink-500 text-pink-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-                        >
-                            Target History
-                        </button>
-                        {/* ------------------------------- */}
-                        {/* --- NEW: CA Expense Tab --- */}
-                        <button 
-                            onClick={() => setActiveSubTab('ca_expense')} 
-                            className={`pb-3 text-sm font-bold transition-colors border-b-2 whitespace-nowrap ${activeSubTab === 'ca_expense' ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-                        >
-                            CA Expense
-                        </button>
-                        {/* --------------------------- */}
+                    {/* --- Sub-Tabs Navigation (Dropdown) --- */}
+                    <div className="mb-6 max-w-md">
+                        <FormSelect 
+                            label="Shop Configuration Menu" 
+                            labelIcon="Settings"
+                            name="activeSubTab" 
+                            value={activeSubTab} 
+                            onChange={(e) => setActiveSubTab(e.target.value)} 
+                            options={[
+                                { value: 'list', label: 'Shops List' },
+                                { value: 'history', label: 'GCA Adjustment History' },
+                                { value: 'margins', label: 'Sale Margin History' },
+                                { value: 'targets', label: 'Target History' },
+                                { value: 'ca_expense', label: 'CA Expense (Shop Monthly)' }
+                            ]} 
+                        />
                     </div>
 
                     {activeSubTab === 'list' && (
@@ -8690,7 +8839,7 @@
         const ShopEditModal = ({ shop, onClose }) => {
             const { showNotification } = useNotification();
             const { doc, updateDoc, addDoc, collection, Timestamp } = window.Firebase;
-            const { userData, staffList } = useData(); 
+            const { userData, staffList, logActivity } = useData(); // <-- ADDED logActivity
             
             // --- Helper for Safe ID Generation ---
             const generateId = () => {
@@ -8857,11 +9006,18 @@
                 try {
                     if (shop?.id) {
                         await updateDoc(doc(window.db, "shops", shop.id), dataToSave);
+                        logActivity('UPDATE', 'Shops', formData.name, 'Shop configuration updated'); // <-- ADDED LOG
                         showNotification(`Shop ${adjustmentRecordSaved ? "and GCA" : ""} updated!`, "success");
                     } else {
                         await addDoc(collection(window.db, "shops"), dataToSave);
+                        logActivity('CREATE', 'Shops', formData.name, 'New shop added to system'); // <-- ADDED LOG
                         showNotification("New shop created!", "success");
                     }
+                    
+                    if (adjustmentRecordSaved) {
+                        logActivity('UPDATE', 'Shops (GCA)', formData.name, `Manual adjustment of ${adjustmentAmount}. Reason: ${adjustmentReason}`); // <-- ADDED LOG
+                    }
+
                     if (isMounted.current) onClose();
                 } catch (error) {
                     showNotification("Failed to save shop.", "error");
@@ -9242,7 +9398,7 @@
         // --- END: EmployeeTable ---
 
         const ManageEmployeesSection = () => {
-            const { employees, shops } = useData(); 
+            const { employees, shops, logActivity } = useData(); // <-- ADDED logActivity
             const { showNotification } = useNotification();
             const { doc, deleteDoc } = window.Firebase; 
             const [isFormOpen, setIsFormOpen] = useState(false);
@@ -9272,6 +9428,7 @@
                 setIsDeleting(true);
                 try {
                     await deleteDoc(doc(window.db, "employees", deletingEmployee.id));
+                    logActivity('DELETE', 'Employees', deletingEmployee.name, 'Employee profile removed'); // <-- ADDED LOG
                     showNotification("Employee deleted.", "success");
                 } catch(e) {
                      showNotification("Failed to delete employee.", "error");
@@ -9379,7 +9536,7 @@
         };
 
         const EmployeeFormModal = ({ employee, onClose }) => {
-            const { shops } = useData();
+            const { shops, logActivity } = useData(); // <-- ADDED logActivity
             const { showNotification } = useNotification();
             const { doc, updateDoc } = window.Firebase;
             const [isSubmitting, setIsSubmitting] = useState(false);
@@ -9414,6 +9571,7 @@
                         return;
                     }
                     await updateDoc(doc(window.db, "employees", employee.id), employeeData); 
+                    logActivity('UPDATE', 'Employees', formData.name, `Updated Role: ${formData.role} | Status: ${formData.status}`); // <-- ADDED LOG
                     showNotification(`Employee updated.`, "success");
                     if (isMounted.current) onClose();
                 } catch (error) {
@@ -9463,7 +9621,7 @@
         };
 
         const EmployeeCreateModal = ({ onClose }) => {
-            const { shops } = useData();
+            const { shops, logActivity } = useData(); // <-- ADDED logActivity
             const { showNotification } = useNotification();
             const { initializeApp, getAuth, createUserWithEmailAndPassword, deleteApp, setDoc, doc } = window.Firebase;
 
@@ -9507,6 +9665,8 @@
                     
                     // 4. Save the employee profile to Firestore using the *main* db instance
                     await setDoc(doc(window.db, "employees", newUid), profileData);
+                    
+                    logActivity('CREATE', 'Employees', profileData.name, `Created Role: ${profileData.role}`); // <-- ADDED LOG
                     
                     showNotification("Employee created successfully!", "success");
                     if (isMounted.current) onClose();
