@@ -814,8 +814,16 @@
                             {products.map(p => {
                                 const cat = categories.find(c => c.id === p.categoryId);
                                 const unit = units.find(u => u.id === p.unitId);
+                                const currentQty = parseInt(p.qty) || 0;
+                                const isLowStock = currentQty <= 5;
+
                                 return (
-                                    <div key={p.id} className="bg-white dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700/50 rounded-2xl p-3 flex flex-col gap-2 relative shadow-sm hover:shadow-lg transition-all active:scale-[0.98] group">
+                                    <div key={p.id} className={`bg-white dark:bg-slate-800/40 border ${isLowStock ? 'border-red-300 dark:border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.1)]' : 'border-slate-200 dark:border-slate-700/50'} rounded-2xl p-3 flex flex-col gap-2 relative shadow-sm hover:shadow-lg transition-all active:scale-[0.98] group`}>
+                                        {isLowStock && (
+                                            <div className="absolute -top-2 -right-2 bg-red-500 text-white text-[8px] font-black px-2 py-1 rounded-lg shadow-lg z-10 animate-pulse border border-white dark:border-slate-800 uppercase tracking-widest">
+                                                Low Stock
+                                            </div>
+                                        )}
                                         <div className="flex flex-col items-center gap-2 cursor-pointer" onClick={() => openProductForm(p)}>
                                             <div className="w-full aspect-square rounded-xl bg-slate-50 dark:bg-slate-700 overflow-hidden flex items-center justify-center shadow-inner relative">
                                                 {p.photo ? (
@@ -834,7 +842,7 @@
                                                     <p className="text-xs lg:text-sm font-black text-brand-600 dark:text-brand-400">${parseFloat(p.price || 0).toFixed(2)}</p>
                                                     {unit && <span className="text-[8px] text-slate-400 dark:text-slate-500 uppercase">/ {unit.symbol || unit.name}</span>}
                                                 </div>
-                                                {p.qty && <p className="text-[9px] font-bold text-slate-500 dark:text-slate-400">Stock: {p.qty}</p>}
+                                                {p.qty && <p className={`text-[9px] font-bold ${isLowStock ? 'text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>Stock: {p.qty}</p>}
                                             </div>
                                         </div>
                                         <div className="flex gap-1 pt-2 border-t border-slate-100 dark:border-slate-700/50 mt-auto">
@@ -997,6 +1005,7 @@
             const [customEndDate, setCustomEndDate] = useState('');
             const [reportSellerId, setReportSellerId] = useState('All');
             const [reportPaymentMethod, setReportPaymentMethod] = useState('All');
+            const [reportCustomerSearch, setReportCustomerSearch] = useState('');
 
             const [isSaleModalOpen, setIsSaleModalOpen] = useState(false);
             const [loading, setLoading] = useState(false);
@@ -1071,15 +1080,31 @@
                     }
                 }
 
+                const customerSearchLower = reportCustomerSearch.toLowerCase();
+                let matchingCustomerIds = null;
+                if (customerSearchLower) {
+                    matchingCustomerIds = new Set(customers.filter(c => 
+                        (c.shopName || '').toLowerCase().includes(customerSearchLower) ||
+                        (c.ownerName || '').toLowerCase().includes(customerSearchLower) ||
+                        (c.contact || '').includes(customerSearchLower)
+                    ).map(c => c.id));
+                }
+
                 return sales.filter(s => {
                     const t = s.createdAt ? (s.createdAt.seconds * 1000) : new Date(s.date).getTime();
                     const timeMatch = t >= startTime && t <= endTime;
                     const sellerMatch = reportSellerId === 'All' || s.sellerId === reportSellerId;
                     const paymentMatch = reportPaymentMethod === 'All' || s.paymentMethod === reportPaymentMethod;
-                    return timeMatch && sellerMatch && paymentMatch;
+                    
+                    let customerMatch = true;
+                    if (matchingCustomerIds) {
+                        customerMatch = matchingCustomerIds.has(s.customerId) || (s.customerName || '').toLowerCase().includes(customerSearchLower);
+                    }
+
+                    return timeMatch && sellerMatch && paymentMatch && customerMatch;
                 }).sort((a,b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
 
-            }, [sales, reportFilter, customStartDate, customEndDate, reportSellerId, reportPaymentMethod]);
+            }, [sales, reportFilter, customStartDate, customEndDate, reportSellerId, reportPaymentMethod, reportCustomerSearch, customers]);
 
             const reportTotal = filteredReportSales.reduce((acc, s) => acc + (parseFloat(s.total) || 0), 0);
             
@@ -1132,7 +1157,21 @@
             const handleDeleteSale = async (id) => {
                 if (confirmSaleDeleteId === id) {
                     try {
-                        const { doc, deleteDoc } = window.firebaseSDK;
+                        const { doc, deleteDoc, updateDoc } = window.firebaseSDK;
+                        
+                        // 1. Inventory Refund Strategy
+                        const saleToDelete = sales.find(s => s.id === id);
+                        if (saleToDelete && saleToDelete.items) {
+                            for (const item of saleToDelete.items) {
+                                const product = products.find(p => p.id === item.id);
+                                if (product) {
+                                    const currentQty = parseInt(product.qty) || 0;
+                                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', item.id), { qty: (currentQty + item.qty).toString() });
+                                }
+                            }
+                        }
+
+                        // 2. Delete Order
                         await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id));
                         setConfirmSaleDeleteId(null);
                     } catch (e) {
@@ -1169,6 +1208,24 @@
                 setLoading(true);
                 const { collection, addDoc, updateDoc, doc, serverTimestamp } = window.firebaseSDK;
                 try {
+                    // --- 1. Calculate Inventory Net Changes ---
+                    const stockChanges = {}; // { productId: netChange (positive = return to stock, negative = subtract from stock) }
+                    
+                    if (editingSaleId) {
+                        // Reverting old cart quantities back to stock
+                        const oldSale = sales.find(s => s.id === editingSaleId);
+                        const oldCart = oldSale?.items || [];
+                        oldCart.forEach(item => {
+                            stockChanges[item.id] = (stockChanges[item.id] || 0) + item.qty;
+                        });
+                    }
+                    
+                    // Subtracting new cart quantities from stock
+                    cart.forEach(item => {
+                        stockChanges[item.id] = (stockChanges[item.id] || 0) - item.qty;
+                    });
+
+                    // --- 2. Save Order Data ---
                     const payload = {
                         invoiceNo,
                         date: saleDate,
@@ -1189,6 +1246,20 @@
                         payload.createdAt = serverTimestamp();
                         await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), payload);
                     }
+
+                    // --- 3. Apply Inventory Updates ---
+                    for (const [productId, change] of Object.entries(stockChanges)) {
+                        if (change === 0) continue; // No change in quantity for this product
+                        
+                        const product = products.find(p => p.id === productId);
+                        if (product) {
+                            const currentQty = parseInt(product.qty) || 0;
+                            // Ensure stock doesn't drop below 0 due to an error
+                            const newQty = Math.max(0, currentQty + change); 
+                            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', productId), { qty: newQty.toString() });
+                        }
+                    }
+
                     setIsSaleModalOpen(false);
                 } catch (e) { 
                     console.error("Sale Completion Error:", e);
@@ -1282,7 +1353,7 @@
                         <div className="space-y-6 animate-in fade-in duration-300 max-w-5xl mx-auto">
                             {/* Filter Section */}
                             <div className="bg-white dark:bg-slate-800/60 p-5 rounded-3xl border border-slate-200 dark:border-slate-700/50 shadow-sm space-y-4">
-                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                                     <div className="space-y-1">
                                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-2">Time Period</label>
                                         <select className="select font-bold" value={reportFilter} onChange={e=>setReportFilter(e.target.value)}>
@@ -1295,6 +1366,18 @@
                                             <option value="This Year">This Year</option>
                                             <option value="Custom">Custom Date Range...</option>
                                         </select>
+                                    </div>
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-2">Customer</label>
+                                        <div className="relative">
+                                            <i className="fas fa-search absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
+                                            <input 
+                                                className="input !pl-10 font-bold" 
+                                                placeholder="Shop, Owner, Phone..." 
+                                                value={reportCustomerSearch} 
+                                                onChange={e=>setReportCustomerSearch(e.target.value)} 
+                                            />
+                                        </div>
                                     </div>
                                     <div className="space-y-1">
                                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-2">Seller ID</label>
@@ -1355,7 +1438,7 @@
                                         <div className="py-16 text-center text-slate-400">
                                             <i className="fas fa-receipt text-5xl mb-4 opacity-20"></i>
                                             <p className="text-xs font-bold uppercase tracking-widest">No Sales Found</p>
-                                            <p className="text-[10px] mt-2 opacity-70">Adjust your date filter to see more data.</p>
+                                            <p className="text-[10px] mt-2 opacity-70">Adjust your filters to see more data.</p>
                                         </div>
                                     ) : (
                                         filteredReportSales.map(s => (
@@ -1558,6 +1641,7 @@
         const DashboardView = ({ setActiveTab, profileName, greeting }) => {
             const sales = useCollection('sales');
             const customers = useCollection('customers');
+            const products = useCollection('products'); // NEW: Fetch products to check stock
 
             const todayStr = new Date().toLocaleDateString();
             
@@ -1568,6 +1652,9 @@
             // Latest Lists
             const recentSales = useMemo(() => [...sales].sort((a,b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)).slice(0, 5), [sales]);
             const recentCustomers = useMemo(() => [...customers].sort((a,b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)).slice(0, 5), [customers]);
+
+            // Low Stock Calculation
+            const lowStockProducts = useMemo(() => products.filter(p => parseInt(p.qty || 0) <= 5), [products]);
 
             return (
                 <div className="space-y-6 lg:space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-10 px-1">
@@ -1621,6 +1708,29 @@
                             </div>
                         </div>
                     </div>
+
+                    {/* Inventory Alerts (NEW) */}
+                    {lowStockProducts.length > 0 && (
+                        <div className="space-y-3 pt-2">
+                            <div className="flex justify-between items-center px-1">
+                                <h3 className="text-[10px] font-bold text-red-500 uppercase tracking-widest flex items-center gap-1.5">
+                                    <i className="fas fa-exclamation-triangle animate-pulse"></i> Low Stock Alerts
+                                </h3>
+                                <button onClick={() => setActiveTab('inventory')} className="text-[9px] font-bold text-slate-400 hover:text-brand-500 transition-colors">VIEW INVENTORY</button>
+                            </div>
+                            <div className="bg-red-50 dark:bg-red-500/10 border border-red-100 dark:border-red-500/20 rounded-3xl p-4 flex gap-3 overflow-x-auto hide-scrollbar snap-x">
+                                {lowStockProducts.map(p => (
+                                    <div key={p.id} className="flex-none w-48 lg:w-56 bg-white dark:bg-slate-800 rounded-2xl p-3 shadow-sm border border-red-100 dark:border-red-500/30 flex items-center gap-3 snap-start cursor-pointer hover:shadow-md transition-all" onClick={() => setActiveTab('inventory')}>
+                                        <Avatar name={p.name} url={p.photo} size="10" />
+                                        <div className="min-w-0 flex-1">
+                                            <p className="text-xs font-bold text-slate-900 dark:text-white truncate">{p.name}</p>
+                                            <p className="text-[10px] text-red-500 font-black mt-0.5">{p.qty || 0} Left in Stock</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
                     {/* Recent Activity */}
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-8 pt-2">
