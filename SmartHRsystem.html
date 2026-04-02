@@ -994,8 +994,12 @@
             
             const noAttendance = absentDays + noCheckOutCount;
 
-            // NEW: Calculate "Given Off Days" based on the total number of work days.
-            const givenOffDays = Math.floor(workDays / 6.5);
+            // --- FIX: Dynamic "Given Off Days" Calculation (Handles 28/29/30/31 day months) ---
+            const maxOffDays = 4; // Target off days per month
+            const standardWorkDays = daysInMonth - maxOffDays;
+            // Pro-rate the off days based on actual work days, capped at 4
+            const givenOffDays = Math.min(maxOffDays, Math.round((workDays / standardWorkDays) * maxOffDays));
+            // --- END FIX ---
 
             // FIX: Create the autoInputs object to be returned, now including noAttendance.
             // --- MODIFIED: Also add the new autoLoanDeduction field ---
@@ -8757,18 +8761,22 @@
                         const diffTime = end.getTime() - start.getTime();
                         const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
 
-                        // Case: User selects same leave and return date. We interpret this as a single-day event.
                         if (diffDays === 0) {
-                            if (leaveSession === 'Full Day') { newFormData.numberOfDays = 1; } 
-                            else { newFormData.numberOfDays = 0.5; }
-                        } 
-                        // Case: Standard single day leave (e.g., leave Mon, return Tue)
-                        else if (diffDays === 1) {
-                            if (leaveSession === 'Full Day') { newFormData.numberOfDays = 1; } 
-                            else { newFormData.numberOfDays = 0.5; }
-                        } 
-                        // Case: Multi-day leave
-                        else {
+                            // UX FIX: Same date means Half-Day Leave
+                            newFormData.numberOfDays = 0.5;
+                            if (newFormData.leaveSession === 'Full Day') {
+                                newFormData.leaveSession = 'AM'; // Auto-correct to half-day session
+                            }
+                        } else if (diffDays === 1) {
+                            // UX FIX: 1 day difference means 1 Full Day off (Leave Mon, Return Tue)
+                            // Allow AM/PM if they are only taking 0.5 days (e.g., Leave Mon PM, Return Tue AM)
+                            if (newFormData.leaveSession === 'Full Day') { 
+                                newFormData.numberOfDays = 1; 
+                            } else { 
+                                newFormData.numberOfDays = 0.5; 
+                            }
+                        } else {
+                            // Multi-day leave
                             newFormData.numberOfDays = diffDays;
                             newFormData.leaveSession = 'Full Day'; // Force full day for multi-day leaves
                         }
@@ -10830,7 +10838,22 @@
             
             const handleSaveCheckOut = useCallback(async (record, time) => {
                 const { addDoc, collection } = window.firebaseSDK;
-                const checkOutDateTime = new Date(`${record.date}T${time}:00`);
+                
+                // --- BUG FIX: Parse the manual check-out time in the SHOP'S timezone ---
+                // Prevent check-outs from being skewed if the Admin is in a different timezone
+                const shopObj = shops.find(s => s.name === record.shop);
+                const targetTz = shopObj?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+                
+                const dateString = `${record.date}T${time}:00`;
+                const assumedLocalDate = new Date(dateString);
+                
+                // Calculate the exact offset between the Admin's device timezone and the Shop's timezone
+                const targetTimeStr = assumedLocalDate.toLocaleString('en-US', { timeZone: targetTz });
+                const targetDateInLocal = new Date(targetTimeStr);
+                const offset = assumedLocalDate.getTime() - targetDateInLocal.getTime();
+                
+                const checkOutDateTime = new Date(assumedLocalDate.getTime() + offset);
+                // --- END BUG FIX ---
 
                 try {
                     const newDocRef = await addDoc(collection(db, 'attendance'), {
@@ -10859,7 +10882,7 @@
                     console.error("Error saving manual check-out:", error);
                     alert("Failed to save the manual check-out time.");
                 }
-            }, [db, handleCloseCorrectionModal, userProfile]);
+            }, [db, handleCloseCorrectionModal, userProfile, shops]);
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = attendanceReport.map(report => ({
@@ -11254,7 +11277,12 @@
                         }
                     }
 
-                    const givenOffDays = Math.floor(workDays / 6.5);
+                    // --- FIX: Dynamic "Given Off Days" Calculation for Monthly Report ---
+                    const maxOffDays = 4;
+                    const standardWorkDays = daysInMonth - maxOffDays;
+                    const givenOffDays = Math.min(maxOffDays, Math.round((workDays / standardWorkDays) * maxOffDays));
+                    // --- END FIX ---
+                    
                     const [reportYear, reportMonth] = targetMonth.split('-');
                     const salaryDay = workDays + givenOffDays + totalOT;
 
@@ -11705,7 +11733,7 @@
                     : (Array.isArray(selectedEmployee.shop) ? selectedEmployee.shop[0] : selectedEmployee.shop);
 
                 // MODIFIED: Use writeBatch instead of runTransaction to avoid mandatory reads (Quota Fix)
-                const { addDoc, collection, serverTimestamp, doc, updateDoc, getDocs, query, where, writeBatch } = window.firebaseSDK;
+                const { addDoc, collection, serverTimestamp, doc, updateDoc, getDocs, query, where, writeBatch, increment } = window.firebaseSDK;
                 
                 // 1. Duplicate Check (Read 1 - Necessary Check)
                 if (!editingRecord) {
@@ -11788,37 +11816,21 @@
 
                     // C. Update Savings (if amount > 0)
                     if (savingsAmount > 0) {
-                        const parseSafeFloat = (val) => {
-                            if (val === null || val === undefined) return 0;
-                            const num = parseFloat(val);
-                            return isNaN(num) ? 0 : num;
-                        };
-
-                        // Use the LOCALLY loaded savingsData (fresh from listener)
-                        let currentBalance = 0;
-                        let currentWithdrawals = 0;
-
-                        if (savingsData) {
-                            currentBalance = parseSafeFloat(savingsData.currentBalance);
-                            currentWithdrawals = parseSafeFloat(savingsData.mySavingWithdrawalTotal);
-                        }
-
-                        const newBalance = currentBalance + savingsAmount;
-                        const newCredit = newBalance + currentWithdrawals;
-
                         const savingsRef = doc(db, 'savingprogram', selectedEmployee.id);
-                        const savingsUpdateData = { 
-                            currentBalance: newBalance, 
-                            mySavingCredit: newCredit, 
-                            lastUpdated: serverTimestamp() 
-                        };
 
                         if (savingsData) {
-                            batch.update(savingsRef, savingsUpdateData);
+                            // BUG FIX: Use atomic increment to prevent race conditions
+                            batch.update(savingsRef, { 
+                                currentBalance: increment(savingsAmount), 
+                                mySavingCredit: increment(savingsAmount), 
+                                lastUpdated: serverTimestamp() 
+                            });
                         } else {
                             // Robustness: Create if it doesn't exist yet
                             batch.set(savingsRef, { 
-                                ...savingsUpdateData,
+                                currentBalance: savingsAmount,
+                                mySavingCredit: savingsAmount,
+                                lastUpdated: serverTimestamp(),
                                 employeeId: selectedEmployee.id,
                                 employeeName: selectedEmployee.name,
                                 shop: shopName,
@@ -14902,8 +14914,8 @@ service cloud.firestore {
                 setProcessLog([]);
                 setProcessComplete(false);
 
-                // MODIFIED: Added writeBatch
-                const { collection, getDocs, query, where, doc, serverTimestamp, collectionGroup, writeBatch } = window.firebaseSDK;
+                // MODIFIED: Added writeBatch and increment
+                const { collection, getDocs, query, where, doc, serverTimestamp, collectionGroup, writeBatch, increment } = window.firebaseSDK;
 
                 setProcessLog(prev => [...prev, 'Step 1: Identifying unprocessed employees...']);
 
@@ -15087,32 +15099,26 @@ service cloud.firestore {
 
                             // 3. Update Savings (if amount > 0)
                             if (savingsAmount > 0) {
-                                const parseSafeFloat = (val) => {
-                                    if (val === null || val === undefined) return 0;
-                                    const num = parseFloat(val);
-                                    return isNaN(num) ? 0 : num;
-                                };
-
-                                let currentBalance = 0;
-                                let currentWithdrawals = 0;
-
-                                // Use Pre-fetched Data
-                                if (employeeSavingsData) {
-                                    currentBalance = parseSafeFloat(employeeSavingsData.currentBalance);
-                                    currentWithdrawals = parseSafeFloat(employeeSavingsData.mySavingWithdrawalTotal);
-                                }
-
-                                const newBalance = currentBalance + savingsAmount;
-                                const newCredit = newBalance + currentWithdrawals;
-                                
                                 const savingsRef = doc(db, 'savingprogram', employee.id);
-                                const savingsUpdateData = { currentBalance: newBalance, mySavingCredit: newCredit, lastUpdated: serverTimestamp() };
                                 
                                 if (employeeSavingsData) {
-                                    batch.update(savingsRef, savingsUpdateData);
+                                    // BUG FIX: Use atomic increment to prevent race conditions
+                                    batch.update(savingsRef, {
+                                        currentBalance: increment(savingsAmount),
+                                        mySavingCredit: increment(savingsAmount),
+                                        lastUpdated: serverTimestamp()
+                                    });
                                 } else {
                                     batch.set(savingsRef, { 
-                                        ...savingsUpdateData, employeeId: employee.id, employeeName: employee.name, shop: shopName, mySavingWithdrawalTotal: 0, savingsProgramStatus: 'Active', savingsPercentage: 0 
+                                        currentBalance: savingsAmount,
+                                        mySavingCredit: savingsAmount,
+                                        lastUpdated: serverTimestamp(),
+                                        employeeId: employee.id, 
+                                        employeeName: employee.name, 
+                                        shop: shopName, 
+                                        mySavingWithdrawalTotal: 0, 
+                                        savingsProgramStatus: 'Active', 
+                                        savingsPercentage: 0 
                                     });
                                 }
                                 opCount++;
@@ -16358,7 +16364,7 @@ service cloud.firestore {
 
             // --- NEW: AUTO-REJECT LOGIC FOR OVERDUE TASKS (>10 Hours) ---
             useEffect(() => {
-                if (!tasks || tasks.length === 0 || !db) return;
+                if (!tasks || tasks.length === 0 || !db || !userProfile) return;
 
                 const checkAndRejectOverdue = async () => {
                     const now = new Date();
@@ -16367,6 +16373,14 @@ service cloud.firestore {
                     // Filter for tasks that are IN_PROGRESS and Total Time > 10 hours
                     const overdueTasks = tasks.filter(t => {
                         if (t.status !== KANBAN_STATUS.IN_PROGRESS || !t.progressTimestamp) return false;
+                        
+                        // --- BUG FIX: Prevent Massive Write Amplification (DDoS Effect) ---
+                        // Only the assigned staff member should process the auto-rejection for their own task.
+                        // If the task has no assignee (edge case), only the Admin processes it.
+                        // This prevents 50+ clients from trying to update the exact same document simultaneously.
+                        const canProcessAutoReject = (t.staffId === userProfile.id) || (!t.staffId && userProfile.role === 'Admin');
+                        if (!canProcessAutoReject) return false;
+                        // --- END FIX ---
                         
                         const start = t.progressTimestamp.toDate ? t.progressTimestamp.toDate() : new Date(t.progressTimestamp);
                         const currentSessionMs = Math.max(0, now - start);
@@ -16399,7 +16413,7 @@ service cloud.firestore {
                 checkAndRejectOverdue();
                 const interval = setInterval(checkAndRejectOverdue, 60000); 
                 return () => clearInterval(interval);
-            }, [tasks, db]); // Re-run when tasks list updates to catch new overdues
+            }, [tasks, db, userProfile]); // FIX: Added userProfile to dependency array
             // --- END AUTO-REJECT LOGIC ---
 
             const employeesForFilter = useMemo(() => {
