@@ -238,6 +238,9 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js" defer></script>
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript" defer></script>
     
+    <!-- NEW: IndexedDB Wrapper for Caching (Bypasses 5MB LocalStorage Limit) -->
+    <script src="https://cdn.jsdelivr.net/npm/idb-keyval@6/dist/umd.js" defer></script>
+
     <!-- NEW: CropperJS Library -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.5.13/cropper.min.js" defer></script>
 
@@ -357,8 +360,8 @@
         };
 
         // --- START REACT & FIREBASE SETUP ---
-        // OPTIMIZATION: Imported startTransition for React 18 Concurrent Data Fetching
-        const { useState, useEffect, useMemo, useCallback, createContext, useContext, memo, useRef, startTransition } = React;
+        // OPTIMIZATION: Imported startTransition, Suspense, and lazy for React 18 Concurrent Data Fetching & Lazy Loading
+        const { useState, useEffect, useMemo, useCallback, createContext, useContext, memo, useRef, startTransition, Suspense, lazy } = React;
 
         // ... (rest of the React application code)
         // === FIREBASE CONFIGURATION ===
@@ -572,32 +575,12 @@
         };
         
         // Custom hook for real-time Firestore collection data
-        // MODIFIED: Added 'persistKey' for instant offline loading (Stale-While-Revalidate pattern)
+        // OPTIMIZATION: Upgraded to IndexedDB (idb-keyval) to bypass 5MB LocalStorage limits
         const useCollection = (collectionName, queryConstraints = [], persistKey = null) => {
             const { db, currentUser } = useFirebase(); 
             
-            // OPTIMIZATION: Initialize state from LocalStorage if key is provided
-            const [data, setData] = useState(() => {
-                if (persistKey) {
-                    try {
-                        const cached = localStorage.getItem(persistKey);
-                        if (cached) {
-                            const parsed = JSON.parse(cached);
-                            // FIX: Filter out null/undefined items to prevent render crashes
-                            return Array.isArray(parsed) ? parsed.filter(item => item !== null && item !== undefined) : [];
-                        }
-                    } catch (e) {
-                        console.error(`Error parsing cache for ${persistKey}`, e);
-                    }
-                }
-                return [];
-            });
-
-            // OPTIMIZATION: If we have cached data, we are NOT loading.
-            const [loading, setLoading] = useState(() => {
-                if (persistKey && localStorage.getItem(persistKey)) return false;
-                return true;
-            });
+            const [data, setData] = useState([]);
+            const [loading, setLoading] = useState(true);
             
             // FIX: Use a ref to store the serialized constraints to prevent effect loops
             const constraintsRef = useRef(JSON.stringify(queryConstraints));
@@ -605,44 +588,37 @@
                 constraintsRef.current = JSON.stringify(queryConstraints);
             }
 
-            // NEW: Effect to re-hydrate from cache if key changes (e.g. after login)
+            // NEW: Asynchronous IndexedDB Cache Hydration
             useEffect(() => {
-                if(persistKey) {
-                    const cached = localStorage.getItem(persistKey);
-                    if (cached && data.length === 0) {
-                        try {
-                            const parsed = JSON.parse(cached);
-                            if(Array.isArray(parsed) && parsed.length > 0) {
-                                setData(parsed);
-                                setLoading(false);
-                            }
-                        } catch(e) {}
-                    }
+                let isMounted = true;
+                
+                if (persistKey && window.idbKeyval) {
+                    window.idbKeyval.get(persistKey).then(cached => {
+                        if (isMounted && cached && Array.isArray(cached) && cached.length > 0) {
+                            // Only set cache if live data hasn't already loaded
+                            setData(prev => prev.length === 0 ? cached : prev);
+                            setLoading(false);
+                        }
+                    }).catch(e => console.warn(`IDB Read Error for ${persistKey}:`, e));
                 }
+                
+                return () => { isMounted = false; };
             }, [persistKey]);
 
             useEffect(() => {
-                // If we have cache, we don't block. If no cache, set loading true.
                 if ((!db || !currentUser)) { 
-                    // MODIFIED PERFORMANCE FIX: Only set loading if we have NO data AND no cache key.
-                    // If we have a persistKey (even if data is empty array from cache), don't show loading spinner.
                     if (!persistKey && data.length === 0) setLoading(true);
                     return;
                 }
 
-                // Only set loading to true if we don't have cached data to show
-                // MODIFIED: Stronger check to prevent skeleton flash
                 if (!persistKey && data.length === 0) setLoading(true);
                 
                 const { collection, onSnapshot, query } = window.firebaseSDK;
-                
                 const q = query(collection(db, collectionName), ...queryConstraints);
                 
                 const unsubscribe = onSnapshot(q, (querySnapshot) => {
                     const items = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                     
-                    // OPTIMIZATION: Use React 18 Concurrent Mode to prioritize user interactions
-                    // over rendering large data lists. Keeps the app feeling snappy.
                     if (typeof startTransition === 'function') {
                         startTransition(() => {
                             setData(items);
@@ -653,23 +629,16 @@
                         setLoading(false);
                     }
                     
-                    // Update Cache (Silent Background Async Update)
-                    if (persistKey) {
+                    // MODIFIED: Update Cache using IndexedDB (No 5MB limit!)
+                    if (persistKey && window.idbKeyval) {
                         const performCacheWrite = () => {
-                            try {
-                                let cacheData = items;
-                                // OPTIMIZATION: Strip heavy Base64 image fields before caching
-                                // LocalStorage has a strict ~5MB limit. Storing photos here causes immediate crashes.
-                                if (collectionName === 'employees') {
-                                    cacheData = items.map(({ photo, ...rest }) => rest);
-                                }
-                                localStorage.setItem(persistKey, JSON.stringify(cacheData));
-                            } catch (e) {
-                                console.warn("LocalStorage caching disabled (quota exceeded).");
-                            }
+                            // Because we use IndexedDB, we NO LONGER need to strip the Base64 photo strings!
+                            // IDB can safely handle hundreds of megabytes of data asynchronously.
+                            window.idbKeyval.set(persistKey, items).catch(e => {
+                                console.warn("IndexedDB caching disabled or failed.", e);
+                            });
                         };
 
-                        // Use requestIdleCallback to prevent the cache write from blocking UI rendering/animations
                         if (window.requestIdleCallback) {
                             window.requestIdleCallback(performCacheWrite);
                         } else {
@@ -681,7 +650,7 @@
                     setLoading(false);
                 });
                 return () => unsubscribe();
-            }, [db, currentUser, collectionName, constraintsRef.current, persistKey]); // Depend on stable string & persistKey
+            }, [db, currentUser, collectionName, constraintsRef.current, persistKey]); 
             
             return { data, loading };
         };
@@ -2024,18 +1993,21 @@
                                 </p>
                             </div>
                             <form className="mt-8 space-y-6" onSubmit={handleInitSubmit}>
-                                <div>
+                                <div className="relative">
                                     <label htmlFor="init-code" className="sr-only">Initialization Code</label>
                                     <input 
                                         id="init-code" 
                                         name="code" 
-                                        type="password" 
+                                        type={showPassword ? "text" : "password"} 
                                         required 
-                                        className="appearance-none rounded relative block w-full px-3 py-3 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 focus:outline-none focus:ring-yellow-500 focus:border-yellow-500 sm:text-sm text-center tracking-widest" 
+                                        className="appearance-none rounded relative block w-full px-3 py-3 pr-10 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 focus:outline-none focus:ring-yellow-500 focus:border-yellow-500 sm:text-sm text-center tracking-widest" 
                                         placeholder="ENTER CODE" 
                                         value={initCode} 
                                         onChange={(e) => setInitCode(e.target.value)} 
                                     />
+                                    <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm leading-5 z-20 cursor-pointer">
+                                        <i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'} text-slate-400 hover:text-slate-200`}></i>
+                                    </button>
                                 </div>
                                 {error && <p className="text-red-500 text-sm text-center font-bold animate-pulse">{error}</p>}
                                 <div>
@@ -2065,7 +2037,7 @@
                         <form className="mt-8 space-y-6" onSubmit={handleLogin}>
                             <div className="rounded-md shadow-sm -space-y-px">
                                 <div><input id="email-address" name="email" type="email" autoComplete="email" required className="appearance-none rounded-none relative block w-full px-3 py-3 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 rounded-t-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm" placeholder="Email address" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
-                                <div className="relative"><input id="password" name="password" type={showPassword ? "text" : "password"} autoComplete="current-password" required className="appearance-none rounded-none relative block w-full px-3 py-3 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 rounded-b-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} /><button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm leading-5"><i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'} text-slate-400 hover:text-slate-200`}></i></button></div>
+                                <div className="relative"><input id="password" name="password" type={showPassword ? "text" : "password"} autoComplete="current-password" required className="appearance-none rounded-none relative block w-full px-3 py-3 pr-10 border border-slate-600 bg-slate-700 text-white placeholder-slate-400 rounded-b-md focus:outline-none focus:ring-blue-500 focus:border-blue-500 focus:z-10 sm:text-sm" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} /><button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm leading-5 z-20 cursor-pointer"><i className={`fas ${showPassword ? 'fa-eye-slash' : 'fa-eye'} text-slate-400 hover:text-slate-200`}></i></button></div>
                             </div>
                             {error && <p className="text-red-500 text-sm text-center">{error}</p>}
                             <div>
@@ -13781,7 +13753,7 @@ service cloud.firestore {
                 setIsRuleModalOpen(true);
             };
 
-            // NEW: Unified helper to instantly save any global setting changes to DB and Cache
+            // NEW: Unified helper to instantly save any global setting changes to DB and Cache via IndexedDB
             const persistGlobalSettings = async (updates) => {
                 const { doc, setDoc, serverTimestamp } = window.firebaseSDK;
                 try {
@@ -13790,15 +13762,17 @@ service cloud.firestore {
                         updatedAt: serverTimestamp()
                     }, { merge: true });
                     
-                    // Update cache instantly to prevent visual flickers on reload
-                    const cached = JSON.parse(localStorage.getItem('hr_cache_sys_config') || '[]');
-                    const globalIdx = cached.findIndex(d => d.id === 'global');
-                    if (globalIdx >= 0) {
-                        cached[globalIdx] = { ...cached[globalIdx], ...updates };
-                    } else {
-                        cached.push({ id: 'global', ...updates });
+                    // Update cache instantly in IndexedDB
+                    if (window.idbKeyval) {
+                        const cached = (await window.idbKeyval.get('hr_cache_sys_config')) || [];
+                        const globalIdx = cached.findIndex(d => d.id === 'global');
+                        if (globalIdx >= 0) {
+                            cached[globalIdx] = { ...cached[globalIdx], ...updates };
+                        } else {
+                            cached.push({ id: 'global', ...updates });
+                        }
+                        await window.idbKeyval.set('hr_cache_sys_config', cached);
                     }
-                    localStorage.setItem('hr_cache_sys_config', JSON.stringify(cached));
                 } catch (error) {
                     console.error("Persistence error:", error);
                     throw error;
@@ -21471,31 +21445,62 @@ service cloud.firestore {
             const { db } = useFirebase();
             const { employees } = useAppData();
             const [logs, setLogs] = useState([]);
-            const [limitCount, setLimitCount] = useState(50);
+            
+            // MODIFIED: Replaced limitCount with Pagination State
             const [loading, setLoading] = useState(true);
+            const [loadingMore, setLoadingMore] = useState(false);
+            const [lastDoc, setLastDoc] = useState(null);
+            const [hasMore, setHasMore] = useState(true);
+            const PAGE_SIZE = 20;
 
-            // OPTIMIZATION: Use getDocs (Fetch Once) instead of onSnapshot (Real-time).
-            // Logs are high-frequency data. Real-time listeners here cause performance degradation.
-            const fetchLogs = useCallback(async () => {
+            // OPTIMIZATION: Implemented Cursor-Based Pagination
+            const fetchLogs = useCallback(async (isLoadMore = false, forceReset = false) => {
                 if (!db) return;
-                setLoading(true);
+                
+                if (isLoadMore) setLoadingMore(true);
+                else setLoading(true);
+
                 try {
-                    const { collection, query, orderBy, limit, getDocs } = window.firebaseSDK;
-                    const q = query(collection(db, 'userLogs'), orderBy('timestamp', 'desc'), limit(limitCount));
+                    const { collection, query, orderBy, limit, getDocs, startAfter } = window.firebaseSDK;
+                    let q = query(collection(db, 'userLogs'), orderBy('timestamp', 'desc'), limit(PAGE_SIZE));
+                    
+                    const currentLastDoc = forceReset ? null : lastDoc;
+
+                    if (isLoadMore && currentLastDoc) {
+                        q = query(collection(db, 'userLogs'), orderBy('timestamp', 'desc'), startAfter(currentLastDoc), limit(PAGE_SIZE));
+                    }
                     
                     const snapshot = await getDocs(q);
                     const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    setLogs(data);
+                    
+                    if (snapshot.docs.length > 0) {
+                        setLastDoc(snapshot.docs[snapshot.docs.length - 1]);
+                    }
+                    
+                    setHasMore(snapshot.docs.length === PAGE_SIZE);
+
+                    if (isLoadMore && !forceReset) {
+                        setLogs(prev => [...prev, ...data]);
+                    } else {
+                        setLogs(data);
+                    }
                 } catch (error) {
                     console.error("Error fetching user logs:", error);
                 } finally {
                     setLoading(false);
+                    setLoadingMore(false);
                 }
-            }, [db, limitCount]);
+            }, [db, lastDoc]);
 
             useEffect(() => {
-                fetchLogs();
-            }, [fetchLogs]);
+                fetchLogs(false, true);
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [db]); // Run once on mount
+
+            const handleRefresh = () => {
+                setLastDoc(null);
+                fetchLogs(false, true);
+            };
 
             const getEmployeeName = (uid) => {
                 if (!uid) return 'System';
@@ -21547,16 +21552,9 @@ service cloud.firestore {
                         <h3 className="text-xl font-semibold text-slate-100">System Activity Logs</h3>
                         <div className="flex items-center gap-2">
                             {/* NEW: Manual Refresh Button */}
-                            <Button variant="secondary" icon="fa-sync" onClick={fetchLogs} disabled={loading} className="text-xs py-1 h-8">
+                            <Button variant="secondary" icon="fa-sync" onClick={handleRefresh} disabled={loading} className="text-xs py-1 h-8">
                                 Refresh
                             </Button>
-
-                            <label className="text-sm text-slate-400 ml-2">Show:</label>
-                            <select value={limitCount} onChange={(e) => setLimitCount(Number(e.target.value))} className="select w-auto py-1 px-2 text-sm">
-                                <option value={50}>50</option>
-                                <option value={100}>100</option>
-                                <option value={200}>200</option>
-                            </select>
                         </div>
                     </div>
                     {loading ? (
@@ -21586,6 +21584,14 @@ service cloud.firestore {
                                     {logs.length === 0 && <tr><td colSpan="5" className="px-4 py-8 text-center text-slate-500">No activity recorded found.</td></tr>}
                                 </tbody>
                             </table>
+                            {/* NEW: Infinite Scroll / Load More Footer */}
+                            {hasMore && (
+                                <div className="p-4 flex justify-center border-t border-slate-700">
+                                    <Button variant="secondary" onClick={() => fetchLogs(true)} disabled={loadingMore}>
+                                        {loadingMore ? <><i className="fas fa-spinner fa-spin mr-2"></i>Loading...</> : "Load More Logs"}
+                                    </Button>
+                                </div>
+                            )}
                         </div>
                     )}
                 </Card>
@@ -21596,11 +21602,17 @@ service cloud.firestore {
         const DeviceAuditTab = ({ userProfile }) => {
             const { db } = useFirebase();
             const { employees, shops } = useAppData(); // Use global data for name lookup
+            const [rawRecords, setRawRecords] = useState([]);
             const [deviceStats, setDeviceStats] = useState([]);
             const [loading, setLoading] = useState(true);
-            const [scanLimit, setScanLimit] = useState(500); // Default to last 500 records
             const [selectedShop, setSelectedShop] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
+
+            // NEW: Pagination states
+            const [loadingMore, setLoadingMore] = useState(false);
+            const [lastDoc, setLastDoc] = useState(null);
+            const [hasMore, setHasMore] = useState(true);
+            const FETCH_LIMIT = 100; // Load 100 records per chunk for aggregation
 
             // Set initial shop for managers
             useEffect(() => {
@@ -21612,30 +21624,61 @@ service cloud.firestore {
             // Helper to get allowed shops
             const allowedShops = useAllowedShops(userProfile, shops);
 
-            useEffect(() => {
+            // OPTIMIZATION: Cursor-Based Pagination Fetch
+            const fetchDeviceHistory = useCallback(async (isLoadMore = false, forceReset = false) => {
                 if (!db) return;
-                
-                const fetchDeviceHistory = async () => {
-                    setLoading(true);
-                    const { collection, query, orderBy, limit, getDocs, where } = window.firebaseSDK;
+                if (isLoadMore) setLoadingMore(true);
+                else setLoading(true);
+
+                try {
+                    const { collection, query, orderBy, limit, getDocs, startAfter } = window.firebaseSDK;
+                    let q = query(collection(db, 'attendance'), orderBy('timestamp', 'desc'), limit(FETCH_LIMIT));
                     
-                    try {
-                        // 1. Base Query: Get recent attendance
-                        let q = query(collection(db, 'attendance'), orderBy('timestamp', 'desc'), limit(scanLimit));
-                        
-                        // Apply shop filter if selected (Optimization: Filter at DB level if possible)
-                        // Note: Can't easily combine orderBy timestamp + where shop without custom index.
-                        // We'll stick to client-side filtering for simplicity unless volume is huge.
-                        
-                        const snapshot = await getDocs(q);
-                        const records = snapshot.docs.map(doc => doc.data());
+                    const currentLastDoc = forceReset ? null : lastDoc;
 
-                        // 2. Process Records into Unique (Staff + Device) entries
-                        const deviceMap = new Map(); // Key: "StaffId_DeviceModel"
+                    if (isLoadMore && currentLastDoc) {
+                        q = query(collection(db, 'attendance'), orderBy('timestamp', 'desc'), startAfter(currentLastDoc), limit(FETCH_LIMIT));
+                    }
+                    
+                    const snapshot = await getDocs(q);
+                    const records = snapshot.docs.map(doc => doc.data());
 
-                        records.forEach(rec => {
-                            // Filter logic
-                            if (selectedShop && rec.shop !== selectedShop) return;
+                    if (snapshot.docs.length > 0) {
+                        setLastDoc(snapshot.docs[snapshot.docs.length - 1]);
+                    }
+                    
+                    setHasMore(snapshot.docs.length === FETCH_LIMIT);
+
+                    if (isLoadMore && !forceReset) {
+                        setRawRecords(prev => [...prev, ...records]);
+                    } else {
+                        setRawRecords(records);
+                    }
+                } catch (error) {
+                    console.error("Error fetching device audit:", error);
+                } finally {
+                    setLoading(false);
+                    setLoadingMore(false);
+                }
+            }, [db, lastDoc]);
+
+            useEffect(() => {
+                fetchDeviceHistory(false, true);
+            // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [db]); // Run once on mount
+
+            const handleRefresh = () => {
+                setLastDoc(null);
+                fetchDeviceHistory(false, true);
+            };
+
+            useEffect(() => {
+                // 2. Process Records into Unique (Staff + Device) entries
+                const deviceMap = new Map(); // Key: "StaffId_DeviceModel"
+
+                rawRecords.forEach(rec => {
+                    // Filter logic
+                    if (selectedShop && rec.shop !== selectedShop) return;
                             
                             // Role-based filtering
                             if (userProfile.role === 'Shop Manager') {
@@ -21675,23 +21718,15 @@ service cloud.firestore {
                                 if (ts > entry.lastSeen) entry.lastSeen = ts;
                                 if (ts < entry.firstSeen) entry.firstSeen = ts;
                             }
-                        });
+                });
 
-                        // 3. Convert to Array and Sort
-                        // Sort by "First Seen" DESCENDING -> Shows newly introduced devices at the top
-                        const sortedStats = Array.from(deviceMap.values()).sort((a, b) => b.firstSeen - a.firstSeen);
-                        
-                        setDeviceStats(sortedStats);
+                // 3. Convert to Array and Sort
+                // Sort by "First Seen" DESCENDING -> Shows newly introduced devices at the top
+                const sortedStats = Array.from(deviceMap.values()).sort((a, b) => b.firstSeen - a.firstSeen);
+                
+                setDeviceStats(sortedStats);
 
-                    } catch (error) {
-                        console.error("Error fetching device audit:", error);
-                    } finally {
-                        setLoading(false);
-                    }
-                };
-
-                fetchDeviceHistory();
-            }, [db, scanLimit, selectedShop, userProfile, employees]); // Re-run when dependencies change
+            }, [rawRecords, selectedShop, userProfile, employees]); // Re-run when records or filters change
 
             // Final Display Filter (Search)
             const filteredStats = useMemo(() => {
@@ -21728,13 +21763,11 @@ service cloud.firestore {
                                 onChange={e => setSelectedShop(e.target.value)}
                             />
 
-                            <select value={scanLimit} onChange={e => setScanLimit(Number(e.target.value))} className="select w-auto text-sm">
-                                <option value={100}>Last 100 Checks</option>
-                                <option value={500}>Last 500 Checks</option>
-                                <option value={1000}>Last 1000 Checks</option>
-                            </select>
+                            <Button variant="secondary" icon="fa-sync" onClick={handleRefresh} disabled={loading} className="text-xs h-9">
+                                Refresh
+                            </Button>
 
-                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel} className="h-9">Excel</Button>
                         </div>
                     </PageHeader>
 
@@ -21800,6 +21833,14 @@ service cloud.firestore {
                                     )}
                                 </tbody>
                             </table>
+                            {/* NEW: Infinite Scroll / Load More Footer */}
+                            {hasMore && (
+                                <div className="p-4 flex justify-center border-t border-slate-700">
+                                    <Button variant="secondary" onClick={() => fetchDeviceHistory(true)} disabled={loadingMore}>
+                                        {loadingMore ? <><i className="fas fa-spinner fa-spin mr-2"></i>Analyzing More...</> : "Analyze Older Records"}
+                                    </Button>
+                                </div>
+                            )}
                         </div>
                     )}
                 </Card>
@@ -22457,9 +22498,35 @@ service cloud.firestore {
             );
         };
 
+        // --- OPTIMIZATION: FAUX CODE SPLITTING (Main Thread Yielding) ---
+        // In a single-file app, true network-based code splitting isn't possible.
+        // However, using React.lazy() and Promises forces the browser to yield the main thread 
+        // before evaluating massive component trees. This drastically improves Time To Interactive (TTI) 
+        // and prevents the UI from freezing/stuttering when switching tabs.
+        const deferComponent = (Component) => {
+            return lazy(() => new Promise(resolve => {
+                // Yield to the browser's rendering pipeline (paint the skeleton) before parsing the heavy component
+                setTimeout(() => resolve({ default: Component }), 15);
+            }));
+        };
+
+        const LazyDashboard = deferComponent(DashboardSummaryPage);
+        const LazyCompanyHub = deferComponent(CompanyHubPage);
+        const LazyEmployees = deferComponent(EmployeesPage);
+        const LazyCheckInMe = deferComponent(CheckInMePage);
+        const LazyAttendanceReport = deferComponent(AttendanceReportPage);
+        const LazyPayroll = deferComponent(PayrollPage);
+        const LazyHRBanking = deferComponent(HRBankingPage);
+        const LazyExpenseReport = deferComponent(ExpenseReportPage);
+        const LazyAssetManager = deferComponent(AssetManagerPage);
+        const LazyTaskBoard = deferComponent(TaskBoardPage);
+        const LazyUserActivity = deferComponent(UserActivityPage);
+        const LazySettings = deferComponent(SettingsPage);
+
         // --- START MAIN APP COMPONENT ---
         const AppContent = () => {
-            const { userProfile, loading, auth, db } = useFirebase();
+            // FIX: Destructure 'currentUser' from useFirebase to bridge the auth-to-database micro-gap
+            const { userProfile, loading, auth, db, currentUser } = useFirebase();
             const [activePage, setActivePage] = useState('dashboard');
             
             // FIX: Ensure SDK is ready or handle gracefully. 
@@ -22516,8 +22583,9 @@ service cloud.firestore {
             const { isOnline } = useConnectivity();
 
             // 7. Data Fetching Hooks (Must be unconditional)
-            // PERFORMANCE FIX: Added cache keys to prevent blocking load on every refresh
-            const { data: allNotices } = useCollection('memoAlerts', [], 'hr_cache_notices');
+            // PERFORMANCE FIX: Added cache keys and restricted global notices to 'Active' only.
+            // This prevents the app from downloading years of archived history globally to all idle devices.
+            const { data: allNotices } = useCollection('memoAlerts', [where('status', '==', 'Active')], 'hr_cache_notices');
             const { data: allPolicies } = useCollection('policies', [], 'hr_cache_policies');
 
             // --- NEW: Global Chat Listener for Notification Badge ---
@@ -22543,24 +22611,27 @@ service cloud.firestore {
                     q = query(collection(db, 'team_messages'));
                 }
 
-                // Limit to recent messages to save bandwidth, order by newest
-                q = query(q, orderBy('createdAt', 'desc'), limit(30));
+                // PERFORMANCE FIX: Limit to 1. We only need to know if the *absolute newest* message 
+                // is unread to show the notification dot. Downloading 30 messages globally for 50+ users 
+                // every time someone chats drains Firebase Quota and battery life.
+                q = query(q, orderBy('createdAt', 'desc'), limit(1));
 
                 const unsubscribe = onSnapshot(q, (snapshot) => {
                     // Check local storage again inside snapshot to be fresh
                     const currentLastRead = localStorage.getItem('hr_chat_last_read') || new Date().toISOString();
                     
-                    const count = snapshot.docs.filter(doc => {
-                        const data = doc.data();
+                    let hasNew = false;
+                    if (!snapshot.empty) {
+                        const data = snapshot.docs[0].data();
                         // Ignore own messages
-                        if (data.senderId === userProfile.id) return false;
-                        if (!data.createdAt) return false;
-                        
-                        const msgTime = data.createdAt.toDate().toISOString();
-                        return msgTime > currentLastRead;
-                    }).length;
+                        if (data.senderId !== userProfile.id && data.createdAt) {
+                            const msgTime = data.createdAt.toDate().toISOString();
+                            if (msgTime > currentLastRead) hasNew = true;
+                        }
+                    }
 
-                    setUnreadChatCount(count);
+                    // Just use 1 or 0 to act as a boolean "New Message" indicator
+                    setUnreadChatCount(hasNew ? 1 : 0);
                 }, (err) => console.error("Global Chat Badge Error:", err));
 
                 return () => unsubscribe();
@@ -22956,7 +23027,8 @@ service cloud.firestore {
             };
             
             // --- EARLY RETURNS (Now Safe because hooks are above) ---
-            if (loading) return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white"><i className="fas fa-spinner fa-spin text-4xl mr-3"></i> Loading System...</div>;
+            // FIX: Prevent Login Page flash. If currentUser is authenticated but userProfile hasn't downloaded yet, force the loading screen.
+            if (loading || (currentUser && !userProfile)) return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white"><i className="fas fa-spinner fa-spin text-4xl mr-3"></i> Loading System...</div>;
             if (!userProfile) return <LoginPage />;
 
             const activePageKey = activePage.split(':')[0];
@@ -22990,25 +23062,28 @@ service cloud.firestore {
                 if (!activePageKey) return null;
                 if (!hasPermission) return <Card><CardTitle>Access Denied</CardTitle><p>You do not have permission to view this page.</p></Card>;
                 
+                let PageComponent;
                 switch(activePageKey) {
-                    case 'dashboard': return <DashboardSummaryPage userProfile={userProfile} setActivePage={setActivePage} onNavigateWithTab={handleNotificationClick} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />;
-                    {/* PHASE 2: Pass setActivePage as onNavigate to CompanyHubPage for tab switching */}
-                    {/* MODIFIED: Pass chat props to CompanyHubPage */}
-                    case 'companyHub': return <CompanyHubPage userProfile={userProfile} pageParams={activePageParams} onNavigate={setActivePage} chatUnreadCount={unreadChatCount} onChatRead={handleChatRead} />;
-                    case 'employees': return <EmployeesPage userProfile={userProfile} pageParams={activePageParams} pendingSalaryRevisions={pendingSalaryRevisions} />;
-                    case 'checkinme': return <CheckInMePage userProfile={userProfile} initialTab={initialCheckInMeTab} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />;
-                    case 'attendanceReport': return <AttendanceReportPage userProfile={userProfile} />;
-                    case 'payroll': return <PayrollPage userProfile={userProfile} />;
-                    case 'hrBanking': return <HRBankingPage userProfile={userProfile} />;
-                    case 'expenseReport': return <ExpenseReportPage userProfile={userProfile} />;
-                    case 'assets': return <AssetManagerPage userProfile={userProfile} />;
-                    {/* MODIFIED: Pass activePageParams to TaskBoardPage */}
-                    case 'tasks': return <TaskBoardPage userProfile={userProfile} pageParams={activePageParams} />;
-                    {/* FIX: Passed userProfile to UserActivityPage to resolve "reading 'role' of undefined" error in DeviceAuditTab */}
-                    case 'userActivity': return <UserActivityPage userProfile={userProfile} />;
-                    case 'settings': return <SettingsPage />;
+                    case 'dashboard': PageComponent = <LazyDashboard userProfile={userProfile} setActivePage={setActivePage} onNavigateWithTab={handleNotificationClick} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />; break;
+                    case 'companyHub': PageComponent = <LazyCompanyHub userProfile={userProfile} pageParams={activePageParams} onNavigate={setActivePage} chatUnreadCount={unreadChatCount} onChatRead={handleChatRead} />; break;
+                    case 'employees': PageComponent = <LazyEmployees userProfile={userProfile} pageParams={activePageParams} pendingSalaryRevisions={pendingSalaryRevisions} />; break;
+                    case 'checkinme': PageComponent = <LazyCheckInMe userProfile={userProfile} initialTab={initialCheckInMeTab} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />; break;
+                    case 'attendanceReport': PageComponent = <LazyAttendanceReport userProfile={userProfile} />; break;
+                    case 'payroll': PageComponent = <LazyPayroll userProfile={userProfile} />; break;
+                    case 'hrBanking': PageComponent = <LazyHRBanking userProfile={userProfile} />; break;
+                    case 'expenseReport': PageComponent = <LazyExpenseReport userProfile={userProfile} />; break;
+                    case 'assets': PageComponent = <LazyAssetManager userProfile={userProfile} />; break;
+                    case 'tasks': PageComponent = <LazyTaskBoard userProfile={userProfile} pageParams={activePageParams} />; break;
+                    case 'userActivity': PageComponent = <LazyUserActivity userProfile={userProfile} />; break;
+                    case 'settings': PageComponent = <LazySettings />; break;
                     default: return <UnderConstructionPage title="Page Not Found" />;
                 }
+
+                return (
+                    <Suspense fallback={<DashboardSkeleton />}>
+                        {PageComponent}
+                    </Suspense>
+                );
             };
 
             return (
