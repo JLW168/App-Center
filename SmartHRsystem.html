@@ -972,11 +972,11 @@
 
                 // An absence is a past day with no attendance record.
                 if (!attendedDays.has(dayKey)) {
-                    // FIX: Check if the employee was on approved leave for this day before marking as absent.
-                    const isOnApprovedLeave = monthLeave.some(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                    // FIX: Check for specific leave record to handle half-days precisely
+                    const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
                     
-                    if (!isOnApprovedLeave) {
-                        absentDays++; // Only count as absent if not on approved leave.
+                    if (!todayLeaveRecord) {
+                        absentDays++; // Full absence
 
                         // Check if there was a REJECTED leave request for this absent day.
                         const hadRejectedLeave = (leaveRequests || []).some(
@@ -990,6 +990,9 @@
                             // Apply penalty: Salary per day x 2
                             rejectedLeavePenaltyAmount += (salaryPerDay * 2);
                         }
+                    } else if (todayLeaveRecord.leaveSession !== 'Full Day') {
+                        // UX FIX: If they had a half-day leave but didn't show up at all, they are absent for 0.5 days.
+                        absentDays += 0.5;
                     }
                 }
             }
@@ -5509,7 +5512,7 @@
 
         // --- UPDATED: CompanyHubPage to include Messenger ---
         // MODIFIED: Accepts chatUnreadCount and onChatRead from parent (AppContent)
-        const CompanyHubPage = ({ userProfile, pageParams, onNavigate, chatUnreadCount, onChatRead }) => {
+        const CompanyHubPage = ({ userProfile, pageParams, onNavigate, chatUnreadCount, noticesUnreadCount, policiesUnreadCount, meetingsUnreadCount, onChatRead }) => {
             const { moduleConfig = {} } = useAppData();
             
             const [activeTab, setActiveTab] = useState('');
@@ -5529,7 +5532,14 @@
 
             const tabs = useMemo(() => {
                 const available = {};
-                if (moduleConfig['companyHub:notices'] !== false) available.notices = <span><i className="fas fa-bullhorn mr-2 text-yellow-500"></i>Notices</span>;
+                if (moduleConfig['companyHub:notices'] !== false) {
+                    available.notices = (
+                        <span className="flex items-center gap-2">
+                            <span><i className="fas fa-bullhorn mr-1 text-yellow-500"></i>Notices</span>
+                            {noticesUnreadCount > 0 && <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">{noticesUnreadCount}</span>}
+                        </span>
+                    );
+                }
                 
                 // MODIFIED: Messenger Tab with Badge (using prop)
                 if (moduleConfig['companyHub:messenger'] !== false) {
@@ -5545,10 +5555,25 @@
                     );
                 }
 
-                if (moduleConfig['companyHub:meetingRoom'] !== false) available.meetingRoom = <span><i className="fas fa-chalkboard-user mr-2 text-purple-400"></i>Meeting Room</span>;
-                if (moduleConfig['companyHub:policies'] !== false) available.policies = <span><i className="fas fa-scale-balanced mr-2 text-blue-400"></i>Policies</span>;
+                if (moduleConfig['companyHub:meetingRoom'] !== false) {
+                    available.meetingRoom = (
+                        <span className="flex items-center gap-2">
+                            <span><i className="fas fa-chalkboard-user mr-1 text-purple-400"></i>Meeting Room</span>
+                            {meetingsUnreadCount > 0 && <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">{meetingsUnreadCount}</span>}
+                        </span>
+                    );
+                }
+
+                if (moduleConfig['companyHub:policies'] !== false) {
+                    available.policies = (
+                        <span className="flex items-center gap-2">
+                            <span><i className="fas fa-scale-balanced mr-1 text-blue-400"></i>Policies</span>
+                            {policiesUnreadCount > 0 && <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">{policiesUnreadCount}</span>}
+                        </span>
+                    );
+                }
                 return available;
-            }, [moduleConfig, chatUnreadCount]); 
+            }, [moduleConfig, chatUnreadCount, noticesUnreadCount, policiesUnreadCount, meetingsUnreadCount]); 
 
             useEffect(() => {
                 if (pageParams) {
@@ -8274,7 +8299,6 @@
                     
                     setSelectedShopForCheckIn(qrText);
 
-                    // Late Logic ... (keep existing) ...
                     if (nextActionType === 'in') {
                         // 1. Prepare Date/Time in Shop Timezone
                         const shopTz = scannedShop.timezone || 'Asia/Phnom_Penh';
@@ -8288,54 +8312,85 @@
                             effectiveShiftName = 'AM';
                         }
 
+                        // --- NEW: Find today's approved leave ---
+                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                            lr.staffId === userProfile.id && 
+                            lr.status === 'Approved' && 
+                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                        );
+
                         const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === qrText);
                         if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
                             
-                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE ---
+                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE WITH LEAVE OFFSET ---
                             let startMins = startHour * 60 + (startMinute || 0);
                             let lateLimitMins = lateHour * 60 + lateMinute;
                             let checkInMins = checkInHour * 60 + checkInMinute;
 
                             // Handle overnight shifts wrapping past midnight
-                            if (checkInMins < startMins - 720) checkInMins += 1440;
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
+                            const allowedLateDelta = lateLimitMins - startMins;
 
-                            // Evaluate window: Check-in is AFTER start time, but within 14 hours
-                            if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
-                                if (checkInMins > lateLimitMins) {
-                                    
-                                    // Calculate EXACT minutes late from START TIME
-                                    const lateMinutes = checkInMins - startMins;
+                            let isExcused = false;
 
-                                    const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                    const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
-                                    const snap = await getDocs(q);
-                                    
-                                    // Strict check to prevent duplicate late penalties on the same day
-                                    if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
-                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
+                            // Apply Half-Day Leave Offset
+                            if (todayLeave) {
+                                if (todayLeave.leaveSession === 'Full Day') {
+                                    isExcused = true;
+                                } else if (todayLeave.leaveSession === 'AM') {
+                                    // 'AM' Leave means First Half Leave. Shift the start time to the Afternoon check-in limit.
+                                    if (shiftDetails.amLeaveThreshold) {
+                                        const [alH, alM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
+                                        startMins = alH * 60 + alM;
+                                        lateLimitMins = startMins + allowedLateDelta;
+                                    } else {
+                                        isExcused = true; // Fallback
+                                    }
+                                }
+                                // If 'PM' (Second Half) leave, normal morning start time applies.
+                            }
+
+                            if (!isExcused) {
+                                // Handle overnight shifts wrapping past midnight
+                                if (checkInMins < startMins - 720) checkInMins += 1440;
+
+                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
+                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
+                                    if (checkInMins > lateLimitMins) {
                                         
-                                        // --- Dynamic Tiered Penalty Logic ---
-                                        penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
-                                        if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
-                                            const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
-                                            let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
-                                            for (const rule of sortedRules) {
-                                                if (lateMinutes <= rule.limit) {
-                                                    appliedAmount = parseFloat(rule.amount);
-                                                    break;
+                                        // Calculate EXACT minutes late from START TIME
+                                        const lateMinutes = checkInMins - startMins;
+
+                                        const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                        const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
+                                        const snap = await getDocs(q);
+                                        
+                                        // Strict check to prevent duplicate late penalties on the same day
+                                        if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
+                                            const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
+                                            
+                                            // --- Dynamic Tiered Penalty Logic ---
+                                            penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
+                                            if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
+                                                const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
+                                                let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
+                                                for (const rule of sortedRules) {
+                                                    if (lateMinutes <= rule.limit) {
+                                                        appliedAmount = parseFloat(rule.amount);
+                                                        break;
+                                                    }
                                                 }
+                                                penaltyAmount = appliedAmount;
                                             }
-                                            penaltyAmount = appliedAmount;
+                                            
+                                            const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
+                                            await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
+                                                staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
+                                            });
+                                            penaltyApplied = true;
                                         }
-                                        
-                                        const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
-                                        await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
-                                            staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
-                                        });
-                                        penaltyApplied = true;
                                     }
                                 }
                             }
@@ -8393,7 +8448,6 @@
                         isOptimistic: true
                     });
                     
-                    // ... (keep Late Logic GPS same as before) ...
                     if (nextActionType === 'in') {
                         // 1. Prepare Date/Time in Shop Timezone
                         const shopTz = shop.timezone || 'Asia/Phnom_Penh';
@@ -8415,6 +8469,13 @@
                             effectiveShiftName = 'AM';
                         }
 
+                        // --- NEW: Find today's approved leave ---
+                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                            lr.staffId === userProfile.id && 
+                            lr.status === 'Approved' && 
+                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                        );
+
                         // 3. Get Shift Rules
                         const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === selectedShopForCheckIn);
                         
@@ -8422,51 +8483,73 @@
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
                             
-                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE ---
+                            // --- FIX: ROBUST MINUTE-BASED MATH ENGINE WITH LEAVE OFFSET ---
                             let startMins = startHour * 60 + (startMinute || 0);
                             let lateLimitMins = lateHour * 60 + lateMinute;
                             let checkInMins = checkInHour * 60 + checkInMinute;
 
                             // Handle overnight shifts wrapping past midnight
-                            if (checkInMins < startMins - 720) checkInMins += 1440;
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
-                            
-                            // Evaluate window: Check-in is AFTER start time, but within 14 hours
-                            if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
-                                if (checkInMins > lateLimitMins) {
-                                    
-                                    // Calculate EXACT minutes late from START TIME
-                                    const lateMinutes = checkInMins - startMins;
+                            const allowedLateDelta = lateLimitMins - startMins;
 
-                                    const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                    const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
-                                    const snap = await getDocs(q);
-                                    
-                                    // Strict check to prevent duplicate late penalties on the same day
-                                    if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
-                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
+                            let isExcused = false;
+
+                            // Apply Half-Day Leave Offset
+                            if (todayLeave) {
+                                if (todayLeave.leaveSession === 'Full Day') {
+                                    isExcused = true;
+                                } else if (todayLeave.leaveSession === 'AM') {
+                                    // 'AM' Leave means First Half Leave. Shift the start time to the Afternoon check-in limit.
+                                    if (shiftDetails.amLeaveThreshold) {
+                                        const [alH, alM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
+                                        startMins = alH * 60 + alM;
+                                        lateLimitMins = startMins + allowedLateDelta;
+                                    } else {
+                                        isExcused = true; // Fallback
+                                    }
+                                }
+                            }
+
+                            if (!isExcused) {
+                                if (checkInMins < startMins - 720) checkInMins += 1440;
+                                
+                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
+                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
+                                    if (checkInMins > lateLimitMins) {
                                         
-                                        // --- Dynamic Tiered Penalty Logic ---
-                                        penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
-                                        if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
-                                            const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
-                                            let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
-                                            for (const rule of sortedRules) {
-                                                if (lateMinutes <= rule.limit) {
-                                                    appliedAmount = parseFloat(rule.amount);
-                                                    break;
+                                        // Calculate EXACT minutes late from START TIME
+                                        const lateMinutes = checkInMins - startMins;
+
+                                        const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                        const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
+                                        const snap = await getDocs(q);
+                                        
+                                        // Strict check to prevent duplicate late penalties on the same day
+                                        if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
+                                            const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
+                                            
+                                            // --- Dynamic Tiered Penalty Logic ---
+                                            penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
+                                            if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
+                                                const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
+                                                let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
+                                                for (const rule of sortedRules) {
+                                                    if (lateMinutes <= rule.limit) {
+                                                        appliedAmount = parseFloat(rule.amount);
+                                                        break;
+                                                    }
                                                 }
+                                                penaltyAmount = appliedAmount;
                                             }
-                                            penaltyAmount = appliedAmount;
-                                        }
-                                        
-                                        const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
+                                            
+                                            const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
 
-                                        await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
-                                            staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
-                                        });
-                                        
-                                        penaltyApplied = true;
+                                            await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
+                                                staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
+                                            });
+                                            
+                                            penaltyApplied = true;
+                                        }
                                     }
                                 }
                             }
@@ -8837,8 +8920,8 @@
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-sun mr-2 text-yellow-400"></i>Session</label>
                                     <select name="leaveSession" value={formData.leaveSession || 'Full Day'} onChange={handleChange} className="select" disabled={isMultiDayLeave}>
                                         <option value="Full Day">Full Day</option>
-                                        <option value="AM">AM (Morning)</option>
-                                        <option value="PM">PM (Afternoon)</option>
+                                        <option value="AM">First Half (AM Leave)</option>
+                                        <option value="PM">Second Half (PM Leave)</option>
                                     </select>
                                 </div>
                                 <div>
@@ -10149,10 +10232,11 @@
 
                                     <td className="px-4 py-4 text-center whitespace-nowrap">
                                         <div className="flex items-center justify-center gap-4">
-                                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && report.checkIn && !report.checkOut && (
+                                            {/* FIX: Replaced !report.checkOut with report.checkOut === '-' to fix the disappearing button bug for Admins */}
+                                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.checkIn !== '-' && report.checkOut === '-' && (
                                                 <Button variant="icon-add-time" icon="fa-clock" onClick={() => onAddCheckOut(report)} title="Add Check-Out"/>
                                             )}
-                                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && report.docIds.length > 0 && (
+                                            {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.docIds.length > 0 && (
                                                 <Button variant="icon-delete" icon="fa-trash" onClick={() => onDeleteRecord(report)} title="Delete" />
                                             )}
                                         </div>
@@ -10808,29 +10892,23 @@
                         employeeId: employee.id,
                         employeeName: employee.name,
                         shop: shopDisplay,
-                        shift: employee.shift,
-                        checkIn: checkInTimeStr,
-                        checkOut: checkOutTimeStr,
-                        breakStart: breakStartTimeStr, 
-                        breakEnd: breakEndTimeStr,
-                        totalBreak: totalBreakStr, // NEW: Include calculated duration
-                        isLate, isOnLeave, otStatus, docIds: entry.docIds,
-                        deviceModel, devicePlatform // Pass to row
+                        shift: employee.shift || 'N/A',
+                        checkIn: checkInTimeStr || '-',
+                        checkOut: checkOutTimeStr || '-',
+                        breakStart: breakStartTimeStr || null,
+                        breakEnd: breakEndTimeStr || null,
+                        totalBreak: totalBreakStr || '-',
+                        isOnLeave,
+                        otStatus,
+                        isLate,
+                        deviceModel,
+                        devicePlatform,
+                        docIds: entry.docIds
                     };
                 }).filter(Boolean);
-                
-                return reportArray.sort((a, b) => (a.shop || '').localeCompare(b.shop || '') || b.date.localeCompare(a.date) || a.employeeName.localeCompare(b.employeeName));
-            }, [attendance, selectedShop, filterType, customMonth, searchTerm, employees, leaveRequests, otRequests, selectedShift, shops, shifts, userProfile, isReportLoading]);
 
-            // ... (keep Handlers: handleDelete, handleOpenCorrectionModal, etc.) ...
-            const handleDelete = async () => {
-                if (!recordToDelete?.docIds) return;
-                const { doc, writeBatch } = window.firebaseSDK;
-                const batch = writeBatch(db);
-                recordToDelete.docIds.forEach(id => batch.delete(doc(db, 'attendance', id)));
-                try { await batch.commit(); } catch (error) { console.error("Error deleting attendance records: ", error); } 
-                finally { setRecordToDelete(null); }
-            };
+                return reportArray.sort((a, b) => b.date.localeCompare(a.date) || a.employeeName.localeCompare(b.employeeName));
+            }, [attendance, leaveRequests, otRequests, employees, shops, filterType, selectedShop, searchTerm, selectedShift, customMonth, isReportLoading]);
 
             const handleOpenCorrectionModal = useCallback((record) => {
                 setRecordToCorrect(record);
@@ -10868,10 +10946,11 @@
                         shop: record.shop,
                         timestamp: checkOutDateTime,
                         type: 'out',
-                        location: { manualEntry: true, note: 'Added by Admin' }
+                        location: { manualEntry: true, note: `Added manually by ${userProfile?.role || 'Manager'}` }
                     });
 
-                    if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO') {
+                    // FIX: Ensure Shop Managers also get their local view updated immediately
+                    if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') {
                         const newRecordForState = {
                             id: newDocRef.id,
                             employeeId: record.employeeId,
@@ -10879,7 +10958,7 @@
                             shop: record.shop,
                             timestamp: { toDate: () => checkOutDateTime },
                             type: 'out',
-                            location: { manualEntry: true, note: 'Added by Admin' }
+                            location: { manualEntry: true, note: `Added manually by ${userProfile?.role || 'Manager'}` }
                         };
                         setAdminAttendance(prev => [...prev, newRecordForState]);
                     }
@@ -10889,6 +10968,38 @@
                     alert("Failed to save the manual check-out time.");
                 }
             }, [db, handleCloseCorrectionModal, userProfile, shops]);
+
+            // --- FIX: Added missing handleDelete function ---
+            const handleDelete = async () => {
+                if (!recordToDelete || !recordToDelete.docIds || recordToDelete.docIds.length === 0) {
+                    setRecordToDelete(null);
+                    return;
+                }
+                
+                try {
+                    const { writeBatch, doc } = window.firebaseSDK;
+                    const batch = writeBatch(db);
+                    
+                    // A single row in the report might consist of multiple attendance records 
+                    // (e.g. In, Out, Break Start, Break End). Delete them all together.
+                    recordToDelete.docIds.forEach(docId => {
+                        batch.delete(doc(db, 'attendance', docId));
+                    });
+                    
+                    await batch.commit();
+
+                    // Clean up local state for Admins/CEOs/Managers who fetched the data on-demand
+                    if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') {
+                        setAdminAttendance(prev => prev.filter(rec => !recordToDelete.docIds.includes(rec.id)));
+                    }
+                } catch (error) {
+                    console.error("Error deleting attendance records:", error);
+                    alert("Failed to delete the records.");
+                } finally {
+                    setRecordToDelete(null);
+                }
+            };
+            // --- END FIX ---
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = attendanceReport.map(report => ({
@@ -11277,9 +11388,15 @@
                     for (let day = 1; day <= daysInMonth; day++) {
                         const dayKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                         if (dayKey >= todayStr) break;
+                        
                         if (!attendedDays.has(dayKey)) {
-                            const isOnLeave = monthLeave.some(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
-                            if (!isOnLeave) noAbsentCount++;
+                            // FIX: Check for specific leave record to handle half-days precisely
+                            const leaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                            if (!leaveRecord) {
+                                noAbsentCount++;
+                            } else if (leaveRecord.leaveSession !== 'Full Day') {
+                                noAbsentCount += 0.5;
+                            }
                         }
                     }
 
@@ -12162,27 +12279,28 @@
                                             <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{rec.month}</td>
                                             <td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td>
                                             <td className="px-4 py-4 text-sm text-slate-200 font-medium">{rec.employeeName}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-slate-400">{Utils.formatCurrency(rec.baseSalary)}</td>
-                                            
-                                            {/* NEW: Requested Data Fields */}
-                                            <td className="px-4 py-4 text-sm text-right text-green-300 font-medium">{Utils.formatCurrency(rec.calculations?.engagements)}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-blue-300">{Utils.formatCurrency(rec.calculations?.otSalary)}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-indigo-300">{Utils.formatCurrency(rec.calculations?.totalSavingsWithdrawal)}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-orange-300">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-red-300">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td>
-                                            <td className="px-4 py-4 text-sm text-right text-blue-400">{Utils.formatCurrency(rec.calculations?.savingsDeduction)}</td>
+                                    <td className="px-4 py-4 text-xs text-slate-400 font-mono">
+                                        {report.deviceModel && report.deviceModel !== 'Unknown' ? (
+                                            <span title={report.devicePlatform || ''} className="text-blue-300">{report.deviceModel}</span>
+                                        ) : (
+                                            <span className="opacity-30">-</span>
+                                        )}
+                                    </td>
+                                )}
 
-                                            <td className="px-4 py-4 text-sm text-right font-bold text-green-400">{Utils.formatCurrency(rec.netSalary)}</td>
-                                            <td className="px-4 py-4 text-center">
-                                                <div className="flex items-center justify-center gap-2">
-                                                    <Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit & Recalculate" />
-                                                    {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO') && (
-                                                        <Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete Record" />
-                                                    )}
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    ))}
+                                <td className="px-4 py-4 text-center whitespace-nowrap">
+                                    <div className="flex items-center justify-center gap-4">
+                                        {/* FIX: Corrected condition to check for '-' string, and allowed Shop Managers to assist */}
+                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.checkIn !== '-' && report.checkOut === '-' && (
+                                            <Button variant="icon-add-time" icon="fa-clock" onClick={() => onAddCheckOut(report)} title="Add Check-Out"/>
+                                        )}
+                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.docIds.length > 0 && (
+                                            <Button variant="icon-delete" icon="fa-trash" onClick={() => onDeleteRecord(report)} title="Delete" />
+                                        )}
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
                                     {filteredHistory.length === 0 && (
                                         <tr><td colSpan="12" className="px-4 py-8 text-center text-slate-500">No records found.</td></tr>
                                     )}
@@ -12399,27 +12517,27 @@
 
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-sm">
-                    <form onSubmit={handleSubmit}>
+                    <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
                         <ModalHeader title={`Top Up: ${shopName}`} onClose={onClose} />
                         <ModalBody>
                             <div className="space-y-4">
-                                <div className="p-3 bg-blue-900/20 border border-blue-700/30 rounded-lg text-sm text-blue-200">
-                                    <i className="fas fa-info-circle mr-2"></i> Adding funds to the shop's petty cash wallet.
-                                </div>
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400">Amount (KHR)</label>
+                                    <label className="text-sm font-medium text-slate-400">
+                                        <i className="fas fa-money-bill-wave mr-2 text-green-400"></i>Amount (KHR)
+                                    </label>
                                     <input 
                                         type="number" 
                                         value={amount} 
                                         onChange={e => setAmount(e.target.value)} 
-                                        className="input font-bold text-green-400 text-lg" 
+                                        className="input font-bold text-green-400" 
                                         placeholder="0" 
                                         required 
-                                        autoFocus 
                                     />
                                 </div>
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                                    <label className="text-sm font-medium text-slate-400">
+                                        <i className="fas fa-sticky-note mr-2 text-slate-400"></i>Note (Optional)
+                                    </label>
                                     <input 
                                         type="text" 
                                         value={note} 
@@ -22530,11 +22648,20 @@ service cloud.firestore {
             const [activePage, setActivePage] = useState('dashboard');
             
             // FIX: Ensure SDK is ready or handle gracefully. 
-            // In a real app, we might wait, but here we assume provider handles loading.
             const { where, collection, query, onSnapshot, orderBy, limit } = window.firebaseSDK || {}; 
             
             // MODIFIED: Destructure systemSettings
             const { employees, shops, kpis, moduleConfig = {}, systemSettings } = useAppData(); 
+
+            // --- NEW: Delayed Background Hydration ---
+            // This prevents heavy background listeners (Chat, Global Notices) from competing
+            // with the initial React rendering thread, making the app feel significantly faster to load.
+            const [startBackgroundTasks, setStartBackgroundTasks] = useState(false);
+            useEffect(() => {
+                // Wait 2 seconds after the app boots before starting background network listeners
+                const timer = setTimeout(() => setStartBackgroundTasks(true), 2000);
+                return () => clearTimeout(timer);
+            }, []);
 
             // --- NEW: Dynamic Title Effect ---
             useEffect(() => {
@@ -22584,15 +22711,24 @@ service cloud.firestore {
 
             // 7. Data Fetching Hooks (Must be unconditional)
             // PERFORMANCE FIX: Added cache keys and restricted global notices to 'Active' only.
-            // This prevents the app from downloading years of archived history globally to all idle devices.
-            const { data: allNotices } = useCollection('memoAlerts', [where('status', '==', 'Active')], 'hr_cache_notices');
-            const { data: allPolicies } = useCollection('policies', [], 'hr_cache_policies');
+            // OPTIMIZATION: Only run these fetches after the initial UI has painted (startBackgroundTasks)
+            const noticeConstraints = useMemo(() => {
+                return startBackgroundTasks ? [where('status', '==', 'Active')] : [where('status', '==', '___BLOCK___')];
+            }, [startBackgroundTasks]);
+            
+            const policyConstraints = useMemo(() => {
+                return startBackgroundTasks ? [] : [where('status', '==', '___BLOCK___')];
+            }, [startBackgroundTasks]);
+
+            const { data: allNotices } = useCollection('memoAlerts', noticeConstraints, 'hr_cache_notices');
+            const { data: allPolicies } = useCollection('policies', policyConstraints, 'hr_cache_policies');
 
             // --- NEW: Global Chat Listener for Notification Badge ---
             const [unreadChatCount, setUnreadChatCount] = useState(0);
 
             useEffect(() => {
-                if (!db || !userProfile || moduleConfig['companyHub:messenger'] === false) return;
+                // OPTIMIZATION: Do not connect to chat until background tasks are allowed
+                if (!startBackgroundTasks || !db || !userProfile || moduleConfig['companyHub:messenger'] === false) return;
 
                 const lastRead = localStorage.getItem('hr_chat_last_read') || new Date().toISOString();
                 
@@ -22655,7 +22791,7 @@ service cloud.firestore {
             // Notification Constraints
             const notificationConstraints = useMemo(() => {
                 // MODIFIED: Initializer to include 'maintenance'
-                if (!userProfile || !window.firebaseSDK) return { leave: [], ot: [], state: [], maintenance: [] };
+                if (!userProfile || !window.firebaseSDK) return { leave: [], ot: [], state: [], maintenance: [], salary: [] };
                 const { role, shop } = userProfile;
                 const { where } = window.firebaseSDK;
                 const pendingStatus = where("status", "==", "Pending");
@@ -22666,7 +22802,8 @@ service cloud.firestore {
                         leave: [pendingStatus], 
                         ot: [pendingStatus], 
                         state: [pendingStatus],
-                        maintenance: [openStatus] // Admin sees all open tickets
+                        maintenance: [openStatus], // Admin sees all open tickets
+                        salary: [pendingStatus]
                     };
                 }
                 if (role === 'Shop Manager') {
@@ -22675,14 +22812,17 @@ service cloud.firestore {
                         leave: [where("status", "==", "impossible")], 
                         ot: [where("status", "==", "impossible")], 
                         state: [where("status", "==", "impossible")],
-                        maintenance: [where("status", "==", "impossible")]
+                        maintenance: [where("status", "==", "impossible")],
+                        salary: [where("status", "==", "impossible")]
                     };
                     const shopFilter = where("shop", "in", shopsArr);
                     return { 
                         leave: [pendingStatus, shopFilter], 
                         ot: [pendingStatus, shopFilter], 
                         state: [pendingStatus, shopFilter],
-                        maintenance: [openStatus, shopFilter] // Manager sees open tickets in their shops
+                        // Note: Salary revisions use 'shopName' instead of 'shop'
+                        maintenance: [openStatus, shopFilter], 
+                        salary: [pendingStatus, where("shopName", "in", shopsArr)]
                     };
                 }
                 // Staff don't see management badges
@@ -22948,9 +23088,9 @@ service cloud.firestore {
 
             // --- COMPUTED VALUES ---
 
-            const companyHubUnreadCount = useMemo(() => {
+            const unreadNoticesCount = useMemo(() => {
                 if (!userProfile) return 0;
-                const unreadNoticesCount = (allNotices || []).filter(n => {
+                return (allNotices || []).filter(n => {
                     if (userProfile.role === 'Staff' && n.status !== 'Active') return false;
                     if (n.targetShops && n.targetShops.length > 0) {
                         const userShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
@@ -22958,11 +23098,17 @@ service cloud.firestore {
                     }
                     return !(n.readBy || []).includes(userProfile.id);
                 }).length;
-                const unreadPoliciesCount = (allPolicies || []).filter(p => { return !(p.readBy || []).includes(userProfile.id); }).length;
-                
-                // MODIFIED: Include Chat Count in the total Hub Badge
-                return unreadNoticesCount + unreadPoliciesCount + unreadChatCount;
-            }, [allNotices, allPolicies, userProfile, unreadChatCount]);
+            }, [allNotices, userProfile]);
+
+            const unreadPoliciesCount = useMemo(() => {
+                if (!userProfile) return 0;
+                return (allPolicies || []).filter(p => !(p.readBy || []).includes(userProfile.id)).length;
+            }, [allPolicies, userProfile]);
+
+            const companyHubUnreadCount = useMemo(() => {
+                // MODIFIED: Include Chat Count and Meeting invites in the total Hub Badge
+                return unreadNoticesCount + unreadPoliciesCount + unreadChatCount + (pendingMeetingInvites ? pendingMeetingInvites.length : 0);
+            }, [unreadNoticesCount, unreadPoliciesCount, unreadChatCount, pendingMeetingInvites]);
 
 
             // --- HANDLERS ---
@@ -23065,7 +23211,7 @@ service cloud.firestore {
                 let PageComponent;
                 switch(activePageKey) {
                     case 'dashboard': PageComponent = <LazyDashboard userProfile={userProfile} setActivePage={setActivePage} onNavigateWithTab={handleNotificationClick} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />; break;
-                    case 'companyHub': PageComponent = <LazyCompanyHub userProfile={userProfile} pageParams={activePageParams} onNavigate={setActivePage} chatUnreadCount={unreadChatCount} onChatRead={handleChatRead} />; break;
+                    case 'companyHub': PageComponent = <LazyCompanyHub userProfile={userProfile} pageParams={activePageParams} onNavigate={setActivePage} chatUnreadCount={unreadChatCount} noticesUnreadCount={unreadNoticesCount} policiesUnreadCount={unreadPoliciesCount} meetingsUnreadCount={pendingMeetingInvites.length} onChatRead={handleChatRead} />; break;
                     case 'employees': PageComponent = <LazyEmployees userProfile={userProfile} pageParams={activePageParams} pendingSalaryRevisions={pendingSalaryRevisions} />; break;
                     case 'checkinme': PageComponent = <LazyCheckInMe userProfile={userProfile} initialTab={initialCheckInMeTab} pendingLeaves={pendingLeaves} pendingOTs={pendingOTs} />; break;
                     case 'attendanceReport': PageComponent = <LazyAttendanceReport userProfile={userProfile} />; break;
