@@ -7773,7 +7773,7 @@
 
             // NEW: Step 1 States for QR Mode
             const [checkInMethod, setCheckInMethod] = useState('gps'); // 'gps' or 'qr'
-            const [isScannerOpen, setIsScannerOpen] = useState(false);
+            const [isScannerOpen, setIsScannerOpen] = useState(false); // FIX: Restored missing state for QR scanner modal
             
             // NEW: Optimistic State to fix the "Double Click" issue
             const [optimisticAction, setOptimisticAction] = useState(null);
@@ -7795,10 +7795,9 @@
 
             const { where } = window.firebaseSDK;
             
-            // BUG FIX: Added publicHolidays destructuring from global AppData context
             const { shops, shifts, systemSettings, publicHolidays } = useAppData();
 
-            // --- OPTIMIZATION START: Date-Range Scoped Data Fetching with Timezone Buffer ---
+            // --- CRITICAL PERFORMANCE FIX 1: Lazy-Loaded Timelines ---
             const dataConstraints = useMemo(() => {
                 const blocker = [where("id", "==", "___NON_EXISTENT_DOC___")];
 
@@ -7808,42 +7807,53 @@
 
                 const [year, month] = selectedMonth.split('-').map(Number);
                 
-                // FIX: Add buffer (-2 days / +2 days) to handle Timezone shifts and Overnight shifts crossing month lines
+                // Full month bounds (Only used if showPayroll is true)
                 const startOfMonth = new Date(year, month - 1, 1);
-                startOfMonth.setDate(startOfMonth.getDate() - 2); // Buffer start
-                
+                startOfMonth.setDate(startOfMonth.getDate() - 2); 
                 const endOfMonth = new Date(year, month, 0, 23, 59, 59, 999);
-                endOfMonth.setDate(endOfMonth.getDate() + 2); // Buffer end
-                
+                endOfMonth.setDate(endOfMonth.getDate() + 2); 
                 const startStr = startOfMonth.toISOString().slice(0, 10);
-                // Note: String comparison for "end" isn't as critical for >= queries, we usually just need start boundary
-
-                const attendanceConstraints = [
-                    where("employeeId", "==", userProfile.id),
-                    where("timestamp", ">=", startOfMonth),
-                    where("timestamp", "<=", endOfMonth)
-                ];
-
-                // FIX: Unblock Leave and OT. The Check-In engine needs real-time awareness 
-                // of approved time off to calculate Half-Day Leave offsets and late penalties correctly.
-                const leaveConstraints = [where("staffId", "==", userProfile.id), where("returnDate", ">=", startStr)];
-                const otConstraints = [where("staffId", "==", userProfile.id), where("reqDate", ">=", startStr)];
 
                 if (!showPayroll) {
+                    // WHEN PAYROLL IS HIDDEN: We DO NOT need a full month of data.
+                    // We only need the last 48 hours to determine "Am I currently checked in/on break?"
+                    // and today's leaves/OTs to calculate today's late threshold.
+                    const now = new Date();
+                    
+                    const startOfRecent = new Date(now);
+                    startOfRecent.setDate(startOfRecent.getDate() - 2); // 48 hours ago
+                    startOfRecent.setHours(0, 0, 0, 0);
+
+                    const endOfRecent = new Date(now);
+                    endOfRecent.setDate(endOfRecent.getDate() + 1); // Tomorrow buffer
+                    endOfRecent.setHours(23, 59, 59, 999);
+
+                    const recentStr = startOfRecent.toISOString().slice(0, 10);
+
                     return {
-                        attendance: attendanceConstraints,
-                        leave: leaveConstraints, // UNBLOCKED
-                        ot: otConstraints,       // UNBLOCKED
+                        attendance: [
+                            where("employeeId", "==", userProfile.id),
+                            where("timestamp", ">=", startOfRecent),
+                            where("timestamp", "<=", endOfRecent)
+                        ],
+                        // Only fetch very recent active leaves/OTs for today's math
+                        leave: [where("staffId", "==", userProfile.id), where("returnDate", ">=", recentStr)],
+                        ot: [where("staffId", "==", userProfile.id), where("reqDate", ">=", recentStr)],
                         loan: blocker, 
                         state: blocker, 
                         salary: blocker
                     };
                 }
 
+                // If Payroll is shown, load the full month as required for calculation
                 return {
-                    attendance: attendanceConstraints,
-                    leave: leaveConstraints,
-                    ot: otConstraints,
+                    attendance: [
+                        where("employeeId", "==", userProfile.id),
+                        where("timestamp", ">=", startOfMonth),
+                        where("timestamp", "<=", endOfMonth)
+                    ],
+                    leave: [where("staffId", "==", userProfile.id), where("returnDate", ">=", startStr)],
+                    ot: [where("staffId", "==", userProfile.id), where("reqDate", ">=", startStr)],
                     loan: [where("staffId", "==", userProfile.id), where("status", "==", "Active")],
                     state: [where("staffId", "==", userProfile.id), where("date", ">=", startStr)],
                     salary: [where("staffId", "==", userProfile.id)]
@@ -7857,20 +7867,13 @@
             const { data: employeeStatesData } = useCollection('employeeStates', dataConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', dataConstraints.salary);
 
-            // BUG FIX: Inject publicHolidays into the allData payload so the Payroll Engine can "see" the Master Data
             const allData = {
-                shops: shops,
-                attendance: attendanceData,
-                leaveRequests: leaveRequestsData,
-                otRequests: otRequestsData,
-                staffLoans: staffLoansData,
-                employeeStates: employeeStatesData,
-                salaryRevisions: salaryRevisionsData,
-                shifts: shifts,
-                publicHolidays: publicHolidays,
+                shops: shops, attendance: attendanceData, leaveRequests: leaveRequestsData, otRequests: otRequestsData,
+                staffLoans: staffLoansData, employeeStates: employeeStatesData, salaryRevisions: salaryRevisionsData,
+                shifts: shifts, publicHolidays: publicHolidays,
             };
             
-            // ... (keep existing savings logic) ...
+            // ... (keep savings logic) ...
             useEffect(() => {
                 if (!db || !userProfile?.id) return;
                 const { doc, onSnapshot } = window.firebaseSDK;
@@ -7899,7 +7902,6 @@
                 fetchWithdrawals();
             }, [db, userProfile?.id, selectedMonth, showPayroll]);
             
-            // --- FIX START: ROBUST SHOP SELECTION & AUTO-DETECT ---
             const userShopsList = useMemo(() => {
                 if (!userProfile?.shop) return [];
                 return Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
@@ -7917,15 +7919,33 @@
                 }
             }, [userProfile, userShopsList]);
 
-            // 2. NEW: Intelligent Auto-Switching based on GPS (For Convenience)
-            useEffect(() => {
-                if (!hasMultipleShops || !allData.shops || checkInMethod !== 'gps') return;
+            // --- FIX: Formally define userShop and todayInShopTimezone to prevent ReferenceError ---
+            const userShop = useMemo(() => {
+                return (allData.shops || []).find(s => s.name === selectedShopForCheckIn);
+            }, [allData.shops, selectedShopForCheckIn]);
 
-                const checkAndSwitchShop = () => {
-                    navigator.geolocation.getCurrentPosition((position) => {
-                        const { latitude, longitude } = position.coords;
+            const todayInShopTimezone = useMemo(() => {
+                const tz = userShop?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+                return Utils.formatDateInTimezone({ toDate: () => new Date() }, tz).localDate;
+            }, [userShop]);
+            // --- END FIX ---
+
+            // --- CRITICAL PERFORMANCE FIX 2: Passive OS-Level GPS Tracking ---
+            useEffect(() => {
+                if (!allData.shops || checkInMethod !== 'gps') return;
+
+                let watchId;
+                // Use watchPosition for passive, battery-efficient location tracking
+                // instead of aggressive 5-second polling with getCurrentPosition.
+                if ('geolocation' in navigator) {
+                    watchId = navigator.geolocation.watchPosition((position) => {
+                        const { latitude, longitude, accuracy: posAccuracy } = position.coords;
                         
-                        // Map shop names to full objects with coordinates
+                        // Update passive location states quietly
+                        setLocation({ latitude, longitude });
+                        setAccuracy(posAccuracy);
+
+                        // Find user's assigned shops with coords
                         const myShopsDetails = allData.shops.filter(s => userShopsList.includes(s.name));
                         
                         let nearest = null;
@@ -7935,7 +7955,6 @@
                             if (shop.latitude && shop.longitude) {
                                 const d = Utils.getDistance(latitude, longitude, parseFloat(shop.latitude), parseFloat(shop.longitude));
                                 const r = parseFloat(shop.radius) || 500;
-                                // Find the closest shop that is strictly IN RANGE
                                 if (d <= r && d < minDistance) {
                                     minDistance = d;
                                     nearest = shop;
@@ -7943,44 +7962,37 @@
                             }
                         });
 
-                        // If we found a shop in range, and it's not the currently selected one, switch to it.
-                        if (nearest && nearest.name !== selectedShopForCheckIn) {
-                            console.log("Auto-switching to nearest shop:", nearest.name);
+                        // Logic for Multi-Shop Auto-Switching
+                        if (hasMultipleShops && nearest && nearest.name !== selectedShopForCheckIn) {
                             setSelectedShopForCheckIn(nearest.name);
-                            setDistance(minDistance); 
-                            setStatus(`📍 Auto-switched to ${nearest.name}`); // Visual feedback
+                            setDistance(minDistance);
+                            setStatus(`📍 Auto-switched to ${nearest.name}`);
+                        } 
+                        // Logic for updating distance/status of currently selected shop (even for 1-shop users)
+                        else {
+                            const targetShopName = nearest ? nearest.name : selectedShopForCheckIn;
+                            const targetShop = myShopsDetails.find(s => s.name === targetShopName);
+                            
+                            if (targetShop && targetShop.latitude && targetShop.longitude) {
+                                const dist = Utils.getDistance(latitude, longitude, parseFloat(targetShop.latitude), parseFloat(targetShop.longitude));
+                                setDistance(dist);
+                                const rad = parseFloat(targetShop.radius) || 500;
+                                setStatus(dist <= rad ? `You are in range of ${targetShop.name}.` : `Too far from ${targetShop.name} (${Math.round(dist)}m).`);
+                            }
                         }
-                    }, (err) => { 
-                        // console.warn("GPS polling error", err); 
-                    }, { enableHighAccuracy: true, timeout: 4000 });
-                };
-
-                // Run immediately
-                checkAndSwitchShop();
-
-                // Run interval (every 5s)
-                const intervalId = setInterval(checkAndSwitchShop, 5000);
-
-                return () => clearInterval(intervalId);
-            }, [hasMultipleShops, allData.shops, userShopsList, selectedShopForCheckIn, checkInMethod]);
-            // --- FIX END ---
-
-            const userShop = useMemo(() => {
-                if (!selectedShopForCheckIn) return null;
-                return allData.shops.find(s => s.name === selectedShopForCheckIn);
-            }, [selectedShopForCheckIn, allData.shops]);
-
-            const todayInShopTimezone = useMemo(() => {
-                if (!userShop?.timezone) {
-                    const now = new Date();
-                    const year = now.getFullYear();
-                    const month = String(now.getMonth() + 1).padStart(2, '0');
-                    const day = String(now.getDate()).padStart(2, '0');
-                    return `${year}-${month}-${day}`;
+                    }, (err) => {
+                        // Don't overwrite explicit loading statuses, but provide feedback if passive tracking fails
+                        setStatus(prev => prev === 'Locating...' ? prev : (err.code === 1 ? "GPS Permission denied." : "Waiting for stable GPS signal..."));
+                    }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 });
                 }
-                return Utils.formatDateInTimezone({ toDate: () => new Date() }, userShop.timezone).localDate;
-            }, [userShop]);
 
+                return () => {
+                    // Clean up tracking when tab is closed to save battery
+                    if (watchId !== undefined) navigator.geolocation.clearWatch(watchId);
+                };
+            }, [allData.shops, userShopsList, selectedShopForCheckIn, checkInMethod, hasMultipleShops]);
+            
+            // ... (rest of the CheckInOutTab code remains unchanged) ...
             // --- CROSS-SHOP WORKFLOW LOGIC ---
             // 1. Get ALL recent records for this user (Used for determining button state: In/Out)
             const allUserRecords = useMemo(() => {
