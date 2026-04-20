@@ -844,7 +844,8 @@
             // NEW (Plan Step 1): Log the incoming withdrawal data to confirm it's being received.
             console.log(`[Payroll Calc] Received ${savingsWithdrawals.length} savings withdrawals for ${employee?.name} in ${selectedMonth}`, savingsWithdrawals);
 
-            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts } = allData;
+            // MODIFIED: Destructured publicHolidays from allData
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts, publicHolidays } = allData;
 
             // --- FIX: MOVED TIMEZONE LOGIC UP ---
             // We must get the employee's timezone *first* to correctly filter attendance by the local month.
@@ -958,6 +959,7 @@
             // NEW: Calculate Absent days & Penalty for absence on a rejected leave day.
             const attendedDays = new Set(Object.keys(dailyRecords));
             let absentDays = 0;
+            let holidayPaidDays = 0; // NEW: Track paid holidays
             let rejectedLeavePenaltyAmount = 0; // Initialize penalty amount
 
             for (let day = 1; day <= daysInMonth; day++) {
@@ -972,27 +974,32 @@
 
                 // An absence is a past day with no attendance record.
                 if (!attendedDays.has(dayKey)) {
-                    // FIX: Check for specific leave record to handle half-days precisely
-                    const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                    // --- PHASE 2.1 LOGIC: Check Public Holidays FIRST before marking as absent ---
+                    const isHoliday = (publicHolidays || []).some(h => dayKey >= h.startDate && dayKey <= h.endDate);
                     
-                    if (!todayLeaveRecord) {
-                        absentDays++; // Full absence
-
-                        // Check if there was a REJECTED leave request for this absent day.
-                        const hadRejectedLeave = (leaveRequests || []).some(
-                            lr => lr.staffId === employee.id &&
-                                  lr.status === 'Rejected' &&
-                                  // Check if the absent day falls within the rejected leave period.
-                                  dayKey >= lr.leaveDate && dayKey < lr.returnDate 
-                        );
+                    if (isHoliday) {
+                        holidayPaidDays++;
+                    } else {
+                        // FIX: Check for specific leave record to handle half-days precisely
+                        const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
                         
-                        if (hadRejectedLeave) {
-                            // Apply penalty: Salary per day x 2
-                            rejectedLeavePenaltyAmount += (salaryPerDay * 2);
+                        if (!todayLeaveRecord) {
+                            absentDays++; // Full absence
+
+                            // Check if there was a REJECTED leave request for this absent day.
+                            const hadRejectedLeave = (leaveRequests || []).some(
+                                lr => lr.staffId === employee.id &&
+                                      lr.status === 'Rejected' &&
+                                      dayKey >= lr.leaveDate && dayKey < lr.returnDate 
+                            );
+                            
+                            if (hadRejectedLeave) {
+                                rejectedLeavePenaltyAmount += (salaryPerDay * 2);
+                            }
+                        } else if (todayLeaveRecord.leaveSession !== 'Full Day') {
+                            // UX FIX: If they had a half-day leave but didn't show up at all, they are absent for 0.5 days.
+                            absentDays += 0.5;
                         }
-                    } else if (todayLeaveRecord.leaveSession !== 'Full Day') {
-                        // UX FIX: If they had a half-day leave but didn't show up at all, they are absent for 0.5 days.
-                        absentDays += 0.5;
                     }
                 }
             }
@@ -1007,8 +1014,8 @@
             // --- END FIX ---
 
             // FIX: Create the autoInputs object to be returned, now including noAttendance.
-            // --- MODIFIED: Also add the new autoLoanDeduction field ---
-            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance, autoLoanDeduction: autoLoanDeduction };
+            // --- MODIFIED: Added holidayPaidDays to outputs ---
+            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance, autoLoanDeduction: autoLoanDeduction, holidayPaidDays };
 
             // --- 3. Perform Final Salary Calculations ---
             const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
@@ -1022,7 +1029,8 @@
             const otherDeductions = monthStates.filter(es => es.statusState === 'Deduction' && !es.note?.includes('CheckIn Late @')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
 
             // "No-CheckOut" is informational. Any associated monetary deduction is handled via the "Other Deductions" from Employee States.
-            const daysToPayFor = (workDays || 0) + (givenOffDays || 0);
+            // PHASE 2.1 LOGIC: Add Paid Holidays to the total days they earn a salary for
+            const daysToPayFor = (workDays || 0) + (givenOffDays || 0) + (holidayPaidDays || 0);
             const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
             const otSalary = salaryPerDay * (otDays || 0);
             
@@ -1130,6 +1138,9 @@
             // NEW: Fetch Banks globally (Fix for undefined map error)
             const { data: banks, loading: banksLoading } = useCollection('banks', [], 'hr_cache_banks');
 
+            // NEW: Fetch Public Holidays globally (PHASE 1)
+            const { data: publicHolidays, loading: holidaysLoading } = useCollection('publicHolidays', [], 'hr_cache_holidays');
+
             // NEW: Fetch KPIs globally
             const { data: kpis, loading: kpisLoading } = useCollection('kpis', [], 'hr_cache_kpis');
 
@@ -1179,10 +1190,11 @@
                 expenseCategories, 
                 kpis,              
                 banks, // NEW: Expose banks to context
+                publicHolidays, // NEW: Expose holidays to context
                 moduleConfig, // Expose the correct config object
                 systemSettings, // NEW: Expose global settings
                 isLoading
-            }), [employees, shops, shifts, positions, expenseCategories, kpis, banks, moduleConfig, systemSettings, isLoading]);
+            }), [employees, shops, shifts, positions, expenseCategories, kpis, banks, publicHolidays, moduleConfig, systemSettings, isLoading]);
 
             return (
                 <AppDataContext.Provider value={value}>
@@ -7775,7 +7787,9 @@
             }, [selectedMonth]);
 
             const { where } = window.firebaseSDK;
-            const { shops, shifts, systemSettings } = useAppData();
+            
+            // BUG FIX: Added publicHolidays destructuring from global AppData context
+            const { shops, shifts, systemSettings, publicHolidays } = useAppData();
 
             // --- OPTIMIZATION START: Date-Range Scoped Data Fetching with Timezone Buffer ---
             const dataConstraints = useMemo(() => {
@@ -7827,6 +7841,7 @@
             const { data: employeeStatesData } = useCollection('employeeStates', dataConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', dataConstraints.salary);
 
+            // BUG FIX: Inject publicHolidays into the allData payload so the Payroll Engine can "see" the Master Data
             const allData = {
                 shops: shops,
                 attendance: attendanceData,
@@ -7836,6 +7851,7 @@
                 employeeStates: employeeStatesData,
                 salaryRevisions: salaryRevisionsData,
                 shifts: shifts,
+                publicHolidays: publicHolidays,
             };
             
             // ... (keep existing savings logic) ...
@@ -8719,6 +8735,15 @@
                                         <h5 className="font-semibold text-slate-200 border-b border-slate-600 pb-1 mb-2">ប្រាក់ចំណូល :</h5>
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថ្ងៃធ្វើការ :</span><span className="font-semibold text-slate-200">{inputs.workDays || 0}</span></div>
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ផ្តល់ជូន :</span><span className="font-semibold text-slate-200">{inputs.givenOffDays || 0}</span></div>
+                                        
+                                        {/* CRITICAL UX FIX: Always show the Public Holiday row for transparency, even if 0 */}
+                                        <div className="flex justify-between items-center text-sm" title="Public Holidays (Paid)">
+                                            <span className="text-slate-400">ថ្ងៃបុណ្យជាតិ :</span>
+                                            <span className={`font-semibold ${inputs.holidayPaidDays > 0 ? 'text-teal-400 font-bold' : 'text-slate-200'}`}>
+                                                {inputs.holidayPaidDays || 0}
+                                            </span>
+                                        </div>
+                                        
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថែមម៉ោង :</span><span className="font-semibold text-slate-200">{inputs.otDays || 0}</span></div>
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់បន្ថែម :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.engagements)}</span></div>
                                         {calculations.totalSavingsWithdrawal > 0 && (<div className="flex justify-between items-center text-sm" title="Savings Program Payback"><span className="text-slate-400">ការទូទាត់សងប្រាក់សន្សំ :</span><span className="font-semibold text-indigo-400">{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</span></div>)}
@@ -8737,7 +8762,8 @@
                                     </div>
                                 </div>
                                 <div className="mt-4 pt-4 border-t border-slate-600 flex justify-between items-center">
-                                    <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន :</span>
+                                    {/* FIX: Aligned label directly with the Official Payslip terminology */}
+                                    <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន (NET SALARY) :</span>
                                     <span className="text-xl font-bold text-blue-400">{Utils.formatCurrency(calculations.netSalary)}</span>
                                 </div>
                             </div>
@@ -10475,7 +10501,8 @@
             const [selectedShift, setSelectedShift] = useState('');
 
             // Data State
-            const { shops, employees, shifts } = useAppData();
+            // PHASE 2.2: Destructure publicHolidays from AppData context
+            const { shops, employees, shifts, publicHolidays } = useAppData();
             
             // NEW: Get unique shift names for the filter dropdown to avoid duplicates.
             const uniqueShiftNames = useMemo(() => {
@@ -10857,13 +10884,19 @@
                         }
                     }
 
+                    // --- PHASE 2.2 LOGIC: Check if current date is a Public Holiday ---
+                    const isHoliday = (publicHolidays || []).some(h => entry.date >= h.startDate && entry.date <= h.endDate);
+
                     // --- OPTIMIZATION: Use Lookup Map instead of .find() ---
                     const employeeLeaves = leaveLookup.get(employee.id) || [];
                     const approvedLeave = employeeLeaves.find(lr => entry.date >= lr.leaveDate && entry.date < lr.returnDate);
                     // --- END OPTIMIZATION ---
 
                     let isOnLeave;
-                    if (approvedLeave) {
+                    if (isHoliday) {
+                        // If they checked in/out on a holiday, explicitly note it, otherwise mark as Holiday
+                        isOnLeave = (checkIn || checkOut) ? 'Worked (Holiday)' : 'Holiday';
+                    } else if (approvedLeave) {
                         isOnLeave = approvedLeave.leaveSession === 'Full Day' ? 'Y-Full Day' : `Y-${approvedLeave.leaveSession}`;
                     } else if (checkIn || checkOut) {
                         isOnLeave = 'N';
@@ -11088,7 +11121,8 @@
             const [selectedShift, setSelectedShift] = useState('');
 
             // Data States
-            const { shops, employees, shifts } = useAppData();
+            // PHASE 2.2: Destructure publicHolidays from context
+            const { shops, employees, shifts, publicHolidays } = useAppData();
 
             // NEW: Get unique shift names for the filter dropdown
             const uniqueShiftNames = useMemo(() => {
@@ -11385,18 +11419,28 @@
                     const daysInMonth = new Date(year, month, 0).getDate();
                     const attendedDays = new Set(Object.keys(dailyRecords));
                     let noAbsentCount = 0;
+                    
+                    // PHASE 2.2 LOGIC: Track paid holidays for the monthly report
+                    let holidayPaidDays = 0; 
 
                     for (let day = 1; day <= daysInMonth; day++) {
                         const dayKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                         if (dayKey >= todayStr) break;
                         
                         if (!attendedDays.has(dayKey)) {
-                            // FIX: Check for specific leave record to handle half-days precisely
-                            const leaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
-                            if (!leaveRecord) {
-                                noAbsentCount++;
-                            } else if (leaveRecord.leaveSession !== 'Full Day') {
-                                noAbsentCount += 0.5;
+                            // PHASE 2.2 LOGIC: Exempt Public Holidays from Absences
+                            const isHoliday = (publicHolidays || []).some(h => dayKey >= h.startDate && dayKey <= h.endDate);
+                            
+                            if (isHoliday) {
+                                holidayPaidDays++;
+                            } else {
+                                // FIX: Check for specific leave record to handle half-days precisely
+                                const leaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                                if (!leaveRecord) {
+                                    noAbsentCount++;
+                                } else if (leaveRecord.leaveSession !== 'Full Day') {
+                                    noAbsentCount += 0.5;
+                                }
                             }
                         }
                     }
@@ -11408,7 +11452,9 @@
                     // --- END FIX ---
                     
                     const [reportYear, reportMonth] = targetMonth.split('-');
-                    const salaryDay = workDays + givenOffDays + totalOT;
+                    
+                    // PHASE 2.2 LOGIC: Add Paid Holidays to the total salary days calculated
+                    const salaryDay = workDays + givenOffDays + totalOT + holidayPaidDays;
 
                     return { 
                         dueTime: `${reportMonth}-${reportYear.substring(2)}`, 
@@ -11416,6 +11462,7 @@
                         staffName: employee.name, 
                         workDays, 
                         givenOffDays, 
+                        holidayPaidDays, // Added to output
                         totalOT, 
                         totalLeave, 
                         totalLate, 
@@ -11427,7 +11474,7 @@
                 
                 return report.sort((a, b) => (a.shopName || '').localeCompare(b.shopName || '') || (a.staffName || '').localeCompare(b.staffName || ''));
 
-            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, searchTerm, userProfile, selectedShift]);
+            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, searchTerm, userProfile, selectedShift, publicHolidays]); // Added publicHolidays to dependencies
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = workDayReport.map(rec => ({
@@ -11436,6 +11483,7 @@
                     'Staff Name': rec.staffName,
                     'No. Work Day': rec.workDays,
                     'Given Off Day': rec.givenOffDays,
+                    'Public Holiday': rec.holidayPaidDays || 0, // PHASE 2.2: Added to Excel Export
                     'Total OT': rec.totalOT,
                     'Total Leave No': rec.totalLeave,
                     'Total LATE': rec.totalLate,
@@ -11465,7 +11513,8 @@
                 const workbook = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(workbook, worksheet, "Monthly Work Day Report");
                 
-                worksheet["!cols"] = [ { wch: 18 }, { wch: 20 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 } ];
+                // Adjusted widths for 12 columns
+                worksheet["!cols"] = [ { wch: 18 }, { wch: 20 }, { wch: 25 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 } ];
                 
                 XLSX.writeFile(workbook, getReportFilename());
             }, [workDayReport, filterType, selectedMonth]);
@@ -11534,48 +11583,45 @@
                                 <h3 className="text-lg font-semibold text-slate-900">Earnings</h3>
                                 <div className="flex justify-between text-sm"><p>Work Days</p><p className={getChangeIndicatorClass(manualInputs.workDays, oldInputs.workDays)}>{manualInputs.workDays || 0}</p></div>
                                 <div className="flex justify-between text-sm"><p>Given Off Days</p><p className={getChangeIndicatorClass(manualInputs.givenOffDays, oldInputs.givenOffDays)}>{manualInputs.givenOffDays || 0}</p></div>
-                                <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
-                                <div className="flex justify-between text-sm"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
-                                <div className="flex justify-between text-sm"><p>Engagements</p><p className={getChangeIndicatorClass(calculations.engagements, oldCalcs.engagements)}>{Utils.formatCurrency(calculations.engagements)}</p></div>
                                 
-                                {calculations.totalSavingsWithdrawal > 0 && (
-                                    <div className="flex justify-between text-sm text-indigo-700 font-semibold" title="Savings Program Payback">
-                                        <p>Savings Payback</p>
-                                        <p className={getChangeIndicatorClass(calculations.totalSavingsWithdrawal, oldCalcs.totalSavingsWithdrawal)}>{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</p>
+                                {/* PHASE 2.1 LOGIC: Explicitly show Paid Holidays if applicable */}
+                                {manualInputs.holidayPaidDays > 0 && (
+                                    <div className="flex justify-between text-sm text-teal-700 font-semibold" title="Public Holidays (Paid)">
+                                        <p>Public Holidays</p>
+                                        <p className={getChangeIndicatorClass(manualInputs.holidayPaidDays, oldInputs.holidayPaidDays)}>{manualInputs.holidayPaidDays}</p>
                                     </div>
                                 )}
 
-                                <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Gross Salary</p><p className={getChangeIndicatorClass(calculations.grossSalary, oldCalcs.grossSalary)}>{Utils.formatCurrency(calculations.grossSalary)}</p></div>
+                                <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
+                                <div className="flex justify-between text-sm"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
+                                {calculations.engagements > 0 && <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className={getChangeIndicatorClass(calculations.engagements, oldCalcs.engagements)}>{Utils.formatCurrency(calculations.engagements)}</p></div>}
+                                {calculations.totalSavingsWithdrawal > 0 && <div className="flex justify-between text-sm text-indigo-600"><p>Savings Payback</p><p className={getChangeIndicatorClass(calculations.totalSavingsWithdrawal, oldCalcs.totalSavingsWithdrawal)}>{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</p></div>}
+                                <div className="flex justify-between text-sm font-bold pt-2 border-t border-green-300 text-green-700"><p>Gross Earnings</p><p className={getChangeIndicatorClass(calculations.grossSalary, oldCalcs.grossSalary)}>{Utils.formatCurrency(calculations.grossSalary)}</p></div>
                             </div>
                             <div className="space-y-2 p-4 border-t-4 border-red-500 bg-red-50 rounded-b-lg">
                                 <h3 className="text-lg font-semibold text-slate-900">Deductions</h3>
-                                <div className="flex justify-between text-sm"><p>Leave Days</p><p className={`text-red-600 ${getChangeIndicatorClass(manualInputs.leaveDays, oldInputs.leaveDays)}`}>-{manualInputs.leaveDays || 0}</p></div>
-                                <div className="flex justify-between text-sm"><p>Late ({manualInputs.totalLateDays || 0})</p><p className={getChangeIndicatorClass(calculations.lateDeductionsAmount, oldCalcs.lateDeductionsAmount)}>{Utils.formatCurrency(calculations.lateDeductionsAmount)}</p></div>
-                                <div className="flex justify-between text-sm" title="Absent + No-CheckOut"><p>No-Attendance</p><p className={getChangeIndicatorClass(manualInputs.noAttendance, oldInputs.noAttendance)}>{manualInputs.noAttendance || 0}</p></div>
-                                <div className="flex justify-between text-sm"><p>Loan Deduction</p><p className={getChangeIndicatorClass(manualInputs.loanDeduction, oldInputs.loanDeduction)}>{Utils.formatCurrency(manualInputs.loanDeduction)}</p></div>
-                                <div className="flex justify-between text-sm"><p>Other Deductions</p><p className={getChangeIndicatorClass(calculations.otherDeductions, oldCalcs.otherDeductions)}>{Utils.formatCurrency(calculations.otherDeductions)}</p></div>
-                                {calculations.rejectedLeavePenaltyAmount > 0 && (
-                                    <div className="flex justify-between text-sm text-red-700 font-semibold" title="Penalty: Absence on a day with a rejected leave request. (Salary Per Day x 2)">
-                                        <p>Penalty Leave Rejected</p>
-                                        <p className={getChangeIndicatorClass(calculations.rejectedLeavePenaltyAmount, oldCalcs.rejectedLeavePenaltyAmount)}>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p>
-                                    </div>
-                                )}
-                                {calculations.savingsDeduction > 0 && (
-                                    <div className="flex justify-between text-sm text-blue-700 font-semibold" title="Voluntary Savings Program">
-                                        <p>Savings Deduction</p>
-                                        <p className={getChangeIndicatorClass(calculations.savingsDeduction, oldCalcs.savingsDeduction)}>{Utils.formatCurrency(calculations.savingsDeduction)}</p>
-                                    </div>
-                                )}
-                                <div className="flex justify-between font-bold pt-2 border-t border-slate-300"><p>Total Deductions</p><p className={`text-red-600 ${getChangeIndicatorClass(calculations.totalDeductions, oldCalcs.totalDeductions)}`}>{Utils.formatCurrency(calculations.totalDeductions)}</p></div>
+                                <div className="flex justify-between text-sm"><p>Leave Days</p><p className={getChangeIndicatorClass(manualInputs.leaveDays, oldInputs.leaveDays)}>{manualInputs.leaveDays || 0}</p></div>
+                                <div className="flex justify-between text-sm"><p>Total Late Days</p><p className={getChangeIndicatorClass(manualInputs.totalLateDays, oldInputs.totalLateDays)}>{manualInputs.totalLateDays || 0}</p></div>
+                                <div className="flex justify-between text-sm"><p>Absent</p><p className={getChangeIndicatorClass(manualInputs.noAttendance, oldInputs.noAttendance)}>{manualInputs.noAttendance || 0}</p></div>
+                                {manualInputs.loanDeduction > 0 && <div className="flex justify-between text-sm"><p>Loan Deduction</p><p className={getChangeIndicatorClass(manualInputs.loanDeduction, oldInputs.loanDeduction)}>{Utils.formatCurrency(manualInputs.loanDeduction)}</p></div>}
+                                {calculations.savingsDeduction > 0 && <div className="flex justify-between text-sm"><p>Savings Deposit</p><p className={getChangeIndicatorClass(calculations.savingsDeduction, oldCalcs.savingsDeduction)}>{Utils.formatCurrency(calculations.savingsDeduction)}</p></div>}
+                                {calculations.lateDeductionsAmount > 0 && <div className="flex justify-between text-sm"><p>Late Penalties</p><p className={getChangeIndicatorClass(calculations.lateDeductionsAmount, oldCalcs.lateDeductionsAmount)}>{Utils.formatCurrency(calculations.lateDeductionsAmount)}</p></div>}
+                                {calculations.rejectedLeavePenaltyAmount > 0 && <div className="flex justify-between text-sm"><p>Leave Penalty</p><p className={getChangeIndicatorClass(calculations.rejectedLeavePenaltyAmount, oldCalcs.rejectedLeavePenaltyAmount)}>{Utils.formatCurrency(calculations.rejectedLeavePenaltyAmount)}</p></div>}
+                                {calculations.otherDeductions > 0 && <div className="flex justify-between text-sm"><p>Other Deductions</p><p className={getChangeIndicatorClass(calculations.otherDeductions, oldCalcs.otherDeductions)}>{Utils.formatCurrency(calculations.otherDeductions)}</p></div>}
+                                <div className="flex justify-between text-sm font-bold pt-2 border-t border-red-300 text-red-700"><p>Total Deductions</p><p className={getChangeIndicatorClass(calculations.totalDeductions, oldCalcs.totalDeductions)}>{Utils.formatCurrency(calculations.totalDeductions)}</p></div>
                             </div>
                         </div>
-                        <div className="mt-6 p-4 bg-blue-100 border border-blue-300 rounded-lg text-center">
-                            <p className="text-sm font-semibold text-blue-800">NET SALARY</p>
-                            <p className={`text-3xl font-bold text-blue-900 ${getChangeIndicatorClass(calculations.netSalary, oldCalcs.netSalary)}`}>{Utils.formatCurrency(calculations.netSalary)}</p>
+                        <div className="mt-8 pt-4 border-t-2 border-slate-300 flex justify-between items-center bg-slate-100 p-4 rounded-lg">
+                            <span className="font-bold text-lg text-slate-700">NET SALARY (KHR)</span>
+                            <span className="text-2xl font-black text-blue-600">{Utils.formatCurrency(calculations.netSalary)}</span>
+                        </div>
+                        <div className="mt-8 text-center text-xs text-slate-400">
+                            <p>This is a computer-generated document. No signature is required.</p>
+                            <p className="mt-1">Generated on {new Date().toLocaleDateString()} at {new Date().toLocaleTimeString()}</p>
                         </div>
                     </>
                     ) : (
-                        <div className="text-center py-20 text-slate-500"><i className="fas fa-file-invoice-dollar text-4xl mb-4"></i><p>Please select an employee to view the payslip.</p></div>
+                        <div className="text-center py-10 text-slate-400"><i className="fas fa-file-invoice-dollar text-4xl mb-4 opacity-50"></i><p>Select an employee and calculate payroll to generate payslip.</p></div>
                     )}
                 </div>
             );
@@ -11590,7 +11636,8 @@
             const [selectedEmployeeId, setSelectedEmployeeId] = useState('');
             const { where } = window.firebaseSDK;
 
-            const { shops, employees, shifts } = useAppData();
+            // FIX: Consolidated all AppData variables into a single declaration at the top
+            const { shops, employees, shifts, publicHolidays } = useAppData();
 
             // --- OPTIMIZATION: DATE RANGE CONSTRAINTS (The Silent Killer Fix) ---
             const dateConstraints = useMemo(() => {
@@ -11685,11 +11732,13 @@
             const { data: employeeStatesData } = useCollection('employeeStates', payrollQueryConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', payrollQueryConstraints.salary);
 
+            // REMOVED duplicate useAppData() call here to prevent SyntaxError
+
             const allData = useMemo(() => ({
-                shops, employees, shifts,
+                shops, employees, shifts, publicHolidays,
                 attendance: attendanceData, leaveRequests: leaveRequestsData, otRequests: otRequestsData,
                 staffLoans: staffLoansData, employeeStates: employeeStatesData, salaryRevisions: salaryRevisionsData,
-            }), [shops, employees, shifts, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData]);
+            }), [shops, employees, shifts, publicHolidays, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData]);
             
             const [manualLoanDeduction, setManualLoanDeduction] = useState(undefined);
             const [isProcessing, setIsProcessing] = useState(false);
@@ -12029,7 +12078,7 @@
                                 {employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                             </select>
                         </div>
-                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-3 text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-hand-holding-dollar mr-2 text-green-400"></i>Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div>
+                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-full text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-star mr-2 text-teal-400"></i>Holidays</label><input type="number" name="holidayPaidDays" value={displayInputs.holidayPaidDays ?? ''} className="input" disabled title="Public Holidays (Paid)" /></div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-hand-holding-dollar mr-2 text-green-400"></i>Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div>
                     
                     {/* FIX: Updated Button Group with Cancel Option */}
                     <div className="pt-6 border-t border-slate-700 flex flex-col gap-4">
@@ -12230,7 +12279,49 @@
                 }
             };
 
-            // FIX: Restored Correct UI for Payroll History (Was incorrectly showing SysConfig UI)
+            // --- NEW: Comprehensive Excel Export for Finance ---
+            const handleExportExcel = () => {
+                if (filteredHistory.length === 0) {
+                    alert("No records to export for this month.");
+                    return;
+                }
+
+                const dataToExport = filteredHistory.map(rec => ({
+                    'Month': rec.month,
+                    'Shop': rec.shop,
+                    'Employee Name': rec.employeeName,
+                    'Base Salary': rec.baseSalary || 0,
+                    'Work Days': rec.manualInputs?.workDays || 0,
+                    'Given Off Days': rec.manualInputs?.givenOffDays || 0,
+                    'Public Holidays': rec.manualInputs?.holidayPaidDays || 0, // Explicitly extracted
+                    'Salary Earned': rec.calculations?.baseSalaryEarned || 0,
+                    'OT Days': rec.manualInputs?.otDays || 0,
+                    'OT Salary (KHR)': rec.calculations?.otSalary || 0,
+                    'Engagements/Bonuses': rec.calculations?.engagements || 0,
+                    'Savings Payback': rec.calculations?.totalSavingsWithdrawal || 0,
+                    'Gross Earnings': rec.calculations?.grossSalary || 0,
+                    'Leave Days Taken': rec.manualInputs?.leaveDays || 0,
+                    'Absent Days': rec.manualInputs?.noAttendance || 0,
+                    'Late Penalty': rec.calculations?.lateDeductionsAmount || 0,
+                    'Leave Penalty': rec.calculations?.rejectedLeavePenaltyAmount || 0,
+                    'Other Deductions': rec.calculations?.otherDeductions || 0,
+                    'Loan Deduction': rec.manualInputs?.loanDeduction || 0,
+                    'Savings Deposit': rec.calculations?.savingsDeduction || 0,
+                    'Total Deductions': rec.calculations?.totalDeductions || 0,
+                    'NET SALARY (KHR)': rec.netSalary || 0
+                }));
+
+                const colWidths = [
+                    { wch: 10 }, { wch: 15 }, { wch: 25 }, { wch: 15 }, { wch: 12 }, 
+                    { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 10 }, { wch: 15 }, 
+                    { wch: 20 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 15 }, 
+                    { wch: 15 }, { wch: 15 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, 
+                    { wch: 18 }, { wch: 20 }
+                ];
+
+                Utils.exportToExcel(dataToExport, "Final Payroll", `Final_Payroll_Report_${selectedMonth}.xlsx`, colWidths);
+            };
+
             const availableShops = useAllowedShops(userProfile, shops);
 
             return (
@@ -12247,6 +12338,11 @@
                             )}
                             
                             <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto" />
+                            
+                            {/* NEW: Export Button added to UI */}
+                            <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel} disabled={loading || filteredHistory.length === 0}>
+                                Export Final Payroll
+                            </Button>
                         </div>
                     </PageHeader>
 
@@ -12279,29 +12375,31 @@
                                         <tr key={rec.id} className="hover:bg-slate-700/50 transition-colors">
                                             <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{rec.month}</td>
                                             <td className="px-4 py-4 text-sm text-slate-300">{rec.shop}</td>
-                                            <td className="px-4 py-4 text-sm text-slate-200 font-medium">{rec.employeeName}</td>
-                                    <td className="px-4 py-4 text-xs text-slate-400 font-mono">
-                                        {report.deviceModel && report.deviceModel !== 'Unknown' ? (
-                                            <span title={report.devicePlatform || ''} className="text-blue-300">{report.deviceModel}</span>
-                                        ) : (
-                                            <span className="opacity-30">-</span>
-                                        )}
-                                    </td>
-                                )}
-
-                                <td className="px-4 py-4 text-center whitespace-nowrap">
-                                    <div className="flex items-center justify-center gap-4">
-                                        {/* FIX: Corrected condition to check for '-' string, and allowed Shop Managers to assist */}
-                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.checkIn !== '-' && report.checkOut === '-' && (
-                                            <Button variant="icon-add-time" icon="fa-clock" onClick={() => onAddCheckOut(report)} title="Add Check-Out"/>
-                                        )}
-                                        {(userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') && report.docIds.length > 0 && (
-                                            <Button variant="icon-delete" icon="fa-trash" onClick={() => onDeleteRecord(report)} title="Delete" />
-                                        )}
-                                    </div>
-                                </td>
-                            </tr>
-                        ))}
+                                            <td className="px-4 py-4 text-sm text-slate-200 font-medium">
+                                                {rec.employeeName}
+                                                {/* NEW: Visual Badge to show if Holiday Pay was included in this bulk generation */}
+                                                {rec.manualInputs?.holidayPaidDays > 0 && (
+                                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 bg-teal-900/50 text-teal-400 text-[9px] rounded-full font-bold border border-teal-700/50 whitespace-nowrap" title={`${rec.manualInputs.holidayPaidDays} Public Holiday(s) Credited`}>
+                                                        <i className="fas fa-star mr-1"></i>{rec.manualInputs.holidayPaidDays}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-4 text-sm text-right text-slate-400">{Utils.formatCurrency(rec.baseSalary)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-green-400">{Utils.formatCurrency(rec.calculations?.engagements)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-blue-300">{Utils.formatCurrency(rec.calculations?.otSalary)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-indigo-400">{Utils.formatCurrency(rec.calculations?.totalSavingsWithdrawal)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-orange-400">{Utils.formatCurrency(rec.manualInputs?.loanDeduction)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-red-300">{Utils.formatCurrency(rec.calculations?.otherDeductions)}</td>
+                                            <td className="px-4 py-4 text-sm text-right text-red-400">{Utils.formatCurrency(rec.calculations?.savingsDeduction)}</td>
+                                            <td className="px-4 py-4 text-sm text-right font-bold text-blue-400">{Utils.formatCurrency(rec.netSalary)}</td>
+                                            <td className="px-4 py-4 text-center whitespace-nowrap">
+                                                <div className="flex items-center justify-center gap-2">
+                                                    <Button variant="icon-edit" icon="fa-edit" onClick={() => onEdit(rec)} title="Edit Record" />
+                                                    <Button variant="icon-delete" icon="fa-trash" onClick={() => setRecordToDelete(rec)} title="Delete Record" />
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))}
                                     {filteredHistory.length === 0 && (
                                         <tr><td colSpan="12" className="px-4 py-8 text-center text-slate-500">No records found.</td></tr>
                                     )}
@@ -13761,26 +13859,25 @@ service cloud.firestore {
     
     // Global & Audit
     match /{path=**}/transactions/{txId} { allow read, write: if isAuthenticated(); }
-    match /userLogs/{logId} { allow create, read: if isAuthenticated(); }
+    match /userLogs/{logId} { allow read, write: if isAuthenticated(); }
     
     // Core Data
     match /employees/{employeeId} { 
       allow read, write: if isAuthenticated(); 
       match /documents/{docId} { allow read, write: if isAuthenticated(); }
-      // NEW: Allow access to generated docs (Warning Letters, Contracts)
       match /generated_docs/{docId} { allow read, write: if isAuthenticated(); }
     }
     
-    // Dashboard & Stats Data (Fixes "Missing Permissions" Errors)
+    // Dashboard & Stats Data
     match /attendance/{recordId} { allow read, write: if isAuthenticated(); }
     match /leaveRequests/{requestId} { allow read, write: if isAuthenticated(); }
     match /otRequests/{requestId} { allow read, write: if isAuthenticated(); }
     match /employeeStates/{stateId} { allow read, write: if isAuthenticated(); }
     
-    // KPI & Tasks (Required for Scorecards)
+    // KPI & Tasks
     match /tasks/{taskId} { allow read, write: if isAuthenticated(); }
     
-    // NEW: Disciplinary & Rewards (Required for Warning Letters & Store)
+    // Disciplinary & Rewards
     match /disciplinaryActions/{actionId} { allow read, write: if isAuthenticated(); }
     match /rewards/{rewardId} { allow read, write: if isAuthenticated(); }
     match /rewardRedemptions/{redemptionId} { allow read, write: if isAuthenticated(); }
@@ -13803,6 +13900,7 @@ service cloud.firestore {
     match /positions/{posId} { allow read, write: if isAuthenticated(); }
     match /expenseCategories/{catId} { allow read, write: if isAuthenticated(); }
     match /banks/{bankId} { allow read, write: if isAuthenticated(); }
+    match /publicHolidays/{holidayId} { allow read, write: if isAuthenticated(); }
     match /kpis/{kpiId} { allow read, write: if isAuthenticated(); }
     match /assets/{assetId} { allow read, write: if isAuthenticated(); }
     
@@ -13816,7 +13914,7 @@ service cloud.firestore {
     }
     match /policies/{policyId} { allow read, write: if isAuthenticated(); }
     
-    // *** NEW: TEAM CHAT ***
+    // *** TEAM CHAT ***
     match /team_messages/{msgId} { allow read, write: if isAuthenticated(); }
   }
 }`}
@@ -14838,7 +14936,8 @@ service cloud.firestore {
 
         const SettingsPage = ({ initialTab = 'shop' }) => {
             // REDUNDANCY FIX: Use global context data instead of fetching collections again
-            const { shops, positions, shifts, expenseCategories, banks } = useAppData();
+            // MODIFIED: Destructured publicHolidays
+            const { shops, positions, shifts, expenseCategories, banks, publicHolidays } = useAppData();
             
             const [activeTab, setActiveTab] = useState(initialTab);
             const { userProfile } = useFirebase(); 
@@ -14950,6 +15049,25 @@ service cloud.firestore {
                 { header: 'Short Name', accessor: 'shortName' }
             ];
 
+            // NEW: Public Holidays Settings Configuration
+            const holidayFormFields = [
+                { name: 'name', label: 'Holiday Name', required: true, icon: 'fa-calendar-star', placeholder: 'e.g. Khmer New Year' },
+                { name: 'startDate', label: 'Start Date', type: 'date', required: true, icon: 'fa-calendar-day' },
+                { name: 'endDate', label: 'End Date', type: 'date', required: true, icon: 'fa-calendar-day' }
+            ];
+
+            const holidayListColumns = [
+                { header: 'Holiday Name', accessor: 'name' },
+                { header: 'Start Date', accessor: (h) => Utils.formatISOToDisplay(h.startDate) },
+                { header: 'End Date', accessor: (h) => Utils.formatISOToDisplay(h.endDate) },
+                { header: 'Duration', accessor: (h) => {
+                    const s = new Date(h.startDate); 
+                    const e = new Date(h.endDate);
+                    const diff = Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1;
+                    return `${diff > 0 ? diff : 0} Day(s)`;
+                }}
+            ];
+
             return (
                 <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop">
@@ -14980,6 +15098,7 @@ service cloud.firestore {
                                 <option value="positions">Position & KPI</option>
                                 <option value="expenses">Expense Categories</option>
                                 <option value="banks">Bank List</option>
+                                <option value="holidays">Public Holidays</option> {/* NEW Option */}
                             </select>
                         </div>
 
@@ -14997,6 +15116,15 @@ service cloud.firestore {
                         {masterDataView === 'banks' && (
                             <div className="animate-fade-in">
                                 <SettingsCRUD title="Bank" collectionName="banks" items={banks} formFields={bankFormFields} listColumns={bankListColumns} />
+                            </div>
+                        )}
+                        {/* NEW: Holidays Renderer */}
+                        {masterDataView === 'holidays' && (
+                            <div className="animate-fade-in">
+                                <div className="mb-4 p-4 bg-teal-900/20 border border-teal-500/30 rounded-lg text-teal-200 text-sm">
+                                    <i className="fas fa-info-circle mr-2"></i> <strong>Phase 1 (Master Data):</strong> Add your official Public Holidays here. Once verified, this data will be automatically integrated into the Payroll and Attendance engines.
+                                </div>
+                                <SettingsCRUD title="Public Holiday" collectionName="publicHolidays" items={publicHolidays || []} formFields={holidayFormFields} listColumns={holidayListColumns} />
                             </div>
                         )}
                     </div>
@@ -15027,8 +15155,8 @@ service cloud.firestore {
             const [processComplete, setProcessComplete] = useState(false);
 
             // FIX: Use AppData and AllowedShops hook instead of static collection
-            // This ensures Shop Managers only see their assigned shops
-            const { shops } = useAppData();
+            // MODIFIED: Also destructure publicHolidays for bulk generation
+            const { shops, publicHolidays } = useAppData();
             const allowedShops = useAllowedShops(userProfile, shops);
 
             const handleTriggerPayroll = async () => {
@@ -15158,7 +15286,8 @@ service cloud.firestore {
                         otRequests: otSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         staffLoans: loanSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         employeeStates: stateSnap.docs.map(d => ({ id: d.id, ...d.data() })),
-                        salaryRevisions: revSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+                        salaryRevisions: revSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        publicHolidays: publicHolidays // NEW: Inject global holidays for trigger
                     };
                     
                     // Map for O(1) access to savings data (Pre-fetched)
@@ -15453,8 +15582,16 @@ service cloud.firestore {
                         await addDoc(collection(db, collectionName), item); 
                     }
                     handleCloseModal();
-                } catch (e) { console.error(`Error saving ${collectionName}:`, e); }
-            }, [db, collectionName, items]); 
+                } catch (e) { 
+                    console.error(`Error saving ${collectionName}:`, e); 
+                    // FIX: Added explicit error feedback to prevent silent failures
+                    if (e.code === 'permission-denied') {
+                        alert(`Permission Denied: Cannot save to '${collectionName}'.\n\nPlease ensure you have updated the Firebase Security Rules in the System Config > Startup ReadMe tab.`);
+                    } else {
+                        alert(`Failed to save ${title}: ${e.message}`);
+                    }
+                }
+            }, [db, collectionName, items, title]); 
             
             const handleDelete = useCallback(async () => {
                 if (!itemToDelete) return;
@@ -15685,67 +15822,28 @@ service cloud.firestore {
                                 <div className="grid grid-cols-2 gap-4">
                                     <div>
                                         <label className="text-sm font-medium text-slate-400">
-                                            <i className="fas fa-layer-group mr-2 text-purple-400"></i>Category
+                                            <i className="fas fa-tags mr-2 text-purple-400"></i>Category
                                         </label>
                                         <select name="category" value={formData.category} onChange={handleChange} className="select">
                                             <option>Equipment</option>
-                                            <option>Keys</option>
                                             <option>Electronics</option>
-                                            <option>Uniform</option>
+                                            <option>Furniture</option>
                                             <option>Vehicle</option>
+                                            <option>Keys</option>
+                                            <option>Uniform</option>
                                             <option>Other</option>
                                         </select>
                                     </div>
                                     <div>
                                         <label className="text-sm font-medium text-slate-400">
-                                            <i className="fas fa-store mr-2 text-cyan-400"></i>Shop Location
+                                            <i className="fas fa-store mr-2 text-cyan-400"></i>Shop
                                         </label>
-                                        <select name="shop" value={formData.shop || ''} onChange={handleChange} className="select" required disabled={asset && asset.status === 'Assigned'}>
+                                        <select name="shop" value={formData.shop} onChange={handleChange} className="select" required disabled={userProfile.role === 'Shop Manager' && availableShops.length === 1}>
                                             <option value="">Select Shop</option>
                                             {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
                                         </select>
                                     </div>
                                 </div>
-
-                                {/* NEW: Assignment Section - Only visible if Shop is selected */}
-                                {formData.shop && (
-                                    <div className="p-4 bg-slate-700/30 rounded-lg border border-slate-600/50">
-                                        <h4 className="text-xs font-bold text-slate-400 uppercase mb-3">Initial Assignment</h4>
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <div>
-                                                <label className="text-sm font-medium text-slate-400">
-                                                    <i className="fas fa-user mr-2 text-emerald-400"></i>Assigned To
-                                                </label>
-                                                <select 
-                                                    name="currentHolderId" 
-                                                    value={formData.currentHolderId || ''} 
-                                                    onChange={handleChange} 
-                                                    className="select"
-                                                >
-                                                    <option value="">-- Available (None) --</option>
-                                                    {shopEmployees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-                                                </select>
-                                            </div>
-                                            
-                                            {/* Show Date Picker only if a staff is selected */}
-                                            {formData.currentHolderId && (
-                                                <div className="animate-fade-in">
-                                                    <label className="text-sm font-medium text-slate-400">
-                                                        <i className="fas fa-calendar-check mr-2 text-orange-400"></i>Assigned Date
-                                                    </label>
-                                                    <input 
-                                                        type="date" 
-                                                        name="assignedDate" 
-                                                        value={formData.assignedDate || ''} 
-                                                        onChange={handleChange} 
-                                                        className="input" 
-                                                    />
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                )}
-
                                 <div className="grid grid-cols-2 gap-4">
                                     <div>
                                         <label className="text-sm font-medium text-slate-400">
