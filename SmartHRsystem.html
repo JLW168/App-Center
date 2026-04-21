@@ -844,8 +844,8 @@
             // NEW (Plan Step 1): Log the incoming withdrawal data to confirm it's being received.
             console.log(`[Payroll Calc] Received ${savingsWithdrawals.length} savings withdrawals for ${employee?.name} in ${selectedMonth}`, savingsWithdrawals);
 
-            // MODIFIED: Destructured publicHolidays from allData
-            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts, publicHolidays } = allData;
+            // --- PHASE 2: Destructured systemSettings to access the Policy Multiplier ---
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts, publicHolidays, systemSettings } = allData;
 
             // --- FIX: MOVED TIMEZONE LOGIC UP ---
             // We must get the employee's timezone *first* to correctly filter attendance by the local month.
@@ -917,21 +917,30 @@
 
             // --- 2. Calculate inputs automatically ---
             const leaveDays = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
-            const otDays = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
             
-            // --- FIX: Separate auto-calculation from manual override ---
-            // 1. Calculate the "pure" automatic loan deduction first, CAPPED at the remaining balance.
+            // --- CRITICAL FIX 1: Prevent Phantom Deductions & Track Total Debt ---
             let autoLoanDeduction = 0;
-            if (activeLoan) {
-                const agreed = parseFloat(activeLoan.agreedMonthlyDeduction) || 0;
-                const remainingBalance = (parseFloat(activeLoan.loanAmount) || 0) - (parseFloat(activeLoan.totalPaid) || 0);
-                
-                // CRITICAL FIX: Never deduct more than what the employee actually owes for their final payment
-                autoLoanDeduction = Math.min(agreed, Math.max(0, remainingBalance));
+            let totalRemainingDebt = 0; // NEW: Track the absolute ceiling
+
+            if (applicableLoans.length > 0) {
+                for (const loan of applicableLoans) {
+                    const agreed = parseFloat(loan.agreedMonthlyDeduction) || 0;
+                    const remainingBalance = Math.max(0, (parseFloat(loan.loanAmount) || 0) - (parseFloat(loan.totalPaid) || 0));
+                    
+                    if (remainingBalance > 0) {
+                        totalRemainingDebt += remainingBalance;
+                        autoLoanDeduction += Math.min(agreed, remainingBalance);
+                    }
+                }
             }
             
-            // 2. Use the manual override if it exists, otherwise use the auto-value.
-            const loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : autoLoanDeduction;
+            let loanDeduction = manualLoanDeduction !== undefined ? parseFloat(manualLoanDeduction) : autoLoanDeduction;
+            
+            // STRICT ENFORCEMENT: A manual override can NEVER exceed the total remaining debt.
+            // This prevents money from being deducted from the payslip and vanishing into the void.
+            if (loanDeduction > totalRemainingDebt) {
+                loanDeduction = totalRemainingDebt;
+            }
             // --- END FIX ---
             
             const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
@@ -968,8 +977,13 @@
             const attendedDays = new Set(Object.keys(dailyRecords));
             let absentDays = 0;
             let holidayPaidDays = 0; // Track paid holidays
-            let holidayWorkedDays = 0; // NEW: Track holidays actually worked (1x2 Pay)
+            let holidayWorkedDays = 0; // Track holidays actually worked (1x2 Pay)
             let rejectedLeavePenaltyAmount = 0; // Initialize penalty amount
+            
+            // --- PHASE 2: Initialize OT Days to be calculated dynamically ---
+            let otDays = 0;
+            
+            // REMOVED: Flawed static maxHolidayMultiplier logic from here
 
             for (let day = 1; day <= daysInMonth; day++) {
                 const currentDay = new Date(year, month - 1, day);
@@ -986,6 +1000,31 @@
                 if (employee.joinedDate && dayKey < employee.joinedDate) continue; 
                 if ((employee.status === 'Resigned' || employee.status === 'Terminated') && employee.statusChangeDate && dayKey >= employee.statusChangeDate) continue;
 
+                // --- PHASE 2: Calculate OT Requested specifically for this day ---
+                const todayOTRequested = monthOT
+                    .filter(ot => ot.reqDate === dayKey)
+                    .reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+                
+                let allowedOTForToday = 0; // FIX 1: Default to 0, not the requested amount
+
+                // --- FIX 2: Evaluate Multiplier dynamically based on actual attendance location ---
+                let dynamicMultiplier = 2.0;
+                if (attendedDays.has(dayKey)) {
+                    // Find where they actually checked in today
+                    const todaysRecords = dailyRecords[dayKey] || [];
+                    const firstIn = todaysRecords.find(r => r.type === 'in');
+                    if (firstIn && firstIn.shop) {
+                        const actualShop = (shops || []).find(s => s.name === firstIn.shop);
+                        if (actualShop && actualShop.holidayOTMultiplier) {
+                            dynamicMultiplier = parseFloat(actualShop.holidayOTMultiplier);
+                        } else if (systemSettings?.holidayOTMultiplier !== undefined) {
+                            dynamicMultiplier = parseFloat(systemSettings.holidayOTMultiplier);
+                        }
+                    }
+                } else if (systemSettings?.holidayOTMultiplier !== undefined) {
+                    dynamicMultiplier = parseFloat(systemSettings.holidayOTMultiplier);
+                }
+
                 // --- CRITICAL FIX 2: Decoupled Holiday Logic (Restores 1x2 Pay) ---
                 const isHoliday = (publicHolidays || []).some(h => {
                     if (dayKey < h.startDate || dayKey > h.endDate) return false;
@@ -997,11 +1036,20 @@
                 
                 if (isHoliday) {
                     holidayPaidDays++; // 1x Pay for the holiday itself
+                    let currentDayMultiplier = 1;
                     
                     if (attendedDays.has(dayKey)) {
-                        // Track for UI transparency (They also get 1x Pay in the 'workDays' calculation = 2x Pay)
                         holidayWorkedDays++; 
+                        currentDayMultiplier += 1; 
+
+                        // FIX 1: OT is ONLY allowed if they actually checked in
+                        const availableOTRoom = Math.max(0, Number((dynamicMultiplier - currentDayMultiplier).toFixed(2)));
+                        allowedOTForToday = Math.min(todayOTRequested, availableOTRoom);
+                    } else {
+                        // FIX 1: If they didn't check in, they cannot claim OT on a holiday
+                        allowedOTForToday = 0;
                     }
+
                 } else {
                     // ONLY if it's not a holiday do we penalize for absence
                     if (!attendedDays.has(dayKey)) {
@@ -1026,21 +1074,37 @@
                             absentDays += 0.5;
                         }
                     }
+
+                    // --- NEW GUARDRAIL: Normal Day OT Cap ---
+                    // Prevents managers from accidentally approving multiple overlapping OT requests for a normal working day.
+                    // Caps normal daily OT to a strict maximum of 1.0 day (equivalent to 1x Base + 1x OT).
+                    const MAX_NORMAL_OT = 1.0;
+                    // FIX 1: Normal OT also requires attendance (unless it's an off-day OT, which is standard, but we cap it)
+                    if (attendedDays.has(dayKey) || todayOTRequested > 0) {
+                        allowedOTForToday = Math.min(todayOTRequested, MAX_NORMAL_OT);
+                    }
                 }
+
+                // Add the legally allowed OT for this day to the monthly total
+                otDays += allowedOTForToday;
             }
             
             const noAttendance = absentDays + noCheckOutCount;
 
-            // --- FIX: Dynamic "Given Off Days" Calculation (Handles 28/29/30/31 day months) ---
-            const maxOffDays = 4; // Target off days per month
+            // --- FIX 3: True "Given Off Days" Calculation ---
+            const maxOffDays = 4; 
             const standardWorkDays = daysInMonth - maxOffDays;
-            // Pro-rate the off days based on actual work days, capped at 4
-            const givenOffDays = Math.min(maxOffDays, Math.round((workDays / standardWorkDays) * maxOffDays));
-            // --- END FIX ---
+            
+            // To prevent penalizing employees for excused absences, we add Leave Days and Public Holidays 
+            // to their "Credit" when calculating if they earned their weekends.
+            const creditedWorkDays = workDays + leaveDays + holidayPaidDays;
+            
+            const givenOffDays = Math.min(maxOffDays, Math.round((creditedWorkDays / standardWorkDays) * maxOffDays));
+            // --- END FIX 3 ---
 
             // FIX: Create the autoInputs object to be returned, now including noAttendance.
-            // --- MODIFIED: Added holidayWorkedDays to outputs ---
-            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance, autoLoanDeduction: autoLoanDeduction, holidayPaidDays, holidayWorkedDays };
+            // --- MODIFIED: Added totalRemainingDebt to outputs for UI transparency ---
+            const autoInputs = { workDays, givenOffDays, otDays, leaveDays, totalLateDays, noCheckOutCount, loanDeduction, noAttendance, autoLoanDeduction: autoLoanDeduction, totalRemainingDebt, holidayPaidDays, holidayWorkedDays };
 
             // --- 3. Perform Final Salary Calculations ---
             const engagements = monthStates.filter(es => es.statusState === 'Engagement' && es.status === 'Approved').reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
@@ -7784,15 +7848,27 @@
 
             const confirmDelete = async () => {
                 if (!paymentToDelete) return;
-                const { doc, updateDoc, deleteDoc } = window.firebaseSDK;
+                // --- CRITICAL FIX 2: Smart Status Reversal ---
+                const { doc, updateDoc, deleteDoc, increment } = window.firebaseSDK;
                 try {
-                    // Revert the loan's totalPaid amount
+                    const loanRef = doc(db, 'staffLoans', paymentToDelete.loanId);
+                    
+                    // Evaluate what the status SHOULD be after reversal
                     const loan = staffLoans.find(l => l.id === paymentToDelete.loanId);
+                    let newStatus = 'Active';
+                    
                     if (loan) {
-                        const newTotalPaid = (loan.totalPaid || 0) - paymentToDelete.amountPaid;
-                        const newStatus = newTotalPaid >= loan.loanAmount ? 'Paid Off' : 'Active';
-                        await updateDoc(doc(db, 'staffLoans', loan.id), { totalPaid: newTotalPaid, status: newStatus });
+                        const projectedTotalPaid = (parseFloat(loan.totalPaid) || 0) - paymentToDelete.amountPaid;
+                        if (projectedTotalPaid >= parseFloat(loan.loanAmount)) {
+                            newStatus = 'Paid Off';
+                        }
                     }
+
+                    await updateDoc(loanRef, { 
+                        totalPaid: increment(-paymentToDelete.amountPaid),
+                        status: newStatus 
+                    });
+                    
                     await deleteDoc(doc(db, 'loanPayments', paymentToDelete.id));
                 } catch (error) { console.error("Error deleting loan payment:", error); alert("Failed to delete loan payment."); } 
                 finally { setPaymentToDelete(null); }
@@ -8897,7 +8973,7 @@
                                 </div>
                                 <div className="mt-4 pt-4 border-t border-slate-600 flex justify-between items-center">
                                     {/* FIX: Aligned label directly with the Official Payslip terminology */}
-                                    <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន (NET SALARY) :</span>
+                                    <span className="font-bold text-slate-200">ប្រាក់ខែសុទ្ធទទួលបាន:</span>
                                     <span className="text-xl font-bold text-blue-400">{Utils.formatCurrency(calculations.netSalary)}</span>
                                 </div>
                             </div>
@@ -11409,8 +11485,8 @@
             const [selectedShift, setSelectedShift] = useState('');
 
             // Data States
-            // PHASE 2.2: Destructure publicHolidays from context
-            const { shops, employees, shifts, publicHolidays } = useAppData();
+            // PHASE 3 FIX: Destructure systemSettings from context to read the global policy
+            const { shops, employees, shifts, publicHolidays, systemSettings } = useAppData();
 
             // NEW: Get unique shift names for the filter dropdown
             const uniqueShiftNames = useMemo(() => {
@@ -11654,7 +11730,10 @@
                     }
                 });
                 // --- END PRE-INDEXING ---
-                
+
+                // --- PHASE 3 REMOVAL: Global multiplier removed from here. ---
+                // It MUST be calculated inside the employee loop below so it adapts to each employee's specific shop.
+
                 // 2. Generate report using O(1) Lookups
                 const report = employeesToReportOn.map(employee => {
                     const employeeShopName = employee.primaryShop 
@@ -11665,6 +11744,14 @@
                     const employeeShop = shopsMap.get(employeeShopName);
                     const employeeShopTimezone = employeeShop?.timezone;
 
+                    // --- CRITICAL FIX: Cascading Fallback Architecture (Context-Aware) ---
+                    let maxHolidayMultiplier = 2.0;
+                    if (employeeShop && employeeShop.holidayOTMultiplier !== undefined && employeeShop.holidayOTMultiplier !== '') {
+                        maxHolidayMultiplier = parseFloat(employeeShop.holidayOTMultiplier);
+                    } else if (systemSettings?.holidayOTMultiplier !== undefined) {
+                        maxHolidayMultiplier = parseFloat(systemSettings.holidayOTMultiplier);
+                    }
+
                     // Retrieve pre-filtered data from Maps
                     const rawAttendance = attendanceByEmp.get(employee.id) || [];
                     const monthLeave = leaveByEmp.get(employee.id) || [];
@@ -11672,7 +11759,10 @@
                     const monthStates = statesByEmp.get(employee.id) || [];
 
                     const totalLeave = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
-                    const totalOT = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+                    
+                    // --- PHASE 3 REMOVAL: Do not blindly sum OT days here anymore. ---
+                    // const totalOT = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+                    
                     const totalLate = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
                     
                     const dailyRecords = {};
@@ -11711,6 +11801,9 @@
                     // PHASE 2.2 LOGIC: Track paid holidays for the monthly report
                     let holidayPaidDays = 0; 
                     let holidayWorkedDays = 0; // NEW: Track worked holidays
+                    
+                    // --- PHASE 3: Initialize dynamic OT counter ---
+                    let totalOT = 0;
 
                     for (let day = 1; day <= daysInMonth; day++) {
                         const dayKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
@@ -11719,6 +11812,13 @@
                         // --- CRITICAL FIX 1: Strict Employment Boundary (The "Time Traveler" Bug) ---
                         if (employee.joinedDate && dayKey < employee.joinedDate) continue; 
                         if ((employee.status === 'Resigned' || employee.status === 'Terminated') && employee.statusChangeDate && dayKey >= employee.statusChangeDate) continue;
+
+                        // --- PHASE 3: Calculate OT Requested specifically for this day ---
+                        const todayOTRequested = monthOT
+                            .filter(ot => ot.reqDate === dayKey)
+                            .reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
+                        
+                        let allowedOTForToday = todayOTRequested;
 
                         // --- CRITICAL FIX 2: Decoupled Holiday Logic (Restores 1x2 Pay) ---
                         const isHoliday = (publicHolidays || []).some(h => {
@@ -11731,9 +11831,18 @@
                         
                         if (isHoliday) {
                             holidayPaidDays++;
+                            let currentDayMultiplier = 1;
+                            
                             if (attendedDays.has(dayKey)) {
                                 holidayWorkedDays++;
+                                currentDayMultiplier += 1;
                             }
+
+                            // --- PHASE 3 GUARDRAIL: Enforce Holiday OT Policy for the Report ---
+                            // FIX: Added Number().toFixed(2) to prevent floating point math errors
+                            const availableOTRoom = Math.max(0, Number((maxHolidayMultiplier - currentDayMultiplier).toFixed(2)));
+                            allowedOTForToday = Math.min(todayOTRequested, availableOTRoom);
+                            
                         } else {
                             if (!attendedDays.has(dayKey)) {
                                 // FIX: Check for specific leave record to handle half-days precisely
@@ -11744,7 +11853,14 @@
                                     noAbsentCount += 0.5;
                                 }
                             }
+
+                            // --- NEW GUARDRAIL: Normal Day OT Cap for the Report ---
+                            const MAX_NORMAL_OT = 1.0;
+                            allowedOTForToday = Math.min(todayOTRequested, MAX_NORMAL_OT);
                         }
+                        
+                        // Accumulate the legally allowed OT for the report
+                        totalOT += allowedOTForToday;
                     }
 
                     // --- FIX: Dynamic "Given Off Days" Calculation for Monthly Report ---
@@ -11777,7 +11893,8 @@
                 
                 return report.sort((a, b) => (a.shopName || '').localeCompare(b.shopName || '') || (a.staffName || '').localeCompare(b.staffName || ''));
 
-            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, searchTerm, userProfile, selectedShift, publicHolidays]); // Added publicHolidays to dependencies
+            // FIX: Added systemSettings to dependencies to force a re-render if the global policy changes
+            }, [attendance, leaveRequests, otRequests, employeeStates, employees, shops, filterType, selectedMonth, selectedShop, searchTerm, userProfile, selectedShift, publicHolidays, systemSettings]); 
 
             const handleExportExcel = useCallback(() => {
                 const dataToExport = workDayReport.map(rec => ({
@@ -11949,7 +12066,8 @@
             const { where } = window.firebaseSDK;
 
             // FIX: Consolidated all AppData variables into a single declaration at the top
-            const { shops, employees, shifts, publicHolidays } = useAppData();
+            // PHASE 2: Extracted systemSettings to pass to the engine
+            const { shops, employees, shifts, publicHolidays, systemSettings } = useAppData();
 
             // --- OPTIMIZATION: DATE RANGE CONSTRAINTS (The Silent Killer Fix) ---
             const dateConstraints = useMemo(() => {
@@ -12046,11 +12164,12 @@
 
             // REMOVED duplicate useAppData() call here to prevent SyntaxError
 
+            // PHASE 2: Added systemSettings to the allData payload
             const allData = useMemo(() => ({
-                shops, employees, shifts, publicHolidays,
+                shops, employees, shifts, publicHolidays, systemSettings,
                 attendance: attendanceData, leaveRequests: leaveRequestsData, otRequests: otRequestsData,
                 staffLoans: staffLoansData, employeeStates: employeeStatesData, salaryRevisions: salaryRevisionsData,
-            }), [shops, employees, shifts, publicHolidays, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData]);
+            }), [shops, employees, shifts, publicHolidays, systemSettings, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData]);
             
             const [manualLoanDeduction, setManualLoanDeduction] = useState(undefined);
             const [isProcessing, setIsProcessing] = useState(false);
@@ -12390,7 +12509,29 @@
                                 {employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                             </select>
                         </div>
-                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-full text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-star mr-2 text-teal-400"></i>Holidays</label><input type="number" name="holidayPaidDays" value={displayInputs.holidayPaidDays ?? ''} className="input" disabled title="Public Holidays (Paid)" /></div><div><label className="text-sm"><i className="fas fa-briefcase-medical mr-2 text-blue-400"></i>Hols. Worked</label><input type="number" name="holidayWorkedDays" value={displayInputs.holidayWorkedDays ?? ''} className="input" disabled title="Worked on Public Holidays (Bonus)" /></div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-hand-holding-dollar mr-2 text-green-400"></i>Loan Deduction</label><input type="number" name="loanDeduction" value={manualLoanDeduction ?? ''} onChange={handleManualLoanChange} className="input" /></div></div>
+                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-full text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-star mr-2 text-teal-400"></i>Holidays</label><input type="number" name="holidayPaidDays" value={displayInputs.holidayPaidDays ?? ''} className="input" disabled title="Public Holidays (Paid)" /></div><div><label className="text-sm"><i className="fas fa-briefcase-medical mr-2 text-blue-400"></i>Hols. Worked</label><input type="number" name="holidayWorkedDays" value={displayInputs.holidayWorkedDays ?? ''} className="input" disabled title="Worked on Public Holidays (Bonus)" /></div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div>
+                    
+                    {/* CRITICAL FIX 3: UI Transparency for Debt Caps */}
+                    <div>
+                        <label className="text-sm"><i className="fas fa-hand-holding-dollar mr-2 text-green-400"></i>Loan Deduction</label>
+                        <input 
+                            type="number" 
+                            name="loanDeduction" 
+                            value={manualLoanDeduction ?? ''} 
+                            onChange={handleManualLoanChange} 
+                            className="input font-bold text-orange-400" 
+                        />
+                        {displayInputs.totalRemainingDebt > 0 ? (
+                            <p className="text-[10px] text-slate-400 mt-1 flex items-center gap-1">
+                                <i className="fas fa-info-circle text-blue-400"></i> 
+                                Max Debt: {Utils.formatCurrency(displayInputs.totalRemainingDebt)}
+                            </p>
+                        ) : (
+                            <p className="text-[10px] text-slate-500 mt-1 italic">No active loan debt.</p>
+                        )}
+                    </div>
+                    
+                    </div>
                     
                     {/* FIX: Updated Button Group with Cancel Option */}
                     <div className="pt-6 border-t border-slate-700 flex flex-col gap-4">
@@ -14367,7 +14508,8 @@ service cloud.firestore {
                         lateDeductionAmount: parseFloat(lateFee), // Kept for legacy fallback
                         latePenaltyRules: processedRules,
                         maxLatePenalty: parseFloat(maxLatePenalty) || 0,
-                        appName: systemName 
+                        appName: systemName
+                        // MODIFIED: Holiday OT Multiplier removed from here
                     });
                     alert("System settings updated successfully. The page title will update momentarily.");
                 } catch (error) {
@@ -14464,6 +14606,8 @@ service cloud.firestore {
                             </div>
                         </div>
 
+                        {/* MODIFIED: Payroll Policies Section Extracted to HolidayPolicyWidget */}
+
                         <div className="md:col-span-2 flex justify-end mt-4">
                             <Button type="submit" variant="primary" disabled={isSavingSettings} className="w-full md:w-auto">
                                 {isSavingSettings ? 'Saving...' : 'Update Settings'}
@@ -14513,6 +14657,99 @@ service cloud.firestore {
                 </div>
             );
         };
+
+        // --- NEW: Extracted Holiday Policy Widget ---
+        const HolidayPolicyWidget = ({ userProfile }) => {
+            const { db } = useFirebase();
+            const { systemSettings } = useAppData();
+            const [holidayOTMultiplier, setHolidayOTMultiplier] = useState(2);
+            const [isSaving, setIsSaving] = useState(false);
+
+            useEffect(() => {
+                if (systemSettings) {
+                    setHolidayOTMultiplier(systemSettings.holidayOTMultiplier !== undefined ? parseFloat(systemSettings.holidayOTMultiplier) : 2);
+                }
+            }, [systemSettings]);
+
+            // Security check: Only Admin/CEO
+            if (userProfile.role !== 'Admin' && userProfile.role !== 'CEO') return null;
+
+            const handleSave = async (e) => {
+                e.preventDefault();
+                setIsSaving(true);
+                try {
+                    const { doc, setDoc, serverTimestamp } = window.firebaseSDK;
+                    const updates = { holidayOTMultiplier: parseFloat(holidayOTMultiplier) || 2 };
+                    
+                    await setDoc(doc(db, 'systemConfig', 'global'), {
+                        ...updates,
+                        updatedAt: serverTimestamp()
+                    }, { merge: true });
+                    
+                    // Update cache instantly in IndexedDB
+                    if (window.idbKeyval) {
+                        const cached = (await window.idbKeyval.get('hr_cache_sys_config')) || [];
+                        const globalIdx = cached.findIndex(d => d.id === 'global');
+                        if (globalIdx >= 0) {
+                            cached[globalIdx] = { ...cached[globalIdx], ...updates };
+                        } else {
+                            cached.push({ id: 'global', ...updates });
+                        }
+                        await window.idbKeyval.set('hr_cache_sys_config', cached);
+                    }
+                    alert("Holiday Payroll Policy updated successfully.");
+                } catch (error) {
+                    console.error("Persistence error:", error);
+                    alert("Failed to save policy.");
+                } finally {
+                    setIsSaving(false);
+                }
+            };
+
+            return (
+                <div className="mb-6 bg-slate-800/50 p-6 rounded-xl border border-slate-700 shadow-md">
+                    <form onSubmit={handleSave}>
+                        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                            <div className="flex-1">
+                                <h5 className="text-base font-bold text-slate-200 flex items-center gap-2 mb-2">
+                                    <i className="fas fa-globe text-blue-400"></i> Global Holiday Payroll Policy
+                                </h5>
+                                <p className="text-sm text-slate-400 leading-relaxed mb-3">
+                                    Set the <strong>Default</strong> maximum pay multiplier for working on a Public Holiday (Including OT). 
+                                    <br/>
+                                    <span className="text-yellow-400 text-xs"><i className="fas fa-info-circle mr-1"></i> You can override this globally default setting for specific branches in the <strong>Shop & Shift Management</strong> tab.</span>
+                                </p>
+                                <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-700/50 text-xs text-slate-400 space-y-1">
+                                    <p><strong className="text-slate-200">2.0x (Default)</strong>: Automatically blocks OT overlapping with holidays.</p>
+                                    <p><strong className="text-slate-200">3.0x</strong>: Allows exactly 1 day of standard OT to stack.</p>
+                                    <p><strong className="text-slate-200">4.0x</strong>: Allows double OT rate stacking on holidays.</p>
+                                </div>
+                            </div>
+                            
+                            <div className="shrink-0 flex flex-col gap-3 w-full sm:w-auto bg-slate-800/80 p-4 rounded-xl border border-slate-700 mt-2 sm:mt-0">
+                                <div className="flex items-center gap-2 bg-slate-900 p-2 rounded-lg border border-slate-700 shadow-inner">
+                                    <input 
+                                        type="number" 
+                                        min="2" 
+                                        max="5" 
+                                        step="0.5"
+                                        value={holidayOTMultiplier}
+                                        onChange={(e) => setHolidayOTMultiplier(e.target.value)}
+                                        disabled={isSaving}
+                                        className="input !mt-0 font-bold text-blue-400 text-center text-xl !w-24 border-blue-500/30 focus:border-blue-500"
+                                    />
+                                    <span className="text-slate-400 font-bold text-2xl pr-2">x Max</span>
+                                </div>
+                                <Button type="submit" variant="primary" disabled={isSaving} className="w-full shadow-lg">
+                                    {isSaving ? <><i className="fas fa-spinner fa-spin mr-2"></i> Saving...</> : <><i className="fas fa-save mr-2"></i> Update Policy</>}
+                                </Button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            );
+        };
+        // --- END HOLIDAY POLICY WIDGET ---
 
         // NEW: QR Code Generator Modal for Shop Settings (Phase 1)
         const ShopQRModal = ({ isOpen, onClose, shop }) => {
@@ -15297,6 +15534,8 @@ service cloud.firestore {
                 { name: 'name', label: 'Shop Name', icon: 'fa-store', required: true }, 
                 // NEW: Added Born Date field
                 { name: 'bornDate', label: 'Born Date', type: 'date', icon: 'fa-calendar-day' },
+                // --- PHASE 1 FIX: Added Shop-Level Holiday Multiplier Override ---
+                { name: 'holidayOTMultiplier', label: 'Holiday OT Multiplier (Optional Override)', type: 'number', step: '0.5', min: '2', max: '5', icon: 'fa-file-invoice-dollar', placeholder: 'e.g., 3' },
                 { name: 'latitude', label: 'Latitude', icon: 'fa-location-dot' }, 
                 { name: 'longitude', label: 'Longitude', icon: 'fa-location-crosshairs' }, 
                 { name: 'radius', label: 'Radius (m)', type: 'number', icon: 'fa-circle-notch' }, 
@@ -15308,8 +15547,9 @@ service cloud.firestore {
                 { header: 'Shop Name', accessor: 'name' },
                 // NEW: Added Born Date column
                 { header: 'Born Date', accessor: (s) => s.bornDate ? Utils.formatISOToDisplay(s.bornDate) : '-' },
-                // NEW: Added Age column to calculate duration since born date
                 { header: 'Age', accessor: (s) => s.bornDate ? Utils.calculateWorkedDuration(s.bornDate) : '-' },
+                // --- PHASE 1 FIX: Display Shop-Level Multiplier in the list ---
+                { header: 'Holiday OT', accessor: (s) => s.holidayOTMultiplier ? <span className="text-green-400 font-bold">{s.holidayOTMultiplier}x</span> : <span className="text-slate-500 italic">Global</span> },
                 { header: 'Time Zone', accessor: 'timezone' },
                 { header: 'Radius (m)', accessor: 'radius' },
                 { header: 'Note', accessor: 'note' }
@@ -15388,7 +15628,7 @@ service cloud.firestore {
             return (
                 <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
                     <div id="shop">
-                        {/* NEW: Global Settings Widget (Moved here) */}
+                        {/* MODIFIED: GlobalSettingsWidget handles penalty rules and system name only */}
                         <GlobalSettingsWidget userProfile={userProfile} />
                         <SettingsCRUD title="Shop" collectionName="shops" items={shops} formFields={shopFormFields} listColumns={shopListColumns} />
                         <div className="mt-8">
@@ -15438,8 +15678,11 @@ service cloud.firestore {
                         {/* NEW: Holidays Renderer */}
                         {masterDataView === 'holidays' && (
                             <div className="animate-fade-in">
+                                {/* NEW: Grouped Policy Widget at the top of Holidays */}
+                                <HolidayPolicyWidget userProfile={userProfile} />
+                                
                                 <div className="mb-4 p-4 bg-teal-900/20 border border-teal-500/30 rounded-lg text-teal-200 text-sm">
-                                    <i className="fas fa-info-circle mr-2"></i> <strong>Phase 1 (Master Data):</strong> Add your official Public Holidays here. Once verified, this data will be automatically integrated into the Payroll and Attendance engines.
+                                    <i className="fas fa-info-circle mr-2"></i> <strong>System Rule:</strong> Add your official Public Holidays here. The Payroll and Attendance engines will automatically read these dates to calculate holiday pay and excuse staff absences.
                                 </div>
                                 <SettingsCRUD title="Public Holiday" collectionName="publicHolidays" items={publicHolidays || []} formFields={holidayFormFields} listColumns={holidayListColumns} />
                             </div>
@@ -15472,8 +15715,8 @@ service cloud.firestore {
             const [processComplete, setProcessComplete] = useState(false);
 
             // FIX: Use AppData and AllowedShops hook instead of static collection
-            // MODIFIED: Also destructure publicHolidays for bulk generation
-            const { shops, publicHolidays } = useAppData();
+            // MODIFIED: Also destructure publicHolidays and systemSettings for bulk generation
+            const { shops, publicHolidays, systemSettings } = useAppData();
             const allowedShops = useAllowedShops(userProfile, shops);
 
             const handleTriggerPayroll = async () => {
@@ -15595,6 +15838,7 @@ service cloud.firestore {
                     setProcessLog(prev => [...prev, `Data loaded. (${attSnap.docs.length} attendance records)`]);
 
                     // Assemble AllData object
+                    // PHASE 2: Added systemSettings to the trigger payload
                     const allData = {
                         shops: shopsSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         employees: allEmployees,
@@ -15604,7 +15848,8 @@ service cloud.firestore {
                         staffLoans: loanSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         employeeStates: stateSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         salaryRevisions: revSnap.docs.map(d => ({ id: d.id, ...d.data() })),
-                        publicHolidays: publicHolidays // NEW: Inject global holidays for trigger
+                        publicHolidays: publicHolidays,
+                        systemSettings: systemSettings
                     };
                     
                     // Map for O(1) access to savings data (Pre-fetched)
@@ -15891,6 +16136,13 @@ service cloud.firestore {
                         return; // Stop the save
                     }
                 }
+                
+                // --- CRITICAL FIX 1: The Temporal Paradox Guardrail ---
+                // Prevents HR from saving a holiday or shift where the end date is before the start date
+                if (item.startDate && item.endDate && item.startDate > item.endDate) {
+                    alert("Validation Error: The End Date cannot be before the Start Date.");
+                    return; // Intercept and block the save
+                }
                 // --- END FIX ---
 
                 try {
@@ -16032,7 +16284,7 @@ service cloud.firestore {
                                                     ))}
                                                 </div>
                                             ) : (
-                                                <input type={field.type || 'text'} name={field.name} value={formData[field.name] || ''} onChange={(e) => setFormData({...formData, [field.name]: e.target.value})} className="input" required={field.required} />
+                                                <input type={field.type || 'text'} name={field.name} value={formData[field.name] || ''} onChange={(e) => setFormData({...formData, [field.name]: e.target.value})} className="input" required={field.required} min={field.min} max={field.max} step={field.step} placeholder={field.placeholder} />
                                             )}
                                         </div>
                                     ))}
@@ -16519,31 +16771,47 @@ service cloud.firestore {
                             </table>
                         </div>
                     )}
-                    <AssetModal isOpen={isAssetModalOpen} onClose={() => setIsAssetModalOpen(false)} onSave={handleSaveAsset} asset={editingAsset} userProfile={userProfile} />
-                    <AssetActionModal isOpen={isActionModalOpen} onClose={() => setIsActionModalOpen(false)} onProcess={handleProcessAction} asset={activeAsset} employees={employees} />
-                    <ConfirmationModal isOpen={!!assetToDelete} onClose={() => setAssetToDelete(null)} onConfirm={handleDelete} title="Delete Asset" message={`Are you sure you want to delete "${assetToDelete?.name}"?`} />
+
+                    <AssetModal 
+                        isOpen={isAssetModalOpen} 
+                        onClose={() => setIsAssetModalOpen(false)} 
+                        onSave={handleSaveAsset} 
+                        asset={editingAsset} 
+                        userProfile={userProfile} 
+                    />
+
+                    <AssetActionModal 
+                        isOpen={isActionModalOpen} 
+                        onClose={() => setIsActionModalOpen(false)} 
+                        onProcess={handleProcessAction} 
+                        asset={activeAsset} 
+                        employees={employees} 
+                    />
+
+                    <ConfirmationModal 
+                        isOpen={!!assetToDelete} 
+                        onClose={() => setAssetToDelete(null)} 
+                        onConfirm={handleDelete} 
+                        title="Delete Asset" 
+                        message="Are you sure you want to delete this asset?" 
+                    />
                 </Card>
             );
         };
 
         const AssetManagerPage = ({ userProfile }) => {
             const { moduleConfig = {} } = useAppData();
-            const [activeTab, setActiveTab] = useState('');
-
+            const [activeTab, setActiveTab] = useState('main');
+            
             const tabs = useMemo(() => {
                 const available = {};
-                // If enabled, show the dashboard tab
-                if (moduleConfig['assets:main'] !== false) {
-                    available.main = <span><i className="fas fa-boxes-stacked mr-2 text-orange-400"></i>Asset Dashboard</span>;
-                }
+                if (moduleConfig['assets:main'] !== false) available.main = <span><i className="fas fa-boxes-stacked mr-2 text-orange-400"></i>Asset Dashboard</span>;
                 return available;
             }, [moduleConfig]);
 
             useEffect(() => {
                 const keys = Object.keys(tabs);
-                if (keys.length > 0 && !tabs[activeTab]) {
-                    setActiveTab(keys[0]);
-                }
+                if (keys.length > 0 && !tabs[activeTab]) setActiveTab(keys[0]);
             }, [tabs, activeTab]);
 
             return (
@@ -19423,14 +19691,21 @@ service cloud.firestore {
                                 <div className="space-y-2">
                                     {today.map(emp => (
                                         <div key={emp.id} className="flex items-center gap-3 bg-gradient-to-r from-pink-500/10 to-purple-500/10 p-2 rounded-lg border border-pink-500/20">
-                                            <div className="w-8 h-8 rounded-full bg-slate-800 border border-pink-500/30 flex items-center justify-center overflow-hidden">
-                                                {emp.photo ? <img src={emp.photo} className="w-full h-full object-cover"/> : emp.name.charAt(0)}
+                                            <div className="w-8 h-8 rounded-full bg-slate-800 border border-pink-500/30 flex items-center justify-center overflow-hidden shrink-0">
+                                                {emp.photo ? (
+                                                    <img src={emp.photo} alt={emp.name} className="w-full h-full object-cover" />
+                                                ) : (
+                                                    <span className="text-sm font-bold text-pink-400">{emp.name.charAt(0)}</span>
+                                                )}
                                             </div>
-                                            <div>
-                                                <p className="text-sm font-bold text-slate-200">{emp.name}</p>
-                                                <p className="text-[10px] text-pink-300">Turning {emp.turningAge}!</p>
+                                            <div className="flex-1 min-w-0">
+                                                <p className="text-sm font-bold text-slate-200 truncate">{emp.name}</p>
+                                                <p className="text-[10px] text-slate-400 truncate">{emp.position}</p>
                                             </div>
-                                            <i className="fas fa-gift text-pink-500 ml-auto"></i>
+                                            <div className="ml-auto text-right shrink-0">
+                                                <p className="text-[10px] font-bold text-pink-400 uppercase tracking-widest mb-0.5">Turns {emp.turningAge}</p>
+                                                <p className="text-[9px] text-slate-500">{Array.isArray(emp.shop) ? emp.shop[0] : emp.shop}</p>
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
@@ -22491,9 +22766,7 @@ service cloud.firestore {
                                                     {item.lastSeen.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute:'2-digit' })}
                                                 </td>
                                                 <td className="px-4 py-4 text-center">
-                                                    <span className="bg-slate-800 text-slate-300 px-2 py-1 rounded text-xs border border-slate-700">
-                                                        {item.count}
-                                                    </span>
+                                                    <span className="font-bold text-slate-200">{item.count}</span>
                                                 </td>
                                             </tr>
                                         );
@@ -22503,14 +22776,6 @@ service cloud.firestore {
                                     )}
                                 </tbody>
                             </table>
-                            {/* NEW: Infinite Scroll / Load More Footer */}
-                            {hasMore && (
-                                <div className="p-4 flex justify-center border-t border-slate-700">
-                                    <Button variant="secondary" onClick={() => fetchDeviceHistory(true)} disabled={loadingMore}>
-                                        {loadingMore ? <><i className="fas fa-spinner fa-spin mr-2"></i>Analyzing More...</> : "Analyze Older Records"}
-                                    </Button>
-                                </div>
-                            )}
                         </div>
                     )}
                 </Card>
@@ -22519,13 +22784,12 @@ service cloud.firestore {
 
         const UserActivityPage = ({ userProfile }) => {
             const { moduleConfig = {} } = useAppData();
-            const [activeTab, setActiveTab] = useState('');
+            const [activeTab, setActiveTab] = useState('logs');
 
             const tabs = useMemo(() => {
                 const available = {};
-                // Check if enabled (default true)
-                if (moduleConfig['userActivity:logs'] !== false) available.logs = <span><i className="fas fa-file-signature mr-2 text-teal-400"></i>System Logs</span>;
-                if (moduleConfig['userActivity:devices'] !== false) available.devices = <span><i className="fas fa-mobile-screen-button mr-2 text-orange-400"></i>Device Audit</span>;
+                if (moduleConfig['userActivity:logs'] !== false) available.logs = <span><i className="fas fa-list-ul mr-2 text-teal-400"></i>Activity Logs</span>;
+                if (moduleConfig['userActivity:devices'] !== false) available.devices = <span><i className="fas fa-mobile-alt mr-2 text-indigo-400"></i>Device Audit</span>;
                 return available;
             }, [moduleConfig]);
 
