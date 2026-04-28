@@ -943,7 +943,12 @@
             }
             // --- END FIX ---
             
-            const totalLateDays = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
+            const totalLateDays = monthStates.filter(es => {
+                if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @'))) return false;
+                // FIX: Read-Model Reconciliation - Void penalty if approved leave exists
+                const hasLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate);
+                return !hasLeave;
+            }).length;
 
             const dailyRecords = {};
             monthAttendance.forEach(rec => {
@@ -2291,7 +2296,15 @@
                                     <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.joinedDate}</td>
                                     <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{Utils.calculateWorkedDuration(emp.joinedDate)}</td>
                                     <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.shift}</td>
-                                    <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">{emp.tel}</td>
+                                    <td className="px-4 py-4 text-sm text-slate-300 whitespace-nowrap">
+                                        {emp.tel ? (
+                                            <a href={`tel:${emp.tel}`} className="text-blue-400 hover:text-blue-300 hover:underline flex items-center gap-1.5" title={`Call ${emp.name}`}>
+                                                <i className="fas fa-phone-alt text-[10px]"></i> {emp.tel}
+                                            </a>
+                                        ) : (
+                                            <span className="text-slate-500">-</span>
+                                        )}
+                                    </td>
                                     <td className="px-4 py-4 text-sm text-slate-300 text-right whitespace-nowrap">{Utils.formatCurrency(emp.salary)}</td>
                                     <td className="px-4 py-4 text-sm text-green-400 font-bold text-right whitespace-nowrap">{Utils.formatCurrency(emp.latestSalary)}</td>
                                     <td className="px-4 py-4 text-center whitespace-nowrap">
@@ -3961,10 +3974,11 @@
             const [historyEmployee, setHistoryEmployee] = useState(null);
             
             // REFACTORED: Get global shops AND global employees data from context
-            const { shops, employees: globalEmployees } = useAppData();
+            const { shops, employees: globalEmployees, shifts } = useAppData();
             
             const [selectedShop, setSelectedShop] = useState('');
             const [searchTerm, setSearchTerm] = useState(''); // NEW: State for the search term
+            const [selectedShift, setSelectedShift] = useState(''); // NEW: State for Shift Filter
 
             // NEW: Fetch approved salary revisions for "Latest Salary" calculation
             const { data: approvedRevisions } = useCollection('salaryRevisions', [where('status', '==', 'Approved')]);
@@ -4206,19 +4220,29 @@
             // Use the custom hook to fetch and filter employees based on the selected shop.
             const { employees, loading } = useFilteredEmployees(userProfile, selectedShop);
 
-            // NEW: Further filter the employees based on the search term.
+            // --- CRITICAL FIX: Context-Aware Shift List ---
+            // Only show shifts that belong to the currently selected shop to prevent impossible filters
+            const uniqueShiftNames = useMemo(() => {
+                if (!shifts) return [];
+                let relevantShifts = shifts;
+                if (selectedShop) {
+                    relevantShifts = shifts.filter(s => s.shopName === selectedShop);
+                }
+                return [...new Set(relevantShifts.map(s => s.name))].sort();
+            }, [shifts, selectedShop]);
+
+            // NEW: Further filter the employees based on the search term AND shift.
             const searchedEmployees = useMemo(() => {
                 // MODIFIED: Filter out 'Admin' role users from the visible list
                 // This keeps the list focused on Staff/Managers and hides System Admins.
                 const visibleEmployees = employees.filter(e => e.role !== 'Admin');
 
-                if (!searchTerm) {
-                    return visibleEmployees;
-                }
-                return visibleEmployees.filter(emp => 
-                    emp.name.toLowerCase().includes(searchTerm.toLowerCase())
-                );
-            }, [employees, searchTerm]);
+                return visibleEmployees.filter(emp => {
+                    const searchMatch = !searchTerm || emp.name.toLowerCase().includes(searchTerm.toLowerCase());
+                    const shiftMatch = !selectedShift || emp.shift === selectedShift;
+                    return searchMatch && shiftMatch;
+                });
+            }, [employees, searchTerm, selectedShift]);
             
             // NEW: Map Latest Salary to the filtered employees
             const enrichedEmployees = useMemo(() => {
@@ -4460,8 +4484,23 @@
                             userProfile={userProfile}
                             shops={shops}
                             selectedShop={selectedShop}
-                            onChange={e => setSelectedShop(e.target.value)}
+                            onChange={e => { 
+                                setSelectedShop(e.target.value); 
+                                setSelectedShift(''); // FIX: Auto-clear shift when shop changes
+                            }}
                         />
+
+                        {/* --- NEW: Dynamic Shift Filter Dropdown --- */}
+                        <select 
+                            value={selectedShift} 
+                            onChange={e => setSelectedShift(e.target.value)} 
+                            className="select w-full sm:w-auto"
+                        >
+                            <option value="">All Shifts</option>
+                            {uniqueShiftNames.map(name => (
+                                <option key={name} value={name}>{name}</option>
+                            ))}
+                        </select>
 
                         <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel} disabled={loading}>
                             Excel
@@ -8498,10 +8537,14 @@
                     const isCurrentlyWorking = lastAction?.type === 'in' || lastAction?.type === 'break_end';
                     const nextActionType = isCurrentlyWorking ? 'out' : 'in';
                     const checkInTimestamp = new Date();
-                    const { addDoc, collection, serverTimestamp, setDoc, doc, query, getDocs, where } = window.firebaseSDK;
                     const deviceInfo = await Utils.getDeviceInfo();
 
-                    await addDoc(collection(db, 'attendance'), { 
+                    // --- ATOMIC BATCH FIX: Guarantee Attendance & Penalty Save Together ---
+                    const { writeBatch, collection, serverTimestamp, doc } = window.firebaseSDK;
+                    const batch = writeBatch(db);
+                    
+                    const attendanceRef = doc(collection(db, 'attendance'));
+                    batch.set(attendanceRef, { 
                         employeeId: userProfile.id, 
                         employeeName: userProfile.name, 
                         shop: qrText, 
@@ -8533,18 +8576,27 @@
                         const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
                         const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
 
+                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups ---
+                        const todayOT = (allData.otRequests || []).find(ot => 
+                            ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
+                        );
+                        
+                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                            lr.staffId === userProfile.id && lr.status === 'Approved' && 
+                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                        );
+
+                        const isHoliday = (allData.publicHolidays || []).some(h => {
+                            if (todayStr < h.startDate || todayStr > h.endDate) return false;
+                            if (!h.targetShops || h.targetShops.length === 0) return true;
+                            const empShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                            return h.targetShops.includes(qrText) || empShops.some(s => h.targetShops.includes(s));
+                        });
+
                         let effectiveShiftName = userProfile.shift;
-                        const todayOT = (allData.otRequests || []).find(ot => ot.staffId === userProfile.id && ot.reqDate === todayStr && ot.status === 'Approved');
                         if (todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
                             effectiveShiftName = 'AM';
                         }
-
-                        // --- NEW: Find today's approved leave ---
-                        const todayLeave = (allData.leaveRequests || []).find(lr => 
-                            lr.staffId === userProfile.id && 
-                            lr.status === 'Approved' && 
-                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
-                        );
 
                         const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === qrText);
                         if (shiftDetails && shiftDetails.lateThreshold) {
@@ -8560,13 +8612,14 @@
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
                             const allowedLateDelta = lateLimitMins - startMins;
 
-                            let isExcused = false;
+                            let isExcused = isHoliday;
 
                             // Apply Half-Day Leave Offset
-                            if (todayLeave) {
-                                if (todayLeave.leaveSession === 'Full Day') {
+                            if (!isExcused && todayLeave) {
+                                const sessionType = todayLeave.leaveSession?.trim().toLowerCase();
+                                if (sessionType === 'full day') {
                                     isExcused = true;
-                                } else if (todayLeave.leaveSession === 'AM') {
+                                } else if (sessionType === 'am') {
                                     // 'AM' Leave means First Half Leave. Shift the start time to the Afternoon check-in limit.
                                     if (shiftDetails.amLeaveThreshold) {
                                         const [alH, alM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
@@ -8590,12 +8643,14 @@
                                         // Calculate EXACT minutes late from START TIME
                                         const lateMinutes = checkInMins - startMins;
 
-                                        const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                        const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
-                                        const snap = await getDocs(q);
+                                        // Memory Cache check to prevent duplicates
+                                        const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
+                                            stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
+                                            stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
+                                        );
                                         
                                         // Strict check to prevent duplicate late penalties on the same day
-                                        if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
+                                        if (!existingPenalty) {
                                             const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                             
                                             // --- Dynamic Tiered Penalty Logic ---
@@ -8613,9 +8668,13 @@
                                             }
                                             
                                             const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
-                                            await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
+                                            
+                                            const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                            const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
+                                            batch.set(penaltyRef, { 
                                                 staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
                                             });
+                                            
                                             penaltyApplied = true;
                                         }
                                     }
@@ -8623,6 +8682,8 @@
                             }
                         }
                     }
+                    
+                    await batch.commit(); // Execute all DB writes simultaneously
                     
                     const message = generateCheckInOutMessage(nextActionType, penaltyApplied, penaltyAmount, checkInTimestamp);
                     setAlertModal({ isOpen: true, message: message });
@@ -8643,7 +8704,7 @@
                         setStatus(`Too far (${Math.round(freshDistance)}m).`); setLoading(false); return;
                     }
                     
-                    const { addDoc, collection, serverTimestamp, getDocs, query, where, setDoc, doc } = window.firebaseSDK;
+                    const { writeBatch, collection, serverTimestamp, doc } = window.firebaseSDK;
                     
                     // --- FIX: Correctly determine Next Action handling the Break End state ---
                     const isCurrentlyWorking = lastAction?.type === 'in' || lastAction?.type === 'break_end';
@@ -8652,7 +8713,11 @@
                     const checkInTimestamp = new Date();
                     const deviceInfo = await Utils.getDeviceInfo();
 
-                    await addDoc(collection(db, 'attendance'), { 
+                    // --- ATOMIC BATCH FIX: Guarantee Attendance & Penalty Save Together ---
+                    const batch = writeBatch(db);
+                    const attendanceRef = doc(collection(db, 'attendance'));
+
+                    batch.set(attendanceRef, { 
                         employeeId: userProfile.id, 
                         employeeName: userProfile.name, 
                         shop: selectedShopForCheckIn, // USES CURRENTLY SELECTED SHOP (Auto-Detected)
@@ -8682,26 +8747,30 @@
                         const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
                         const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
 
+                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups ---
+                        const todayOT = (allData.otRequests || []).find(ot => 
+                            ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
+                        );
+                        
+                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                            lr.staffId === userProfile.id && lr.status === 'Approved' && 
+                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                        );
+
+                        const isHoliday = (allData.publicHolidays || []).some(h => {
+                            if (todayStr < h.startDate || todayStr > h.endDate) return false;
+                            if (!h.targetShops || h.targetShops.length === 0) return true;
+                            const empShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
+                            return h.targetShops.includes(selectedShopForCheckIn) || empShops.some(s => h.targetShops.includes(s));
+                        });
+
                         // 2. Determine Effective Shift (Handle OT Override)
                         let effectiveShiftName = userProfile.shift;
                         
-                        const todayOT = (allData.otRequests || []).find(ot => 
-                            ot.staffId === userProfile.id && 
-                            ot.reqDate === todayStr && 
-                            ot.status === 'Approved'
-                        );
-
                         // Handle OT Override for GPS as well (e.g. PM Staff working AM OT)
                         if (todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
                             effectiveShiftName = 'AM';
                         }
-
-                        // --- NEW: Find today's approved leave ---
-                        const todayLeave = (allData.leaveRequests || []).find(lr => 
-                            lr.staffId === userProfile.id && 
-                            lr.status === 'Approved' && 
-                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
-                        );
 
                         // 3. Get Shift Rules
                         const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === selectedShopForCheckIn);
@@ -8719,13 +8788,14 @@
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
                             const allowedLateDelta = lateLimitMins - startMins;
 
-                            let isExcused = false;
+                            let isExcused = isHoliday;
 
                             // Apply Half-Day Leave Offset
-                            if (todayLeave) {
-                                if (todayLeave.leaveSession === 'Full Day') {
+                            if (!isExcused && todayLeave) {
+                                const sessionType = todayLeave.leaveSession?.trim().toLowerCase();
+                                if (sessionType === 'full day') {
                                     isExcused = true;
-                                } else if (todayLeave.leaveSession === 'AM') {
+                                } else if (sessionType === 'am') {
                                     // 'AM' Leave means First Half Leave. Shift the start time to the Afternoon check-in limit.
                                     if (shiftDetails.amLeaveThreshold) {
                                         const [alH, alM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
@@ -8747,12 +8817,14 @@
                                         // Calculate EXACT minutes late from START TIME
                                         const lateMinutes = checkInMins - startMins;
 
-                                        const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                        const q = query(collection(db, "employeeStates"), where("staffId", "==", userProfile.id), where("date", "==", todayStr));
-                                        const snap = await getDocs(q);
+                                        // Memory Cache check to prevent duplicates
+                                        const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
+                                            stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
+                                            stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
+                                        );
                                         
                                         // Strict check to prevent duplicate late penalties on the same day
-                                        if (!snap.docs.some(doc => doc.data().statusState === 'Deduction' && doc.data().note?.includes('CheckIn Late'))) {
+                                        if (!existingPenalty) {
                                             const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                             
                                             // --- Dynamic Tiered Penalty Logic ---
@@ -8771,7 +8843,9 @@
                                             
                                             const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
 
-                                            await setDoc(doc(db, 'employeeStates', penaltyDocId), { 
+                                            const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                            const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
+                                            batch.set(penaltyRef, { 
                                                 staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
                                             });
                                             
@@ -8782,6 +8856,8 @@
                             }
                         }
                     }
+
+                    await batch.commit(); // Execute all DB writes simultaneously
 
                     const message = generateCheckInOutMessage(nextActionType, penaltyApplied, penaltyAmount, checkInTimestamp);
                     setAlertModal({ isOpen: true, message: message });
@@ -9663,7 +9739,7 @@
             }, [db, employees, handleCloseModal, collectionName, title, submissionDateField]);
 
             const handleUpdateRequestStatus = useCallback(async (id, status) => {
-                const { doc, updateDoc } = window.firebaseSDK;
+                const { doc, collection, query, where, getDocs, writeBatch } = window.firebaseSDK;
                 const dataToUpdate = { status };
                 
                 // FIX: Record the exact time the decision was made for BOTH Approvals and Rejections
@@ -9671,15 +9747,61 @@
                     const now = new Date();
                     const formattedTimestamp = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')} | ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`;
                     
-                    // Keep approvalTimestamp for backwards compatibility with older records, 
-                    // but add processedTimestamp as the new semantic standard.
                     dataToUpdate.approvalTimestamp = formattedTimestamp;
                     dataToUpdate.processedTimestamp = formattedTimestamp;
                 }
                 
-                try { await updateDoc(doc(db, collectionName, id), dataToUpdate); } 
+                try { 
+                    // --- CRITICAL FIX: TRUE ATOMIC EVENT-DRIVEN CLEANSING ---
+                    // We MUST wrap the Approval and the Deletions in the SAME batch.
+                    // If the network drops, they both succeed or both fail together.
+                    const batch = writeBatch(db);
+                    const requestRef = doc(db, collectionName, id);
+                    
+                    // 1. Queue the Approval Update
+                    batch.update(requestRef, dataToUpdate); 
+                    
+                    let penaltiesVoided = 0;
+
+                    // 2. Queue the Penalty Deletions (if applicable)
+                    if (collectionName === 'leaveRequests' && status === 'Approved') {
+                        const leaveReq = requests.find(r => r.id === id);
+                        if (leaveReq) {
+                            const { staffId, leaveDate, returnDate } = leaveReq;
+                            
+                            const statesQ = query(
+                                collection(db, 'employeeStates'),
+                                where("staffId", "==", staffId),
+                                where("date", ">=", leaveDate),
+                                where("date", "<=", returnDate)
+                            );
+                            
+                            const statesSnap = await getDocs(statesQ);
+
+                            statesSnap.forEach(stateDoc => {
+                                const stateData = stateDoc.data();
+                                // Target exactly the late check-in penalties
+                                if (stateData.statusState === 'Deduction' && stateData.note?.includes('CheckIn Late @')) {
+                                    // Ensure it's strictly within the active leave boundary
+                                    if (stateData.date >= leaveDate && stateData.date < returnDate) {
+                                        batch.delete(stateDoc.ref);
+                                        penaltiesVoided++;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    
+                    // 3. Commit everything simultaneously
+                    await batch.commit();
+
+                    if (penaltiesVoided > 0) {
+                        console.log(`[Ledger Cleansed] Voided ${penaltiesVoided} late penalties due to retroactive leave approval.`);
+                    }
+                    
+                } 
                 catch (error) { console.error(`Error updating status for ${title} ${id}:`, error); }
-            }, [db, collectionName, title]);
+            }, [db, collectionName, title, requests]);
 
             const confirmDelete = useCallback(async () => {
                 if (!requestToDelete) return;
@@ -11256,6 +11378,11 @@
                     const approvedLeave = employeeLeaves.find(lr => entry.date >= lr.leaveDate && entry.date < lr.returnDate);
                     // --- END OPTIMIZATION ---
 
+                    // FIX: Read-Model Reconciliation - Void Late flag if excused by Leave or Holiday
+                    if (approvedLeave || isHoliday) {
+                        isLate = false;
+                    }
+
                     let isOnLeave;
                     if (isHoliday) {
                         // If they checked in/out on a holiday, explicitly note it, otherwise mark as Holiday
@@ -11350,57 +11477,81 @@
                     // FIX: Ensure Shop Managers also get their local view updated immediately
                     if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') {
                         const newRecordForState = {
-                            id: newDocRef.id,
-                            employeeId: record.employeeId,
-                            employeeName: record.employeeName,
-                            shop: record.shop,
-                            timestamp: { toDate: () => checkOutDateTime },
-                            type: 'out',
-                            location: { manualEntry: true, note: `Added manually by ${userProfile?.role || 'Manager'}` }
-                        };
-                        setAdminAttendance(prev => [...prev, newRecordForState]);
-                    }
-                    handleCloseCorrectionModal();
-                } catch (error) {
-                    console.error("Error saving manual check-out:", error);
-                    alert("Failed to save the manual check-out time.");
+                        id: newDocRef.id,
+                        employeeId: record.employeeId,
+                        employeeName: record.employeeName,
+                        shop: record.shop,
+                        timestamp: { toDate: () => checkOutDateTime },
+                        type: 'out',
+                        location: { manualEntry: true, note: `Added manually by ${userProfile?.role || 'Manager'}` }
+                    };
+                    setAdminAttendance(prev => [...prev, newRecordForState]);
                 }
-            }, [db, handleCloseCorrectionModal, userProfile, shops]);
+                handleCloseCorrectionModal();
+            } catch (error) {
+                console.error("Error saving manual check-out:", error);
+                alert("Failed to save the manual check-out time.");
+            }
+        }, [db, handleCloseCorrectionModal, userProfile, shops]);
 
-            // --- FIX: Added missing handleDelete function ---
-            const handleDelete = async () => {
-                if (!recordToDelete || !recordToDelete.docIds || recordToDelete.docIds.length === 0) {
-                    setRecordToDelete(null);
-                    return;
-                }
+        // --- FIX: ORPHANED PENALTY CLEANSING (Admin Mutability Guardrail) ---
+        const handleDelete = async () => {
+            if (!recordToDelete || !recordToDelete.docIds || recordToDelete.docIds.length === 0) {
+                setRecordToDelete(null);
+                return;
+            }
+            
+            try {
+                // Ensure we have query tools available for the cascading delete
+                const { writeBatch, doc, collection, query, where, getDocs } = window.firebaseSDK;
+                const batch = writeBatch(db);
                 
-                try {
-                    const { writeBatch, doc } = window.firebaseSDK;
-                    const batch = writeBatch(db);
-                    
-                    // A single row in the report might consist of multiple attendance records 
-                    // (e.g. In, Out, Break Start, Break End). Delete them all together.
-                    recordToDelete.docIds.forEach(docId => {
-                        batch.delete(doc(db, 'attendance', docId));
-                    });
-                    
-                    await batch.commit();
-
-                    // Clean up local state for Admins/CEOs/Managers who fetched the data on-demand
-                    if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') {
-                        setAdminAttendance(prev => prev.filter(rec => !recordToDelete.docIds.includes(rec.id)));
+                // 1. Delete all attendance records associated with this report row
+                recordToDelete.docIds.forEach(docId => {
+                    batch.delete(doc(db, 'attendance', docId));
+                });
+                
+                // 2. Cascade Delete: Wipe any associated late penalties for this employee on this date.
+                // If we don't do this, the employee is fined for a check-in that has been erased.
+                const statesQ = query(
+                    collection(db, 'employeeStates'),
+                    where("staffId", "==", recordToDelete.employeeId),
+                    where("date", "==", recordToDelete.date)
+                );
+                
+                const statesSnap = await getDocs(statesQ);
+                let penaltiesWiped = 0;
+                
+                statesSnap.forEach(stateDoc => {
+                    const data = stateDoc.data();
+                    if (data.statusState === 'Deduction' && data.note?.includes('CheckIn Late')) {
+                        batch.delete(stateDoc.ref);
+                        penaltiesWiped++;
                     }
-                } catch (error) {
-                    console.error("Error deleting attendance records:", error);
-                    alert("Failed to delete the records.");
-                } finally {
-                    setRecordToDelete(null);
-                }
-            };
-            // --- END FIX ---
+                });
+                
+                // Execute Attendance deletion and Penalty deletion simultaneously
+                await batch.commit();
 
-            const handleExportExcel = useCallback(() => {
-                const dataToExport = attendanceReport.map(report => ({
+                if (penaltiesWiped > 0) {
+                    console.log(`[Ledger Cleansed] Automatically wiped ${penaltiesWiped} orphaned late penalties associated with deleted attendance.`);
+                }
+
+                // Clean up local state for Admins/CEOs/Managers who fetched the data on-demand
+                if (userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager') {
+                    setAdminAttendance(prev => prev.filter(rec => !recordToDelete.docIds.includes(rec.id)));
+                }
+            } catch (error) {
+                console.error("Error deleting attendance records:", error);
+                alert("Failed to delete the records.");
+            } finally {
+                setRecordToDelete(null);
+            }
+        };
+        // --- END FIX ---
+
+        const handleExportExcel = useCallback(() => {
+            const dataToExport = attendanceReport.map(report => ({
                     'Date': report.date,
                     'Shop Name': report.shop,
                     'Staff Name': report.employeeName,
@@ -11760,10 +11911,12 @@
 
                     const totalLeave = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
                     
-                    // --- PHASE 3 REMOVAL: Do not blindly sum OT days here anymore. ---
-                    // const totalOT = monthOT.reduce((sum, r) => sum + (parseFloat(r.numberOfOTDays) || 0), 0);
-                    
-                    const totalLate = monthStates.filter(es => es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @')).length;
+                    // FIX: Read-Model Reconciliation - Exclude late days covered by approved leave
+                    const totalLate = monthStates.filter(es => {
+                        if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @'))) return false;
+                        const hasLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate);
+                        return !hasLeave;
+                    }).length;
                     
                     const dailyRecords = {};
                     rawAttendance.forEach(rec => {
