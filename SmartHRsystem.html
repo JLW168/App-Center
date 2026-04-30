@@ -8281,15 +8281,26 @@
             // --- NEW: Calculate Total Break Duration for Display ---
             const totalBreakToday = useMemo(() => {
                 let totalMs = 0;
-                // Sort chronologically
-                const recs = [...userAttendanceToday].sort((a,b) => a.timestamp.toDate() - b.timestamp.toDate());
+                
+                // --- CRITICAL FIX: Safe Timestamp Parsing ---
+                // Prevent TypeError: .toDate() is not a function when Optimistic Action (JS Date) is in the array
+                const getSafeDate = (ts) => {
+                    if (!ts) return 0;
+                    if (typeof ts.toDate === 'function') return ts.toDate();
+                    if (ts instanceof Date) return ts;
+                    return new Date(ts);
+                };
+
+                // Sort chronologically using the safe parser
+                const recs = [...userAttendanceToday].sort((a,b) => getSafeDate(a.timestamp) - getSafeDate(b.timestamp));
                 let start = null;
                 
                 recs.forEach(r => {
+                    const safeTs = getSafeDate(r.timestamp);
                     if (r.type === 'break_start') {
-                        start = r.timestamp.toDate();
+                        start = safeTs;
                     } else if (r.type === 'break_end' && start) {
-                        totalMs += (r.timestamp.toDate() - start);
+                        totalMs += (safeTs - start);
                         start = null;
                     }
                 });
@@ -20827,10 +20838,30 @@ service cloud.firestore {
                                 getDocs(revQ).catch(e => { console.warn("Salary Rev fetch failed", e); return { docs: [] }; })
                             ]);
 
-                            // Process Stats
-                            const uniqueDays = new Set(attSnap.docs.map(d => {
-                                return d.data().timestamp?.toDate().toDateString();
-                            }));
+                            // --- FIX: Accurate Half-Day Calculation for Dashboard ---
+                            // Replaces the flawed `uniqueDays.size` with strict duration-based logic matching the Payroll Engine
+                            const dailyRecordsForStats = {};
+                            attSnap.docs.forEach(d => {
+                                const data = d.data();
+                                if (!data.timestamp) return;
+                                const dateObj = data.timestamp.toDate ? data.timestamp.toDate() : new Date(data.timestamp);
+                                const dayKey = dateObj.toDateString(); 
+                                if (!dailyRecordsForStats[dayKey]) dailyRecordsForStats[dayKey] = [];
+                                dailyRecordsForStats[dayKey].push({ date: dateObj, type: data.type });
+                            });
+
+                            let calculatedWorkDays = 0;
+                            Object.entries(dailyRecordsForStats).forEach(([dayKey, dayRecs]) => {
+                                const ins = dayRecs.filter(r => r.type === 'in').sort((a,b) => a.date - b.date);
+                                const outs = dayRecs.filter(r => r.type === 'out').sort((a,b) => b.date - a.date);
+                                
+                                if (ins.length > 0 && outs.length > 0) {
+                                    const diffHours = (outs[0].date.getTime() - ins[0].date.getTime()) / 3600000;
+                                    if (diffHours >= 7) calculatedWorkDays += 1;
+                                    else if (diffHours >= 4) calculatedWorkDays += 0.5;
+                                }
+                            });
+                            // --- END FIX ---
                             
                             // Filter for Lates
                             const lates = stateSnap.docs.filter(d => d.data().statusState === 'Deduction' && d.data().note?.includes('Late')).length;
@@ -20880,7 +20911,7 @@ service cloud.firestore {
                             } catch (e) { console.warn("Savings fetch failed", e); }
 
                             const myStatsData = { 
-                                workDays: uniqueDays.size, 
+                                workDays: calculatedWorkDays, 
                                 lateCount: lates, 
                                 otDays: otTotal, 
                                 leaveTaken: leaveTakenTotal, // NEW
