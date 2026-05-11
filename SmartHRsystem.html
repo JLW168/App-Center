@@ -1472,7 +1472,8 @@
             // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 2: Payback) ---
             // This function transactionally processes a savings withdrawal.
             // MODIFIED (STEP 3): Added 'employeeName' and 'shop' parameters for denormalization.
-            manageSavingsWithdrawal: async (db, employeeId, employeeName, shop, amount, note) => {
+            // MODIFIED (Phase 2): Added 'pauseDeductions' flag for atomic status updates.
+            manageSavingsWithdrawal: async (db, employeeId, employeeName, shop, amount, note, pauseDeductions = false) => {
                 // OPTIMIZED: Switched from runTransaction to writeBatch + increment to avoid Read Quota errors.
                 const { doc, collection, serverTimestamp, writeBatch, increment } = window.firebaseSDK;
                 const savingsRef = doc(db, 'savingprogram', employeeId);
@@ -1482,11 +1483,18 @@
                     const batch = writeBatch(db);
 
                     // Operation 1: Atomic Update (0 Reads). Decrement balance, increment total withdrawals.
-                    batch.set(savingsRef, { 
+                    const updatePayload = { 
                         currentBalance: increment(-amount), 
                         mySavingWithdrawalTotal: increment(amount), 
                         lastUpdated: serverTimestamp() 
-                    }, { merge: true });
+                    };
+                    
+                    // --- SMART AUTO-PAUSE LOGIC ---
+                    if (pauseDeductions) {
+                        updatePayload.savingsProgramStatus = 'Paused';
+                    }
+
+                    batch.set(savingsRef, updatePayload, { merge: true });
     
                     // Operation 2: Create transaction log
                     batch.set(transactionRef, {
@@ -4735,195 +4743,206 @@
         // NEW: Modal for adding/editing salary revisions
         // MODIFIED: Added allRevisions to props so the modal can read history
         const SalaryRevisionModal = ({ isOpen, onClose, onSave, revision, userProfile, allRevisions = [] }) => {
-            // Get global data from context
-            const { shops, employees } = useAppData();
-            const [formData, setFormData] = useState({});
-
-            // OPTIMIZATION: Use the new hook
-            const availableShops = useAllowedShops(userProfile, shops);
-
-            const employeesInShop = useMemo(() => {
-                if (!formData.shopName) return [];
-                return employees.filter(emp => {
-                    const employeeShops = Array.isArray(emp.shop) ? emp.shop : [emp.shop];
-                    return employeeShops.includes(formData.shopName) && emp.status === 'Active';
-                });
-            }, [formData.shopName, employees]);
-
-            // Initialize form
-            useEffect(() => {
-                const initialData = revision 
-                    ? { ...revision }
-                    : {
-                        reqDate: new Date().toISOString().substring(0, 10),
-                        effectiveDate: new Date().toISOString().substring(0, 10),
-                        shopName: '',
-                        staffId: '',
-                        reviseAmount: '',
-                        baseSalary: 0,
-                        updatedSalary: 0,
-                        status: 'Pending'
-                    };
-                setFormData(initialData);
-            }, [revision, isOpen]);
-            
-            // REMOVED: The two separate useEffect hooks for salary calculation have been removed.
-
-            // REVISED: Consolidated all salary calculation logic into a single, more robust handleChange function.
-            // This prevents race conditions and ensures data consistency when the form is updated.
-            const handleChange = useCallback((e) => {
-                const { name, value } = e.target;
-                
-                setFormData(prev => {
-                    const newFormData = { ...prev, [name]: value };
-
-                    // When the shop selection changes...
-                    if (name === 'shopName') {
-                        // ...reset all employee-specific fields.
-                        newFormData.staffId = '';
-                        newFormData.staffName = '';
-                        newFormData.baseSalary = 0;
-                        newFormData.reviseAmount = '';
-                        newFormData.updatedSalary = 0;
-                    }
-
-                    // --- NEW: Helper to dynamically find the true current active salary ---
-                    const getLatestSalary = (staffId, effectiveDate) => {
-                        const emp = employees.find(e => e.id === staffId);
-                        if (!emp) return 0;
-                        
-                        const defaultBase = parseFloat(String(emp.salary).replace(/[^0-9.-]/g, '')) || 0;
-                        
-                        // Find all approved revisions that take effect on or before the target date
-                        const applicable = allRevisions
-                            .filter(r => r.staffId === staffId && r.status === 'Approved' && r.effectiveDate <= effectiveDate)
-                            .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate)); // Sort latest first
-                            
-                        if (applicable.length > 0) {
-                            return parseFloat(String(applicable[0].updatedSalary).replace(/[^0-9.-]/g, '')) || 0;
-                        }
-                        return defaultBase;
-                    };
-
-                    // When the staff selection changes OR effective date changes...
-                    if (name === 'staffId' || name === 'effectiveDate') {
-                        const targetStaffId = name === 'staffId' ? value : newFormData.staffId;
-                        const targetDate = name === 'effectiveDate' ? value : newFormData.effectiveDate;
-
-                        if (targetStaffId) {
-                            const selectedEmployee = employees.find(emp => emp.id === targetStaffId);
-                            if (selectedEmployee) {
-                                newFormData.staffName = selectedEmployee.name;
-                                
-                                // FIX: Use the dynamic active salary instead of the stale profile base
-                                const currentSalary = getLatestSalary(targetStaffId, targetDate);
-                                
-                                const revisedAmount = parseFloat(newFormData.reviseAmount) || 0;
-                                newFormData.baseSalary = currentSalary;
-                                newFormData.updatedSalary = currentSalary + revisedAmount;
-                            }
-                        } else {
-                            newFormData.staffName = '';
-                            newFormData.baseSalary = 0;
-                            newFormData.updatedSalary = parseFloat(newFormData.reviseAmount) || 0;
-                        }
-                    }
-
-                    // When only the revision amount changes...
-                    if (name === 'reviseAmount') {
-                        // ...recalculate just the final salary.
-                        const base = parseFloat(newFormData.baseSalary) || 0;
-                        const revise = parseFloat(value) || 0;
-                        newFormData.updatedSalary = base + revise;
-                    }
-
-                    return newFormData;
-                });
-            }, [employees, allRevisions]); // MODIFIED: Added allRevisions to dependencies so it stays up to date
-            
-            const handleSubmit = (e) => {
-                e.preventDefault();
-                onSave(formData);
-            };
-            
-            return (
-                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-3xl">
-                    {/* FIX: Added 'flex flex-col h-full overflow-hidden' to ensure proper scrolling on mobile */}
-                    <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
-                        <ModalHeader title={revision ? "Edit Salary Revision" : "Add New Salary Revision"} onClose={onClose} />
-                        <ModalBody>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-calendar-alt mr-2 text-blue-400"></i>Request Date
-                                    </label>
-                                    <input type="date" name="reqDate" value={formData.reqDate || ''} onChange={handleChange} className="input" required />
-                                </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-calendar-check mr-2 text-green-400"></i>Effective Date
-                                    </label>
-                                    <input type="date" name="effectiveDate" value={formData.effectiveDate || ''} onChange={handleChange} className="input" required />
-                                </div>
-                                
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-store mr-2 text-purple-400"></i>Shop Name
-                                    </label>
-                                    <select name="shopName" value={formData.shopName || ''} onChange={handleChange} className="select" required>
-                                        <option value="">Select Shop</option>
-                                        {availableShops.map(shop => <option key={shop.id} value={shop.name}>{shop.name}</option>)}
-                                    </select>
-                                </div>
-                                
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-user mr-2 text-orange-400"></i>Staff Name
-                                    </label>
-                                    <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required disabled={!formData.shopName}>
-                                        <option value="">Select Staff</option>
-                                        {employeesInShop.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
-                                    </select>
-                                </div>
-
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-money-bill mr-2 text-slate-400"></i>Base Salary
-                                    </label>
-                                    <input value={Utils.formatCurrency(formData.baseSalary)} className="input" disabled />
-                                </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-400">
-                                        <i className="fas fa-chart-line mr-2 text-yellow-400"></i>Revise Amount
-                                    </label>
-                                    <input type="number" name="reviseAmount" value={formData.reviseAmount || ''} onChange={handleChange} className="input" required />
-                                </div>
-
-                                <div className="md:col-span-2">
-                                   <label className="text-sm font-medium text-slate-400">
-                                       <i className="fas fa-money-bill-wave mr-2 text-green-500"></i>Updated Salary
-                                   </label>
-                                   <input value={Utils.formatCurrency(formData.updatedSalary)} className="input" disabled />
-                                </div>
-                            </div>
-                        </ModalBody>
-                        <ModalFooter>
-                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button 
-                                type="submit" 
-                                variant="primary"
-                                disabled={!formData.staffId || !formData.reviseAmount}
-                            >
-                                Save Revision
-                            </Button>
-                        </ModalFooter>
-                    </form>
-                </Modal>
-            );
+            // ... (existing SalaryRevisionModal code) ...
         };
 
-        // Component: Salary Revise Report Tab
-        // MODIFIED: Receive pendingGlobalRevisions directly from AppContent to ensure 100% sync with the Badge
+        // --- NEW COMPONENT: Bulk Payslip Generator (Enterprise Workflow) ---
+        const BulkPayslipGenerator = memo(({ payrollDataArray, selectedMonth, systemSettings }) => {
+            // FIX: Pull in global employees array to fetch missing details (like position/bank account)
+            const { employees } = useAppData(); 
+            const [isGenerating, setIsGenerating] = useState(false);
+            const [progress, setProgress] = useState({ current: 0, total: 0 });
+            const printRef = useRef(null);
+            const [currentRenderData, setCurrentRenderData] = useState(null);
+
+            // NEW: Memoized helper to instantly find the full employee profile for the rendering payslip
+            const currentRenderEmp = useMemo(() => {
+                if (!currentRenderData || !employees) return null;
+                return employees.find(e => e.id === currentRenderData.employeeId);
+            }, [currentRenderData, employees]);
+
+            const generateBulkPDF = async () => {
+                if (!payrollDataArray || payrollDataArray.length === 0) {
+                    alert("No payroll data available to generate.");
+                    return;
+                }
+
+                setIsGenerating(true);
+                setProgress({ current: 0, total: payrollDataArray.length });
+
+                try {
+                    const { jsPDF } = window.jspdf;
+                    const pdf = new jsPDF('p', 'mm', 'a4');
+
+                    for (let i = 0; i < payrollDataArray.length; i++) {
+                        const data = payrollDataArray[i];
+                        
+                        // 1. Mount the specific employee's data to the hidden DOM element
+                        setCurrentRenderData(data);
+                        
+                        // 2. Wait a moment for React to flush the state to the DOM and render the layout
+                        await new Promise(resolve => setTimeout(resolve, 150));
+
+                        // 3. Capture the rendered HTML as an image
+                        if (printRef.current && window.html2canvas) {
+                            const canvas = await window.html2canvas(printRef.current, { 
+                                scale: 2, 
+                                useCORS: true, 
+                                logging: false, 
+                                backgroundColor: '#ffffff' 
+                            });
+                            
+                            const imgData = canvas.toDataURL('image/png');
+                            
+                            // 4. Add to the PDF (Create a new page if it's not the first employee)
+                            if (i > 0) pdf.addPage();
+                            pdf.addImage(imgData, 'PNG', 0, 0, 210, 297);
+                        }
+                        
+                        setProgress({ current: i + 1, total: payrollDataArray.length });
+                    }
+
+                    // 5. Download the bundled multi-page document
+                    pdf.save(`Bulk_Payslips_${selectedMonth}.pdf`);
+                    
+                } catch (error) {
+                    console.error("Bulk Payslip Generation Error:", error);
+                    alert("An error occurred while generating the bulk payslips. Check the console.");
+                } finally {
+                    setIsGenerating(false);
+                    setCurrentRenderData(null); // Clear the hidden DOM
+                }
+            };
+
+            return (
+                <div className="relative">
+                    {/* The Trigger Button */}
+                    <Button 
+                        variant="primary" 
+                        icon={isGenerating ? "fa-spinner fa-spin" : "fa-file-pdf"} 
+                        onClick={generateBulkPDF} 
+                        disabled={isGenerating || !payrollDataArray || payrollDataArray.length === 0}
+                        className="bg-purple-600 hover:bg-purple-700 focus:ring-purple-500 shadow-lg"
+                        title="Generates a single multi-page PDF containing payslips for all listed employees."
+                    >
+                        {isGenerating ? `Generating (${progress.current}/${progress.total})...` : "Download All Payslips"}
+                    </Button>
+
+                    {/* The Engine: Hidden Off-Screen Render Target for html2canvas */}
+                    <div style={{ position: 'fixed', top: '-9999px', left: '-9999px', zIndex: -999, pointerEvents: 'none' }}>
+                        {currentRenderData && (
+                            <div ref={printRef} className="bg-white text-black w-[210mm] min-h-[297mm] p-16 box-border font-['Battambang'] relative" style={{ fontFamily: "'Inter', 'Battambang', sans-serif" }}>
+                                
+                                <div className="text-center mb-10">
+                                    <h1 className="text-3xl font-bold font-['Moul'] text-blue-900 uppercase border-b-2 border-blue-900 inline-block pb-2 mb-2">
+                                        {systemSettings?.appName || 'COMPANY NAME'}
+                                    </h1>
+                                    <h2 className="text-xl font-bold text-slate-800">PAYSLIP / ប័ណ្ណបើកប្រាក់បៀវត្ស</h2>
+                                    <p className="text-sm mt-1 text-slate-600">For the month of: <strong>{selectedMonth}</strong></p>
+                                </div>
+
+                                {/* FIX: Redesigned Detailed Header replacing the basic one */}
+                                <div className="grid grid-cols-2 gap-4 mb-6 text-sm border-b-2 border-black pb-4">
+                                    <div className="space-y-1">
+                                        <p className="text-lg font-bold">{currentRenderData.employeeName}</p>
+                                        <p><strong>Position:</strong> {currentRenderEmp?.position || 'N/A'}</p>
+                                        <p><strong>Shift:</strong> {currentRenderEmp?.shift || 'N/A'}</p>
+                                        <p><strong>Joined Date:</strong> {currentRenderEmp?.joinedDate ? Utils.formatISOToDisplay(currentRenderEmp.joinedDate) : 'N/A'}</p>
+                                    </div>
+                                    <div className="text-right space-y-1">
+                                        <p><strong>Shop:</strong> {currentRenderData.shop}</p>
+                                        <p><strong>Account No:</strong> <span className="font-mono">{currentRenderEmp?.bankAccount || 'Cash'}</span></p>
+                                        <p><strong>Base Salary:</strong> <span className="font-bold text-green-700">{Utils.formatCurrency(currentRenderData.baseSalary)}</span></p>
+                                        <p><strong>Worked Dur.:</strong> {currentRenderEmp?.joinedDate ? Utils.calculateWorkedDuration(currentRenderEmp.joinedDate) : 'N/A'}</p>
+                                    </div>
+                                </div>
+
+                                {/* FIX: Replaced Single Table with the detailed 2-Column Earnings/Deductions layout */}
+                                <div className="grid grid-cols-2 gap-6 mb-8">
+                                    {/* Earnings Column */}
+                                    <div className="space-y-2 p-4 border-t-4 border-green-500 bg-green-50 rounded-b-lg h-fit">
+                                        <h3 className="text-lg font-bold text-slate-900 mb-3">Earnings / ប្រាក់ចំណូល</h3>
+                                        <div className="flex justify-between text-sm"><p>Work Days</p><p className="font-medium">{currentRenderData.manualInputs?.workDays || 0}</p></div>
+                                        <div className="flex justify-between text-sm"><p>Given Off Days</p><p className="font-medium">{currentRenderData.manualInputs?.givenOffDays || 0}</p></div>
+                                        
+                                        {currentRenderData.manualInputs?.holidayPaidDays > 0 && (
+                                            <div className="flex justify-between text-sm text-teal-700 font-semibold">
+                                                <p>Public Holidays</p><p>{currentRenderData.manualInputs.holidayPaidDays}</p>
+                                            </div>
+                                        )}
+                                        {currentRenderData.manualInputs?.holidayWorkedDays > 0 && (
+                                            <div className="flex justify-between text-sm text-blue-700 font-bold">
+                                                <p>Holidays Worked</p><p>{currentRenderData.manualInputs.holidayWorkedDays}</p>
+                                            </div>
+                                        )}
+
+                                        <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.baseSalaryEarned)}</p></div>
+                                        <div className="flex justify-between text-sm"><p>OT Salary ({currentRenderData.manualInputs?.otDays || 0})</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.otSalary)}</p></div>
+                                        
+                                        {currentRenderData.calculations?.engagements > 0 && (
+                                            <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.engagements)}</p></div>
+                                        )}
+                                        {currentRenderData.calculations?.totalSavingsWithdrawal > 0 && (
+                                            <div className="flex justify-between text-sm text-indigo-600"><p>Savings Payback</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.totalSavingsWithdrawal)}</p></div>
+                                        )}
+                                        
+                                        <div className="flex justify-between text-sm font-bold pt-3 border-t border-green-300 text-green-700 mt-2">
+                                            <p>Gross Earnings</p><p>{Utils.formatCurrency(currentRenderData.calculations?.grossSalary)}</p>
+                                        </div>
+                                    </div>
+
+                                    {/* Deductions Column */}
+                                    <div className="space-y-2 p-4 border-t-4 border-red-500 bg-red-50 rounded-b-lg h-fit">
+                                        <h3 className="text-lg font-bold text-slate-900 mb-3">Deductions / ការកាត់ប្រាក់</h3>
+                                        <div className="flex justify-between text-sm"><p>Leave Days</p><p className="font-medium">{currentRenderData.manualInputs?.leaveDays || 0}</p></div>
+                                        <div className="flex justify-between text-sm"><p>Total Late Days</p><p className="font-medium">{currentRenderData.manualInputs?.totalLateDays || 0}</p></div>
+                                        <div className="flex justify-between text-sm"><p>Absent</p><p className="font-medium">{currentRenderData.manualInputs?.noAttendance || 0}</p></div>
+                                        
+                                        {currentRenderData.manualInputs?.loanDeduction > 0 && (
+                                            <div className="flex justify-between text-sm text-orange-600"><p>Loan Deduction</p><p className="font-medium">-{Utils.formatCurrency(currentRenderData.manualInputs.loanDeduction)}</p></div>
+                                        )}
+                                        {currentRenderData.calculations?.savingsDeduction > 0 && (
+                                            <div className="flex justify-between text-sm text-blue-600"><p>Savings Deposit</p><p className="font-medium">-{Utils.formatCurrency(currentRenderData.calculations.savingsDeduction)}</p></div>
+                                        )}
+                                        {currentRenderData.calculations?.lateDeductionsAmount > 0 && (
+                                            <div className="flex justify-between text-sm text-red-600"><p>Late Penalties</p><p className="font-medium">-{Utils.formatCurrency(currentRenderData.calculations.lateDeductionsAmount)}</p></div>
+                                        )}
+                                        {currentRenderData.calculations?.rejectedLeavePenaltyAmount > 0 && (
+                                            <div className="flex justify-between text-sm text-red-600"><p>Leave Penalty</p><p className="font-medium">-{Utils.formatCurrency(currentRenderData.calculations.rejectedLeavePenaltyAmount)}</p></div>
+                                        )}
+                                        {currentRenderData.calculations?.otherDeductions > 0 && (
+                                            <div className="flex justify-between text-sm text-red-600"><p>Other Deductions</p><p className="font-medium">-{Utils.formatCurrency(currentRenderData.calculations.otherDeductions)}</p></div>
+                                        )}
+                                        
+                                        <div className="flex justify-between text-sm font-bold pt-3 border-t border-red-300 text-red-700 mt-2">
+                                            <p>Total Deductions</p><p>{Utils.formatCurrency(currentRenderData.calculations?.totalDeductions)}</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 border-t-2 border-slate-300 flex justify-between items-center bg-slate-100 p-4 rounded-lg">
+                                    <span className="font-bold text-lg text-slate-700">NET SALARY / ប្រាក់បៀវត្សសុទ្ធ:</span>
+                                    <span className="text-2xl font-black text-blue-600 underline">{Utils.formatCurrency(currentRenderData.netSalary)}</span>
+                                </div>
+
+                                <div className="flex justify-between mt-32 px-10">
+                                    <div className="text-center w-1/3">
+                                        <div className="border-t border-black w-full mx-auto"></div>
+                                        <p className="mt-2 font-bold text-sm">Employee Signature</p>
+                                    </div>
+                                    <div className="text-center w-1/3">
+                                        <div className="border-t border-black w-full mx-auto"></div>
+                                        <p className="mt-2 font-bold text-sm">Manager Signature</p>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        });
+        // --- END BULK PAYSLIP COMPONENT ---
+
         const SalaryReviseReportTab = ({ userProfile, pendingGlobalRevisions = [] }) => {
             const { db, auth } = useFirebase();
             const { where } = window.firebaseSDK;
@@ -5798,7 +5817,6 @@
             const [effectiveMonth, setEffectiveMonth] = useState('');
             // --- NEW: State for participant status ---
             const [savingsProgramStatus, setSavingsProgramStatus] = useState('Active');
-            // --- NEW: State for Current Balance (Total Accumulated Savings) ---
             const [currentBalance, setCurrentBalance] = useState(0);
         
             useEffect(() => {
@@ -5853,7 +5871,10 @@
                     alert("Please fill all required fields, including a savings percentage greater than 0.");
                     return;
                 }
-                // MODIFIED: Pass currentBalance and existing withdrawals to save handler
+                
+                // CRITICAL ACCOUNTING FIX: 
+                // We pass the existing balance/withdrawals back to handleSaveParticipant,
+                // but the backend will NO LONGER overwrite the balance. It will only update settings.
                 onSave(
                     selectedEmployeeId, 
                     savingsPercentage || 0, 
@@ -5861,14 +5882,11 @@
                     effectiveMonth, 
                     !!participant, 
                     savingsProgramStatus, 
-                    parseFloat(currentBalance), // New Balance
-                    participant ? (participant.mySavingWithdrawalTotal || 0) : 0 // Existing Withdrawals (needed for credit calc)
+                    parseFloat(currentBalance), 
+                    participant ? (participant.mySavingWithdrawalTotal || 0) : 0 
                 );
             };
 
-            // NEW: Permission check for balance editing
-            const canEditBalance = userProfile?.role === 'Admin' || userProfile?.role === 'CEO';
-        
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-xl">
                     <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
@@ -5890,27 +5908,20 @@
                                     </select>
                                 </div>
                                 
-                                {/* --- NEW: Editable Current Balance Field (Restricted) --- */}
+                                {/* --- CRITICAL FIX: Ledger Integrity Lock --- */}
                                 <div>
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-wallet mr-2 text-green-400"></i>Total Accumulated Savings (KHR)</label>
                                     <input
-                                        type="number"
-                                        value={currentBalance}
-                                        onChange={e => setCurrentBalance(e.target.value)}
-                                        className={`input font-bold text-green-400 bg-slate-700/50 border-slate-600 focus:border-green-500 ${!canEditBalance ? 'opacity-60 cursor-not-allowed' : ''}`}
-                                        placeholder="0"
-                                        disabled={!canEditBalance} // FIX: Disable for non-admins
+                                        type="text"
+                                        value={Utils.formatCurrency(currentBalance)}
+                                        className="input font-bold text-green-400 bg-slate-800/50 border-slate-700 opacity-80 cursor-not-allowed"
+                                        disabled
                                     />
-                                    {canEditBalance ? (
-                                        <p className="text-[10px] text-slate-500 mt-1">
-                                            <i className="fas fa-info-circle mr-1"></i> You can manually adjust this value if needed.
-                                        </p>
-                                    ) : (
-                                        <p className="text-[10px] text-slate-500 mt-1">
-                                            <i className="fas fa-lock mr-1"></i> Contact Admin to adjust balance manually.
-                                        </p>
-                                    )}
+                                    <p className="text-[10px] text-slate-500 mt-1">
+                                        <i className="fas fa-lock mr-1 text-red-400"></i> Balance is locked for accounting integrity. To adjust, use the Deposit or Payback tools.
+                                    </p>
                                 </div>
+                                {/* --- END FIX --- */}
 
                                 <div className="grid grid-cols-2 gap-4">
                                     <div>
@@ -5955,7 +5966,7 @@
                                             name="status"
                                             value={savingsProgramStatus}
                                             onChange={e => setSavingsProgramStatus(e.target.value)}
-                                            className={`select ${
+                                            className={`select font-bold ${
                                                 savingsProgramStatus === 'Active' ? 'text-green-400' :
                                                 savingsProgramStatus === 'Paused' ? 'text-yellow-400' :
                                                 'text-red-400'
@@ -5972,11 +5983,7 @@
                         </ModalBody>
                         <ModalFooter>
                             <Button variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button 
-                                type="submit" 
-                                variant="primary"
-                                disabled={!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0 || !joinDate || !effectiveMonth}
-                            >
+                            <Button type="submit" variant="primary" disabled={!selectedEmployeeId || isNaN(savingsPercentage) || savingsPercentage <= 0 || !joinDate || !effectiveMonth}>
                                 {participant ? "Update" : "Save Participant"}
                             </Button>
                         </ModalFooter>
@@ -5986,50 +5993,71 @@
         };
 
         // NEW: Modal for processing a savings payback
+        // --- SMART UX FIX: Unlocked custom amounts & added auto-pause logic ---
         const PaybackModal = ({ isOpen, onClose, onSave, participant }) => {
-            const [amount, setAmount] = useState(0); 
+            const [amountStr, setAmountStr] = useState(''); 
             const [note, setNote] = useState('');
             const [error, setError] = useState('');
             const [selectedPercentage, setSelectedPercentage] = useState(null); 
+            const [pauseDeductions, setPauseDeductions] = useState(false);
 
             useEffect(() => {
                 if (isOpen) {
-                    setAmount(0);
+                    setAmountStr('');
                     setNote('');
                     setError('');
                     setSelectedPercentage(null); 
+                    setPauseDeductions(false);
                 }
             }, [isOpen]);
             
-            // NEW: Handler for percentage buttons
             const handlePercentageClick = (percentage) => {
                 if (!participant) return;
                 const paybackAmount = Math.round((participant.savingsBalance || 0) * (percentage / 100));
-                setAmount(paybackAmount);
+                setAmountStr(paybackAmount.toString());
                 setSelectedPercentage(percentage);
                 setError('');
+                
+                // Auto-suggest pausing if they withdraw 100%
+                if (percentage === 100 && participant.savingsProgramStatus === 'Active') {
+                    setPauseDeductions(true);
+                } else {
+                    setPauseDeductions(false);
+                }
+            };
+
+            const handleAmountChange = (e) => {
+                const val = e.target.value.replace(/[^0-9]/g, '');
+                setAmountStr(val);
+                setSelectedPercentage(null);
+                
+                // Auto-suggest pausing if typed amount equals total balance
+                if (parseFloat(val) === participant?.savingsBalance && participant?.savingsProgramStatus === 'Active') {
+                    setPauseDeductions(true);
+                } else {
+                    setPauseDeductions(false);
+                }
             };
 
             const handleSubmit = (e) => {
                 e.preventDefault();
-                const paybackAmount = parseFloat(amount);
+                const paybackAmount = parseFloat(amountStr);
                 
                 if (isNaN(paybackAmount) || paybackAmount <= 0) { 
-                    setError('Please select a valid payback percentage.');
+                    setError('Please enter a valid payback amount.');
                     return;
                 }
                 if (paybackAmount > participant.savingsBalance) {
                     setError('Payback amount cannot exceed the total savings.');
                     return;
                 }
-                onSave(participant.id, paybackAmount, note);
+                onSave(participant.id, paybackAmount, note, pauseDeductions);
             };
 
             if (!participant) return null;
 
             return (
                 <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-md">
-                    {/* FIX: Added flex layout class */}
                     <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
                         <ModalHeader title="Process Savings Payback" onClose={onClose} />
                         <ModalBody>
@@ -6040,11 +6068,11 @@
                                 </div>
                                 <div>
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-wallet mr-2 text-green-400"></i>Current Balance</label>
-                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input" disabled />
+                                    <input value={Utils.formatCurrency(participant.savingsBalance)} className="input font-bold text-green-400 bg-slate-800" disabled />
                                 </div>
                                 
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400"><i className="fas fa-percent mr-2 text-blue-400"></i>Payback Percentage</label>
+                                    <label className="text-sm font-medium text-slate-400"><i className="fas fa-percent mr-2 text-blue-400"></i>Quick Calculate</label>
                                     <div className="grid grid-cols-4 gap-2 mt-1">
                                         {[25, 50, 75, 100].map(pct => (
                                             <button
@@ -6053,7 +6081,7 @@
                                                 onClick={() => handlePercentageClick(pct)}
                                                 className={`py-2 text-sm font-medium rounded border transition-colors ${
                                                     selectedPercentage === pct
-                                                        ? 'bg-blue-600 border-blue-600 text-white'
+                                                        ? 'bg-blue-600 border-blue-600 text-white shadow-md'
                                                         : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'
                                                 }`}
                                             >
@@ -6064,14 +6092,39 @@
                                 </div>
 
                                 <div>
-                                    <label className="text-sm font-medium text-slate-400"><i className="fas fa-coins mr-2 text-yellow-400"></i>Calculated Amount (KHR)</label>
+                                    <label className="text-sm font-medium text-slate-400"><i className="fas fa-coins mr-2 text-yellow-400"></i>Payback Amount (KHR)</label>
+                                    {/* FIX: Unlocked the input so custom amounts can be typed */}
                                     <input
                                         type="text"
-                                        value={Utils.formatCurrency(amount)}
-                                        className="input"
-                                        disabled
+                                        value={amountStr ? Utils.formatCurrency(amountStr).replace('៛', '').trim() : ''}
+                                        onChange={handleAmountChange}
+                                        className="input font-bold text-yellow-400 text-lg placeholder-slate-600"
+                                        placeholder="0"
+                                        required
                                     />
+                                    <p className="text-[10px] text-slate-500 mt-1">You can type a custom amount or use the percentages above.</p>
                                 </div>
+
+                                {/* FIX: Smart Auto-Pause UX */}
+                                {participant.savingsProgramStatus === 'Active' && (
+                                    <div className={`p-3 rounded-lg border transition-colors ${pauseDeductions ? 'bg-orange-900/20 border-orange-500/50' : 'bg-slate-800 border-slate-700'} flex items-start gap-3 mt-4`}>
+                                        <input 
+                                            id="pause-deductions" 
+                                            type="checkbox" 
+                                            checked={pauseDeductions} 
+                                            onChange={(e) => setPauseDeductions(e.target.checked)}
+                                            className="mt-1 h-4 w-4 rounded border-gray-600 text-orange-600 focus:ring-orange-500 bg-slate-700 shrink-0"
+                                        />
+                                        <div>
+                                            <label htmlFor="pause-deductions" className="text-sm font-bold text-slate-200 cursor-pointer">
+                                                Pause future payroll deductions
+                                            </label>
+                                            <p className="text-[10px] text-slate-400 mt-0.5 leading-tight">
+                                                If checked, the employee's status will change to <strong>Paused</strong> and they will not be deducted next month.
+                                            </p>
+                                        </div>
+                                    </div>
+                                )}
 
                                 <div>
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-sticky-note mr-2 text-slate-400"></i>Note (Optional)</label>
@@ -6080,10 +6133,10 @@
                                         value={note}
                                         onChange={(e) => setNote(e.target.value)}
                                         className="input"
-                                        placeholder="e.g., Resignation payout"
+                                        placeholder="e.g., Emergency funds, Resignation payout"
                                     />
                                 </div>
-                                {error && <p className="text-sm text-red-400">{error}</p>}
+                                {error && <p className="text-sm text-red-400 font-bold animate-pulse">{error}</p>}
                             </div>
                         </ModalBody>
                         <ModalFooter>
@@ -6091,7 +6144,7 @@
                             <Button 
                                 type="submit" 
                                 variant="primary"
-                                disabled={!amount || parseFloat(amount) <= 0}
+                                disabled={!amountStr || parseFloat(amountStr) <= 0}
                             >
                                 Confirm Payback
                             </Button>
@@ -6457,7 +6510,8 @@
             
             // MODIFIED (STEP 4): This function now passes the required 'employeeName' and 'shop'
             // to match the new signature of Utils.manageSavingsWithdrawal.
-            const handleProcessPayback = async (employeeId, amount, note) => {
+            // MODIFIED (Phase 2): Accept the 'pauseDeductions' flag from the modal.
+            const handleProcessPayback = async (employeeId, amount, note, pauseDeductions) => {
                 if (!paybackParticipant) {
                     alert("Error: No participant selected for payback.");
                     return;
@@ -6471,11 +6525,12 @@
                     paybackParticipant.name, // Pass Employee Name
                     participantShop, // Pass Shop
                     amount, 
-                    note
+                    note,
+                    pauseDeductions // Phase 2: Pass down to atomic transaction
                 );
                 
                 if (result.success) {
-                    alert("Payback processed successfully!");
+                    alert(`Payback processed successfully!${pauseDeductions ? ' The account has also been paused.' : ''}`);
                     setPaybackParticipant(null);
                 } else {
                     alert(`Payback failed: ${result.error?.message || 'An unknown error occurred.'}`);
@@ -12736,7 +12791,8 @@
         // --- RESTORED COMPONENT: Payroll History Tab ---
         const PayrollHistoryTab = ({ userProfile, onEdit }) => {
             const { db } = useFirebase();
-            const { shops } = useAppData(); 
+            // FIX: Added systemSettings to AppData destructuring so the Bulk Generator can use it for the company name
+            const { shops, systemSettings } = useAppData(); 
             const [history, setHistory] = useState([]);
             const [loading, setLoading] = useState(true);
             const [selectedShop, setSelectedShop] = useState('');
@@ -12942,6 +12998,14 @@
                             <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel} disabled={loading || filteredHistory.length === 0}>
                                 Export Final Payroll
                             </Button>
+
+                            {/* --- FIX: ADDED BULK PAYSLIP GENERATOR HERE --- */}
+                            {/* It takes the currently filtered history list and generates PDFs for them */}
+                            <BulkPayslipGenerator 
+                                payrollDataArray={filteredHistory} 
+                                selectedMonth={selectedMonth} 
+                                systemSettings={systemSettings} 
+                            />
                         </div>
                     </PageHeader>
 
