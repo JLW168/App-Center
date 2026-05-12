@@ -466,6 +466,7 @@
             ];
             const auditLogs = useCollection('auditLogs', auditLogQuery);
             const capitalInvestments = useCollection('capitalInvestments');
+            const lossAndRecovery = useCollection('lossAndRecovery'); // <--- ADDED HERE
 
             const collections = {
                 shops: useCollection('shops'),
@@ -492,6 +493,7 @@
                 auditLogs: useCollection('auditLogs', auditLogQuery), // <-- ADDED
                 capitalInvestments: useCollection('capitalInvestments'), // <-- ADDED CAPEX
                 closedMonths: useCollection('closedMonths'), // <-- NEW: Month-End Close Snapshot
+                lossAndRecovery: lossAndRecovery, // <--- ADDED HERE
             };
 
             const appSettings = useDocument("settings", "app") || { exchangeRate: 4000 };
@@ -2824,7 +2826,7 @@
 
         // --- NEW PAGE: Dashboard Page ---
         const DashboardPage = () => {
-            const { shops, userData, cashDrops, purchaseOrders, internalTransfers, businessExpenses, appSettings, saleMarginHistory, targetHistory } = useData();
+            const { shops, userData, cashDrops, purchaseOrders, internalTransfers, businessExpenses, appSettings, saleMarginHistory, targetHistory, lossAndRecovery, gcaHistory } = useData();
             const { showNotification } = useNotification();
 
             const [filters, setFilters] = useState({
@@ -2902,7 +2904,8 @@
                         poCurr: 0, poPrev: 0, poAllTime: 0,
                         transInCurr: 0, transInAllTime: 0,
                         transOutCurr: 0, transOutAllTime: 0,
-                        salesContributionAllTime: 0, gcaAdjustment: 0 
+                        salesContributionAllTime: 0, gcaAdjustment: 0,
+                        repaidLossesAllTime: 0 // <-- ADDED for Phase 2
                     };
                     shopConfig[s.name] = { defaultMargin: s.saleMargin || 0, openingGCA: s.gca || 0 };
                 });
@@ -2964,27 +2967,55 @@
                     }
                 });
 
+                // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
+                if (lossAndRecovery) {
+                    lossAndRecovery.forEach(loss => {
+                        if (!stats[loss.shop]) return;
+                        if (loss.status === 'Repaid') {
+                            const amount = (loss.amountKhr || 0) + ((loss.amountUsd || 0) * exchangeRate);
+                            stats[loss.shop].repaidLossesAllTime += amount;
+                        }
+                    });
+                }
+                // -----------------------------------------------
+
+                // --- FIXED: Process manual GCA Adjustments ---
+                if (gcaHistory) {
+                    gcaHistory.forEach(adj => {
+                        if (stats[adj.shopName]) {
+                            stats[adj.shopName].gcaAdjustment += (adj.adjustmentAmount || 0);
+                        }
+                    });
+                }
+                // ---------------------------------------------
+
                 // 5. Final Calculation
                 const processedData = availableShops.map(shop => {
                     const s = stats[shop.name];
                     const config = shopConfig[shop.name];
-                    const currentGCA = config.openingGCA + s.salesContributionAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment;
-
-                    // Target Scaling based on Period
-                    const thisMonthKey = new Date().toISOString().slice(0, 7);
-                    const historyKey = `${shop.name}|${thisMonthKey}`;
-                    const baseTarget = targetHistoryMap.has(historyKey) ? targetHistoryMap.get(historyKey) : (shop.target || 0);
-
-                    let daysInPeriod = Math.max(1, Math.ceil((currEnd - currStart) / (1000 * 60 * 60 * 24)));
-                    let periodTarget = (baseTarget / 30) * daysInPeriod;
-                    if (filters.period === 'this_month' || filters.period === 'last_month') periodTarget = baseTarget;
-                    if (filters.period === 'this_year') periodTarget = baseTarget * 12;
-
-                    const progress = periodTarget > 0 ? (s.salesCurr / periodTarget) * 100 : 0;
+                    const currentGCA = config.openingGCA + s.salesContributionAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
 
                     globalGCA += currentGCA;
                     globalSalesCurr += s.salesCurr;
                     globalExpenseCurr += s.expCurr;
+
+                    // --- FIXED: Calculate Target and Progress ---
+                    let monthKey = '';
+                    if (currStart) {
+                        const year = currStart.getFullYear();
+                        const month = String(currStart.getMonth() + 1).padStart(2, '0');
+                        monthKey = `${year}-${month}`;
+                    } else {
+                        const now = new Date();
+                        monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                    }
+                    
+                    const periodTarget = targetHistoryMap.has(`${shop.name}|${monthKey}`) 
+                        ? targetHistoryMap.get(`${shop.name}|${monthKey}`) 
+                        : (shop.target || 0);
+                        
+                    const progress = periodTarget > 0 ? (s.salesCurr / periodTarget) * 100 : 0;
+                    // ------------------------------------------
 
                     return { ...shop, ...s, currentGCA, periodTarget, progress };
                 });
@@ -2995,7 +3026,7 @@
                     periodLabels: { curr: label, prev: prevLabel }
                 };
 
-            }, [availableShops, cashDrops, businessExpenses, purchaseOrders, internalTransfers, appSettings, saleMarginHistory, filters, targetHistory]);
+            }, [availableShops, cashDrops, businessExpenses, purchaseOrders, internalTransfers, appSettings, saleMarginHistory, filters, targetHistory, lossAndRecovery, gcaHistory]);
 
             // --- Shared Helpers ---
             const TrendIndicator = ({ current, previous, reverse = false }) => {
@@ -6104,237 +6135,337 @@
                         <LiveFormatInput label="Cash USD" name="cashUsd" value={formData.cashUsd} onChange={handleFormChange} />
                         <LiveFormatInput label="Bank KHR" name="bankKhr" value={formData.bankKhr} onChange={handleFormChange} />
                         <LiveFormatInput label="Bank USD" name="bankUsd" value={formData.bankUsd} onChange={handleFormChange} />
-                        <LiveFormatInput label="Cash Exchange" name="cashExchange" value={formData.cashExchange} onChange={handleFormChange} />
-                        <FormTextarea label="Note" name="note" value={formData.note || ''} onChange={handleFormChange} />
-                         <div className="flex justify-end gap-4 pt-4 border-t border-slate-700">
+                        <LiveFormatInput label="Exchange" name="cashExchange" value={formData.cashExchange} onChange={handleFormChange} />
+                        <FormTextarea label="Note" name="note" value={formData.note} onChange={handleFormChange} />
+                        <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
                             <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : null}>
-                                {isSubmitting ? 'Saving...' : 'Save Changes'}
+                            <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : "CheckCircle"}>
+                                {isSubmitting ? 'Saving...' : 'Update Report'}
                             </Button>
                         </div>
                     </form>
                 </Modal>
             );
         };
-        
-        const NoteViewModal = ({ onClose, note, title = "Note" }) => (
-            <Modal title={title} onClose={onClose} size="lg">
-                <div className="space-y-4">
-                    <p className="text-slate-300 whitespace-pre-wrap max-h-[60vh] overflow-y-auto">{note}</p>
-                    <div className="flex justify-end gap-4 pt-4 mt-4 border-t border-slate-700">
-                        <Button type="button" onClick={onClose} variant="secondary">Close</Button>
-                    </div>
-                </div>
-            </Modal>
-        );
-        
-        const CustomDateRangeModal = ({ isOpen, onClose, onApply }) => {
-            const [dates, setDates] = useState({ startDate: '', endDate: '' });
-            const handleApply = () => { onApply(dates); onClose(); };
+
+        // ==========================================
+        // --- NEW COMPONENT: Loss & Breakage Tab ---
+        // ==========================================
+        const LossAndBreakageModal = ({ item, onClose, onSave, shops, staffList }) => {
+            const { userData } = useData();
+            const [formData, setFormData] = useState({
+                date: getCambodiaISODate(),
+                shop: shops[0]?.name || '',
+                itemName: '',
+                amountKhr: '',
+                amountUsd: '',
+                responsibleParty: '',
+                status: 'Pending',
+                note: ''
+            });
+
+            useEffect(() => {
+                if (item) {
+                    setFormData({
+                        ...item,
+                        date: item.date?.toDate ? getCambodiaISODate(item.date.toDate()) : item.date,
+                        amountKhr: String(item.amountKhr || ''),
+                        amountUsd: String(item.amountUsd || '')
+                    });
+                }
+            }, [item]);
+
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => {
+                    const nextState = { ...prev, [name]: value };
+                    if (name === 'shop') {
+                        nextState.responsibleParty = ''; // Reset when shop changes
+                    }
+                    return nextState;
+                });
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                onSave(formData);
+            };
+
+            // --- NEW: Filter staff based on selected shop ---
+            const filteredStaffList = useMemo(() => {
+                if (!formData.shop) return [];
+                const selectedShop = shops.find(s => s.name === formData.shop);
+                if (!selectedShop) return [];
+                
+                return staffList.filter(staff => {
+                    // Always keep the currently selected person in the list so it doesn't vanish on edit
+                    const isCurrentlySelected = formData.responsibleParty && staff.name === formData.responsibleParty;
+                    const belongsToShop = staff.shopIds?.includes(selectedShop.id);
+                    const isActive = staff.status !== 'Inactive';
+                    
+                    return isCurrentlySelected || (belongsToShop && isActive);
+                });
+            }, [formData.shop, shops, staffList, formData.responsibleParty]);
+            // ------------------------------------------------
+
             return (
-                <Modal isOpen={isOpen} onClose={onClose} title="Select Custom Date Range">
-                    <div className="space-y-4">
-                        <FormInput label="Start Date" type="date" value={dates.startDate} onChange={e => setDates(d => ({...d, startDate: e.target.value}))} />
-                        <FormInput label="End Date" type="date" value={dates.endDate} onChange={e => setDates(d => ({...d, endDate: e.target.value}))} />
-                    </div>
-                    <div className="bg-slate-900/50 px-6 py-3 flex justify-end items-center gap-3 rounded-b-lg">
-                        <Button onClick={onClose} variant="secondary">Cancel</Button>
-                        <Button onClick={handleApply}>Apply</Button>
-                    </div>
+                <Modal title={item ? 'Edit Loss Record' : 'Report Loss & Breakage'} onClose={onClose} size="md">
+                    <form onSubmit={handleSubmit} className="space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormInput label="Date" type="date" name="date" value={formData.date} onChange={handleChange} required />
+                            <FormSelect label="Shop" name="shop" value={formData.shop} onChange={handleChange} options={shops.map(s => ({value: s.name, label: s.name}))} required />
+                        </div>
+                        <FormInput label="Item Name / Description" name="itemName" value={formData.itemName} onChange={handleChange} placeholder="e.g. Broken blender part" required />
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-700/30 p-4 rounded-lg border border-slate-700">
+                            <LiveFormatInput label="Cost (KHR)" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+                            <LiveFormatInput label="Cost (USD)" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <FormSelect label="Responsible Party" name="responsibleParty" value={formData.responsibleParty} onChange={handleChange} options={[{value: '', label: 'Select Person'}, ...filteredStaffList.map(s => ({value: s.name, label: s.name}))]} required />
+                            <FormSelect label="Status" name="status" value={formData.status} onChange={handleChange} options={[{value: 'Pending', label: 'Pending (Owed)'}, {value: 'Repaid', label: 'Repaid'}]} />
+                            <FormInput label="Reported By" value={item ? (item.createdBy || 'Unknown') : (userData?.name || 'Unknown')} disabled icon="Lock" />
+                        </div>
+                        <FormTextarea label="Note" name="note" value={formData.note} onChange={handleChange} placeholder="Optional notes..." />
+                        <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
+                            <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" icon="CheckCircle">Save Record</Button>
+                        </div>
+                    </form>
                 </Modal>
             );
         };
-        // --- END: Cash Drop Report Page ---
 
-        // --- START: Purchase Order Page ---
-        const useMonthlyData = (filters) => {
-            const { reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory } = useData(); 
-            
-            return useMemo(() => {
-                const now = new Date();
-                let startDate, endDate;
-
-                switch (filters.dateRangeType) {
-                    case 'last_month':
-                        startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-                        endDate = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
-                        break;
-                    case 'this_year':
-                        startDate = new Date(now.getFullYear(), 0, 1);
-                        endDate = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999);
-                        break;
-                    case 'by_month':
-                        const [year, month] = filters.month.split('-').map(Number);
-                        startDate = new Date(year, month - 1, 1);
-                        endDate = new Date(year, month, 0, 23, 59, 59, 999);
-                        break;
-                    case 'this_month':
-                    default:
-                        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-                        endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-                        break;
-                }
-
-                const exchangeRate = appSettings.exchangeRate || 4100;
-
-                const filterByDate = (item) => {
-                    const itemDate = item.createdAt?.toDate() || item.date?.toDate();
-                    return itemDate && itemDate >= startDate && itemDate <= endDate;
-                };
-                
-                const filteredReports = reports.filter(filterByDate);
-                const filteredBusinessExpenses = businessExpenses.filter(filterByDate);
-                const filteredFamilyExpenses = familyExpenses.filter(filterByDate);
-                const filteredInternalTransfers = internalTransfers.filter(filterByDate);
-                const filteredPurchaseOrders = purchaseOrders.filter(filterByDate);
-
-                return { 
-                    exchangeRate, shops, 
-                    filteredReports, filteredBusinessExpenses, filteredFamilyExpenses, filteredInternalTransfers, filteredPurchaseOrders, 
-                    allPOs: purchaseOrders, allReports: reports, allTransfers: internalTransfers,
-                    saleMarginHistory 
-                };
-            }, [filters, reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory]); 
-        };
-        
-        const IitPaymentTab = ({ filters, onFilterChange, isCapturing }) => {
-            const data = useMonthlyData(filters);
-            const {shops} = useData();
+        const LossAndBreakageTab = () => {
+            const { lossAndRecovery, shops, staffList, userData, appSettings, checkMonthLock } = useData();
             const { showNotification } = useNotification();
-            const [payeeFilter, setPayeeFilter] = useState('All');
-            const [receiverFilter, setReceiverFilter] = useState('All');
-            const [searchTerm, setSearchTerm] = useState(''); // <-- NEW
+            const { addDoc, collection, doc, updateDoc, deleteDoc, Timestamp } = window.Firebase;
 
-            const iitPaymentData = useMemo(() => {
-                let filteredTransfers = data.filteredInternalTransfers;
-                if (payeeFilter !== 'All') { filteredTransfers = filteredTransfers.filter(t => t.toShop === payeeFilter); }
-                if (receiverFilter !== 'All') { filteredTransfers = filteredTransfers.filter(t => t.fromShop === receiverFilter); }
-                if (searchTerm) {
-                    const term = searchTerm.toLowerCase();
-                    filteredTransfers = filteredTransfers.filter(t => 
-                        (t.toShop?.toLowerCase().includes(term)) || 
-                        (t.fromShop?.toLowerCase().includes(term))
-                    );
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingItem, setEditingItem] = useState(null);
+            const [deletingItem, setDeletingItem] = useState(null);
+            const [confirmingRepay, setConfirmingRepay] = useState(null);
+            const [isRepaying, setIsRepaying] = useState(false);
+            const [filterShop, setFilterShop] = useState('all');
+            const [filterStatus, setFilterStatus] = useState('all');
+
+            const availableShops = useMemo(() => {
+                if (!userData) return [];
+                if (userData.role === 'Admin' || userData.role === 'Management') return shops;
+                return shops.filter(s => userData.shopIds?.includes(s.id));
+            }, [shops, userData]);
+
+            const filteredData = useMemo(() => {
+                if (!lossAndRecovery) return [];
+                return lossAndRecovery.filter(item => {
+                    if (filterShop !== 'all' && item.shop !== filterShop) return false;
+                    if (filterStatus !== 'all' && item.status !== filterStatus) return false;
+                    const isAllowedShop = availableShops.some(s => s.name === item.shop);
+                    if (!isAllowedShop && userData?.role !== 'Admin' && userData?.role !== 'Management') return false;
+                    return true;
+                }).sort((a, b) => (b.date?.toDate()?.getTime() || 0) - (a.date?.toDate()?.getTime() || 0));
+            }, [lossAndRecovery, filterShop, filterStatus, availableShops, userData]);
+
+            const totalPendingKhr = useMemo(() => {
+                return filteredData.filter(i => i.status === 'Pending').reduce((sum, i) => {
+                    const khr = i.amountKhr || 0;
+                    const usd = i.amountUsd || 0;
+                    return sum + khr + (usd * (appSettings.exchangeRate || 4100));
+                }, 0);
+            }, [filteredData, appSettings]);
+
+            // --- NEW: 1-Click Repaid Handler ---
+            const handleMarkRepaid = async () => {
+                if (!confirmingRepay) return;
+                const item = confirmingRepay;
+                
+                if (checkMonthLock(item.date)) {
+                    showNotification("This month is closed and locked.", "error");
+                    setConfirmingRepay(null);
+                    return;
                 }
 
-                return Object.values(filteredTransfers.reduce((acc, transfer) => {
-                    const key = `${transfer.toShop}-${transfer.fromShop}`;
-                    if (!acc[key]) { acc[key] = { payee: transfer.toShop, receiver: transfer.fromShop, totalAmount: 0 }; }
-                    acc[key].totalAmount += (transfer.amountKhr || 0) + ((transfer.amountUsd || 0) * data.exchangeRate);
-                    return acc;
-                }, {}));
-            }, [data, payeeFilter, receiverFilter, searchTerm]);
+                setIsRepaying(true);
+                try {
+                    await updateDoc(doc(window.db, "lossAndRecovery", item.id), {
+                        status: 'Repaid',
+                        repaidAt: Timestamp.now(),
+                        updatedAt: Timestamp.now()
+                    });
+                    showNotification("Marked as Repaid.", "success");
+                } catch (err) {
+                    showNotification("Failed to update status.", "error");
+                } finally {
+                    setIsRepaying(false);
+                    setConfirmingRepay(null);
+                }
+            };
+            // -----------------------------------
 
-            const subtotal = useMemo(() => {
-                return iitPaymentData.reduce((sum, item) => sum + item.totalAmount, 0);
-            }, [iitPaymentData]);
-            
-            const handleExport = useCallback(() => {
-                const dataToExport = iitPaymentData.map((item, index) => ({ "No.": index + 1, "Des. Shop": item.payee, "Source Shop": item.receiver, "Total Amount (៛)": item.totalAmount }));
-                dataToExport.push({ "No.": "", "Des. Shop": "", "Source Shop": "Sub-Total", "Total Amount (៛)": subtotal });
-                exportToExcel(dataToExport, "IIT_Payment_Report.xlsx", "IIT Payments");
-                showNotification("IIT Payment Report exported!", "success");
-            }, [iitPaymentData, subtotal, showNotification]);
+            const handleSave = async (formData) => {
+                if (checkMonthLock(formData.date) || (editingItem && checkMonthLock(editingItem.date))) {
+                    showNotification("This month is closed and locked.", "error");
+                    return;
+                }
+                try {
+                    const payload = {
+                        date: createTimestampFromDateAndCurrentTime(formData.date),
+                        shop: formData.shop,
+                        itemName: formData.itemName,
+                        amountKhr: parseFormattedNumber(formData.amountKhr),
+                        amountUsd: parseFormattedNumber(formData.amountUsd),
+                        responsibleParty: formData.responsibleParty,
+                        status: formData.status,
+                        note: formData.note,
+                        updatedAt: Timestamp.now()
+                    };
 
-            const dateRangeText = { 'this_month': 'This Month', 'last_month': 'Last Month', 'this_year': 'This Year', 'by_month': `Month: ${filters.month}` }[filters.dateRangeType];
+                    if (formData.status === 'Repaid' && editingItem?.status !== 'Repaid') {
+                        payload.repaidAt = Timestamp.now();
+                    } else if (formData.status === 'Pending') {
+                        payload.repaidAt = null;
+                    }
+
+                    if (editingItem?.id) {
+                        await updateDoc(doc(window.db, "lossAndRecovery", editingItem.id), payload);
+                        showNotification("Loss record updated.", "success");
+                    } else {
+                        payload.createdAt = Timestamp.now();
+                        payload.createdBy = userData.name;
+                        await addDoc(collection(window.db, "lossAndRecovery"), payload);
+                        showNotification("Loss recorded successfully.", "success");
+                    }
+                    setIsModalOpen(false);
+                } catch (err) {
+                    showNotification("Error saving record.", "error");
+                }
+            };
+
+            const handleDelete = async () => {
+                if (!deletingItem) return;
+                if (checkMonthLock(deletingItem.date)) {
+                    showNotification("This month is closed.", "error");
+                    setDeletingItem(null);
+                    return;
+                }
+                try {
+                    await deleteDoc(doc(window.db, "lossAndRecovery", deletingItem.id));
+                    showNotification("Record deleted.", "success");
+                } catch (e) {
+                    showNotification("Delete failed.", "error");
+                } finally {
+                    setDeletingItem(null);
+                }
+            };
 
             return (
-                <Card>
-                    <div className="flex justify-between items-center mb-4">
-                        <h3 className="text-lg font-bold flex items-center gap-2 text-slate-100">
-                            <Icon name="FileText" className="text-blue-400" /> IIT Payment Report
-                        </h3>
-                        <Button onClick={handleExport} variant="secondary" icon="Download" title="Export Excel" />
-                    </div>
-                    
-                    {isCapturing ? (
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-                            <div><label className="block text-sm font-medium text-slate-300 mb-1.5">Date</label><div className="block w-full px-3 py-2 border border-slate-600 bg-slate-700 rounded-md shadow-sm sm:text-sm text-slate-200">{dateRangeText}</div></div>
-                            <div><label className="block text-sm font-medium text-slate-300 mb-1.5">Source Shop</label><div className="block w-full px-3 py-2 border border-slate-600 bg-slate-700 rounded-md shadow-sm sm:text-sm text-slate-200">{receiverFilter}</div></div>
-                            <div><label className="block text-sm font-medium text-slate-300 mb-1.5">Des. Shop</label><div className="block w-full px-3 py-2 border border-slate-600 bg-slate-700 rounded-md shadow-sm sm:text-sm text-slate-200">{payeeFilter}</div></div>
+                <div className="space-y-6">
+                    <Card>
+                        <div className="flex justify-between items-center mb-6 border-b border-slate-700 pb-4">
+                            <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                                <Icon name="XCircle" className="text-red-400" />
+                                Loss & Breakage Tracker
+                            </h2>
+                            <Button onClick={() => { setEditingItem(null); setIsModalOpen(true); }} icon="Plus">Report Loss</Button>
                         </div>
-                    ) : (
-                        <>
-                            {/* --- NEW SMART FILTER BAR --- */}
-                            <div className="bg-slate-800/60 p-2 rounded-2xl border border-slate-700 mb-6 flex flex-col xl:flex-row gap-3 shadow-lg">
-                                {/* Global Smart Search */}
-                                <div className="flex-grow flex items-center bg-slate-900/80 rounded-xl px-4 py-2.5 border border-slate-700/50 focus-within:border-blue-500/70 focus-within:shadow-[0_0_10px_rgba(59,130,246,0.1)] transition-all">
-                                    <Icon name="Search" className="text-slate-500 mr-3 shrink-0" size={18} />
-                                    <input 
-                                        type="text"
-                                        value={searchTerm}
-                                        onChange={(e) => setSearchTerm(e.target.value)}
-                                        placeholder="Smart Search: Source or Destination Shop..."
-                                        className="w-full bg-transparent border-none text-slate-200 placeholder-slate-500 focus:outline-none text-sm font-medium"
-                                        autoComplete="off"
-                                    />
-                                    {searchTerm && (
-                                        <button onClick={() => setSearchTerm('')} className="text-slate-500 hover:text-red-400 ml-2 transition-colors"><Icon name="XCircle" size={16} /></button>
-                                    )}
-                                </div>
 
-                                {/* Filter Controls Wrapper */}
-                                <div className="flex flex-col sm:flex-row gap-2">
-                                    {/* Source Dropdown */}
-                                    <div className="relative shrink-0 w-full sm:w-44">
-                                        <select 
-                                            name="receiver"
-                                            value={receiverFilter}
-                                            onChange={(e) => setReceiverFilter(e.target.value)}
-                                            className="w-full h-full min-h-[42px] bg-slate-900/80 rounded-xl pl-10 pr-8 py-2 border border-slate-700/50 text-slate-300 text-sm font-semibold focus:outline-none focus:border-blue-500/50 appearance-none cursor-pointer hover:bg-slate-800 transition-colors"
-                                        >
-                                            <option value="All">All Sources</option>
-                                            {shops.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
-                                        </select>
-                                        <div className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-500"><Icon name="Upload" size={16} /></div>
-                                        <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-slate-500"><Icon name="ChevronLeft" size={14} className="-rotate-90" /></div>
-                                    </div>
-                                    
-                                    {/* Des. Dropdown */}
-                                    <div className="relative shrink-0 w-full sm:w-44">
-                                        <select 
-                                            name="payee"
-                                            value={payeeFilter}
-                                            onChange={(e) => setPayeeFilter(e.target.value)}
-                                            className="w-full h-full min-h-[42px] bg-slate-900/80 rounded-xl pl-10 pr-8 py-2 border border-slate-700/50 text-slate-300 text-sm font-semibold focus:outline-none focus:border-blue-500/50 appearance-none cursor-pointer hover:bg-slate-800 transition-colors"
-                                        >
-                                            <option value="All">All Destinations</option>
-                                            {shops.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
-                                        </select>
-                                        <div className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-500"><Icon name="Download" size={16} /></div>
-                                        <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-slate-500"><Icon name="ChevronLeft" size={14} className="-rotate-90" /></div>
-                                    </div>
-
-                                    {/* Date Dropdown */}
-                                    <div className="relative shrink-0 w-full sm:w-40">
-                                        <select 
-                                            name="dateRangeType"
-                                            value={filters.dateRangeType}
-                                            onChange={onFilterChange}
-                                            className="w-full h-full min-h-[42px] bg-slate-900/80 rounded-xl pl-10 pr-8 py-2 border border-slate-700/50 text-slate-300 text-sm font-semibold focus:outline-none focus:border-blue-500/50 appearance-none cursor-pointer hover:bg-slate-800 transition-colors"
-                                        >
-                                            <option value="this_month">This Month</option>
-                                            <option value="last_month">Last Month</option>
-                                            <option value="this_year">This Year</option>
-                                            <option value="by_month">By Month</option>
-                                        </select>
-                                        <div className="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none text-slate-500"><Icon name="Calendar" size={16} /></div>
-                                        <div className="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-slate-500"><Icon name="ChevronLeft" size={14} className="-rotate-90" /></div>
-                                    </div>
-                                </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                            <div className="bg-red-900/20 border border-red-500/30 p-4 rounded-xl">
+                                <p className="text-[10px] uppercase text-red-400 font-bold mb-1">Total Pending Repayment (Est. KHR)</p>
+                                <p className="text-2xl font-mono font-bold text-red-300">{formatCurrency(totalPendingKhr, 'KHR')}</p>
                             </div>
-                            
-                            {/* Secondary Date Input */}
-                            {filters.dateRangeType === 'by_month' && (
-                                <div className="bg-slate-900/40 p-4 rounded-xl border border-slate-700/50 mb-6 flex flex-wrap gap-4 animate-in slide-in-from-top-2 -mt-4 mx-2">
-                                    <div className="w-full sm:w-64"><FormInput type="month" label="Select Month" name="month" value={filters.month} onChange={onFilterChange} /></div>
-                                </div>
-                            )}
-                            {/* --- END SMART FILTER BAR --- */}
-                        </>
+                            <FormSelect label="Filter by Shop" value={filterShop} onChange={e => setFilterShop(e.target.value)} options={[{value: 'all', label: 'All Shops'}, ...availableShops.map(s => ({value: s.name, label: s.name}))]} />
+                            <FormSelect label="Filter by Status" value={filterStatus} onChange={e => setFilterStatus(e.target.value)} options={[{value: 'all', label: 'All Statuses'}, {value: 'Pending', label: 'Pending'}, {value: 'Repaid', label: 'Repaid'}]} />
+                        </div>
+
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm text-left text-slate-300">
+                                <thead className="bg-slate-900/50 text-xs text-slate-400 uppercase">
+                                    <tr>
+                                        <th className="p-3">Date</th><th className="p-3">Shop</th>
+                                        <th className="p-3">Item / Description</th><th className="p-3">Responsible Party</th>
+                                        <th className="p-3 text-right">Cost KHR</th><th className="p-3 text-right">Cost USD</th>
+                                        <th className="p-3">Status</th><th className="p-3 text-center">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {filteredData.length === 0 ? (
+                                        <tr><td colSpan="8" className="p-6 text-center text-slate-500">No loss records found.</td></tr>
+                                    ) : (
+                                        filteredData.map(item => (
+                                            <tr key={item.id} className="hover:bg-slate-700/50">
+                                                <td className="p-3 whitespace-nowrap">{formatInCambodiaDateOnly(item.date)}</td>
+                                                <td className="p-3 font-semibold text-slate-200">{item.shop}</td>
+                                                <td className="p-3">{item.itemName}</td>
+                                                <td className="p-3">{item.responsibleParty}</td>
+                                                <td className="p-3 text-right font-mono text-red-300">{formatCurrency(item.amountKhr, 'KHR').replace('៛','')}</td>
+                                                <td className="p-3 text-right font-mono text-orange-300">{formatCurrency(item.amountUsd, 'USD').replace('$','')}</td>
+                                                <td className="p-3">
+                                                    {item.status === 'Repaid' ? (
+                                                        <span className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-emerald-500/20 text-emerald-400">
+                                                            Repaid
+                                                        </span>
+                                                    ) : userData?.role === 'Admin' ? (
+                                                        <button 
+                                                            onClick={() => {
+                                                                if (checkMonthLock(item.date)) {
+                                                                    showNotification("This month is closed and locked.", "error");
+                                                                    return;
+                                                                }
+                                                                setConfirmingRepay(item);
+                                                            }}
+                                                            className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-emerald-500/20 hover:text-emerald-400 hover:border-emerald-500/30 transition-all cursor-pointer active:scale-95 shadow-sm"
+                                                            title="Click to mark as Repaid"
+                                                        >
+                                                            Pending
+                                                        </button>
+                                                    ) : (
+                                                        <span 
+                                                            className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-red-500/10 text-red-400 border border-red-500/20 opacity-80 cursor-not-allowed"
+                                                            title="Only Admin can mark as Repaid"
+                                                        >
+                                                            Pending
+                                                        </span>
+                                                    )}
+                                                </td>
+                                                <td className="p-3 text-center flex justify-center gap-1">
+                                                    <Button variant="ghost" size="sm" onClick={() => { setEditingItem(item); setIsModalOpen(true); }} className="text-blue-400 hover:bg-blue-900/50"><Icon name="PenSquare"/></Button>
+                                                    {(userData?.role === 'Admin' || userData?.role === 'Management') && (
+                                                        <Button variant="ghost" size="sm" onClick={() => setDeletingItem(item)} className="text-red-400 hover:bg-red-900/50"><Icon name="Trash2"/></Button>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Card>
+
+                    {isModalOpen && (
+                        <LossAndBreakageModal 
+                            item={editingItem} 
+                            onClose={() => setIsModalOpen(false)} 
+                            onSave={handleSave} 
+                            shops={availableShops}
+                            staffList={staffList}
+                        />
                     )}
-                    <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="bg-slate-900/50 text-slate-300 uppercase text-xs"><tr><th className="p-2 text-left">No.</th><th className="p-2 text-left">Des. Shop</th><th className="p-2 text-left">Source Shop</th><th className="p-2 text-right">Total Amount (៛)</th></tr></thead><tbody className="divide-y divide-slate-700 text-slate-200">{iitPaymentData.map((t, index) => (<tr key={index} className="hover:bg-slate-700/50"><td className="p-2">{index + 1}</td><td className="p-2">{t.payee}</td><td className="p-2">{t.receiver}</td><td className="p-2 text-right font-mono">{formatCurrency(t.totalAmount, 'KHR')}</td></tr>))}</tbody><tfoot className="bg-slate-900/50 font-bold text-slate-100"><tr><td colSpan="3" className="p-2 text-right">Sub-Total</td><td className="p-2 text-right font-mono">{formatCurrency(subtotal, 'KHR')}</td></tr></tfoot></table></div>
-                </Card>
+                    
+                    {deletingItem && (
+                        <ConfirmationModal title="Delete Loss Record" message="Are you sure you want to delete this loss record?" onConfirm={handleDelete} onClose={() => setDeletingItem(null)} isSubmitting={false} confirmVariant="danger" />
+                    )}
+                    {confirmingRepay && (
+                        <ConfirmationModal 
+                            title="Confirm Repayment" 
+                            message={`Mark "${confirmingRepay.itemName}" as Repaid?`} 
+                            onConfirm={handleMarkRepaid} 
+                            onClose={() => setConfirmingRepay(null)} 
+                            isSubmitting={isRepaying} 
+                            confirmVariant="primary" 
+                            confirmText="Mark Repaid"
+                        />
+                    )}
+                </div>
             );
         };
 
@@ -6398,6 +6529,7 @@
                     <div className="border-b border-slate-700 flex space-x-1 sm:space-x-2 flex-wrap">
                         <TabButton tabName="pos" label="Purchase Orders" icon="ShoppingCart" isActive={activeTab === 'pos'} onClick={setActiveTab} />
                         <TabButton tabName="internal_transfer" label="Internal Transfer" icon="ArrowRightLeft" isActive={activeTab === 'internal_transfer'} onClick={setActiveTab} />
+                        <TabButton tabName="loss_breakage" label="Loss & Breakage" icon="XCircle" isActive={activeTab === 'loss_breakage'} onClick={setActiveTab} />
                         <TabButton tabName="iit_payment" label="IIT Payment Report" icon="FileText" isActive={activeTab === 'iit_payment'} onClick={setActiveTab} />
                         <TabButton tabName="vendor_tracking" label="Vendor Tracking" icon="BarChart3" isActive={activeTab === 'vendor_tracking'} onClick={setActiveTab} />
                         <TabButton tabName="vendors" label="Vendors" icon="Truck" isActive={activeTab === 'vendors'} onClick={setActiveTab} />
@@ -6405,6 +6537,7 @@
                     <div className="mt-6">
                         <div className={activeTab === 'pos' ? '' : 'hidden'}><PurchaseOrdersTab /></div>
                         <div className={activeTab === 'internal_transfer' ? '' : 'hidden'}><InternalTransferTab /></div>
+                        <div className={activeTab === 'loss_breakage' ? '' : 'hidden'}><LossAndBreakageTab /></div>
                         <div className={activeTab === 'vendor_tracking' ? '' : 'hidden'}><VendorTrackingTab /></div>
                         <div className={activeTab === 'vendors' ? '' : 'hidden'}><ManageVendorsSection /></div>
                         
@@ -6426,7 +6559,7 @@
         };
         
         const PurchaseOrderModal = ({ po, onClose }) => {
-            const { userData, shops, vendors, purchaseOrders, cashDrops, internalTransfers, appSettings, staffList, checkMonthLock, saleMarginHistory } = useData();
+            const { userData, shops, vendors, purchaseOrders, cashDrops, internalTransfers, appSettings, staffList, checkMonthLock, saleMarginHistory, lossAndRecovery } = useData();
             const { showNotification } = useNotification();
             const { addDoc, collection, doc, updateDoc, Timestamp } = window.Firebase;
             const isMounted = useRef(true);
@@ -6534,8 +6667,14 @@
                 const totalTransIn = internalTransfers.filter(it => it.toShop === activeShop).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate), 0);
                 const totalTransOut = internalTransfers.filter(it => it.fromShop === activeShop).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate), 0);
                 
-                return openingGCA + salesContribution - totalPO - totalTransIn + totalTransOut;
-            }, [formData.shop, shops, cashDrops, purchaseOrders, internalTransfers, appSettings, po, saleMarginHistory]);
+                // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
+                const totalRepaidLosses = (lossAndRecovery || [])
+                    .filter(loss => loss.shop === activeShop && loss.status === 'Repaid')
+                    .reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * exchangeRate), 0);
+                // -----------------------------------------------
+
+                return openingGCA + salesContribution - totalPO - totalTransIn + totalTransOut + totalRepaidLosses;
+            }, [formData.shop, shops, cashDrops, purchaseOrders, internalTransfers, appSettings, po, saleMarginHistory, lossAndRecovery]);
 
             const subTotalPOs = useMemo(() => {
                 const khr = parseFormattedNumber(formData.amountKhr);
@@ -11341,7 +11480,7 @@
             const data = useMonthlyData({ ...filters, dateRangeType: 'by_month' });
             
             // --- NEW: Hooks for Month-End Close ---
-            const { closedMonths, userData, logActivity } = useData();
+            const { closedMonths, userData, logActivity, lossAndRecovery } = useData();
             const { showNotification } = useNotification();
             const { addDoc, deleteDoc, doc, collection, Timestamp } = window.Firebase;
             
@@ -11415,7 +11554,14 @@
                     const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersOutAllTime = data.allTransfers.filter(it => it.fromShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime;
+                    
+                    // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
+                    const totalRepaidLossesAllTime = (lossAndRecovery || [])
+                        .filter(loss => loss.shop === shop.name && loss.status === 'Repaid')
+                        .reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
+                    // -----------------------------------------------
+
+                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + totalRepaidLossesAllTime;
 
                     const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                     const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
@@ -11508,7 +11654,14 @@
                     const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersOutAllTime = data.allTransfers.filter(it => it.fromShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime;
+                    
+                    // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
+                    const totalRepaidLossesAllTime = (lossAndRecovery || [])
+                        .filter(loss => loss.shop === shop.name && loss.status === 'Repaid')
+                        .reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
+                    // -----------------------------------------------
+
+                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + totalRepaidLossesAllTime;
 
                     const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                     const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
@@ -11568,7 +11721,7 @@
                 }, { totalNetSale: 0, totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, totalExpense: 0, finalNetIncome: 0, totalCOH: 0 });
 
                 return { shopCalculations, shopTotals, shareholderData, shareholderTotals };
-            }, [data, getMarginForReport, closedSnapshot]); // <-- ADDED closedSnapshot as dependency
+            }, [data, getMarginForReport, closedSnapshot, lossAndRecovery]); // <-- ADDED lossAndRecovery as dependency
 
             // --- NEW: Handlers for Month-End Close ---
             const executeCloseMonth = async () => {
