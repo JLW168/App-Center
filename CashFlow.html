@@ -179,12 +179,27 @@
         };
 
         const getCambodiaISODate = (date = new Date()) => date.toLocaleDateString('en-CA', { timeZone: 'Asia/Phnom_Penh' });
-        const formatInCambodiaTime = (ts) => ts?.toDate ? ts.toDate().toLocaleString('en-GB', { timeZone: 'Asia/Phnom_Penh', year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true }).replace(',', '') : 'N/A';
-        const formatInCambodiaDateOnly = (ts) => ts?.toDate ? ts.toDate().toLocaleDateString('en-GB', { timeZone: 'Asia/Phnom_Penh' }).split('/').reverse().join('-') : 'N/A';
+        
+        // --- FIXED: Date formatters now safely handle both Firebase Timestamps and Native Date objects ---
+        const formatInCambodiaTime = (ts) => {
+            if (!ts) return 'N/A';
+            const d = ts.toDate ? ts.toDate() : new Date(ts);
+            if (isNaN(d)) return 'N/A';
+            return d.toLocaleString('en-GB', { timeZone: 'Asia/Phnom_Penh', year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true }).replace(',', '');
+        };
+
+        const formatInCambodiaDateOnly = (ts) => {
+            if (!ts) return 'N/A';
+            const d = ts.toDate ? ts.toDate() : new Date(ts);
+            if (isNaN(d)) return 'N/A';
+            return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Phnom_Penh' }).split('/').reverse().join('-');
+        };
         
         const formatInCambodiaDateAndTime = (ts) => {
-            if (!ts?.toDate) return 'N/A';
-            const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Phnom_Penh', year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true }).formatToParts(ts.toDate()).reduce((acc, part) => { acc[part.type] = part.value; return acc; }, {});
+            if (!ts) return 'N/A';
+            const dateObj = ts.toDate ? ts.toDate() : new Date(ts);
+            if (isNaN(dateObj)) return 'N/A';
+            const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Phnom_Penh', year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true }).formatToParts(dateObj).reduce((acc, part) => { acc[part.type] = part.value; return acc; }, {});
             const d = String(parts.day).padStart(2, '0');
             const m = String(parts.month).padStart(2, '0');
             const h = String(parts.hour).padStart(2, '0');
@@ -192,6 +207,7 @@
             const ampm = parts.dayPeriod?.toLowerCase() || '';
             return `${d}-${m}-${parts.year} -${h}:${min} ${ampm}`;
         };
+        // -------------------------------------------------------------------------------------------------
 
         const createTimestampFromDateAndCurrentTime = (dateString) => {
             const now = new Date();
@@ -492,6 +508,7 @@
                 auditLogs: useCollection('auditLogs', auditLogQuery), // <-- ADDED
                 capitalInvestments: useCollection('capitalInvestments'), // <-- ADDED CAPEX
                 closedMonths: useCollection('closedMonths'), // <-- NEW: Month-End Close Snapshot
+                lossAndRecovery: useCollection('lossAndRecovery'), // <-- ADDED Phase 1
             };
 
             const appSettings = useDocument("settings", "app") || { exchangeRate: 4000 };
@@ -2824,7 +2841,7 @@
 
         // --- NEW PAGE: Dashboard Page ---
         const DashboardPage = () => {
-            const { shops, userData, cashDrops, purchaseOrders, internalTransfers, businessExpenses, appSettings, saleMarginHistory, targetHistory } = useData();
+            const { shops, userData, cashDrops, purchaseOrders, internalTransfers, businessExpenses, appSettings, saleMarginHistory, targetHistory, lossAndRecovery, gcaHistory } = useData();
             const { showNotification } = useNotification();
 
             const [filters, setFilters] = useState({
@@ -2902,7 +2919,7 @@
                         poCurr: 0, poPrev: 0, poAllTime: 0,
                         transInCurr: 0, transInAllTime: 0,
                         transOutCurr: 0, transOutAllTime: 0,
-                        salesContributionAllTime: 0, gcaAdjustment: 0 
+                        salesContributionAllTime: 0, gcaAdjustment: 0, repaidLossesAllTime: 0 
                     };
                     shopConfig[s.name] = { defaultMargin: s.saleMargin || 0, openingGCA: s.gca || 0 };
                 });
@@ -2920,71 +2937,106 @@
 
                     if (d >= currStart && d <= currEnd) add(cd.shop, 'salesCurr', amount);
                     if (d >= prevStart && d <= prevEnd) add(cd.shop, 'salesPrev', amount);
-
-                    const monthKey = d.toISOString().slice(0, 7);
-                    const historyKey = `${cd.shop}|${monthKey}`;
-                    const effectiveMargin = marginHistoryMap.has(historyKey) ? marginHistoryMap.get(historyKey) : (shopConfig[cd.shop]?.defaultMargin || 0);
-                    const contribution = amount * (1 - (effectiveMargin / 100));
-                    add(cd.shop, 'salesContributionAllTime', contribution);
                 });
 
-                // 2. Expenses
+                // 2. Business Expenses
                 businessExpenses.forEach(e => {
-                    if (!stats[e.shop]) return;
+                    if (!stats[e.shop] || e.type !== 'Business') return;
                     const d = e.date?.toDate ? e.date.toDate() : new Date(e.date);
                     const amount = e.totalAmountKhr || 0;
                     if (d >= currStart && d <= currEnd) add(e.shop, 'expCurr', amount);
                     if (d >= prevStart && d <= prevEnd) add(e.shop, 'expPrev', amount);
                 });
 
-                // 3. POs
+                // 3. Purchase Orders
                 purchaseOrders.forEach(po => {
                     if (!stats[po.shop]) return;
-                    const amount = (po.amountKhr || 0) + ((po.amountUsd || 0) * exchangeRate);
-                    add(po.shop, 'poAllTime', amount);
-                    
                     const d = po.date?.toDate ? po.date.toDate() : new Date(po.date);
+                    const amount = (po.amountKhr || 0) + ((po.amountUsd || 0) * exchangeRate);
                     if (d >= currStart && d <= currEnd) add(po.shop, 'poCurr', amount);
                     if (d >= prevStart && d <= prevEnd) add(po.shop, 'poPrev', amount);
-
+                    stats[po.shop].poAllTime += amount;
                     if (po.status === 'Unpaid') globalUnpaidPO += amount;
                 });
 
-                // 4. Transfers
-                internalTransfers.forEach(t => {
-                    const amount = (t.amountKhr || 0) + ((t.amountUsd || 0) * exchangeRate);
-                    const d = t.date?.toDate ? t.date.toDate() : new Date(t.date);
-                    if (stats[t.fromShop]) { 
-                        add(t.fromShop, 'transOutAllTime', amount); 
-                        if (d >= currStart && d <= currEnd) add(t.fromShop, 'transOutCurr', amount); 
+                // 4. Internal Transfers
+                internalTransfers.forEach(it => {
+                    const d = it.date?.toDate ? it.date.toDate() : new Date(it.date);
+                    const amount = (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate);
+                    
+                    if (stats[it.toShop]) {
+                        if (d >= currStart && d <= currEnd) add(it.toShop, 'transInCurr', amount);
+                        stats[it.toShop].transInAllTime += amount;
                     }
-                    if (stats[t.toShop]) { 
-                        add(t.toShop, 'transInAllTime', amount); 
-                        if (d >= currStart && d <= currEnd) add(t.toShop, 'transInCurr', amount); 
+                    if (stats[it.fromShop]) {
+                        if (d >= currStart && d <= currEnd) add(it.fromShop, 'transOutCurr', amount);
+                        stats[it.fromShop].transOutAllTime += amount;
                     }
                 });
+
+                // --- Calculate Sales Contribution ---
+                cashDrops.forEach(cd => {
+                    if (!stats[cd.shop]) return;
+                    const dateObj = cd.createdAt?.toDate ? cd.createdAt.toDate() : new Date(cd.createdAt);
+                    const month = dateObj.toISOString().slice(0, 7);
+                    const defaultMargin = shopConfig[cd.shop]?.defaultMargin || 0;
+                    const effectiveMargin = marginHistoryMap.has(`${cd.shop}|${month}`) 
+                        ? marginHistoryMap.get(`${cd.shop}|${month}`) 
+                        : defaultMargin;
+                    
+                    const amount = (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
+                    stats[cd.shop].salesContributionAllTime += amount;
+                });
+
+                // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
+                if (lossAndRecovery) {
+                    lossAndRecovery.forEach(loss => {
+                        if (!stats[loss.shop]) return;
+                        if (loss.status === 'Repaid') {
+                            const amount = (loss.amountKhr || 0) + ((loss.amountUsd || 0) * exchangeRate);
+                            stats[loss.shop].repaidLossesAllTime += amount;
+                        }
+                    });
+                }
+                // -----------------------------------------------
+
+                // --- FIXED: Process manual GCA Adjustments ---
+                if (gcaHistory) {
+                    gcaHistory.forEach(adj => {
+                        if (stats[adj.shopName]) {
+                            stats[adj.shopName].gcaAdjustment += (adj.adjustmentAmount || 0);
+                        }
+                    });
+                }
+                // ---------------------------------------------
 
                 // 5. Final Calculation
                 const processedData = availableShops.map(shop => {
                     const s = stats[shop.name];
                     const config = shopConfig[shop.name];
-                    const currentGCA = config.openingGCA + s.salesContributionAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment;
-
-                    // Target Scaling based on Period
-                    const thisMonthKey = new Date().toISOString().slice(0, 7);
-                    const historyKey = `${shop.name}|${thisMonthKey}`;
-                    const baseTarget = targetHistoryMap.has(historyKey) ? targetHistoryMap.get(historyKey) : (shop.target || 0);
-
-                    let daysInPeriod = Math.max(1, Math.ceil((currEnd - currStart) / (1000 * 60 * 60 * 24)));
-                    let periodTarget = (baseTarget / 30) * daysInPeriod;
-                    if (filters.period === 'this_month' || filters.period === 'last_month') periodTarget = baseTarget;
-                    if (filters.period === 'this_year') periodTarget = baseTarget * 12;
-
-                    const progress = periodTarget > 0 ? (s.salesCurr / periodTarget) * 100 : 0;
+                    const currentGCA = config.openingGCA + s.salesContributionAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
 
                     globalGCA += currentGCA;
                     globalSalesCurr += s.salesCurr;
                     globalExpenseCurr += s.expCurr;
+
+                    // --- FIXED: Calculate Target and Progress ---
+                    let monthKey = '';
+                    if (currStart) {
+                        const year = currStart.getFullYear();
+                        const month = String(currStart.getMonth() + 1).padStart(2, '0');
+                        monthKey = `${year}-${month}`;
+                    } else {
+                        const now = new Date();
+                        monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                    }
+                    
+                    const periodTarget = targetHistoryMap.has(`${shop.name}|${monthKey}`) 
+                        ? targetHistoryMap.get(`${shop.name}|${monthKey}`) 
+                        : (shop.target || 0);
+                        
+                    const progress = periodTarget > 0 ? (s.salesCurr / periodTarget) * 100 : 0;
+                    // ------------------------------------------
 
                     return { ...shop, ...s, currentGCA, periodTarget, progress };
                 });
@@ -4859,6 +4911,297 @@
         };
         // --- END: ComparisonReport ---
 
+        // ==========================================
+        // --- NEW COMPONENT: Loss & Breakage Tab ---
+        // ==========================================
+        const LossAndBreakageModal = ({ item, onClose }) => {
+            const { shops, staffList, userData } = useData();
+            const { showNotification } = useNotification();
+            const { addDoc, collection, doc, updateDoc, Timestamp } = window.Firebase;
+            const [isSubmitting, setIsSubmitting] = useState(false);
+
+            const availableShops = useMemo(() => {
+                if (!userData) return [];
+                if (userData.role === 'Admin' || userData.role === 'Management') return shops;
+                return shops.filter(s => userData.shopIds?.includes(s.id));
+            }, [shops, userData]);
+
+            const [formData, setFormData] = useState({
+                date: getCambodiaISODate(),
+                shop: availableShops[0]?.name || '',
+                itemName: '',
+                amountKhr: '',
+                amountUsd: '',
+                responsibleParty: '',
+                status: 'Pending',
+                note: ''
+            });
+
+            useEffect(() => {
+                if (item) {
+                    setFormData({
+                        ...item,
+                        date: item.date?.toDate ? getCambodiaISODate(item.date.toDate()) : item.date,
+                        amountKhr: String(item.amountKhr || ''),
+                        amountUsd: String(item.amountUsd || '')
+                    });
+                }
+            }, [item]);
+
+            // Filter staff based on selected shop
+            const filteredStaffList = useMemo(() => {
+                if (!formData.shop) return [];
+                const selectedShop = shops.find(s => s.name === formData.shop);
+                if (!selectedShop) return [];
+                
+                return staffList.filter(staff => {
+                    const isCurrentlySelected = formData.responsibleParty && staff.name === formData.responsibleParty;
+                    const belongsToShop = staff.shopIds?.includes(selectedShop.id);
+                    const isActive = staff.status !== 'Inactive';
+                    return isCurrentlySelected || (belongsToShop && isActive);
+                });
+            }, [formData.shop, shops, staffList, formData.responsibleParty]);
+
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => {
+                    const next = { ...prev, [name]: value };
+                    if (name === 'shop') next.responsibleParty = '';
+                    return next;
+                });
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsSubmitting(true);
+                try {
+                    const dataToSave = {
+                        date: createTimestampFromDateAndCurrentTime(formData.date),
+                        shop: formData.shop,
+                        itemName: formData.itemName,
+                        amountKhr: parseFormattedNumber(formData.amountKhr),
+                        amountUsd: parseFormattedNumber(formData.amountUsd),
+                        responsibleParty: formData.responsibleParty,
+                        status: formData.status,
+                        note: formData.note,
+                        createdBy: item ? item.createdBy : userData.uid,
+                        createdByName: item ? item.createdByName : userData.name,
+                        updatedAt: Timestamp.now()
+                    };
+
+                    if (formData.status === 'Repaid' && (!item || item.status !== 'Repaid')) {
+                        dataToSave.repaidAt = Timestamp.now();
+                    } else if (item && item.status === 'Repaid') {
+                        dataToSave.repaidAt = item.repaidAt;
+                    }
+
+                    if (item?.id) {
+                        await updateDoc(doc(window.db, "lossAndRecovery", item.id), dataToSave);
+                        showNotification("Loss record updated.", "success");
+                    } else {
+                        await addDoc(collection(window.db, "lossAndRecovery"), { ...dataToSave, createdAt: Timestamp.now() });
+                        showNotification("Loss record added.", "success");
+                    }
+                    onClose();
+                } catch (err) {
+                    showNotification("Failed to save.", "error");
+                } finally {
+                    setIsSubmitting(false);
+                }
+            };
+
+            return (
+                <Modal title={item ? 'Edit Loss Record' : 'Report Loss & Breakage'} onClose={onClose} size="md">
+                    <form onSubmit={handleSubmit} className="space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <FormInput label="Date" type="date" name="date" value={formData.date} onChange={handleChange} required />
+                            <FormSelect label="Shop" name="shop" value={formData.shop} onChange={handleChange} options={availableShops.map(s => ({value: s.name, label: s.name}))} required />
+                        </div>
+                        <FormInput label="Item Name / Description" name="itemName" value={formData.itemName} onChange={handleChange} placeholder="e.g. Broken blender part" required />
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-700/30 p-4 rounded-lg border border-slate-700">
+                            <LiveFormatInput label="Cost (KHR)" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+                            <LiveFormatInput label="Cost (USD)" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <FormSelect label="Responsible Party" name="responsibleParty" value={formData.responsibleParty} onChange={handleChange} options={[{value: '', label: 'Select Person'}, ...filteredStaffList.map(s => ({value: s.name, label: s.name}))]} required />
+                            <FormSelect label="Status" name="status" value={formData.status} onChange={handleChange} options={[{value: 'Pending', label: 'Pending (Owed)'}, {value: 'Repaid', label: 'Repaid'}]} disabled={userData?.role !== 'Admin' && formData.status === 'Pending'} />
+                            <FormInput label="Reported By" value={item ? (item.createdByName || 'Unknown') : (userData?.name || 'Unknown')} disabled icon="Lock" />
+                        </div>
+                        <FormTextarea label="Note" name="note" value={formData.note} onChange={handleChange} placeholder="Optional notes..." />
+                        <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
+                            <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : "CheckCircle"}>Save</Button>
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        const LossAndBreakageTab = () => {
+            const { lossAndRecovery, shops, userData, appSettings, checkMonthLock } = useData();
+            const { showNotification } = useNotification();
+            const { doc, deleteDoc, updateDoc, Timestamp } = window.Firebase;
+
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingItem, setEditingItem] = useState(null);
+            const [deletingItem, setDeletingItem] = useState(null);
+            const [confirmingRepay, setConfirmingRepay] = useState(null);
+            const [isRepaying, setIsRepaying] = useState(false);
+            
+            const [filterShop, setFilterShop] = useState('all');
+            const [filterStatus, setFilterStatus] = useState('all');
+
+            const availableShops = useMemo(() => {
+                if (!userData) return [];
+                if (userData.role === 'Admin' || userData.role === 'Management') return shops;
+                return shops.filter(s => userData.shopIds?.includes(s.id));
+            }, [shops, userData]);
+
+            const filteredData = useMemo(() => {
+                if (!lossAndRecovery) return [];
+                return lossAndRecovery.filter(item => {
+                    if (filterShop !== 'all' && item.shop !== filterShop) return false;
+                    if (filterStatus !== 'all' && item.status !== filterStatus) return false;
+                    
+                    const isAllowedShop = availableShops.some(s => s.name === item.shop);
+                    if (!isAllowedShop && userData?.role !== 'Admin' && userData?.role !== 'Management') return false;
+
+                    return true;
+                }).sort((a, b) => (b.date?.toDate()?.getTime() || 0) - (a.date?.toDate()?.getTime() || 0));
+            }, [lossAndRecovery, filterShop, filterStatus, availableShops, userData]);
+
+            const totalPendingKhr = useMemo(() => {
+                return filteredData.filter(i => i.status === 'Pending').reduce((sum, i) => {
+                    const khr = i.amountKhr || 0;
+                    const usd = i.amountUsd || 0;
+                    return sum + khr + (usd * (appSettings.exchangeRate || 4100));
+                }, 0);
+            }, [filteredData, appSettings.exchangeRate]);
+
+            const handleDelete = async () => {
+                if (!deletingItem) return;
+                if (checkMonthLock(deletingItem.date)) {
+                    showNotification("This month is closed and locked.", "error");
+                    setDeletingItem(null); return;
+                }
+                try {
+                    await deleteDoc(doc(window.db, "lossAndRecovery", deletingItem.id));
+                    showNotification("Record deleted.", "success");
+                } catch (err) {
+                    showNotification("Failed to delete.", "error");
+                } finally {
+                    setDeletingItem(null);
+                }
+            };
+
+            const handleMarkRepaid = async () => {
+                if (!confirmingRepay) return;
+                const item = confirmingRepay;
+                if (checkMonthLock(item.date)) {
+                    showNotification("This month is closed and locked.", "error");
+                    setConfirmingRepay(null); return;
+                }
+                setIsRepaying(true);
+                try {
+                    await updateDoc(doc(window.db, "lossAndRecovery", item.id), {
+                        status: 'Repaid',
+                        repaidAt: Timestamp.now(),
+                        updatedAt: Timestamp.now()
+                    });
+                    showNotification("Marked as Repaid.", "success");
+                } catch (err) {
+                    showNotification("Failed to update status.", "error");
+                } finally {
+                    setIsRepaying(false);
+                    setConfirmingRepay(null);
+                }
+            };
+
+            return (
+                <div className="space-y-6">
+                    <Card>
+                        <div className="flex flex-col sm:flex-row justify-between items-center mb-6 border-b border-slate-700 pb-4 gap-4">
+                            <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                                <Icon name="XCircle" className="text-red-400" />
+                                Loss & Breakage Tracking
+                            </h2>
+                            <Button onClick={() => { setEditingItem(null); setIsModalOpen(true); }} icon="Plus">Report Loss</Button>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                            <div className="p-4 rounded-xl bg-gradient-to-br from-red-500/10 to-orange-600/5 border border-red-500/20 shadow-lg">
+                                <p className="text-xs font-bold text-red-400 uppercase tracking-wider mb-1">Total Pending Repayment</p>
+                                <p className="text-2xl font-mono font-bold text-white">{formatCurrency(totalPendingKhr, 'KHR')}</p>
+                            </div>
+                            <div className="md:col-span-2 grid grid-cols-2 gap-4 bg-slate-900/50 p-4 rounded-xl border border-slate-700">
+                                <FormSelect label="Filter by Shop" value={filterShop} onChange={e => setFilterShop(e.target.value)} options={[{value:'all', label:'All Shops'}, ...availableShops.map(s => ({value: s.name, label: s.name}))]} />
+                                <FormSelect label="Filter by Status" value={filterStatus} onChange={e => setFilterStatus(e.target.value)} options={[{value:'all', label:'All Status'}, {value:'Pending', label:'Pending'}, {value:'Repaid', label:'Repaid'}]} />
+                            </div>
+                        </div>
+
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm text-left text-slate-300">
+                                <thead className="bg-slate-900/50 text-xs text-slate-400 uppercase">
+                                    <tr>
+                                        <th className="p-3">Date</th>
+                                        <th className="p-3">Shop</th>
+                                        <th className="p-3">Item / Description</th>
+                                        <th className="p-3">Responsible Party</th>
+                                        <th className="p-3 text-right">Cost KHR</th>
+                                        <th className="p-3 text-right">Cost USD</th>
+                                        <th className="p-3 text-center">Status</th>
+                                        <th className="p-3 text-center">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {filteredData.length === 0 ? (
+                                        <tr><td colSpan="8" className="p-8 text-center text-slate-500">No loss records found.</td></tr>
+                                    ) : (
+                                        filteredData.map(item => (
+                                            <tr key={item.id} className="hover:bg-slate-700/50">
+                                                <td className="p-3 whitespace-nowrap font-mono">{formatInCambodiaDateOnly(item.date)}</td>
+                                                <td className="p-3 font-semibold text-slate-200">{item.shop}</td>
+                                                <td className="p-3">{item.itemName}</td>
+                                                <td className="p-3 text-blue-300"><Icon name="Users" size={12} className="inline mr-1"/>{item.responsibleParty}</td>
+                                                <td className="p-3 text-right font-mono text-red-300">{formatCurrency(item.amountKhr, 'KHR').replace('៛','')}</td>
+                                                <td className="p-3 text-right font-mono text-orange-300">{formatCurrency(item.amountUsd, 'USD').replace('$','')}</td>
+                                                <td className="p-3 text-center">
+                                                    {item.status === 'Repaid' ? (
+                                                        <span className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-emerald-500/20 text-emerald-400">Repaid</span>
+                                                    ) : userData?.role === 'Admin' ? (
+                                                        <button 
+                                                            onClick={() => setConfirmingRepay(item)}
+                                                            className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-emerald-500/20 hover:text-emerald-400 hover:border-emerald-500/30 transition-all cursor-pointer active:scale-95 shadow-sm"
+                                                            title="Click to mark as Repaid"
+                                                        >
+                                                            Pending
+                                                        </button>
+                                                    ) : (
+                                                        <span className="px-2 py-1 text-[10px] uppercase font-bold rounded bg-red-500/10 text-red-400 border border-red-500/20 opacity-80 cursor-not-allowed" title="Only Admin can mark as Repaid">Pending</span>
+                                                    )}
+                                                </td>
+                                                <td className="p-3 text-center flex justify-center gap-1">
+                                                    <Button variant="ghost" size="sm" onClick={() => { setEditingItem(item); setIsModalOpen(true); }} className="text-blue-400 hover:bg-blue-900/50"><Icon name="PenSquare"/></Button>
+                                                    {(userData?.role === 'Admin' || userData?.role === 'Management') && (
+                                                        <Button variant="ghost" size="sm" onClick={() => setDeletingItem(item)} className="text-red-400 hover:bg-red-900/50"><Icon name="Trash2"/></Button>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </Card>
+
+                    {isModalOpen && <LossAndBreakageModal item={editingItem} onClose={() => setIsModalOpen(false)} />}
+                    {deletingItem && <ConfirmationModal title="Delete Loss Record" message="Are you sure you want to delete this loss record?" onConfirm={handleDelete} onClose={() => setDeletingItem(null)} isSubmitting={false} confirmVariant="danger" confirmText="Delete" />}
+                    {confirmingRepay && <ConfirmationModal title="Confirm Repayment" message={`Mark "${confirmingRepay.itemName}" as Repaid?`} onConfirm={handleMarkRepaid} onClose={() => setConfirmingRepay(null)} isSubmitting={isRepaying} confirmVariant="primary" confirmText="Mark Repaid" />}
+                </div>
+            );
+        };
+        // --- END: Loss & Breakage ---
+
         // --- NEW COMPONENT: BillCounterModal ---
         const BillCounterModal = ({ currency, onClose, onApply }) => {
             const [counts, setCounts] = useState({});
@@ -5630,10 +5973,7 @@
                 if (dueTime === 'Today') {
                     const startOfToday = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0) - cambodiaOffset);
                     const endOfToday = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 23, 59, 59, 999) - cambodiaOffset);
-                    filtered = userFilteredReports.filter(r => {
-                        const reportDate = r.createdAt?.toDate();
-                        return reportDate >= startOfToday && reportDate <= endOfToday;
-                    });
+                    filtered = userFilteredReports.filter(r => { const reportDate = r.createdAt?.toDate(); return reportDate >= startOfToday && reportDate <= endOfToday; });
                 } else if (dueTime === 'Yesterday') {
                     const yesterday = new Date(now.getTime() - (24 * 60 * 60 * 1000));
                     const yParts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(yesterday).reduce((acc, part) => { if (part.type !== 'literal') acc[part.type] = parseInt(part.value, 10); return acc; }, {});
@@ -6398,6 +6738,7 @@
                     <div className="border-b border-slate-700 flex space-x-1 sm:space-x-2 flex-wrap">
                         <TabButton tabName="pos" label="Purchase Orders" icon="ShoppingCart" isActive={activeTab === 'pos'} onClick={setActiveTab} />
                         <TabButton tabName="internal_transfer" label="Internal Transfer" icon="ArrowRightLeft" isActive={activeTab === 'internal_transfer'} onClick={setActiveTab} />
+                        <TabButton tabName="loss_breakage" label="Loss & Breakage" icon="XCircle" isActive={activeTab === 'loss_breakage'} onClick={setActiveTab} />
                         <TabButton tabName="iit_payment" label="IIT Payment Report" icon="FileText" isActive={activeTab === 'iit_payment'} onClick={setActiveTab} />
                         <TabButton tabName="vendor_tracking" label="Vendor Tracking" icon="BarChart3" isActive={activeTab === 'vendor_tracking'} onClick={setActiveTab} />
                         <TabButton tabName="vendors" label="Vendors" icon="Truck" isActive={activeTab === 'vendors'} onClick={setActiveTab} />
@@ -6405,6 +6746,7 @@
                     <div className="mt-6">
                         <div className={activeTab === 'pos' ? '' : 'hidden'}><PurchaseOrdersTab /></div>
                         <div className={activeTab === 'internal_transfer' ? '' : 'hidden'}><InternalTransferTab /></div>
+                        <div className={activeTab === 'loss_breakage' ? '' : 'hidden'}><LossAndBreakageTab /></div>
                         <div className={activeTab === 'vendor_tracking' ? '' : 'hidden'}><VendorTrackingTab /></div>
                         <div className={activeTab === 'vendors' ? '' : 'hidden'}><ManageVendorsSection /></div>
                         
@@ -6426,7 +6768,7 @@
         };
         
         const PurchaseOrderModal = ({ po, onClose }) => {
-            const { userData, shops, vendors, purchaseOrders, cashDrops, internalTransfers, appSettings, staffList, checkMonthLock, saleMarginHistory } = useData();
+            const { userData, shops, vendors, purchaseOrders, cashDrops, internalTransfers, appSettings, staffList, checkMonthLock, saleMarginHistory, lossAndRecovery, gcaHistory } = useData();
             const { showNotification } = useNotification();
             const { addDoc, collection, doc, updateDoc, Timestamp } = window.Firebase;
             const isMounted = useRef(true);
@@ -6534,8 +6876,16 @@
                 const totalTransIn = internalTransfers.filter(it => it.toShop === activeShop).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate), 0);
                 const totalTransOut = internalTransfers.filter(it => it.fromShop === activeShop).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate), 0);
                 
-                return openingGCA + salesContribution - totalPO - totalTransIn + totalTransOut;
-            }, [formData.shop, shops, cashDrops, purchaseOrders, internalTransfers, appSettings, po, saleMarginHistory]);
+                const totalRepaidLosses = (lossAndRecovery || [])
+                    .filter(loss => loss.shop === activeShop && loss.status === 'Repaid')
+                    .reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * exchangeRate), 0);
+
+                const totalAdjustments = (gcaHistory || [])
+                    .filter(adj => adj.shopName === activeShop)
+                    .reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
+
+                return openingGCA + salesContribution - totalPO - totalTransIn + totalTransOut + totalRepaidLosses + totalAdjustments;
+            }, [formData.shop, shops, cashDrops, purchaseOrders, internalTransfers, appSettings, po, saleMarginHistory, lossAndRecovery, gcaHistory]);
 
             const subTotalPOs = useMemo(() => {
                 const khr = parseFormattedNumber(formData.amountKhr);
@@ -6603,7 +6953,7 @@
                             <FormInput label="PO Date" type="date" name="poDate" value={formData.poDate} onChange={handleFormChange} />
                             <FormSelect label="Shop" name="shop" value={formData.shop} onChange={handleFormChange} options={availableShops.map(s => ({value: s.name, label: s.name}))} required />
                             <FormSelect label="Order By" name="orderBy" value={formData.orderBy} onChange={handleFormChange} options={staffList.filter(s => s.status !== 'Inactive').map(s => ({value: s.nickName || s.name, label: s.nickName || s.name}))} disabled={userData?.role !== 'Admin'}/>
-                            <FormInput label="Current GCA (៛)" value={currentGCA.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})} disabled readOnly />
+                            <FormInput label="GCA Balance (៛)" value={(currentGCA - subTotalPOs).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})} disabled readOnly />
                         </div>
                         
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -6685,10 +7035,100 @@
         // --- SearchableSelect was moved to Global UI Section ---
         
         const PurchaseOrderHistory = ({ onEdit, onCreate }) => {
-            const { purchaseOrders, shops, vendors, userData, appSettings, checkMonthLock } = useData();
+            const { purchaseOrders, shops, vendors, userData, appSettings, checkMonthLock, cashDrops, internalTransfers, saleMarginHistory, lossAndRecovery, gcaHistory } = useData();
             const { showNotification } = useNotification();
             const { doc, deleteDoc, updateDoc, Timestamp } = window.Firebase;
             const isMounted = useRef(true);
+
+            // --- PHASE 2: Calculate Chronological GCA Balance for each PO ---
+            const poHistoricalGCA = useMemo(() => {
+                if (!shops || !cashDrops || !purchaseOrders) return {};
+                const exchangeRate = appSettings.exchangeRate || 4100;
+
+                const runningGCA = {};
+                const marginMap = new Map();
+                if (saleMarginHistory) {
+                    saleMarginHistory.forEach(h => marginMap.set(`${h.shop}|${h.month}`, h.margin));
+                }
+
+                shops.forEach(s => {
+                    runningGCA[s.name] = s.gca || 0; 
+                });
+
+                const events = [];
+
+                if (cashDrops) {
+                    cashDrops.forEach(cd => {
+                        const d = cd.createdAt?.toDate ? cd.createdAt.toDate() : new Date(cd.createdAt);
+                        const monthKey = d.toISOString().slice(0, 7);
+                        const effectiveMargin = marginMap.has(`${cd.shop}|${monthKey}`) ? marginMap.get(`${cd.shop}|${monthKey}`) : (shops.find(s=>s.name===cd.shop)?.saleMargin || 0);
+                        const amount = (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
+                        events.push({ time: d.getTime(), type: 'sale', shop: cd.shop, amount });
+                    });
+                }
+
+                if (purchaseOrders) {
+                    purchaseOrders.forEach(po => {
+                        const d = po.date?.toDate ? po.date.toDate() : new Date(po.date);
+                        const amount = (po.amountKhr || 0) + ((po.amountUsd || 0) * exchangeRate);
+                        events.push({ time: d.getTime(), type: 'po', shop: po.shop, amount, poId: po.id });
+                    });
+                }
+
+                if (internalTransfers) {
+                    internalTransfers.forEach(t => {
+                        const d = t.date?.toDate ? t.date.toDate() : new Date(t.date);
+                        const amount = (t.amountKhr || 0) + ((t.amountUsd || 0) * exchangeRate);
+                        events.push({ time: d.getTime(), type: 'transOut', shop: t.fromShop, amount });
+                        events.push({ time: d.getTime(), type: 'transIn', shop: t.toShop, amount });
+                    });
+                }
+
+                if (lossAndRecovery) {
+                    lossAndRecovery.forEach(loss => {
+                        if (loss.status === 'Repaid') {
+                            const d = loss.repaidAt?.toDate ? loss.repaidAt.toDate() : new Date();
+                            const amount = (loss.amountKhr || 0) + ((loss.amountUsd || 0) * exchangeRate);
+                            events.push({ time: d.getTime(), type: 'repaidLoss', shop: loss.shop, amount });
+                        }
+                    });
+                }
+
+                if (gcaHistory) {
+                    gcaHistory.forEach(adj => {
+                        const d = adj.adjustedAt?.toDate ? adj.adjustedAt.toDate() : new Date(adj.adjustedAt);
+                        events.push({ time: d.getTime(), type: 'adjustment', shop: adj.shopName, amount: adj.adjustmentAmount || 0 });
+                    });
+                }
+
+                events.sort((a, b) => a.time - b.time);
+
+                const poGCA = {}; 
+
+                events.forEach(ev => {
+                    if (runningGCA[ev.shop] === undefined) runningGCA[ev.shop] = 0;
+
+                    if (ev.type === 'po') {
+                        runningGCA[ev.shop] -= ev.amount;
+                        poGCA[ev.poId] = {
+                            balanceGCA: runningGCA[ev.shop]
+                        };
+                    } else if (ev.type === 'sale') {
+                        runningGCA[ev.shop] += ev.amount;
+                    } else if (ev.type === 'transIn') {
+                        runningGCA[ev.shop] -= ev.amount;
+                    } else if (ev.type === 'transOut') {
+                        runningGCA[ev.shop] += ev.amount;
+                    } else if (ev.type === 'repaidLoss') {
+                        runningGCA[ev.shop] += ev.amount;
+                    } else if (ev.type === 'adjustment') {
+                        runningGCA[ev.shop] += ev.amount;
+                    }
+                });
+
+                return poGCA;
+            }, [shops, cashDrops, purchaseOrders, internalTransfers, saleMarginHistory, lossAndRecovery, gcaHistory, appSettings.exchangeRate]);
+            // -----------------------------------------------------------
 
             // --- UPDATED: Robust Role Check ---
             const normalizedRole = useMemo(() => userData?.role ? userData.role.trim() : '', [userData]);
@@ -7048,7 +7488,9 @@
                                     <th className="p-3">PO Date</th><th className="p-3">Shop</th><th className="p-3">Vendor</th>
                                     <th className="p-3">Order By</th>
                                     <th className="p-3 text-right">Amount KHR</th><th className="p-3 text-right">Amount USD</th>
-                                    <th className="p-3 text-right">Sub-Total (៛)</th><th className="p-3">Status</th>
+                                    <th className="p-3 text-right">Sub-Total (៛)</th>
+                                    <th className="p-3 text-right">GCA Balance</th>
+                                    <th className="p-3">Status</th>
                                     <th className="p-3 text-center">Actions</th>
                                 </tr>
                             </thead>
@@ -7084,7 +7526,12 @@
                                         >
                                             <span className="group-hover:underline decoration-dashed decoration-emerald-500/50 underline-offset-4">{subTotal.toLocaleString()}</span>
                                         </td>
-                                        {/* ------------------------------------------- */}
+                                        
+                                        <td className="p-3 text-right">
+                                            <div className="flex flex-col font-mono">
+                                                <span className="text-xs font-bold text-blue-400">{(poHistoricalGCA[po.id]?.balanceGCA || 0).toLocaleString()}</span>
+                                            </div>
+                                        </td>
 
                                         <td className="p-3">
                                             <span className={`px-2 py-1 text-xs rounded-full ${po.status === 'Paid' ? 'bg-green-500/20 text-green-300' : 'bg-yellow-500/20 text-yellow-300'}`}>
@@ -7138,10 +7585,10 @@
                                     <td className="p-3 text-right font-mono">{footerTotals.khr.toLocaleString()}</td>
                                     <td className="p-3 text-right font-mono">{footerTotals.usd.toLocaleString()}</td>
                                     <td className="p-3 text-right font-mono font-bold">{footerTotals.subTotal.toLocaleString()}</td>
-                                    <td colSpan="2"></td>
+                                    <td colSpan="3"></td>
                                 </tr>
                                 <tr>
-                                    <td colSpan="9" className="p-3">
+                                    <td colSpan="10" className="p-3">
                                         <div className="flex items-center justify-between">
                                             <div className="flex items-center gap-2">
                                                 <span className="text-sm">Rows per page:</span>
@@ -7244,6 +7691,13 @@
                                         </span>
                                     </div>
                                     {/* ------------------------------------------- */}
+
+                                    {/* --- PHASE 2: GCA Cashflow Mobile --- */}
+                                    <div className="flex justify-between items-center bg-slate-900/50 p-2.5 rounded-lg border border-slate-700/50 mt-3 shadow-inner">
+                                       <span className="text-[9px] text-blue-400 uppercase font-bold tracking-wider">GCA Balance</span>
+                                       <span className="font-mono text-sm font-bold text-blue-400">{(poHistoricalGCA[po.id]?.balanceGCA || 0).toLocaleString()}</span>
+                                    </div>
+                                    {/* -------------------------------- */}
 
                                     {/* --- UPDATED: Mobile Action Buttons (Split Layout) --- */}
                                     <div className="flex justify-between items-center mt-4 pt-3 border-t border-slate-700/30 border-dashed">
@@ -11337,11 +11791,276 @@
             <PageHeader title={title} subtitle="This section is under construction."/>
         );
        
+        // --- NEW COMPONENT: GCA Tracer Tab ---
+        const GCATracerTab = ({ globalMonth }) => {
+            const { shops, cashDrops, purchaseOrders, internalTransfers, saleMarginHistory, lossAndRecovery, gcaHistory, appSettings, userData } = useData();
+            
+            const availableShops = useMemo(() => {
+                if (!userData) return [];
+                if (userData.role === 'Admin' || userData.role === 'Management') return shops;
+                return shops.filter(s => userData.shopIds?.includes(s.id));
+            }, [shops, userData]);
+
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(globalMonth || new Date().toISOString().slice(0, 7));
+
+            useEffect(() => {
+                if (availableShops.length > 0 && !selectedShop) {
+                    setSelectedShop(availableShops[0].name);
+                }
+            }, [availableShops, selectedShop]);
+
+            useEffect(() => {
+                if (globalMonth) setSelectedMonth(globalMonth);
+            }, [globalMonth]);
+
+            const ledgerData = useMemo(() => {
+                if (!selectedShop || !shops) return { baseGCA: 0, events: [], currentGCA: 0 };
+                const exchangeRate = appSettings?.exchangeRate || 4100;
+                const shopObj = shops.find(s => s.name === selectedShop);
+                if (!shopObj) return { baseGCA: 0, events: [], currentGCA: 0 };
+
+                const baseGCA = shopObj.gca || 0;
+                const defaultMargin = shopObj.saleMargin || 0;
+
+                const marginMap = new Map();
+                if (saleMarginHistory) {
+                    saleMarginHistory.forEach(h => marginMap.set(`${h.shop}|${h.month}`, h.margin));
+                }
+
+                const events = [];
+
+                const getTimestamp = (val) => val?.toDate ? val.toDate() : new Date(val);
+
+                // 1. Sales (IN)
+                if (cashDrops) {
+                    cashDrops.filter(cd => cd.shop === selectedShop).forEach(cd => {
+                        const d = getTimestamp(cd.createdAt);
+                        const monthKey = d.toISOString().slice(0, 7);
+                        const effectiveMargin = marginMap.has(`${selectedShop}|${monthKey}`) ? marginMap.get(`${selectedShop}|${monthKey}`) : defaultMargin;
+                        const amount = (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
+                        events.push({
+                            id: cd.id, time: d.getTime(), dateObj: d, type: 'Sale', inOut: 'IN', amount, 
+                            desc: `Net Sales (Shift: ${cd.shift || 'N/A'})`, ref: cd.staff || 'N/A'
+                        });
+                    });
+                }
+
+                // 2. POs (OUT)
+                if (purchaseOrders) {
+                    purchaseOrders.filter(po => po.shop === selectedShop).forEach(po => {
+                        const d = getTimestamp(po.date);
+                        const amount = (po.amountKhr || 0) + ((po.amountUsd || 0) * exchangeRate);
+                        events.push({
+                            id: po.id, time: d.getTime(), dateObj: d, type: 'Purchase Order', inOut: 'OUT', amount, 
+                            desc: `Vendor: ${po.vendor}`, ref: po.orderBy || 'N/A'
+                        });
+                    });
+                }
+
+                // 3. Transfers IN (OUT of GCA - Paying for stock)
+                if (internalTransfers) {
+                    internalTransfers.filter(it => it.toShop === selectedShop).forEach(it => {
+                        const d = getTimestamp(it.date);
+                        const amount = (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate);
+                        events.push({
+                            id: it.id + '-in', time: d.getTime(), dateObj: d, type: 'Transfer IN', inOut: 'OUT', amount, 
+                            desc: `Stock From: ${it.fromShop}`, ref: it.transferredBy || 'N/A'
+                        });
+                    });
+                }
+
+                // 4. Transfers OUT (IN to GCA - Getting paid for stock)
+                if (internalTransfers) {
+                    internalTransfers.filter(it => it.fromShop === selectedShop).forEach(it => {
+                        const d = getTimestamp(it.date);
+                        const amount = (it.amountKhr || 0) + ((it.amountUsd || 0) * exchangeRate);
+                        events.push({
+                            id: it.id + '-out', time: d.getTime(), dateObj: d, type: 'Transfer OUT', inOut: 'IN', amount, 
+                            desc: `Stock To: ${it.toShop}`, ref: it.transferredBy || 'N/A'
+                        });
+                    });
+                }
+
+                // 5. Repaid Losses (IN)
+                if (lossAndRecovery) {
+                    lossAndRecovery.filter(l => l.shop === selectedShop && l.status === 'Repaid').forEach(l => {
+                        const d = getTimestamp(l.repaidAt || l.date); // Fallback to date if repaidAt missing
+                        const amount = (l.amountKhr || 0) + ((l.amountUsd || 0) * exchangeRate);
+                        events.push({
+                            id: l.id, time: d.getTime(), dateObj: d, type: 'Loss Repaid', inOut: 'IN', amount, 
+                            desc: `Recovered: ${l.itemName}`, ref: l.responsibleParty || 'N/A'
+                        });
+                    });
+                }
+
+                // 6. Adjustments (IN or OUT depending on sign)
+                if (gcaHistory) {
+                    gcaHistory.filter(adj => adj.shopName === selectedShop).forEach(adj => {
+                        const d = getTimestamp(adj.adjustedAt);
+                        const rawAmount = adj.adjustmentAmount || 0;
+                        events.push({
+                            id: adj.id, time: d.getTime(), dateObj: d, type: 'Manual Adjustment', 
+                            inOut: rawAmount >= 0 ? 'IN' : 'OUT', amount: Math.abs(rawAmount), 
+                            desc: `Reason: ${adj.reason}`, ref: adj.adjustedByName || 'Admin'
+                        });
+                    });
+                }
+
+                // Sort Chronologically (Oldest to Newest)
+                events.sort((a, b) => a.time - b.time);
+
+                // Calculate Running Balances walking through time
+                let runningGCA = baseGCA;
+                const processedEvents = events.map(ev => {
+                    const balanceBefore = runningGCA;
+                    if (ev.inOut === 'IN') runningGCA += ev.amount;
+                    else runningGCA -= ev.amount;
+                    return { ...ev, balanceBefore, balanceAfter: runningGCA };
+                });
+
+                return { baseGCA, events: processedEvents, currentGCA: runningGCA };
+            }, [selectedShop, shops, cashDrops, purchaseOrders, internalTransfers, lossAndRecovery, gcaHistory, saleMarginHistory, appSettings.exchangeRate]);
+
+            // Filter by selected month
+            const { monthEvents, monthOpening, monthClosing, totalIn, totalOut } = useMemo(() => {
+                const monthPrefix = selectedMonth; // "YYYY-MM"
+
+                let filteredEvents = [];
+                let opening = ledgerData.baseGCA;
+                
+                // Find opening balance (balance after the last event BEFORE this month)
+                for (let i = 0; i < ledgerData.events.length; i++) {
+                    const ev = ledgerData.events[i];
+                    const evMonth = ev.dateObj.toISOString().slice(0, 7);
+                    
+                    if (evMonth < monthPrefix) {
+                        opening = ev.balanceAfter;
+                    } else if (evMonth === monthPrefix) {
+                        filteredEvents.push(ev);
+                    } else if (evMonth > monthPrefix) {
+                        break; // Since it's chronologically sorted, we can stop here
+                    }
+                }
+
+                // Reverse chronologically for display (Newest at the top)
+                filteredEvents.sort((a, b) => b.time - a.time); 
+
+                // Closing balance is the balance after the newest event in the month
+                const closing = filteredEvents.length > 0 ? filteredEvents[0].balanceAfter : opening; 
+
+                let sumIn = 0;
+                let sumOut = 0;
+                filteredEvents.forEach(ev => {
+                    if (ev.inOut === 'IN') sumIn += ev.amount;
+                    else sumOut += ev.amount;
+                });
+
+                return { monthEvents: filteredEvents, monthOpening: opening, monthClosing: closing, totalIn: sumIn, totalOut: sumOut };
+            }, [ledgerData, selectedMonth]);
+
+            // Colors for Event Types
+            const getTypeBadge = (type) => {
+                switch(type) {
+                    case 'Sale': return 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
+                    case 'Purchase Order': return 'bg-orange-500/20 text-orange-400 border-orange-500/30';
+                    case 'Transfer IN': return 'bg-pink-500/20 text-pink-400 border-pink-500/30'; // Trans IN is OUT of GCA
+                    case 'Transfer OUT': return 'bg-blue-500/20 text-blue-400 border-blue-500/30'; // Trans OUT is IN to GCA
+                    case 'Loss Repaid': return 'bg-purple-500/20 text-purple-400 border-purple-500/30';
+                    case 'Manual Adjustment': return 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30';
+                    default: return 'bg-slate-500/20 text-slate-400 border-slate-500/30';
+                }
+            };
+
+            return (
+                <div className="space-y-6 animate-in fade-in">
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-700 pb-4 gap-4">
+                        <div>
+                            <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                                <Icon name="List" className="text-blue-400" />
+                                GCA Tracer Ledger
+                            </h2>
+                            <p className="text-sm text-slate-400">Chronological bank-statement view of all GCA movements.</p>
+                        </div>
+                        <div className="flex gap-4 w-full sm:w-auto">
+                            <FormSelect name="shop" value={selectedShop} onChange={e => setSelectedShop(e.target.value)} options={availableShops.map(s => ({value: s.name, label: s.name}))} className="w-full sm:w-48" />
+                            {/* Month is controlled globally by the parent tab, but we show it here for clarity */}
+                        </div>
+                    </div>
+
+                    {/* Summary Cards */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-sm">
+                            <p className="text-[10px] uppercase text-slate-500 font-bold mb-1">Opening Balance</p>
+                            <p className="text-lg font-mono font-bold text-slate-300">{formatCurrency(monthOpening, 'KHR').replace('៛', '')}</p>
+                        </div>
+                        <div className="bg-emerald-900/10 p-4 rounded-xl border border-emerald-500/20 shadow-sm">
+                            <p className="text-[10px] uppercase text-emerald-500 font-bold mb-1">Total IN</p>
+                            <p className="text-lg font-mono font-bold text-emerald-400">+{formatCurrency(totalIn, 'KHR').replace('៛', '')}</p>
+                        </div>
+                        <div className="bg-red-900/10 p-4 rounded-xl border border-red-500/20 shadow-sm">
+                            <p className="text-[10px] uppercase text-red-500 font-bold mb-1">Total OUT</p>
+                            <p className="text-lg font-mono font-bold text-red-400">-{formatCurrency(totalOut, 'KHR').replace('៛', '')}</p>
+                        </div>
+                        <div className="bg-blue-900/10 p-4 rounded-xl border border-blue-500/30 shadow-inner">
+                            <p className="text-[10px] uppercase text-blue-400 font-bold mb-1">Closing Balance ({selectedMonth})</p>
+                            <p className="text-lg font-mono font-bold text-blue-400">{formatCurrency(monthClosing, 'KHR').replace('៛', '')}</p>
+                        </div>
+                    </div>
+
+                    {/* Ledger Table */}
+                    <div className="overflow-x-auto border border-slate-700 rounded-xl">
+                        <table className="w-full text-sm text-left text-slate-300">
+                            <thead className="bg-slate-900/80 text-xs text-slate-400 uppercase border-b border-slate-700">
+                                <tr>
+                                    <th className="p-3">Date & Time</th>
+                                    <th className="p-3">Event Type</th>
+                                    <th className="p-3">Description</th>
+                                    <th className="p-3">Reference / By</th>
+                                    <th className="p-3 text-right">Amount (IN)</th>
+                                    <th className="p-3 text-right">Amount (OUT)</th>
+                                    <th className="p-3 text-right text-blue-300 bg-slate-800/50">Running Balance</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-700/50 bg-slate-800/30">
+                            {monthEvents.length === 0 ? (
+                                <tr><td colSpan="7" className="p-12 text-center text-slate-500 italic">No cash movements recorded for this month.</td></tr>
+                            ) : (
+                                monthEvents.map(ev => (
+                                    <tr key={ev.id} className="hover:bg-slate-700/80 transition-colors">
+                                            <td className="p-3 font-mono text-[11px] text-slate-400 whitespace-nowrap">{formatInCambodiaDateAndTime(ev.dateObj)}</td>
+                                            <td className="p-3">
+                                                <span className={`px-2 py-1 text-[10px] font-bold uppercase rounded border ${getTypeBadge(ev.type)}`}>
+                                                    {ev.type}
+                                                </span>
+                                            </td>
+                                            <td className="p-3 font-medium text-slate-200">{ev.desc}</td>
+                                            <td className="p-3 text-xs text-slate-400">{ev.ref}</td>
+                                            <td className="p-3 text-right font-mono text-emerald-400">{ev.inOut === 'IN' ? `+${formatCurrency(ev.amount, 'KHR').replace('៛','')}` : ''}</td>
+                                            <td className="p-3 text-right font-mono text-red-400">{ev.inOut === 'OUT' ? `-${formatCurrency(ev.amount, 'KHR').replace('៛','')}` : ''}</td>
+                                            <td className="p-3 text-right font-mono font-bold text-blue-300 bg-slate-800/50">{formatCurrency(ev.balanceAfter, 'KHR').replace('៛', '')}</td>
+                                        </tr>
+                                    ))
+                                )}
+
+                                {/* Month Opening Row */}
+                                <tr className="bg-slate-800 font-bold border-t-2 border-slate-600 shadow-inner">
+                                    <td colSpan="6" className="p-3 text-right text-slate-400 uppercase tracking-wider text-[10px]">Opening Balance ({selectedMonth})</td>
+                                    <td className="p-3 text-right font-mono text-slate-300 bg-slate-700/50">{formatCurrency(monthOpening, 'KHR').replace('៛', '')}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+        // --- END GCA TRACER TAB ---
+
         const CashflowHistoryTab = ({ filters }) => {
             const data = useMonthlyData({ ...filters, dateRangeType: 'by_month' });
             
             // --- NEW: Hooks for Month-End Close ---
-            const { closedMonths, userData, logActivity } = useData();
+            const { closedMonths, userData, logActivity, lossAndRecovery, gcaHistory } = useData();
             const { showNotification } = useNotification();
             const { addDoc, deleteDoc, doc, collection, Timestamp } = window.Firebase;
             
@@ -11415,7 +12134,11 @@
                     const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersOutAllTime = data.allTransfers.filter(it => it.fromShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime;
+                    
+                    const repaidLossesAllTime = (lossAndRecovery || []).filter(loss => loss.shop === shop.name && loss.status === 'Repaid').reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
+                    const gcaAdjustmentsAllTime = (gcaHistory || []).filter(adj => adj.shopName === shop.name).reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
+
+                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
 
                     const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                     const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
@@ -11508,7 +12231,11 @@
                     const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersOutAllTime = data.allTransfers.filter(it => it.fromShop === shop.name).reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime;
+                    
+                    const repaidLossesAllTime = (lossAndRecovery || []).filter(loss => loss.shop === shop.name && loss.status === 'Repaid').reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
+                    const gcaAdjustmentsAllTime = (gcaHistory || []).filter(adj => adj.shopName === shop.name).reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
+
+                    const currentGCA = openingGCA + salesContributionAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
 
                     const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                     const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
@@ -11568,7 +12295,7 @@
                 }, { totalNetSale: 0, totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, totalExpense: 0, finalNetIncome: 0, totalCOH: 0 });
 
                 return { shopCalculations, shopTotals, shareholderData, shareholderTotals };
-            }, [data, getMarginForReport, closedSnapshot]); // <-- ADDED closedSnapshot as dependency
+            }, [data, getMarginForReport, closedSnapshot, lossAndRecovery, gcaHistory]); // <-- ADDED closedSnapshot as dependency
 
             // --- NEW: Handlers for Month-End Close ---
             const executeCloseMonth = async () => {
@@ -12439,7 +13166,7 @@
 
                         <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
                             <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
-                            <Button type="submit" icon="CheckCircle">{initialData ? 'Update' : 'Save'}</Button>
+                            <Button type="submit" disabled={isSubmitting} icon="CheckCircle">Save</Button>
                         </div>
                     </form>
                 </Modal>
@@ -12504,7 +13231,13 @@
                             isActive={activeTab === 'cashflowHistory'} 
                             onClick={setActiveTab} 
                         />
-                        {/* --- NEW TAB BUTTON --- */}
+                        <TabButton 
+                            tabName="gcaTracer" 
+                            label="GCA Tracer Ledger" 
+                            icon="List" 
+                            isActive={activeTab === 'gcaTracer'} 
+                            onClick={setActiveTab} 
+                        />
                         <TabButton 
                             tabName="familyWallet" 
                             label="Family Wallet" 
@@ -12512,11 +13245,10 @@
                             isActive={activeTab === 'familyWallet'} 
                             onClick={setActiveTab} 
                         />
-                        {/* ---------------------- */}
                     </div>
 
-                    {/* Only show Month Filter and Download on CashFlow History Tab */}
-                    {activeTab === 'cashflowHistory' && (
+                    {/* Only show Month Filter and Download on CashFlow History Tab and GCA Tracer Tab */}
+                    {(activeTab === 'cashflowHistory' || activeTab === 'gcaTracer') && (
                         <Card>
                             <div className="flex items-end gap-3">
                                 <div className="flex-grow relative">
@@ -12554,9 +13286,8 @@
                     
                     <div ref={printRef} className="bg-slate-900 p-4 rounded-lg space-y-8 mt-6">
                         {activeTab === 'cashflowHistory' && <CashflowHistoryTab filters={filters} />}
-                        {/* --- NEW CONTENT RENDER --- */}
+                        {activeTab === 'gcaTracer' && <GCATracerTab globalMonth={filters.month} />}
                         {activeTab === 'familyWallet' && <FamilyWalletTab filters={filters} />}
-                        {/* -------------------------- */}
                     </div>
                 </div>
             );
