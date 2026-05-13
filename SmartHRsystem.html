@@ -511,6 +511,9 @@
                             // User logged out: Clear Cache & State
                             setUserProfile(null);
                             localStorage.removeItem('hr_user_profile'); 
+                            // --- FIX: Ensure security locks are completely wiped on logout ---
+                            localStorage.removeItem('hr_is_locked'); 
+                            localStorage.removeItem('hr_last_activity'); 
                             setLoading(false);
                         } else {
                             // User logged in: If we don't have a cached profile, we must show loading.
@@ -23843,19 +23846,49 @@ service cloud.firestore {
             const { employees, shops, kpis, moduleConfig = {}, systemSettings } = useAppData(); 
 
             // --- NEW: Idle Auto-Logout / Security Lock ---
-            const [isLocked, setIsLocked] = useState(false);
+            // FIX: Initialize securely from storage so the lock state survives page refreshes
+            const [isLocked, setIsLocked] = useState(() => {
+                return localStorage.getItem('hr_is_locked') === 'true';
+            });
             const [unlockInput, setUnlockInput] = useState('');
             const [unlockError, setUnlockError] = useState('');
             const [isUnlocking, setIsUnlocking] = useState(false);
             const idleTimer = useRef(null);
+            
+            // FIX: Ref to track when we last wrote to local storage (Performance Optimization)
+            const lastActivityWrite = useRef(Date.now());
 
             const idleTimeoutMinutes = systemSettings?.idleTimeoutMinutes !== undefined ? systemSettings.idleTimeoutMinutes : 5;
 
+            // --- FIX: Boot-up Check for Time-based Idle across closed tabs / refreshes ---
+            useEffect(() => {
+                if (!userProfile || idleTimeoutMinutes <= 0 || isLocked) return;
+                
+                const lastActiveStr = localStorage.getItem('hr_last_activity');
+                if (lastActiveStr) {
+                    const timeSinceLastActive = Date.now() - parseInt(lastActiveStr, 10);
+                    // If the time since they last touched the app exceeds the timeout, lock it instantly
+                    if (timeSinceLastActive > idleTimeoutMinutes * 60 * 1000) {
+                        setIsLocked(true);
+                        localStorage.setItem('hr_is_locked', 'true');
+                    }
+                }
+            }, [userProfile, idleTimeoutMinutes]); 
+
             const resetIdleTimer = useCallback(() => {
                 if (isLocked || idleTimeoutMinutes <= 0) return;
+                
+                // --- FIX: Persist last activity securely across refreshes (Throttled to 5 seconds to save CPU) ---
+                const now = Date.now();
+                if (now - lastActivityWrite.current > 5000) {
+                    localStorage.setItem('hr_last_activity', now.toString());
+                    lastActivityWrite.current = now;
+                }
+
                 if (idleTimer.current) clearTimeout(idleTimer.current);
                 idleTimer.current = setTimeout(() => {
                     setIsLocked(true);
+                    localStorage.setItem('hr_is_locked', 'true'); // FIX: Lock the browser session physically
                 }, idleTimeoutMinutes * 60 * 1000);
             }, [isLocked, idleTimeoutMinutes]);
 
@@ -23870,11 +23903,18 @@ service cloud.firestore {
                 
                 resetIdleTimer();
 
+                // FIX: Ensure we write the absolute latest time exactly when they leave the page or refresh
+                const handleBeforeUnload = () => {
+                    if (!isLocked) localStorage.setItem('hr_last_activity', Date.now().toString());
+                };
+                window.addEventListener('beforeunload', handleBeforeUnload);
+
                 return () => {
                     if (idleTimer.current) clearTimeout(idleTimer.current);
                     events.forEach(e => document.removeEventListener(e, resetIdleTimer));
+                    window.removeEventListener('beforeunload', handleBeforeUnload);
                 };
-            }, [userProfile, resetIdleTimer, idleTimeoutMinutes]);
+            }, [userProfile, resetIdleTimer, idleTimeoutMinutes, isLocked]); // Added isLocked to dependency
 
             const handleUnlock = async (e) => {
                 e.preventDefault();
@@ -23886,6 +23926,8 @@ service cloud.firestore {
                         // Quick PIN Verification
                         if (unlockInput === userProfile.pinCode) {
                             setIsLocked(false);
+                            localStorage.removeItem('hr_is_locked'); // FIX: Remove lock state
+                            localStorage.setItem('hr_last_activity', Date.now().toString()); // Reset activity timer
                             setUnlockInput('');
                         } else {
                             setUnlockError("Incorrect PIN");
@@ -23897,6 +23939,8 @@ service cloud.firestore {
                         
                         await window.firebaseSDK.signInWithEmailAndPassword(auth, email, unlockInput);
                         setIsLocked(false);
+                        localStorage.removeItem('hr_is_locked'); // FIX: Remove lock state
+                        localStorage.setItem('hr_last_activity', Date.now().toString()); // Reset activity timer
                         setUnlockInput('');
                     }
                 } catch (err) {
@@ -24523,6 +24567,8 @@ service cloud.firestore {
                                     onClick={() => {
                                         window.firebaseSDK.signOut(auth);
                                         setIsLocked(false);
+                                        localStorage.removeItem('hr_is_locked');
+                                        localStorage.removeItem('hr_last_activity');
                                         setUnlockInput('');
                                     }}
                                     className="mt-6 text-sm font-medium text-slate-500 hover:text-red-400 transition-colors"
