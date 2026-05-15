@@ -3285,9 +3285,13 @@
     };
 
     // --- 8.1 PO Request Page ---
-    const PORequestPage = ({ poDataToEdit, setPage, userProfile }) => {
+    const PORequestPage = ({ poDataToEdit, lossReportToEdit, setPage, userProfile }) => {
         const { shops, vendors, products } = useData(); 
         const [poId, setPoId] = useState('');
+        const [lossReportId, setLossReportId] = useState('');
+        const [originalLossItems, setOriginalLossItems] = useState([]);
+        const [oldLossShopInfo, setOldLossShopInfo] = useState({ id: '', name: '', reportNo: '' });
+        
         const [shopId, setShopId] = useState('');
         const [vendorId, setVendorId] = useState('');
         const [poNumber, setPoNumber] = useState('');
@@ -3306,6 +3310,8 @@
         const [selectedVendor, setSelectedVendor] = useState(null);
         
         const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
+        const [showLossConfirm, setShowLossConfirm] = useState(false);
+        const [lossReason, setLossReason] = useState('Daily Loss Record');
         
         // --- NEW REF for File Input ---
         const importInputRef = useRef(null);
@@ -3317,10 +3323,12 @@
         const debouncedVendorSearch = useDebounce(vendorSearch, 250);
 
         const resetForm = useCallback(() => {
-            setPoId(''); setShopId(''); setVendorId(''); setPoNumber('');
+            setPoId(''); setLossReportId(''); setOriginalLossItems([]); setOldLossShopInfo({ id: '', name: '', reportNo: '' });
+            setShopId(''); setVendorId(''); setPoNumber('');
             setReqDate(new Date().toLocaleDateString('en-CA'));
             setItems([]); resetAddItemForm();
             setVendorSearch(''); setSelectedVendor(null); setVendorSearchResults([]);
+            setLossReason('Daily Loss Record');
         }, []);
         
         useEffect(() => {
@@ -3335,10 +3343,23 @@
                     setSelectedVendor(initialVendor);
                     setVendorSearch(initialVendor.name);
                 }
+            } else if (lossReportToEdit) {
+                const requestDateObj = safeToDate(lossReportToEdit.reportDate);
+                setLossReportId(lossReportToEdit.id); 
+                setShopId(lossReportToEdit.shopId);
+                setOldLossShopInfo({
+                    id: lossReportToEdit.shopId,
+                    name: lossReportToEdit.shopName,
+                    reportNo: lossReportToEdit.reportNo
+                });
+                if (requestDateObj) setReqDate(requestDateObj.toLocaleDateString('en-CA'));
+                setItems(lossReportToEdit.items || []);
+                setOriginalLossItems(lossReportToEdit.items || []);
+                setLossReason(lossReportToEdit.reason || 'Daily Loss Record');
             } else {
                 resetForm();
             }
-        }, [poDataToEdit, resetForm, vendors]);
+        }, [poDataToEdit, lossReportToEdit, resetForm, vendors]);
 
         useEffect(() => {
             if (!poId && shopId && vendorId) {
@@ -3604,6 +3625,145 @@
             handleRemoveItem(index);
         };
 
+        // --- NEW: Handle Submitting the Grid as a Loss/Breakage Report ---
+        const handleReportLossClick = () => {
+            if (!shopId) {
+                setModalInfo({ show: true, title: 'Validation Error', message: 'Please select a Shop where the loss occurred.', isError: true });
+                return;
+            }
+            if (items.length === 0) {
+                setModalInfo({ show: true, title: 'Validation Error', message: 'Please add at least one item to report a loss.', isError: true });
+                return;
+            }
+
+            setShowLossConfirm(true);
+        };
+
+        const executeReportLoss = async () => {
+            setShowLossConfirm(false);
+            try {
+                const batch = db.batch();
+                const selectedShopName = shops.find(s => s.id === shopId)?.name || 'Unknown';
+                const now = new Date();
+                
+                if (lossReportId) {
+                    // --- UPDATE EXISTING LOSS REPORT ---
+                    const reportRef = db.collection('lossReports').doc(lossReportId);
+                    
+                    // 1. Revert original stock
+                    originalLossItems.forEach(item => {
+                        const prodRef = db.collection('products').doc(item.productId);
+                        batch.update(prodRef, {
+                            [`stockByShop.${oldLossShopInfo.id}`]: firebase.firestore.FieldValue.increment(item.quantity)
+                        });
+                        
+                        const moveRef = db.collection('productMovement').doc();
+                        batch.set(moveRef, {
+                            productId: item.productId,
+                            productCode: item.code,
+                            productName: item.name,
+                            type: 'Loss Edit Reversal',
+                            reason: 'Reverting previous report state',
+                            quantityChange: item.quantity,
+                            from: 'Written Off',
+                            to: oldLossShopInfo.name,
+                            referenceNo: `${oldLossShopInfo.reportNo} (REV)`,
+                            performedBy: userProfile.name,
+                            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                    });
+
+                    // 2. Apply new stock
+                    items.forEach(item => {
+                        const prodRef = db.collection('products').doc(item.productId);
+                        batch.update(prodRef, {
+                            [`stockByShop.${shopId}`]: firebase.firestore.FieldValue.increment(-item.quantity)
+                        });
+
+                        const moveRef = db.collection('productMovement').doc();
+                        batch.set(moveRef, {
+                            productId: item.productId,
+                            productCode: item.code,
+                            productName: item.name,
+                            type: 'Loss/Breakage',
+                            reason: 'Daily Loss Record (Updated)',
+                            quantityChange: -item.quantity,
+                            from: selectedShopName,
+                            to: 'Written Off',
+                            referenceNo: oldLossShopInfo.reportNo,
+                            note: item.note || '',
+                            performedBy: userProfile.name,
+                            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                    });
+
+                    // 3. Update report doc
+                    batch.update(reportRef, {
+                        shopId: shopId,
+                        shopName: selectedShopName,
+                        reportDate: new Date(reqDate),
+                        reason: lossReason || 'Daily Loss Record',
+                        items: items,
+                        totalValue: totalAmount,
+                        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+
+                } else {
+                    // --- CREATE NEW LOSS REPORT ---
+                    const reportRef = db.collection('lossReports').doc();
+                    const refNo = `LSS-${now.toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(Math.random()*1000)}`;
+
+                    batch.set(reportRef, {
+                        reportNo: refNo,
+                        shopId: shopId,
+                        shopName: selectedShopName,
+                        reportDate: new Date(reqDate),
+                        reason: lossReason || 'Daily Loss Record',
+                        items: items,
+                        totalValue: totalAmount,
+                        reportedBy: userProfile.name,
+                        reportedByUid: userProfile.uid,
+                        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+
+                    items.forEach(item => {
+                        const prodRef = db.collection('products').doc(item.productId);
+                        batch.update(prodRef, {
+                            [`stockByShop.${shopId}`]: firebase.firestore.FieldValue.increment(-item.quantity)
+                        });
+
+                        const moveRef = db.collection('productMovement').doc();
+                        batch.set(moveRef, {
+                            productId: item.productId,
+                            productCode: item.code,
+                            productName: item.name,
+                            type: 'Loss/Breakage',
+                            reason: 'Daily Loss Record (via PO Form)',
+                            quantityChange: -item.quantity,
+                            from: selectedShopName,
+                            to: 'Written Off',
+                            referenceNo: refNo,
+                            note: item.note || '',
+                            performedBy: userProfile.name,
+                            timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                    });
+                }
+
+                await batch.commit();
+                setModalInfo({ show: true, title: 'Success', message: lossReportId ? 'Loss report updated successfully.' : 'Loss report submitted and stock deducted successfully.' });
+                resetForm();
+                
+                setTimeout(() => {
+                    setPage('inventory', { activeTab: 'loss-breakage' });
+                }, 1000);
+
+            } catch (error) {
+                console.error("Error saving loss report:", error);
+                setModalInfo({ show: true, title: 'Error', message: 'Failed to submit loss report.', isError: true });
+            }
+        };
+
         const handleSubmitPO = async (status) => {
             if (!shopId || !vendorId) {
                 setModalInfo({ show: true, title: 'Validation Error', message: 'Please select Shop and Vendor.', isError: true });
@@ -3645,8 +3805,45 @@
         return (
             <div className="space-y-6">
                 <MessageModal {...modalInfo} show={modalInfo.show} onClose={() => setModalInfo({ show: false })} />
+                
+                {showLossConfirm && (
+                    <Modal show={true} onClose={() => setShowLossConfirm(false)} maxWidth="max-w-md">
+                        <ModalHeader title={lossReportId ? "Update Loss & Breakage" : "Report Loss & Breakage"} onClose={() => setShowLossConfirm(false)} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div className="p-3 bg-red-900/20 border border-red-500/30 rounded-lg text-red-200 text-sm">
+                                    <i className="fas fa-exclamation-triangle mr-2"></i>
+                                    {lossReportId 
+                                        ? "Update this report? Previous deductions will be reverted and new stock adjustments applied." 
+                                        : "Submit this list as a Loss/Breakage Report? This will DEDUCT the stock from the selected shop immediately."}
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-300 mb-1">Reason for Loss</label>
+                                    <input 
+                                        type="text" 
+                                        value={lossReason} 
+                                        onChange={e => setLossReason(e.target.value)} 
+                                        className="w-full bg-slate-700 text-white px-4 py-2 rounded border border-slate-600 focus:border-red-500 outline-none" 
+                                        placeholder="e.g. Expired, Broken, Daily Loss Record"
+                                        autoFocus
+                                    />
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <button onClick={() => setShowLossConfirm(false)} className="bg-slate-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-500 mr-2">Cancel</button>
+                            <button 
+                                onClick={executeReportLoss} 
+                                className="bg-red-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-red-700 flex items-center gap-2 shadow-lg shadow-red-900/20"
+                            >
+                                <i className="fas fa-check"></i> Confirm
+                            </button>
+                        </ModalFooter>
+                    </Modal>
+                )}
+
                 <Card>
-                    <CardTitle>{poDataToEdit ? `Edit PO: ${poDataToEdit.poNumber}` : 'Create Purchase Order'}</CardTitle>
+                    <CardTitle>{poDataToEdit ? `Edit PO: ${poDataToEdit.poNumber}` : lossReportId ? `Edit Loss Report: ${oldLossShopInfo.reportNo}` : 'Create Purchase Order'}</CardTitle>
                     {/* UPDATE: Changed grid-cols-1 to grid-cols-2 for mobile to save space */}
                     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
                         <div>
@@ -3831,14 +4028,28 @@
                 <div className="mt-8 flex flex-col sm:flex-row justify-end gap-3">
                     {/* FIX: Redirect Cancel to the Drafts list within Inventory */}
                     <button 
-                        onClick={() => setPage('inventory', { activeTab: 'drafts-po' })} 
+                        onClick={() => setPage('inventory', { activeTab: lossReportId ? 'loss-breakage' : 'drafts-po' })} 
                         className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-500 transition"
                     >
                         Cancel
                     </button>
                     
-                    <button onClick={() => handleSubmitPO('draft')} className="bg-yellow-500 text-white font-bold py-2 px-6 rounded-lg hover:bg-yellow-600 transition">Save Draft</button>
-                    <button onClick={() => handleSubmitPO('submitted')} className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 transition">Submit PO</button>
+                    {(!poId || lossReportId) && (
+                        <button 
+                            onClick={handleReportLossClick} 
+                            className="bg-red-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-red-700 transition shadow-lg shadow-red-900/20"
+                            title="Submit this list to deduct broken/lost stock"
+                        >
+                            <i className="fas fa-exclamation-triangle mr-2"></i>{lossReportId ? 'Update Loss Report' : 'Report Loss'}
+                        </button>
+                    )}
+
+                    {!lossReportId && (
+                        <>
+                            <button onClick={() => handleSubmitPO('draft')} className="bg-yellow-500 text-white font-bold py-2 px-6 rounded-lg hover:bg-yellow-600 transition">Save Draft</button>
+                            <button onClick={() => handleSubmitPO('submitted')} className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 transition">Submit PO</button>
+                        </>
+                    )}
                 </div>
             </div> // This closes the main div of PORequestPage
         );
@@ -5100,6 +5311,210 @@
         );
     };
 
+    // --- NEW: Loss & Breakage Page (List View Only) ---
+    const LossBreakagePage = ({ userProfile, setPage }) => {
+        const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
+        const [reports, setReports] = useState([]);
+        const [loadingReports, setLoadingReports] = useState(true);
+        const [viewReport, setViewReport] = useState(null);
+        
+        const [deleteReport, setDeleteReport] = useState(null);
+
+        // Fetch Recent Reports
+        useEffect(() => {
+            const unsubscribe = db.collection('lossReports')
+                .orderBy('createdAt', 'desc')
+                .limit(50)
+                .onSnapshot(snapshot => {
+                    let fetchedReports = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    // Filter for Shop Managers
+                    if (userProfile.role !== 'Admin') {
+                        const assignedShops = userProfile.assignedShops || [];
+                        fetchedReports = fetchedReports.filter(r => assignedShops.includes(r.shopId));
+                    }
+                    setReports(fetchedReports);
+                    setLoadingReports(false);
+                }, err => {
+                    console.error("Error fetching loss reports:", err);
+                    setLoadingReports(false);
+                });
+            return () => unsubscribe();
+        }, [userProfile]);
+
+        // --- NEW: Delete Logic (Restores Stock) ---
+        const executeDeleteReport = async () => {
+            if (!deleteReport) return;
+            try {
+                const batch = db.batch();
+                const reportRef = db.collection('lossReports').doc(deleteReport.id);
+                
+                // Restore stock and log movement
+                deleteReport.items.forEach(item => {
+                    const prodRef = db.collection('products').doc(item.productId);
+                    batch.update(prodRef, {
+                        [`stockByShop.${deleteReport.shopId}`]: firebase.firestore.FieldValue.increment(item.quantity)
+                    });
+
+                    const moveRef = db.collection('productMovement').doc();
+                    batch.set(moveRef, {
+                        productId: item.productId,
+                        productCode: item.code,
+                        productName: item.name,
+                        type: 'Loss Reversal',
+                        reason: 'Report Deleted',
+                        quantityChange: item.quantity,
+                        from: 'Written Off',
+                        to: deleteReport.shopName,
+                        referenceNo: `${deleteReport.reportNo} (REV)`,
+                        performedBy: userProfile.name,
+                        timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                    });
+                });
+
+                batch.delete(reportRef);
+                await batch.commit();
+
+                setModalInfo({ show: true, title: 'Success', message: 'Report deleted and stock restored.' });
+                setDeleteReport(null);
+            } catch (err) {
+                console.error("Error deleting report:", err);
+                setModalInfo({ show: true, title: 'Error', message: 'Failed to delete report.', isError: true });
+            }
+        };
+
+        // --- Redirect to Form for Edit ---
+        const handleEditLossReport = (report) => {
+            setPage('inventory', { activeTab: 'create-po', lossReportData: report });
+        };
+
+        return (
+            <div className="space-y-6">
+                <MessageModal {...modalInfo} show={modalInfo.show} onClose={() => setModalInfo({ show: false })} />
+                
+                <ConfirmationModal 
+                    show={!!deleteReport} 
+                    title="Delete Report & Restore Stock" 
+                    message={`Are you sure you want to delete report ${deleteReport?.reportNo}? This will RESTORE the deducted items back into the shop's inventory.`} 
+                    onConfirm={executeDeleteReport} 
+                    onCancel={() => setDeleteReport(null)} 
+                />
+
+                {/* View Report Details Modal */}
+                {viewReport && (
+                    <Modal show={true} onClose={() => setViewReport(null)} maxWidth="max-w-3xl">
+                        <ModalHeader title={`Loss Report: ${viewReport.reportNo}`} onClose={() => setViewReport(null)} />
+                        <ModalBody>
+                            <div className="grid grid-cols-2 gap-4 mb-6 bg-slate-900/50 p-4 rounded-lg border border-slate-700">
+                                <div><span className="text-slate-500 text-xs uppercase">Shop</span><p className="font-bold text-slate-200">{viewReport.shopName}</p></div>
+                                <div><span className="text-slate-500 text-xs uppercase">Date</span><p className="font-bold text-slate-200">{formatDateDDMMYYYY(viewReport.reportDate)}</p></div>
+                                <div><span className="text-slate-500 text-xs uppercase">Reason</span><p className="font-bold text-red-400">{viewReport.reason}</p></div>
+                                <div><span className="text-slate-500 text-xs uppercase">Reported By</span><p className="font-bold text-slate-200">{viewReport.reportedBy}</p></div>
+                            </div>
+                            
+                            <h4 className="font-bold text-slate-300 mb-2">Items Written Off</h4>
+                            <table className="w-full text-left text-sm border-collapse">
+                                <thead className="bg-slate-800 text-slate-400">
+                                    <tr>
+                                        <th className="p-2 border border-slate-700">Code</th>
+                                        <th className="p-2 border border-slate-700">Product</th>
+                                        <th className="p-2 border border-slate-700 text-center">Qty</th>
+                                        <th className="p-2 border border-slate-700 text-right">Cost (៛)</th>
+                                        <th className="p-2 border border-slate-700 text-right">Total (៛)</th>
+                                        <th className="p-2 border border-slate-700">Note</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {viewReport.items.map((item, idx) => (
+                                        <tr key={idx} className="bg-slate-900/30">
+                                            <td className="p-2 border border-slate-700 text-slate-300">{item.code}</td>
+                                            <td className="p-2 border border-slate-700 text-slate-300">{item.name}</td>
+                                            <td className="p-2 border border-slate-700 text-center font-bold text-red-400">{item.quantity}</td>
+                                            <td className="p-2 border border-slate-700 text-right text-slate-400">{khrFormatter.format(item.cost)}</td>
+                                            <td className="p-2 border border-slate-700 text-right text-slate-200">{khrFormatter.format(item.cost * item.quantity)}</td>
+                                            <td className="p-2 border border-slate-700 text-slate-400 text-xs italic">{item.note || '-'}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                                <tfoot>
+                                    <tr>
+                                        <td colSpan="4" className="p-2 border border-slate-700 text-right font-bold text-slate-400 uppercase">Total Loss Value</td>
+                                        <td className="p-2 border border-slate-700 text-right font-bold text-red-400 text-lg">៛{khrFormatter.format(viewReport.totalValue)}</td>
+                                        <td className="p-2 border border-slate-700"></td>
+                                    </tr>
+                                </tfoot>
+                            </table>
+                        </ModalBody>
+                        <ModalFooter>
+                            <button onClick={() => setViewReport(null)} className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Close</button>
+                        </ModalFooter>
+                    </Modal>
+                )}
+
+                <Card>
+                    <div className="flex justify-between items-center mb-4">
+                        <div>
+                            <h3 className="text-xl font-bold text-slate-200">Loss & Breakage Reports</h3>
+                            <p className="text-slate-400 text-sm">Review written-off stock and history.</p>
+                        </div>
+                        <button 
+                            onClick={() => setPage('inventory', { activeTab: 'create-po' })}
+                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition flex items-center gap-2 shadow-lg shadow-blue-900/20"
+                            title="Go to the PO form to report new losses"
+                        >
+                            <i className="fas fa-plus"></i> Use PO Form to Report Loss
+                        </button>
+                    </div>
+                </Card>
+                
+                <TableCard title="Recent Reports">
+                    {loadingReports ? (
+                        <div className="flex justify-center p-8"><div className="loader"></div></div>
+                    ) : reports.length === 0 ? (
+                        <div className="text-center p-8 text-slate-400">
+                            <i className="fas fa-clipboard-check text-4xl mb-3 opacity-50 text-green-500"></i>
+                            <p>No loss reports found. Great!</p>
+                        </div>
+                    ) : (
+                        <table className="min-w-full divide-y divide-slate-700">
+                            <thead className="bg-slate-900/50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Date</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Ref No.</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Reason</th>
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Loss Value</th>
+                                    <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {reports.map(report => (
+                                    <tr key={report.id} className="hover:bg-slate-700/50">
+                                        <td className="px-4 py-3 text-sm text-slate-400">{formatDateDDMMYYYY(report.reportDate)}</td>
+                                        <td className="px-4 py-3 text-sm text-slate-300 font-mono">{report.reportNo}</td>
+                                        <td className="px-4 py-3 text-sm text-slate-300">{report.shopName}</td>
+                                        <td className="px-4 py-3 text-sm text-red-400 font-medium">{report.reason}</td>
+                                        <td className="px-4 py-3 text-sm text-right font-bold text-slate-200">៛{khrFormatter.format(report.totalValue)}</td>
+                                        <td className="px-4 py-3 text-center space-x-3">
+                                            <button onClick={() => setViewReport(report)} className="text-cyan-400 hover:text-cyan-300" title="View Details">
+                                                <i className="fas fa-eye"></i>
+                                            </button>
+                                            <button onClick={() => handleEditLossReport(report)} className="text-blue-400 hover:text-blue-300" title="Edit Items in Report">
+                                                <i className="fas fa-edit"></i>
+                                            </button>
+                                            <button onClick={() => setDeleteReport(report)} className="text-red-500 hover:text-red-400" title="Delete & Restore Stock">
+                                                <i className="fas fa-trash"></i>
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    )}
+                </TableCard>
+            </div>
+        );
+    };
+
     // --- 8.6 Inventory Page (UNIFIED PHASE 2) ---
     // Includes Internal Transfers and Purchase Orders in dual dropdowns
 
@@ -5245,8 +5660,9 @@
         const [transferDataToEdit, setTransferDataToEdit] = useState(null);
         const [viewReqTransfer, setViewReqTransfer] = useState(null);
         
-        // --- Purchase Order State ---
+        // --- Purchase Order & Loss State ---
         const [poDataForEdit, setPoDataForEdit] = useState(null);
+        const [lossReportForEdit, setLossReportForEdit] = useState(null);
 
         // --- Filter State (Shared) ---
         const [fromShopFilter, setFromShopFilter] = useState('');
@@ -5261,6 +5677,7 @@
             if (pageData && pageData.activeTab) {
                 setActiveTab(pageData.activeTab);
                 if (pageData.poData) setPoDataForEdit(pageData.poData);
+                if (pageData.lossReportData) setLossReportForEdit(pageData.lossReportData);
                 if (pageData.transferData) setTransferDataToEdit(pageData.transferData);
             }
         }, [pageData]);
@@ -5270,7 +5687,10 @@
             setActiveTab(newTab);
             // Clear editing states when switching main contexts
             if (newTab === 'internal-transfer') setTransferDataToEdit(null);
-            if (newTab === 'create-po') setPoDataForEdit(null);
+            if (newTab === 'create-po') {
+                setPoDataForEdit(null);
+                setLossReportForEdit(null);
+            }
         };
 
         // --- Helper for Internal Transfers ---
@@ -5316,14 +5736,21 @@
         const handleSetPage = (page, data) => {
             if (page === 'inventory') {
                 setActiveTab(data.activeTab || 'create-po');
+                
+                // Explicitly manage PO edit state
                 if (data.poData) setPoDataForEdit(data.poData);
+                else setPoDataForEdit(null);
+                
+                // Explicitly manage Loss Report edit state
+                if (data.lossReportData) setLossReportForEdit(data.lossReportData);
+                else setLossReportForEdit(null);
             } else {
                 setPage(page, data); // Delegate to global router for other pages
             }
         };
 
         // Determine which Dropdown Value to show visually
-        const isPOActive = ['create-po', 'drafts-po', 'active-po', 'auditing-po', 'audited-po'].includes(activeTab);
+        const isPOActive = ['create-po', 'drafts-po', 'active-po', 'auditing-po', 'audited-po', 'loss-breakage'].includes(activeTab);
         const isTransferActive = ['internal-transfer', 'drafts', 'active-transfer', 'transfer-report'].includes(activeTab);
         const isProductionActive = ['product-list', 'vendor-list'].includes(activeTab);
 
@@ -5356,6 +5783,7 @@
                                         <option value="active-po">Active PO</option>
                                         <option value="auditing-po">Auditing PO</option>
                                         <option value="audited-po">Audited PO</option>
+                                        <option value="loss-breakage">Loss & Breakage</option>
                                     </select>
                                     <div className={`absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none ${isPOActive ? 'text-purple-400' : 'text-slate-400'}`}>
                                         <i className="fas fa-chevron-down text-xs"></i>
@@ -5426,11 +5854,12 @@
                 {activeTab === 'internal-transfer' && <InternalTransfer transferDataToEdit={transferDataToEdit} userProfile={userProfile} setActiveTab={setActiveTab} onEdit={handleEditTransfer} onViewReq={setViewReqTransfer} activeTransfers={activeTransfers} />}
                 
                 {/* Purchase Order Views (Moved from POCenterPage) */}
-                {activeTab === 'create-po' && <PORequestPage poDataToEdit={poDataForEdit} setPage={handleSetPage} userProfile={userProfile} />}
+                {activeTab === 'create-po' && <PORequestPage poDataToEdit={poDataForEdit} lossReportToEdit={lossReportForEdit} setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'drafts-po' && <POList pos={allPOs} loading={posLoading} status="draft" setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'active-po' && <POList pos={allPOs} loading={posLoading} status="submitted" setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'auditing-po' && <POList pos={allPOs} loading={posLoading} status="auditing" setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'audited-po' && <POList pos={allPOs} loading={posLoading} status="audited" setPage={handleSetPage} userProfile={userProfile} />}
+                {activeTab === 'loss-breakage' && <LossBreakagePage userProfile={userProfile} setPage={handleSetPage} />}
 
                 {/* Production Views */}
                 {activeTab === 'product-list' && <ProductList userProfile={userProfile} />}
@@ -9830,7 +10259,7 @@
 
                 {/* KPI Cards */}
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-6">
-                    <div onClick={() => setPage('po-center', { activeTab: 'auditing-po' })} className="bg-gradient-to-br from-indigo-600/20 to-indigo-900/20 border border-indigo-500/30 p-3 md:p-6 rounded-xl shadow-lg cursor-pointer hover:border-indigo-500/60 transition group">
+                    <div onClick={() => setPage('inventory', { activeTab: 'auditing-po' })} className="bg-gradient-to-br from-indigo-600/20 to-indigo-900/20 border border-indigo-500/30 p-3 md:p-6 rounded-xl shadow-lg cursor-pointer hover:border-indigo-500/60 transition group">
                         <div className="flex justify-between items-start">
                             <div>
                                 <p className="text-indigo-300 text-xs md:text-base font-medium mb-1">Pending Audits</p>
@@ -9869,7 +10298,7 @@
                         <p className="text-[10px] md:text-xs text-emerald-400/60 mt-2 md:mt-4">Est. Value (Millions)</p>
                     </div>
 
-                    <div onClick={() => setPage('po-center', { activeTab: 'drafts-po' })} className="bg-gradient-to-br from-yellow-600/20 to-yellow-900/20 border border-yellow-500/30 p-3 md:p-6 rounded-xl shadow-lg cursor-pointer hover:border-yellow-500/60 transition group">
+                    <div onClick={() => setPage('inventory', { activeTab: 'drafts-po' })} className="bg-gradient-to-br from-yellow-600/20 to-yellow-900/20 border border-yellow-500/30 p-3 md:p-6 rounded-xl shadow-lg cursor-pointer hover:border-yellow-500/60 transition group">
                         <div className="flex justify-between items-start">
                             <div>
                                 <p className="text-yellow-300 text-xs md:text-base font-medium mb-1">Draft POs</p>
@@ -9951,7 +10380,7 @@
                                                     <td className="px-3 py-2 text-center font-bold text-red-400">{item.currentStock}</td>
                                                     <td className="px-3 py-2 text-right">
                                                         <button 
-                                                            onClick={() => setPage('po-center', { activeTab: 'create-po' })}
+                                                            onClick={() => setPage('inventory', { activeTab: 'create-po' })}
                                                             className="text-xs bg-red-500/20 text-red-300 px-2 py-1 rounded hover:bg-red-500 hover:text-white transition"
                                                         >
                                                             Order
@@ -10000,7 +10429,7 @@
                                             <div className="ml-3 text-right">
                                                 <p className="text-sm font-bold text-slate-300">៛{khrFormatter.format(activity.amount)}</p>
                                                 <button 
-                                                    onClick={() => activity.type === 'PO' ? setPage('po-center', { activeTab: 'active-po' }) : setPage('inventory', { activeTab: 'transfer-report' })}
+                                                    onClick={() => activity.type === 'PO' ? setPage('inventory', { activeTab: 'active-po' }) : setPage('inventory', { activeTab: 'transfer-report' })}
                                                     className="text-[10px] text-blue-400 hover:text-blue-300 mt-1"
                                                 >
                                                     View
@@ -10019,7 +10448,7 @@
                         <Card>
                             <h3 className="text-lg font-bold text-slate-200 mb-4">Quick Actions</h3>
                             <div className="space-y-3">
-                                <button onClick={() => setPage('po-center', { activeTab: 'create-po' })} className="w-full bg-slate-700 hover:bg-blue-600 hover:text-white text-slate-300 p-3 rounded-lg flex items-center transition group">
+                                <button onClick={() => setPage('inventory', { activeTab: 'create-po' })} className="w-full bg-slate-700 hover:bg-blue-600 hover:text-white text-slate-300 p-3 rounded-lg flex items-center transition group">
                                     <div className="bg-slate-800 p-2 rounded mr-3 group-hover:bg-blue-500/20"><i className="fas fa-plus"></i></div>
                                     <div className="text-left">
                                         <div className="font-semibold">Create Purchase Order</div>
