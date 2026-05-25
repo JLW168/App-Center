@@ -511,10 +511,60 @@
                 lossAndRecovery: useCollection('lossAndRecovery'), // <-- ADDED Phase 1
             };
 
+            // --- NICK NAME INTERCEPTOR: Efficiently map historical names to nicknames ---
+            const mappedData = useMemo(() => {
+                const empMap = {};
+                if (collections.employees) {
+                    collections.employees.forEach(emp => {
+                        if (emp.name && emp.nickName) {
+                            empMap[emp.name] = emp.nickName;
+                        }
+                    });
+                }
+
+                const mapNames = (data, fields) => {
+                    if (!data) return [];
+                    return data.map(item => {
+                        let modified = false;
+                        const newItem = { ...item };
+                        fields.forEach(f => {
+                            if (newItem[f] && empMap[newItem[f]]) {
+                                newItem[f] = empMap[newItem[f]];
+                                modified = true;
+                            }
+                        });
+                        // Return original object reference if nothing changed to preserve React optimization
+                        return modified ? newItem : item;
+                    });
+                };
+
+                return {
+                    cashDrops: mapNames(collections.cashDrops, ['staff']),
+                    purchaseOrders: mapNames(collections.purchaseOrders, ['orderBy']),
+                    internalTransfers: mapNames(collections.internalTransfers, ['transferredBy', 'confirmedByName']),
+                    businessExpenses: mapNames(collections.businessExpenses, ['recordedBy']),
+                    familyExpenses: mapNames(collections.familyExpenses, ['recordedBy', 'paidBy']),
+                    dailySOPs: mapNames(collections.dailySOPs, ['submittedByName']),
+                    maintenanceIssues: mapNames(collections.maintenanceIssues, ['reportedBy', 'lastUpdatedBy']),
+                    lossAndRecovery: mapNames(collections.lossAndRecovery, ['responsibleParty', 'createdByName']),
+                    deposits: mapNames(collections.deposits, ['verifiedBy']),
+                    auditLogs: mapNames(collections.auditLogs, ['performedBy']),
+                    capitalInvestments: mapNames(collections.capitalInvestments, ['recordedBy']),
+                    gcaAdjustments: mapNames(collections.gcaAdjustments, ['adjustedByName']),
+                    socialPosts: mapNames(collections.socialPosts, ['authorName'])
+                };
+            }, [
+                collections.employees, collections.cashDrops, collections.purchaseOrders, 
+                collections.internalTransfers, collections.businessExpenses, collections.familyExpenses, 
+                collections.dailySOPs, collections.maintenanceIssues, collections.lossAndRecovery, 
+                collections.deposits, collections.auditLogs, collections.capitalInvestments, 
+                collections.gcaAdjustments, collections.socialPosts
+            ]);
+            // -------------------------------------------------------------------------
+
             const appSettings = useDocument("settings", "app") || { exchangeRate: 4000 };
             const sopSettings = useDocument("settings", "sop");
 
-            // --- NEW: Global Financial Lock Checker ---
             const checkMonthLock = useCallback((dateValue) => {
                 if (!dateValue || !collections.closedMonths) return false;
                 let monthStr = '';
@@ -553,19 +603,20 @@
 
             const value = { 
                 ...collections, 
+                ...mappedData,
                 appSettings,
                 sopSettings, 
                 userData,
                 businessCategories: collections.businessExpenseCategories,
                 familyCategories: collections.familyExpenseCategories,
                 staffList: collections.employees,
-                reports: collections.cashDrops,
+                reports: mappedData.cashDrops,
                 saleMarginHistory: collections.saleMarginHistory,
                 targetHistory: collections.shopTargetHistory, // Added alias
-                sops: collections.dailySOPs, 
-                issues: collections.maintenanceIssues,
+                sops: mappedData.dailySOPs, 
+                issues: mappedData.maintenanceIssues,
                 familyWallet: collections.familyWallet,
-                gcaHistory: collections.gcaAdjustments,
+                gcaHistory: mappedData.gcaAdjustments,
                 banks: collections.banks, 
                 logActivity, // <-- ADDED to context
                 checkMonthLock, // <-- ADDED to context
@@ -2615,7 +2666,7 @@
                         transInCurr: 0, transInAllTime: 0,
                         transOutCurr: 0, transOutAllTime: 0,
                         salesContributionAllTime: 0, gcaAdjustment: 0, repaidLossesAllTime: 0,
-                        promoReceivedAllTime: 0
+                        promoReceivedAllTime: 0, promoPaidAllTime: 0
                     };
                     shopConfig[s.name] = { defaultMargin: s.saleMargin || 0, openingGCA: s.gca || 0 };
                 });
@@ -2694,6 +2745,11 @@
                     if (cd.promoEnabled && cd.promoPayToShop && stats[cd.promoPayToShop]) {
                         stats[cd.promoPayToShop].promoReceivedAllTime += (cd.promoAmount || 0);
                     }
+                    
+                    // --- FIX: Track Promo Paid for Source Shop ---
+                    if (cd.promoEnabled) {
+                        stats[cd.shop].promoPaidAllTime += (cd.promoAmount || 0);
+                    }
                 });
 
                 // --- NEW: Add Repaid Losses to GCA (Phase 2) ---
@@ -2720,8 +2776,8 @@
                 const processedData = availableShops.map(shop => {
                     const s = stats[shop.name];
                     const config = shopConfig[shop.name];
-                    // --- UPDATED: Sponsoring Shop's GCA is no longer directly reduced by promoPaidAllTime (moved to Business Expenses) ---
-                    const currentGCA = config.openingGCA + s.salesContributionAllTime + s.promoReceivedAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
+                    // --- FIX: Sponsoring Shop's GCA MUST be reduced by promoPaidAllTime to balance the ledger ---
+                    const currentGCA = config.openingGCA + s.salesContributionAllTime + s.promoReceivedAllTime - s.promoPaidAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
 
                     globalGCA += currentGCA;
                     globalSalesCurr += s.salesCurr;
@@ -7253,12 +7309,17 @@
                 // 1. Sales Contribution & Promo Received
                 let salesContribution = 0;
                 let promoReceived = 0;
+                let promoPaid = 0;
                 if (cashDrops) {
                     cashDrops.filter(cd => cd.shop === sObj.name).forEach(cd => {
                         const d = cd.createdAt?.toDate ? cd.createdAt.toDate() : new Date(cd.createdAt);
                         const monthKey = d.toISOString().slice(0, 7);
                         const effectiveMargin = marginMap.has(`${sObj.name}|${monthKey}`) ? marginMap.get(`${sObj.name}|${monthKey}`) : defaultMargin;
                         salesContribution += (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
+                        
+                        if (cd.promoEnabled) {
+                            promoPaid += (cd.promoAmount || 0);
+                        }
                     });
 
                     cashDrops.filter(cd => cd.promoEnabled && cd.promoPayToShop === sObj.name).forEach(cd => {
@@ -7304,7 +7365,7 @@
                     });
                 }
 
-                return baseGCA + salesContribution + promoReceived - poTotal - transIn + transOut + repaidLosses + adjustments;
+                return baseGCA + salesContribution + promoReceived - promoPaid - poTotal - transIn + transOut + repaidLosses + adjustments;
             }, [shops, formData.shop, cashDrops, purchaseOrders, internalTransfers, lossAndRecovery, gcaHistory, saleMarginHistory, appSettings]);
 
             const subTotalPOs = useMemo(() => {
@@ -7509,6 +7570,7 @@
                         // --- Handle destination GCA addition for Cross-Shop Promotion ---
                         if (cd.promoEnabled && cd.promoPayToShop) {
                             events.push({ time: d.getTime(), type: 'promoReceived', shop: cd.promoPayToShop, amount: cd.promoAmount || 0 });
+                            events.push({ time: d.getTime(), type: 'promoPaid', shop: cd.shop, amount: cd.promoAmount || 0 });
                         }
                     });
                 }
@@ -7564,6 +7626,8 @@
                         runningGCA[ev.shop] += ev.amount;
                     } else if (ev.type === 'promoReceived') {
                         runningGCA[ev.shop] += ev.amount;
+                    } else if (ev.type === 'promoPaid') {
+                        runningGCA[ev.shop] -= ev.amount;
                     } else if (ev.type === 'transIn') {
                         runningGCA[ev.shop] -= ev.amount;
                     } else if (ev.type === 'transOut') {
@@ -12570,6 +12634,16 @@
                             desc: `Promo Received From: ${cd.shop} (${cd.promoDetail || 'N/A'})`, ref: cd.staff || 'N/A'
                         });
                     });
+
+                    // --- FIX: Add Promo Paid (OUT) as Sponsoring Shop ---
+                    cashDrops.filter(cd => cd.promoEnabled && cd.shop === selectedShop).forEach(cd => {
+                        const d = getTimestamp(cd.createdAt);
+                        events.push({
+                            id: cd.id + '-promoPaid', time: d.getTime(), dateObj: d, type: 'Promo Paid', inOut: 'OUT', amount: cd.promoAmount || 0,
+                            desc: `Promo Sponsored For: ${cd.promoPayToShop} (${cd.promoDetail || 'N/A'})`, ref: cd.staff || 'N/A'
+                        });
+                    });
+                    // ----------------------------------------------------
                 }
 
                 // 2. POs (OUT)
@@ -13010,6 +13084,10 @@
                     const promoReceivedAllTime = data.allReports
                         .filter(cd => cd.promoEnabled && cd.promoPayToShop === shop.name)
                         .reduce((sum, cd) => sum + (cd.promoAmount || 0), 0);
+                        
+                    const promoPaidAllTime = data.allReports
+                        .filter(cd => cd.promoEnabled && cd.shop === shop.name)
+                        .reduce((sum, cd) => sum + (cd.promoAmount || 0), 0);
 
                     const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
                     const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name && it.status === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
@@ -13018,8 +13096,8 @@
                     const repaidLossesAllTime = (lossAndRecovery || []).filter(loss => loss.shop === shop.name && loss.status === 'Repaid').reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
                     const gcaAdjustmentsAllTime = (gcaHistory || []).filter(adj => adj.shopName === shop.name).reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
 
-                    // --- UPDATED: Sponsoring Shop's GCA is no longer directly reduced by promoPaidAllTime (reconciled through auto Business Expenses) ---
-                    const currentGCA = openingGCA + salesContributionAllTime + promoReceivedAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
+                    // --- FIX: Shareholder's GCA Liability MUST be reduced by promoPaidAllTime to balance the ledger. ---
+                    const currentGCA = openingGCA + salesContributionAllTime + promoReceivedAllTime - promoPaidAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
 
                     const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                     const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
