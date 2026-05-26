@@ -3286,7 +3286,7 @@
 
     // --- 8.1 PO Request Page ---
     const PORequestPage = ({ poDataToEdit, lossReportToEdit, setPage, userProfile }) => {
-        const { shops, vendors, products } = useData(); 
+        const { shops, vendors, products, allPOs } = useData(); 
         const [poId, setPoId] = useState('');
         const [lossReportId, setLossReportId] = useState('');
         const [originalLossItems, setOriginalLossItems] = useState([]);
@@ -3313,6 +3313,10 @@
         const [showLossConfirm, setShowLossConfirm] = useState(false);
         const [lossReason, setLossReason] = useState('Daily Loss Record');
         
+        // --- NEW: AI Copilot State ---
+        const [recentLosses, setRecentLosses] = useState([]);
+        const [aiAlert, setAiAlert] = useState(null);
+        
         // --- NEW REF for File Input ---
         const importInputRef = useRef(null);
 
@@ -3330,6 +3334,74 @@
             setVendorSearch(''); setSelectedVendor(null); setVendorSearchResults([]);
             setLossReason('Daily Loss Record');
         }, []);
+        
+        // --- NEW: Fetch recent loss reports for the Copilot ---
+        useEffect(() => {
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+            const unsub = db.collection('lossReports')
+                .where('reportDate', '>=', thirtyDaysAgo)
+                .onSnapshot(snap => {
+                    setRecentLosses(snap.docs.map(d => d.data()));
+                });
+            return () => unsub();
+        }, []);
+
+        // --- NEW: AI Copilot Real-time Evaluation ---
+        useEffect(() => {
+            if (!selectedProduct || lossReportId) { // Skip if we are just reporting a loss
+                setAiAlert(null);
+                return;
+            }
+
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+            // 1. Calculate Purchased Qty in last 30 days
+            let purchasedQty = 0;
+            allPOs.forEach(po => {
+                if (po.status === 'audited') {
+                    const d = safeToDate(po.auditedAt || po.requestDate);
+                    if (d && d >= thirtyDaysAgo) {
+                        const item = po.items.find(i => i.productId === selectedProduct.id);
+                        if (item) purchasedQty += (parseFloat(item.auditedQty) || 0);
+                    }
+                }
+            });
+
+            // 2. Calculate Lost Qty and reasons in last 30 days
+            let lostQty = 0;
+            const reasons = {};
+            recentLosses.forEach(report => {
+                const item = report.items?.find(i => i.productId === selectedProduct.id);
+                if (item) {
+                    const q = parseFloat(item.quantity) || 0;
+                    lostQty += q;
+                    const reason = report.reason || 'Unknown';
+                    reasons[reason] = (reasons[reason] || 0) + q;
+                }
+            });
+
+            let topReason = '';
+            if (Object.keys(reasons).length > 0) {
+                topReason = Object.keys(reasons).reduce((a, b) => reasons[a] > reasons[b] ? a : b);
+            }
+
+            // 3. Trigger Copilot Alert
+            if (purchasedQty > 0) {
+                const ratio = (lostQty / purchasedQty) * 100;
+                if (ratio > 15) {
+                    setAiAlert({ ratio: ratio.toFixed(1), reason: topReason, lost: lostQty, bought: purchasedQty });
+                } else {
+                    setAiAlert(null);
+                }
+            } else if (lostQty > 0) {
+                // If we didn't buy any recently but still lost some
+                setAiAlert({ ratio: 100, reason: topReason, lost: lostQty, bought: 0 });
+            } else {
+                setAiAlert(null);
+            }
+        }, [selectedProduct, allPOs, recentLosses, lossReportId]);
         
         useEffect(() => {
             if (poDataToEdit) {
@@ -3971,6 +4043,20 @@
                         <div className="lg:col-span-1">
                             <button type="submit" className="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition">Add</button>
                         </div>
+
+                        {/* NEW: AI Copilot Alert Banner */}
+                        {aiAlert && !lossReportId && (
+                            <div className="lg:col-span-12 bg-orange-900/20 border border-orange-500/40 p-4 rounded-lg flex items-start gap-3 mt-2 animate-fade-in-up">
+                                <i className="fas fa-brain text-orange-400 text-2xl mt-0.5 animate-pulse"></i>
+                                <div>
+                                    <h5 className="text-orange-400 font-bold text-sm uppercase tracking-wider mb-1">AI Copilot Alert: High Waste Warning</h5>
+                                    <p className="text-orange-300/80 text-sm">
+                                        This product has a <strong>{aiAlert.ratio}% waste rate</strong> in the last 30 days ({aiAlert.lost} lost vs {aiAlert.bought} bought). 
+                                        Primary reason: <strong className="text-orange-300">"{aiAlert.reason}"</strong>. Ensure there is actual sales demand before ordering more.
+                                    </p>
+                                </div>
+                            </div>
+                        )}
                     </form>
                 </Card>
 
@@ -5313,12 +5399,16 @@
 
     // --- NEW: Loss & Breakage Page (List View Only) ---
     const LossBreakagePage = ({ userProfile, setPage }) => {
+        const { allPOs } = useData(); 
         const [modalInfo, setModalInfo] = useState({ show: false, title: '', message: '', isError: false });
         const [reports, setReports] = useState([]);
         const [loadingReports, setLoadingReports] = useState(true);
         const [viewReport, setViewReport] = useState(null);
         
         const [deleteReport, setDeleteReport] = useState(null);
+
+        // --- NEW: AI Insight State ---
+        const [aiInsightProduct, setAiInsightProduct] = useState(null);
 
         // Fetch Recent Reports
         useEffect(() => {
@@ -5387,6 +5477,71 @@
             setPage('inventory', { activeTab: 'create-po', lossReportData: report });
         };
 
+        // --- NEW: Fetch Purchase History for AI Insight ---
+        const showAiInsight = (item) => {
+            const productPOs = allPOs
+                .filter(po => po.status === 'audited')
+                .map(po => {
+                    const match = po.items.find(i => i.productId === item.productId);
+                    if (!match) return null;
+                    return { 
+                        poNumber: po.poNumber, 
+                        date: po.auditedAt || po.requestDate, 
+                        vendor: po.vendorName || po.vendorDetails?.name || 'Unknown', 
+                        staff: po.createdByName || po.createdBy || 'Unknown', 
+                        qty: match.auditedQty, 
+                        price: match.costPerUnit || match.cost || match.price 
+                    };
+                })
+                .filter(Boolean)
+                .sort((a, b) => safeToDate(b.date) - safeToDate(a.date))
+                .slice(0, 3); // Take the latest 3 purchases
+            
+            setAiInsightProduct({ product: item, history: productPOs });
+        };
+
+        // --- NEW: Export Loss Report to Excel ---
+        const handleExportToExcel = () => {
+            if (!viewReport) return;
+            const wb = XLSX.utils.book_new();
+            const ws_data = [];
+            const headerStyle = { font: { bold: true } };
+
+            ws_data.push([{v: 'Detail Loss Report', s: { font: { sz: 16, bold: true } } }]);
+            ws_data.push([]);
+            ws_data.push([{v: 'Shop:', s: headerStyle}, viewReport.shopName, null, {v: 'Report No.:', s: headerStyle}, viewReport.reportNo]);
+            ws_data.push([{v: 'Date:', s: headerStyle}, formatDateDDMMYYYY(viewReport.reportDate), null, {v: 'Reason:', s: headerStyle}, viewReport.reason]);
+            ws_data.push([{v: 'Reported By:', s: headerStyle}, viewReport.reportedBy]);
+            ws_data.push([]);
+            
+            const tableHeader = ['No', 'Product Code', 'Barcode', 'Name', 'Vendor', 'Qty', 'Cost (៛)', 'Total (៛)', 'Note'];
+            ws_data.push(tableHeader.map(h => ({v: h, s: headerStyle})));
+
+            viewReport.items.forEach((item, index) => {
+                const subTotal = (item.quantity || 0) * (item.cost || 0);
+                ws_data.push([
+                    index + 1, 
+                    item.code, 
+                    item.barcode || '',
+                    item.name, 
+                    item.vendorName || '',
+                    item.quantity || 0,
+                    { t: 'n', v: item.cost || 0, z: '#,##0' },
+                    { t: 'n', v: subTotal, z: '#,##0' },
+                    item.note || ''
+                ]);
+            });
+
+            ws_data.push([]);
+            ws_data.push([null, null, null, null, null, null, {v: 'Total Loss Value (៛):', s: headerStyle}, {t: 'n', v: viewReport.totalValue, z: '#,##0'}]);
+            
+            const ws = XLSX.utils.aoa_to_sheet(ws_data);
+            ws['!cols'] = [ {wch:5}, {wch:15}, {wch:15}, {wch:40}, {wch:20}, {wch:10}, {wch:15}, {wch:15}, {wch:20} ];
+            
+            XLSX.utils.book_append_sheet(wb, ws, 'Loss Report');
+            XLSX.writeFile(wb, `Loss-Report-${viewReport.reportNo}.xlsx`);
+        };
+
         return (
             <div className="space-y-6">
                 <MessageModal {...modalInfo} show={modalInfo.show} onClose={() => setModalInfo({ show: false })} />
@@ -5415,8 +5570,11 @@
                             <table className="w-full text-left text-sm border-collapse">
                                 <thead className="bg-slate-800 text-slate-400">
                                     <tr>
+                                        <th className="p-2 border border-slate-700 text-center w-12">No.</th>
                                         <th className="p-2 border border-slate-700">Code</th>
+                                        <th className="p-2 border border-slate-700">Barcode</th>
                                         <th className="p-2 border border-slate-700">Product</th>
+                                        <th className="p-2 border border-slate-700">Vendor</th>
                                         <th className="p-2 border border-slate-700 text-center">Qty</th>
                                         <th className="p-2 border border-slate-700 text-right">Cost (៛)</th>
                                         <th className="p-2 border border-slate-700 text-right">Total (៛)</th>
@@ -5426,8 +5584,18 @@
                                 <tbody>
                                     {viewReport.items.map((item, idx) => (
                                         <tr key={idx} className="bg-slate-900/30">
+                                            <td className="p-2 border border-slate-700 text-slate-400 text-center">{idx + 1}</td>
                                             <td className="p-2 border border-slate-700 text-slate-300">{item.code}</td>
-                                            <td className="p-2 border border-slate-700 text-slate-300">{item.name}</td>
+                                            <td className="p-2 border border-slate-700 text-slate-300">{item.barcode || '-'}</td>
+                                            <td className="p-2 border border-slate-700 text-slate-300">
+                                                <div className="flex items-center justify-between">
+                                                    <span>{item.name}</span>
+                                                    <button onClick={() => showAiInsight(item)} className="text-purple-400 hover:text-purple-300 ml-2" title="AI Insight: Purchase History">
+                                                        <i className="fas fa-brain"></i>
+                                                    </button>
+                                                </div>
+                                            </td>
+                                            <td className="p-2 border border-slate-700 text-slate-400">{item.vendorName || '-'}</td>
                                             <td className="p-2 border border-slate-700 text-center font-bold text-red-400">{item.quantity}</td>
                                             <td className="p-2 border border-slate-700 text-right text-slate-400">{khrFormatter.format(item.cost)}</td>
                                             <td className="p-2 border border-slate-700 text-right text-slate-200">{khrFormatter.format(item.cost * item.quantity)}</td>
@@ -5437,7 +5605,7 @@
                                 </tbody>
                                 <tfoot>
                                     <tr>
-                                        <td colSpan="4" className="p-2 border border-slate-700 text-right font-bold text-slate-400 uppercase">Total Loss Value</td>
+                                        <td colSpan="7" className="p-2 border border-slate-700 text-right font-bold text-slate-400 uppercase">Total Loss Value</td>
                                         <td className="p-2 border border-slate-700 text-right font-bold text-red-400 text-lg">៛{khrFormatter.format(viewReport.totalValue)}</td>
                                         <td className="p-2 border border-slate-700"></td>
                                     </tr>
@@ -5445,7 +5613,49 @@
                             </table>
                         </ModalBody>
                         <ModalFooter>
-                            <button onClick={() => setViewReport(null)} className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-500">Close</button>
+                            <button onClick={() => setViewReport(null)} className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-500 transition">Close</button>
+                            <button onClick={handleExportToExcel} className="bg-green-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-green-700 transition flex items-center gap-2 shadow-lg shadow-green-900/20">
+                                <i className="fas fa-file-excel"></i> Export to Excel
+                            </button>
+                        </ModalFooter>
+                    </Modal>
+                )}
+
+                {/* NEW: AI Insight Modal */}
+                {aiInsightProduct && (
+                    <Modal show={true} onClose={() => setAiInsightProduct(null)} maxWidth="max-w-lg">
+                        <ModalHeader title={`AI Insight: Purchase History`} onClose={() => setAiInsightProduct(null)} />
+                        <ModalBody>
+                            <div className="mb-4">
+                                <h4 className="text-lg font-bold text-slate-200">{aiInsightProduct.product.name}</h4>
+                                <p className="text-slate-400 text-sm">Last 3 audited purchase orders for this item.</p>
+                            </div>
+                            {aiInsightProduct.history.length === 0 ? (
+                                <div className="text-center p-6 bg-slate-800 rounded-lg border border-slate-700">
+                                    <i className="fas fa-search text-3xl text-slate-500 mb-2"></i>
+                                    <p className="text-slate-400">No audited purchase history found.</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-3">
+                                    {aiInsightProduct.history.map((h, i) => (
+                                        <div key={i} className="bg-slate-800 p-4 rounded-lg border border-slate-700 relative overflow-hidden">
+                                            <div className="absolute top-0 right-0 w-1 h-full bg-purple-500"></div>
+                                            <div className="flex justify-between items-start mb-2">
+                                                <span className="font-bold text-blue-400 font-mono">{h.poNumber}</span>
+                                                <span className="text-xs font-bold text-slate-400 bg-slate-900 px-2 py-1 rounded">{formatDateDDMMYYYY(h.date)}</span>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-y-2 mt-3 text-sm text-slate-300">
+                                                <div><span className="text-slate-500 text-xs block uppercase">Vendor</span> <span className="font-semibold">{h.vendor}</span></div>
+                                                <div><span className="text-slate-500 text-xs block uppercase">Purchaser</span> <span>{h.staff}</span></div>
+                                                <div className="col-span-2"><span className="text-slate-500 text-xs uppercase">Qty Bought</span> <span className="font-bold text-emerald-400 ml-1">{h.qty}</span></div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </ModalBody>
+                        <ModalFooter>
+                            <button onClick={() => setAiInsightProduct(null)} className="bg-slate-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-slate-500 transition">Close</button>
                         </ModalFooter>
                     </Modal>
                 )}
@@ -5510,6 +5720,278 @@
                             </tbody>
                         </table>
                     )}
+                </TableCard>
+            </div>
+        );
+    };
+
+    // --- NEW: PHASE 1 & 2 - Waste Analytics Engine ---
+    const WasteAnalyticsPage = ({ userProfile }) => {
+        const { allPOs, posLoading, shops } = useData();
+        const [lossReports, setLossReports] = useState([]);
+        const [loadingLoss, setLoadingLoss] = useState(true);
+
+        // Filter State
+        const [shopFilter, setShopFilter] = useState('');
+        const [startDate, setStartDate] = useState(() => {
+            const now = new Date();
+            return new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString('en-CA');
+        });
+        const [endDate, setEndDate] = useState(() => new Date().toLocaleDateString('en-CA'));
+
+        const setDateRange = (type) => {
+            const today = new Date();
+            let start = new Date();
+            let end = new Date();
+
+            if (type === 'today') {
+                // Default
+            } else if (type === 'yesterday') {
+                start.setDate(today.getDate() - 1);
+                end.setDate(today.getDate() - 1);
+            } else if (type === 'thisWeek') {
+                const day = today.getDay();
+                const diff = today.getDate() - day + (day === 0 ? -6 : 1);
+                start.setDate(diff);
+            } else if (type === 'lastWeek') {
+                const day = today.getDay();
+                const diff = today.getDate() - day + (day === 0 ? -6 : 1) - 7;
+                start.setDate(diff);
+                end.setDate(diff + 6);
+            } else if (type === 'thisMonth') {
+                start = new Date(today.getFullYear(), today.getMonth(), 1);
+            } else if (type === 'lastMonth') {
+                start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+                end = new Date(today.getFullYear(), today.getMonth(), 0);
+            }
+
+            setStartDate(start.toLocaleDateString('en-CA'));
+            setEndDate(end.toLocaleDateString('en-CA'));
+        };
+
+        // Fetch all loss reports to cross-reference with POs
+        useEffect(() => {
+            const unsubscribe = db.collection('lossReports').onSnapshot(snap => {
+                setLossReports(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+                setLoadingLoss(false);
+            }, err => {
+                console.error("Error fetching loss reports for analytics:", err);
+                setLoadingLoss(false);
+            });
+            return () => unsubscribe();
+        }, []);
+
+        // The Intelligence Engine: Correlating POs to Breakage
+        const analytics = useMemo(() => {
+            if (posLoading || loadingLoss || !allPOs) return { rows: [], totalSunkCost: 0, worstProduct: null };
+
+            const productStats = {};
+            const start = new Date(startDate);
+            start.setHours(0, 0, 0, 0);
+            const end = new Date(endDate);
+            end.setHours(23, 59, 59, 999);
+
+            // 1. Aggregate Historical Purchases (Audited POs only)
+            allPOs.filter(po => {
+                if (po.status !== 'audited') return false;
+                if (shopFilter && po.shopId !== shopFilter) return false;
+                if (userProfile.role !== 'Admin' && !shopFilter && !(userProfile.assignedShops || []).includes(po.shopId)) return false;
+                
+                const d = safeToDate(po.auditedAt || po.updatedAt || po.createdAt);
+                return d && d >= start && d <= end;
+            }).forEach(po => {
+                po.items.forEach(item => {
+                    if (!productStats[item.productId]) {
+                        productStats[item.productId] = { 
+                            id: item.productId, name: item.name, code: item.code, 
+                            totalPurchased: 0, totalLost: 0, sunkCost: 0, purchasers: {} 
+                        };
+                    }
+                    const qty = parseFloat(item.auditedQty) || 0;
+                    productStats[item.productId].totalPurchased += qty;
+                    
+                    // Track who is buying this to find the frequent purchaser
+                    const purchaser = po.createdByName || 'Unknown';
+                    productStats[item.productId].purchasers[purchaser] = (productStats[item.productId].purchasers[purchaser] || 0) + qty;
+                });
+            });
+
+            // 2. Aggregate Losses
+            lossReports.filter(report => {
+                if (shopFilter && report.shopId !== shopFilter) return false;
+                if (userProfile.role !== 'Admin' && !shopFilter && !(userProfile.assignedShops || []).includes(report.shopId)) return false;
+
+                const d = safeToDate(report.reportDate);
+                return d && d >= start && d <= end;
+            }).forEach(report => {
+                report.items.forEach(item => {
+                    if (!productStats[item.productId]) {
+                        productStats[item.productId] = { 
+                            id: item.productId, name: item.name, code: item.code, 
+                            totalPurchased: 0, totalLost: 0, sunkCost: 0, purchasers: {} 
+                        };
+                    }
+                    const qty = parseFloat(item.quantity) || 0;
+                    const cost = parseFloat(item.cost) || 0;
+                    productStats[item.productId].totalLost += qty;
+                    productStats[item.productId].sunkCost += (qty * cost);
+                });
+            });
+
+            let totalSunkCost = 0;
+            let worstProduct = null;
+            let maxWasteCost = -1;
+
+            const rows = Object.values(productStats)
+                .filter(stat => stat.totalPurchased > 0 || stat.totalLost > 0) // Hide blank items
+                .map(stat => {
+                    totalSunkCost += stat.sunkCost;
+                    
+                    // Determine Primary Purchaser
+                    let primaryPurchaser = '-';
+                    let maxP = 0;
+                    Object.entries(stat.purchasers).forEach(([name, qty]) => {
+                        if (qty > maxP) {
+                            maxP = qty;
+                            primaryPurchaser = name;
+                        }
+                    });
+
+                    // Calculate Waste Ratio
+                    const wasteRatio = stat.totalPurchased > 0 
+                        ? (stat.totalLost / stat.totalPurchased) * 100 
+                        : (stat.totalLost > 0 ? 100 : 0);
+
+                    // Identify highest offender
+                    if (stat.sunkCost > maxWasteCost) {
+                        maxWasteCost = stat.sunkCost;
+                        worstProduct = { ...stat, wasteRatio };
+                    }
+
+                    return { ...stat, primaryPurchaser, wasteRatio };
+                });
+
+            // Sort table by highest financial leakage
+            rows.sort((a, b) => b.sunkCost - a.sunkCost);
+
+            return { rows, totalSunkCost, worstProduct };
+        }, [allPOs, lossReports, posLoading, loadingLoss, startDate, endDate, shopFilter, userProfile]);
+
+        if (posLoading || loadingLoss) return <div className="flex justify-center p-12"><div className="loader"></div></div>;
+
+        return (
+            <div className="space-y-6">
+                {/* NEW: Filter Card */}
+                <Card>
+                    <div className="flex flex-col lg:flex-row gap-6 items-end">
+                        <div className="flex-1 w-full">
+                            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-2 gap-2">
+                                <label className="block text-sm font-medium text-slate-300">
+                                    <i className="fas fa-calendar-alt text-blue-400 mr-2"></i>Date Range
+                                </label>
+                                <div className="flex flex-wrap gap-1 bg-slate-900/50 p-1 rounded-md">
+                                    <button onClick={() => setDateRange('today')} className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap ${startDate === new Date().toLocaleDateString('en-CA') && endDate === new Date().toLocaleDateString('en-CA') ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700'}`}>Today</button>
+                                    <button onClick={() => setDateRange('yesterday')} className="px-3 py-1 text-xs font-medium rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors whitespace-nowrap">Yesterday</button>
+                                    <button onClick={() => setDateRange('thisWeek')} className="px-3 py-1 text-xs font-medium rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors whitespace-nowrap">This Week</button>
+                                    <button onClick={() => setDateRange('lastWeek')} className="px-3 py-1 text-xs font-medium rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors whitespace-nowrap">Last Week</button>
+                                    <button onClick={() => setDateRange('thisMonth')} className="px-3 py-1 text-xs font-medium rounded text-slate-400 hover:text-slate-200 hover:bg-slate-700 transition-colors whitespace-nowrap">This Month</button>
+                                </div>
+                            </div>
+                            <div className="flex gap-2 items-center">
+                                <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md w-full focus:ring-2 focus:ring-blue-500 outline-none" style={{colorScheme: 'dark'}} />
+                                <span className="text-slate-500 font-bold">-</span>
+                                <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} className="bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md w-full focus:ring-2 focus:ring-blue-500 outline-none" style={{colorScheme: 'dark'}} />
+                            </div>
+                        </div>
+                        
+                        <div className="w-full lg:w-64">
+                            <label className="block text-sm font-medium text-slate-300 mb-1">
+                                <i className="fas fa-store-alt text-orange-400 mr-2"></i>Filter by Shop
+                            </label>
+                            <select value={shopFilter} onChange={e => setShopFilter(e.target.value)} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer">
+                                <option value="">All Shops</option>
+                                {shops.filter(s => userProfile.role === 'Admin' || (userProfile.assignedShops || []).includes(s.id))
+                                      .map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                </Card>
+
+                <Card className="border-purple-500/30">
+                    <div className="flex justify-between items-center mb-4">
+                        <div>
+                            <h3 className="text-xl font-bold text-slate-200 flex items-center gap-2">
+                                <i className="fas fa-brain text-purple-400"></i> Smart Waste Analytics
+                            </h3>
+                            <p className="text-slate-400 text-sm">Cross-referencing Audited POs with Loss & Breakage reports to detect financial leaks.</p>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                        <div className="bg-red-900/20 border border-red-500/30 p-6 rounded-xl relative overflow-hidden">
+                            <i className="fas fa-chart-line absolute -right-4 -bottom-4 text-6xl text-red-500/10"></i>
+                            <p className="text-red-400 text-xs font-bold uppercase tracking-wider mb-1">Total Sunk Cost (Leakage)</p>
+                            <h3 className="text-3xl font-black text-red-500">៛{new Intl.NumberFormat('en-US').format(analytics.totalSunkCost)}</h3>
+                            <p className="text-xs text-red-400/70 mt-2">Capital lost to waste and breakage.</p>
+                        </div>
+                        <div className="bg-orange-900/20 border border-orange-500/30 p-6 rounded-xl relative overflow-hidden">
+                            <i className="fas fa-exclamation-triangle absolute -right-4 -bottom-4 text-6xl text-orange-500/10"></i>
+                            <p className="text-orange-400 text-xs font-bold uppercase tracking-wider mb-1">Highest Waste Product</p>
+                            {analytics.worstProduct ? (
+                                <>
+                                    <h3 className="text-xl font-bold text-orange-400 truncate">{analytics.worstProduct.name}</h3>
+                                    <p className="text-sm text-orange-300 mt-1">
+                                        Waste Ratio: <span className="font-bold">{analytics.worstProduct.wasteRatio.toFixed(1)}%</span> | 
+                                        Cost: ៛{new Intl.NumberFormat('en-US').format(analytics.worstProduct.sunkCost)}
+                                    </p>
+                                </>
+                            ) : (
+                                <p className="text-slate-500 mt-2">No waste data found.</p>
+                            )}
+                        </div>
+                    </div>
+                </Card>
+
+                <TableCard title="Waste-to-Purchase Correlation">
+                    <table className="min-w-full divide-y divide-slate-700">
+                        <thead className="bg-slate-900/50">
+                            <tr>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Product</th>
+                                <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Total Bought</th>
+                                <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Total Lost</th>
+                                <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Waste Ratio</th>
+                                <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Sunk Cost (៛)</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Primary Purchaser</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-700">
+                            {analytics.rows.length === 0 ? (
+                                <tr><td colSpan="6" className="text-center p-8 text-slate-500">No data to display.</td></tr>
+                            ) : analytics.rows.map((row, idx) => (
+                                <tr key={idx} className="hover:bg-slate-700/50">
+                                    <td className="px-4 py-3">
+                                        <div className="text-sm text-slate-200 font-bold">{row.name}</div>
+                                        <div className="text-xs text-slate-500">{row.code}</div>
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-center text-slate-300 font-bold">{row.totalPurchased}</td>
+                                    <td className="px-4 py-3 text-sm text-center text-red-400 font-bold">{row.totalLost}</td>
+                                    <td className="px-4 py-3 text-sm text-center">
+                                        <span className={`px-2 py-1 rounded text-xs font-bold ${row.wasteRatio > 15 ? 'bg-red-500/20 text-red-400' : row.wasteRatio > 5 ? 'bg-orange-500/20 text-orange-400' : 'bg-green-500/20 text-green-400'}`}>
+                                            {row.wasteRatio.toFixed(1)}%
+                                        </span>
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-right text-red-400 font-bold">
+                                        ៛{new Intl.NumberFormat('en-US').format(row.sunkCost)}
+                                    </td>
+                                    <td className="px-4 py-3 text-sm text-slate-300">
+                                        <div className="flex items-center gap-2">
+                                            <i className="fas fa-user-circle text-slate-500"></i> {row.primaryPurchaser}
+                                        </div>
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
                 </TableCard>
             </div>
         );
@@ -5750,7 +6232,7 @@
         };
 
         // Determine which Dropdown Value to show visually
-        const isPOActive = ['create-po', 'drafts-po', 'active-po', 'auditing-po', 'audited-po', 'loss-breakage'].includes(activeTab);
+        const isPOActive = ['create-po', 'drafts-po', 'active-po', 'auditing-po', 'audited-po', 'loss-breakage', 'waste-analytics'].includes(activeTab);
         const isTransferActive = ['internal-transfer', 'drafts', 'active-transfer', 'transfer-report'].includes(activeTab);
         const isProductionActive = ['product-list', 'vendor-list'].includes(activeTab);
 
@@ -5784,6 +6266,7 @@
                                         <option value="auditing-po">Auditing PO</option>
                                         <option value="audited-po">Audited PO</option>
                                         <option value="loss-breakage">Loss & Breakage</option>
+                                        <option value="waste-analytics">Waste Analytics (AI)</option>
                                     </select>
                                     <div className={`absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none ${isPOActive ? 'text-purple-400' : 'text-slate-400'}`}>
                                         <i className="fas fa-chevron-down text-xs"></i>
@@ -5860,6 +6343,7 @@
                 {activeTab === 'auditing-po' && <POList pos={allPOs} loading={posLoading} status="auditing" setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'audited-po' && <POList pos={allPOs} loading={posLoading} status="audited" setPage={handleSetPage} userProfile={userProfile} />}
                 {activeTab === 'loss-breakage' && <LossBreakagePage userProfile={userProfile} setPage={handleSetPage} />}
+                {activeTab === 'waste-analytics' && <WasteAnalyticsPage userProfile={userProfile} />}
 
                 {/* Production Views */}
                 {activeTab === 'product-list' && <ProductList userProfile={userProfile} />}
