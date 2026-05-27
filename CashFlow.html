@@ -1418,7 +1418,8 @@
         const LiveFormatInput = React.memo(({ value, onChange, name, label, ...props }) => {
             const handleChange = useCallback((e) => {
                 const rawValue = e.target.value;
-                let sanitized = rawValue.replace(/[^0-9.]/g, '');
+                // Allow leading minus sign, digits, and decimals
+                let sanitized = rawValue.replace(/(?!^-)[^0-9.]/g, '');
                 const parts = sanitized.split('.');
                 if (parts.length > 2) sanitized = parts[0] + '.' + parts.slice(1).join('');
                 onChange({ target: { name, value: sanitized } });
@@ -1427,11 +1428,21 @@
             const formatForDisplay = (val) => {
                 if (val === null || val === undefined || val === '') return '';
                 const stringVal = String(val);
-                const [integerPart, decimalPart] = stringVal.split('.');
+                
+                // Preserve the standalone minus sign while typing
+                if (stringVal === '-') return '-';
+                
+                const isNegative = stringVal.startsWith('-');
+                const absoluteVal = isNegative ? stringVal.substring(1) : stringVal;
+                
+                const [integerPart, decimalPart] = absoluteVal.split('.');
                 const formattedIntegerPart = integerPart ? new Intl.NumberFormat('en-US').format(integerPart) : '';
-                if (decimalPart !== undefined) return `${formattedIntegerPart}.${decimalPart}`;
-                if (stringVal.endsWith('.')) return `${formattedIntegerPart}.`;
-                return formattedIntegerPart;
+                
+                let result = isNegative ? '-' + formattedIntegerPart : formattedIntegerPart;
+                
+                if (decimalPart !== undefined) return `${result}.${decimalPart}`;
+                if (absoluteVal.endsWith('.')) return `${result}.`;
+                return result;
             };
 
             return <FormInput label={label} name={name} value={formatForDisplay(value)} onChange={handleChange} placeholder="0.00" {...props}/>;
@@ -10573,6 +10584,7 @@
             // --- State for GCA History Actions ---
             const [editingGcaLog, setEditingGcaLog] = useState(null);
             const [deletingGcaLog, setDeletingGcaLog] = useState(null);
+            const [adjustingGcaShop, setAdjustingGcaShop] = useState(null);
             
             // --- NEW: State for CA Expense Budget ---
             const [editingCABudget, setEditingCABudget] = useState(null);
@@ -10764,6 +10776,7 @@
                                                     <td className="p-3 text-right font-mono text-indigo-400">{(shopInvestments[shop.name] || 0).toLocaleString()}</td>
                                                     <td className="p-3 text-right font-mono">{shop.saleMargin || 0}%</td>
                                                     <td className="p-3 flex gap-1 justify-center">
+                                                        <Button variant="ghost" onClick={() => setAdjustingGcaShop(shop)} className="text-emerald-400 hover:bg-emerald-900/50" title="GCA Adjustment"><Icon name="ArrowRightLeft"/></Button>
                                                         <Button variant="ghost" onClick={() => openModal(shop)}><Icon name="PenSquare"/></Button>
                                                         <Button variant="ghost" onClick={() => setDeletingShop(shop)} className="text-red-400 hover:bg-red-900/50"><Icon name="Trash2"/></Button>
                                                     </td>
@@ -10784,6 +10797,7 @@
                                     <Icon name="BarChart3" className="text-orange-400" />
                                     GCA Adjustment History Log
                                 </h2>
+                                <Button onClick={() => setAdjustingGcaShop({})} icon="Plus">New Adjustment</Button>
                             </div>
                             <div className="overflow-x-auto max-h-[600px]">
                                 <table className="w-full text-left text-sm">
@@ -10880,7 +10894,141 @@
                     {editingGcaLog && ( <GcaLogEditModal log={editingGcaLog} onClose={() => setEditingGcaLog(null)} onSave={handleUpdateGcaLog} /> )}
                     {deletingGcaLog && ( <ConfirmationModal title="Delete Log" message="Are you sure? This will remove the record from history but will NOT automatically revert the GCA on the shop." onConfirm={handleDeleteGcaLog} onClose={() => setDeletingGcaLog(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete Log" /> )}
                     {editingCABudget && ( <CAExpenseLimitModal shop={editingCABudget} onClose={() => setEditingCABudget(null)} onSave={handleUpdateCABudget} /> )}
+                    
+                    {adjustingGcaShop && (
+                        <NewGcaAdjustmentModal
+                            shop={adjustingGcaShop.id ? adjustingGcaShop : null}
+                            onClose={() => setAdjustingGcaShop(null)}
+                        />
+                    )}
                 </div>
+            );
+        };
+
+        // --- NEW COMPONENT: NewGcaAdjustmentModal ---
+        const NewGcaAdjustmentModal = ({ shop, onClose }) => {
+            const { showNotification } = useNotification();
+            const { addDoc, collection, Timestamp } = window.Firebase;
+            const { userData, logActivity, shops } = useData();
+
+            const [formData, setFormData] = useState({
+                shopId: shop?.id || '',
+                adjustmentAmount: '',
+                adjustmentReason: '',
+                adjustmentDate: (() => {
+                    const d = new Date();
+                    const pad = n => String(n).padStart(2, '0');
+                    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                })()
+            });
+
+            const [isSubmitting, setIsSubmitting] = useState(false);
+
+            const handleChange = (e) => setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                const adjustmentAmount = parseFormattedNumber(formData.adjustmentAmount);
+                const adjustmentReason = formData.adjustmentReason.trim();
+
+                if (!formData.shopId) {
+                    showNotification("Please select a shop.", "error");
+                    return;
+                }
+
+                if (adjustmentAmount === 0 || !adjustmentReason) {
+                    showNotification("Amount and Reason are required.", "error");
+                    return;
+                }
+
+                setIsSubmitting(true);
+                try {
+                    const targetShop = shops.find(s => s.id === formData.shopId);
+                    const finalGCA = parseFloat(String(targetShop?.gca || 0)) || 0;
+                    const newGCA = finalGCA + adjustmentAmount;
+                    const adjustmentDateObj = new Date(formData.adjustmentDate);
+
+                    const adjustmentRecord = {
+                        shopId: targetShop.id,
+                        shopName: targetShop.name,
+                        adjustmentAmount: adjustmentAmount,
+                        reason: adjustmentReason,
+                        previousGCA: finalGCA,
+                        newGCA: newGCA,
+                        adjustedAt: Timestamp.fromDate(adjustmentDateObj),
+                        adjustedBy: userData?.uid || 'unknown',
+                        adjustedByName: userData?.name || 'Unknown'
+                    };
+
+                    await addDoc(collection(window.db, "gcaAdjustments"), adjustmentRecord);
+                    logActivity('UPDATE', 'Shops (GCA)', targetShop.name, `Manual adjustment of ${adjustmentAmount}. Reason: ${adjustmentReason}`);
+
+                    showNotification("GCA adjustment recorded successfully!", "success");
+                    onClose();
+                } catch (error) {
+                    console.error("GCA Adjustment Error:", error);
+                    showNotification("Failed to record GCA adjustment.", "error");
+                } finally {
+                    setIsSubmitting(false);
+                }
+            };
+
+            return (
+                <Modal title="New GCA Adjustment" onClose={onClose} size="md">
+                    <form onSubmit={handleSubmit} className="space-y-4">
+                        <div className="bg-orange-500/10 border border-orange-500/20 p-3 rounded-lg text-sm text-orange-200">
+                            <strong>Note:</strong> Use negative numbers to decrease GCA, and positive numbers to increase it.
+                        </div>
+
+                        {!shop?.id && (
+                            <FormSelect
+                                label="Shop"
+                                name="shopId"
+                                value={formData.shopId}
+                                onChange={handleChange}
+                                options={[{value: '', label: 'Select Shop'}, ...shops.map(s => ({value: s.id, label: s.name}))]}
+                                required
+                            />
+                        )}
+                        {shop?.id && (
+                            <FormInput label="Shop" value={shop.name} disabled />
+                        )}
+
+                        <FormInput
+                            type="datetime-local"
+                            label="Date & Time"
+                            name="adjustmentDate"
+                            value={formData.adjustmentDate}
+                            onChange={handleChange}
+                            required
+                        />
+
+                        <LiveFormatInput
+                            label="Adjustment Amount (៛)"
+                            name="adjustmentAmount"
+                            value={formData.adjustmentAmount}
+                            onChange={handleChange}
+                            placeholder="e.g., -50000 or 100000"
+                            required
+                        />
+
+                        <FormTextarea
+                            label="Reason for Adjustment"
+                            name="adjustmentReason"
+                            value={formData.adjustmentReason}
+                            onChange={handleChange}
+                            placeholder="Please provide details for the audit log..."
+                            required
+                        />
+
+                        <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
+                            <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : "CheckCircle"}>
+                                {isSubmitting ? 'Saving...' : 'Record Adjustment'}
+                            </Button>
+                        </div>
+                    </form>
+                </Modal>
             );
         };
 
@@ -11085,9 +11233,6 @@
 
             const [formData, setFormData] = useState({
                 name: '', address: '', phone: '', gca: 0, saleMargin: 0, shareholders: [],
-                adjustmentAmount: '', 
-                adjustmentReason: '', 
-                adjustmentDate: '',
                 logoUrl: '', 
                 target: 0,
                 cashFloat: 0,
@@ -11101,9 +11246,6 @@
 
             useEffect(() => {
                 isMounted.current = true;
-                const defaultDate = new Date();
-                const pad = (n) => String(n).padStart(2, '0');
-                const defaultDateStr = `${defaultDate.getFullYear()}-${pad(defaultDate.getMonth()+1)}-${pad(defaultDate.getDate())}T${pad(defaultDate.getHours())}:${pad(defaultDate.getMinutes())}`;
 
                 if (shop) {
                      setFormData(prev => ({
@@ -11113,9 +11255,6 @@
                             ...s,
                             id: s.id || generateId() 
                         })),
-                        adjustmentAmount: '', 
-                        adjustmentReason: '',
-                        adjustmentDate: defaultDateStr,
                         gca: shop.gca || 0, 
                         logoUrl: shop.logoUrl || '', 
                         target: shop.target || 0,
@@ -11128,9 +11267,6 @@
                      setFormData({ 
                         name: '', address: '', phone: '', gca: 0, saleMargin: 0, 
                         shareholders: [{id: generateId(), name: '', percentage: 100}],
-                        adjustmentAmount: '',
-                        adjustmentReason: '',
-                        adjustmentDate: defaultDateStr,
                         logoUrl: '',
                         target: 0,
                         cashFloat: 0,
@@ -11193,39 +11329,9 @@
                 if (!isMounted.current) return;
                 setIsUpdating(true);
 
-                // Default starting balance from form (or static db field)
                 let finalGCA = parseFloat(String(formData.gca).replace(/,/g, '')) || 0;
-                const adjustmentAmount = parseFormattedNumber(formData.adjustmentAmount);
-                const adjustmentReason = formData.adjustmentReason.trim();
-                let adjustmentRecordSaved = false;
-
-                if (shop?.id && adjustmentAmount !== 0 && adjustmentReason) {
-                    // Manual adjustment event saved in adjustments collection.
-                    // We DO NOT modify the base shop.gca field in Firestore to avoid double-counting.
+                if (shop?.id) {
                     finalGCA = parseFloat(String(shop.gca || 0)) || 0; // Maintain unchanged opening GCA in database
-                    const newGCA = finalGCA + adjustmentAmount; // Just for the log calculation
-
-                    const adjustmentDateObj = formData.adjustmentDate ? new Date(formData.adjustmentDate) : new Date();
-
-                    const adjustmentRecord = {
-                        shopId: shop.id,
-                        shopName: formData.name,
-                        adjustmentAmount: adjustmentAmount,
-                        reason: adjustmentReason,
-                        previousGCA: finalGCA, // Log static opening balance
-                        newGCA: newGCA,
-                        adjustedAt: Timestamp.fromDate(adjustmentDateObj),
-                        adjustedBy: userData?.uid || 'unknown',
-                        adjustedByName: userData?.name || 'Unknown'
-                    };
-
-                    try {
-                        await addDoc(collection(window.db, "gcaAdjustments"), adjustmentRecord);
-                        adjustmentRecordSaved = true;
-                    } catch (error) {
-                        console.error("Failed to save GCA adjustment record:", error);
-                        showNotification("Failed to log GCA adjustment.", "error");
-                    }
                 }
 
                 const dataToSave = {
@@ -11250,15 +11356,11 @@
                     if (shop?.id) {
                         await updateDoc(doc(window.db, "shops", shop.id), dataToSave);
                         logActivity('UPDATE', 'Shops', formData.name, 'Shop configuration updated'); 
-                        showNotification(`Shop ${adjustmentRecordSaved ? "and GCA" : ""} updated!`, "success");
+                        showNotification(`Shop updated!`, "success");
                     } else {
                         await addDoc(collection(window.db, "shops"), dataToSave);
                         logActivity('CREATE', 'Shops', formData.name, 'New shop added to system'); 
                         showNotification("New shop created!", "success");
-                    }
-                    
-                    if (adjustmentRecordSaved) {
-                        logActivity('UPDATE', 'Shops (GCA)', formData.name, `Manual adjustment of ${adjustmentAmount}. Reason: ${adjustmentReason}`); 
                     }
 
                     if (isMounted.current) onClose();
@@ -11319,42 +11421,6 @@
                             </div>
                         </div>
                         {/* ---------------------------------- */}
-
-                        {shop?.id && (
-                            <div className="p-4 rounded-lg bg-slate-700/50 border border-slate-600">
-                                <h4 className="text-lg font-semibold text-slate-200 mb-3">GCA Adjustment</h4>
-                                <p className="text-sm text-slate-400 mb-3">Only fill this out to make a manual adjustment. Use negative numbers to decrease GCA.</p>
-                                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                                    <div className="md:col-span-1">
-                                        <FormInput 
-                                            type="datetime-local" 
-                                            label="Date & Time" 
-                                            name="adjustmentDate" 
-                                            value={formData.adjustmentDate} 
-                                            onChange={handleChange} 
-                                        />
-                                    </div>
-                                    <div className="md:col-span-1">
-                                        <LiveFormatInput 
-                                            label="Adjustment Amount (៛)" 
-                                            name="adjustmentAmount" 
-                                            value={formData.adjustmentAmount} 
-                                            onChange={handleChange}
-                                            placeholder="e.g., -50000 or 100000"
-                                        />
-                                    </div>
-                                    <div className="md:col-span-2">
-                                        <FormInput 
-                                            label="Reason for Adjustment" 
-                                            name="adjustmentReason" 
-                                            value={formData.adjustmentReason} 
-                                            onChange={handleChange}
-                                            placeholder="Required if amount is set"
-                                        />
-                                    </div>
-                                </div>
-                            </div>
-                        )}
 
                         <div>
                             <div className="flex justify-between items-center mb-2">
