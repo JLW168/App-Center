@@ -149,7 +149,6 @@
             const [categories, setCategories] = useState([]);
             const [tables, setTables] = useState([]);
             const [orders, setOrders] = useState([]);
-            const [admins, setAdmins] = useState([]);
             const [loading, setLoading] = useState(true);
 
             // Auto-hide address bar on mobile devices
@@ -190,26 +189,60 @@
                 const unsubP = onSnapshot(getColRef('products'), snap => setProducts(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt)));
                 const unsubC = onSnapshot(getColRef('categories'), snap => setCategories(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order)));
                 const unsubT = onSnapshot(getColRef('tables'), snap => setTables(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                const unsubA = onSnapshot(getColRef('admins'), snap => setAdmins(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
                 const unsubO = onSnapshot(getColRef('orders'), snap => {
                     setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
                     setLoading(false);
                 });
 
-                return () => { unsubP(); unsubC(); unsubT(); unsubO(); unsubA(); };
+                return () => { unsubP(); unsubC(); unsubT(); unsubO(); };
             }, [user]);
 
             return (
                 <div className="min-h-screen">
-                    {view === 'customer' && <CustomerPortal products={products} categories={categories} tables={tables} orders={orders} onAdminClick={() => setView(user && !user.isAnonymous ? 'admin_dashboard' : 'admin_login')} />}
+                    {view === 'customer' && <CustomerPortal products={products} categories={categories} tables={tables} orders={orders} currentUser={user} isLoading={loading} onAdminClick={() => setView(user && !user.isAnonymous ? 'admin_dashboard' : 'admin_login')} />}
                     {view === 'admin_login' && <AdminLogin onBack={() => setView('customer')} onLogin={() => setView('admin_dashboard')} />}
-                    {view === 'admin_dashboard' && <AdminDashboard products={products} categories={categories} tables={tables} orders={orders} admins={admins} currentUser={user} onLogout={() => { window.FirebaseApp.signOut(auth).then(() => setView('customer')); }} onBack={() => setView('customer')} />}
+                    {view === 'admin_dashboard' && <AdminDashboard products={products} categories={categories} tables={tables} orders={orders} currentUser={user} onLogout={() => { window.FirebaseApp.signOut(auth).then(() => setView('customer')); }} onBack={() => setView('customer')} />}
+                </div>
+            );
+        }
+
+        // --- Shared Components ---
+        function LiveOrderTimer({ createdAt, completedAt, status }) {
+            const [elapsed, setElapsed] = useState(0);
+
+            useEffect(() => {
+                const calc = () => {
+                    const end = (status === 'Served' || status === 'Cancelled') && completedAt ? completedAt : Date.now();
+                    setElapsed(Math.max(0, Math.floor((end - createdAt) / 1000)));
+                };
+                calc();
+
+                if (status === 'Served' || status === 'Cancelled') return;
+
+                const timer = setInterval(calc, 1000);
+                return () => clearInterval(timer);
+            }, [createdAt, completedAt, status]);
+
+            const minutes = Math.floor(elapsed / 60);
+            const seconds = elapsed % 60;
+            const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            
+            let colorClass = "bg-stone-100 text-stone-600 border-stone-200";
+            if (status === 'Served') colorClass = "bg-green-50 text-green-700 border-green-200";
+            else if (status === 'Cancelled') colorClass = "bg-red-50 text-red-700 border-red-200";
+            else if (elapsed > 1800) colorClass = "bg-red-100 text-red-800 border-red-300 animate-pulse"; // > 30 mins
+            else if (elapsed > 900) colorClass = "bg-amber-100 text-amber-800 border-amber-300"; // > 15 mins
+
+            return (
+                <div className={`flex items-center gap-1.5 text-[10px] font-bold px-2 py-0.5 rounded border ${colorClass}`}>
+                    <i className={`fa-solid ${status === 'Served' ? 'fa-check-double' : status === 'Cancelled' ? 'fa-ban' : 'fa-clock'}`}></i>
+                    {timeStr}
                 </div>
             );
         }
 
         // --- 1. Customer Portal (Self-Ordering) ---
-        function CustomerPortal({ products, categories, tables, orders, onAdminClick }) {
+        function CustomerPortal({ products, categories, tables, orders, currentUser, isLoading, onAdminClick }) {
             const [activeCategory, setActiveCategory] = useState('All');
             const [searchQuery, setSearchQuery] = useState('');
             const [cart, setCart] = useState([]);
@@ -244,6 +277,60 @@
 
             // Cart supplementary notes
             const [cartNotes, setCartNotes] = useState('');
+            
+            // Order Tracking State
+            const [isTrackerOpen, setIsTrackerOpen] = useState(false);
+            const [phoneSearchQuery, setPhoneSearchQuery] = useState('');
+
+            const myActiveOrders = useMemo(() => {
+                const today = getTodayString();
+                return orders.filter(o => {
+                    const isToday = o.dateString === today;
+                    const isMyAuth = currentUser && o.userId === currentUser.uid;
+                    const isMyPhone = phoneSearchQuery && o.customerPhone === phoneSearchQuery;
+                    return isToday && (isMyAuth || isMyPhone);
+                }).sort((a, b) => b.createdAt - a.createdAt);
+            }, [orders, currentUser, phoneSearchQuery]);
+
+            const renderProgressBar = (status) => {
+                if (status === 'Cancelled') {
+                    return <div className="text-red-500 font-bold mt-4 p-3 bg-red-50 rounded-lg border border-red-200 text-center"><i className="fa-solid fa-ban mr-2"></i>Order Cancelled</div>;
+                }
+
+                const steps = [
+                    { id: 'New', label: 'Received', icon: 'fa-receipt' },
+                    { id: 'Preparing', label: 'Preparing', icon: 'fa-fire-burner' },
+                    { id: 'Ready', label: 'Ready', icon: 'fa-bell' },
+                    { id: 'Served', label: 'Completed', icon: 'fa-check-double' }
+                ];
+
+                const currentIdx = steps.findIndex(s => s.id === status);
+                const activeIdx = currentIdx === -1 ? 0 : currentIdx;
+
+                return (
+                    <div className="mt-5 relative">
+                        {/* Background Line */}
+                        <div className="absolute top-4 left-4 right-4 h-1 bg-stone-200 rounded-full"></div>
+                        {/* Active Line */}
+                        <div className="absolute top-4 left-4 h-1 bg-amber-500 rounded-full transition-all duration-500" style={{ width: `${(activeIdx / (steps.length - 1)) * 100}%` }}></div>
+
+                        <div className="flex justify-between relative z-10">
+                            {steps.map((step, idx) => {
+                                const isCompleted = idx <= activeIdx;
+                                const isCurrent = idx === activeIdx;
+                                return (
+                                    <div key={step.id} className="flex flex-col items-center">
+                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center border-2 transition-colors duration-300 ${isCompleted ? 'bg-amber-500 border-amber-500 text-white shadow-md' : 'bg-white border-stone-300 text-stone-400'}`}>
+                                            <i className={`fa-solid ${step.icon} text-xs`}></i>
+                                        </div>
+                                        <span className={`text-[10px] mt-1.5 font-bold ${isCurrent ? 'text-amber-600' : isCompleted ? 'text-stone-800' : 'text-stone-400'}`}>{step.label}</span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                );
+            };
 
             const filteredProducts = useMemo(() => {
                 return products.filter(p => {
@@ -327,6 +414,7 @@
                 const actualOrderType = (sessionInfo.mode === 'QR' || sessionInfo.mode === 'DINE_IN') ? 'DINE_IN' : 'TAKEAWAY';
 
                 const orderData = {
+                    userId: currentUser ? currentUser.uid : null,
                     queueNo: queueString,
                     orderType: actualOrderType,
                     tableId: sessionInfo.tableId || 'TAKEAWAY',
@@ -392,6 +480,13 @@
 
                             <button onClick={() => {
                                 setSubmittedOrder(null);
+                                setIsTrackerOpen(true);
+                            }} className="w-full bg-amber-600 text-white py-4 rounded-xl font-bold hover:bg-amber-700 transition mb-3 shadow-lg">
+                                <i className="fa-solid fa-radar mr-2"></i> Track Live Order
+                            </button>
+
+                            <button onClick={() => {
+                                setSubmittedOrder(null);
                                 if (sessionInfo.mode !== 'QR') {
                                     setSessionInfo({ isSetup: false, mode: null, tableId: null, tableName: null, customerName: '', customerPhone: '' });
                                 }
@@ -407,6 +502,15 @@
                 <div className="pb-28 relative">
                     {/* Header Banner */}
                     <div className="relative h-48 sm:h-64 bg-stone-900 w-full overflow-hidden flex-shrink-0">
+                        
+                        {/* Track Order Button */}
+                        <button 
+                            onClick={() => setIsTrackerOpen(true)}
+                            className="absolute top-4 right-4 z-20 bg-stone-900/80 backdrop-blur text-white px-4 py-2 rounded-full text-sm font-bold shadow-lg border border-stone-700 hover:bg-stone-800 transition"
+                        >
+                            <i className="fa-solid fa-satellite-dish mr-2 text-amber-500"></i> Track Order
+                        </button>
+
                         <img src="https://images.unsplash.com/photo-1554118811-1e0d58224f24?auto=format&fit=crop&q=80&w=2000" alt="Cafe" className="w-full h-full object-cover opacity-50" />
                         <div className="absolute inset-0 flex flex-col items-center justify-center text-white px-4 text-center">
                             <h1 className="text-3xl sm:text-4xl font-bold tracking-tight drop-shadow-md">Solaris Cafe</h1>
@@ -450,38 +554,67 @@
                         </div>
 
                         <div className="flex gap-3 overflow-x-auto no-scrollbar mb-6 pb-2">
-                            <button onClick={() => setActiveCategory('All')} className={`whitespace-nowrap px-5 py-2 rounded-full text-sm font-semibold transition ${activeCategory === 'All' ? 'bg-stone-900 text-white' : 'bg-white text-stone-600 border border-stone-200'}`}>All</button>
-                            {categories.map(cat => (
-                                <button key={cat.id} onClick={() => setActiveCategory(cat.name)} className={`whitespace-nowrap px-5 py-2 rounded-full text-sm font-semibold transition ${activeCategory === cat.name ? 'bg-stone-900 text-white' : 'bg-white text-stone-600 border border-stone-200'}`}>{cat.name}</button>
-                            ))}
+                            {isLoading ? (
+                                Array.from({length: 5}).map((_, i) => (
+                                    <div key={`skel-cat-${i}`} className="whitespace-nowrap px-8 py-5 rounded-full bg-stone-200 animate-pulse shrink-0"></div>
+                                ))
+                            ) : (
+                                <>
+                                    <button onClick={() => setActiveCategory('All')} className={`whitespace-nowrap px-5 py-2 rounded-full text-sm font-semibold transition ${activeCategory === 'All' ? 'bg-stone-900 text-white' : 'bg-white text-stone-600 border border-stone-200'}`}>All</button>
+                                    {categories.map(cat => (
+                                        <button key={cat.id} onClick={() => setActiveCategory(cat.name)} className={`whitespace-nowrap px-5 py-2 rounded-full text-sm font-semibold transition ${activeCategory === cat.name ? 'bg-stone-900 text-white' : 'bg-white text-stone-600 border border-stone-200'}`}>{cat.name}</button>
+                                    ))}
+                                </>
+                            )}
                         </div>
 
                         {/* Product Grid */}
                         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 sm:gap-4">
-                            {filteredProducts.map(product => (
-                                <div key={product.id} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-stone-100 hover:shadow-md flex flex-col sm:flex-row p-2.5 sm:p-3 gap-2.5 sm:gap-3 transition-all">
-                                    <div className="w-full h-32 sm:w-28 sm:h-28 rounded-xl bg-stone-100 shrink-0 overflow-hidden relative">
-                                        {product.image ? <img src={product.image} className="w-full h-full object-cover absolute inset-0" alt={product.name} loading="lazy" /> : <i className="fa-solid fa-image text-2xl text-stone-300 w-full h-full flex items-center justify-center absolute inset-0"></i>}
-                                    </div>
-                                    <div className="flex-1 flex flex-col w-full relative">
-                                        <h3 className="font-bold text-stone-800 text-sm sm:text-base leading-tight">{product.name}</h3>
-                                        <p className="text-[10px] sm:text-xs text-stone-500 line-clamp-2 mt-1 flex-1">{product.description}</p>
-                                        
-                                        <div className="flex flex-col gap-1.5 mt-2">
-                                            {product.priceSmall > 0 && (
-                                                <button onClick={() => handleSizeClick(product, 'S', product.priceSmall)} className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg border text-[11px] sm:text-xs font-bold transition-colors border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 shadow-sm">
-                                                    <span>S</span><span>{product.priceSmall.toLocaleString()} ៛</span>
-                                                </button>
-                                            )}
-                                            {product.priceLarge > 0 && (
-                                                <button onClick={() => handleSizeClick(product, 'L', product.priceLarge)} className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg border text-[11px] sm:text-xs font-bold transition-colors border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 shadow-sm">
-                                                    <span>L</span><span>{product.priceLarge.toLocaleString()} ៛</span>
-                                                </button>
-                                            )}
+                            {isLoading ? (
+                                Array.from({length: 6}).map((_, i) => (
+                                    <div key={`skel-prod-${i}`} className="bg-white rounded-2xl p-2.5 sm:p-3 flex flex-col sm:flex-row gap-2.5 sm:gap-3 shadow-sm border border-stone-100 animate-pulse">
+                                        <div className="w-full h-32 sm:w-28 sm:h-28 rounded-xl bg-stone-200 shrink-0"></div>
+                                        <div className="flex-1 flex flex-col w-full py-1">
+                                            <div className="h-4 bg-stone-200 rounded w-3/4 mb-2"></div>
+                                            <div className="h-3 bg-stone-200 rounded w-full mb-1"></div>
+                                            <div className="h-3 bg-stone-200 rounded w-5/6 mb-auto"></div>
+                                            <div className="flex flex-col gap-1.5 mt-auto pt-3">
+                                                <div className="h-8 bg-stone-200 rounded-lg w-full"></div>
+                                            </div>
                                         </div>
                                     </div>
+                                ))
+                            ) : filteredProducts.length > 0 ? (
+                                filteredProducts.map(product => (
+                                    <div key={product.id} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-stone-100 hover:shadow-md flex flex-col sm:flex-row p-2.5 sm:p-3 gap-2.5 sm:gap-3 transition-all">
+                                        <div className="w-full h-32 sm:w-28 sm:h-28 rounded-xl bg-stone-100 shrink-0 overflow-hidden relative">
+                                            {product.image ? <img src={product.image} className="w-full h-full object-cover absolute inset-0" alt={product.name} loading="lazy" /> : <i className="fa-solid fa-image text-2xl text-stone-300 w-full h-full flex items-center justify-center absolute inset-0"></i>}
+                                        </div>
+                                        <div className="flex-1 flex flex-col w-full relative">
+                                            <h3 className="font-bold text-stone-800 text-sm sm:text-base leading-tight">{product.name}</h3>
+                                            <p className="text-[10px] sm:text-xs text-stone-500 line-clamp-2 mt-1 flex-1">{product.description}</p>
+                                            
+                                            <div className="flex flex-col gap-1.5 mt-2">
+                                                {product.priceSmall > 0 && (
+                                                    <button onClick={() => handleSizeClick(product, 'S', product.priceSmall)} className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg border text-[11px] sm:text-xs font-bold transition-colors border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 shadow-sm">
+                                                        <span>S</span><span>{product.priceSmall.toLocaleString()} ៛</span>
+                                                    </button>
+                                                )}
+                                                {product.priceLarge > 0 && (
+                                                    <button onClick={() => handleSizeClick(product, 'L', product.priceLarge)} className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg border text-[11px] sm:text-xs font-bold transition-colors border-amber-300 bg-amber-100 text-amber-900 hover:bg-amber-200 shadow-sm">
+                                                        <span>L</span><span>{product.priceLarge.toLocaleString()} ៛</span>
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            ) : (
+                                <div className="col-span-2 md:col-span-3 text-center py-10 text-stone-400 font-medium">
+                                    <i className="fa-solid fa-mug-hot text-4xl mb-3 opacity-30 block"></i>
+                                    No products found in this category.
                                 </div>
-                            ))}
+                            )}
                         </div>
                     </div>
 
@@ -670,6 +803,69 @@
                             </div>
                         </div>
                     )}
+
+                    {/* Order Tracker Modal */}
+                    {isTrackerOpen && (
+                        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex justify-end">
+                            <div className="bg-white w-full max-w-md h-full flex flex-col shadow-2xl animate-slide-in-right">
+                                <div className="p-5 border-b border-stone-100 flex justify-between items-center bg-white shrink-0">
+                                    <h2 className="text-xl font-bold text-stone-900"><i className="fa-solid fa-satellite-dish text-amber-500 mr-2"></i> Live Tracker</h2>
+                                    <button onClick={() => setIsTrackerOpen(false)} className="w-8 h-8 rounded-full bg-stone-100 flex items-center justify-center text-stone-500 hover:bg-stone-200"><i className="fa-solid fa-xmark"></i></button>
+                                </div>
+
+                                <div className="p-5 border-b border-stone-100 bg-stone-50 shrink-0">
+                                    <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2">Lost your session? Search by Phone</label>
+                                    <div className="flex gap-2">
+                                        <div className="relative w-full">
+                                            <i className="fa-solid fa-phone absolute left-4 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                                            <input type="tel" placeholder="Enter phone number..." className="w-full border border-stone-300 rounded-xl pl-10 pr-4 py-2.5 text-sm outline-none focus:border-amber-500 bg-white shadow-sm" value={phoneSearchQuery} onChange={e=>setPhoneSearchQuery(e.target.value)} />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-stone-100">
+                                    {myActiveOrders.length === 0 ? (
+                                        <div className="text-center text-stone-400 py-10 flex flex-col items-center">
+                                            <i className="fa-solid fa-box-open text-5xl mb-4 opacity-30 block"></i>
+                                            <p className="font-medium text-stone-500">No active orders found today.</p>
+                                            <p className="text-xs mt-2">Place an order or search by phone.</p>
+                                        </div>
+                                    ) : (
+                                        myActiveOrders.map(order => (
+                                            <div key={order.id} className="bg-white border border-stone-200 rounded-2xl p-5 shadow-sm">
+                                                <div className="flex justify-between items-start mb-2">
+                                                    <div>
+                                                        <div className="flex items-center gap-2 mb-1">
+                                                            <div className="text-xs font-bold text-stone-400 uppercase tracking-widest">{new Date(order.createdAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                                                            <LiveOrderTimer createdAt={order.createdAt} completedAt={order.completedAt} status={order.status} />
+                                                        </div>
+                                                        <div className="font-black text-3xl text-stone-800 leading-none">{order.queueNo}</div>
+                                                    </div>
+                                                    <div className="text-right flex flex-col items-end">
+                                                        <div className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider mb-1 ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-white' : 'bg-amber-100 text-amber-800'}`}>
+                                                            {order.orderType === 'TAKEAWAY' ? 'Take Away' : `Table ${order.tableName}`}
+                                                        </div>
+                                                        <div className="font-bold text-stone-600 text-lg">{order.totalAmount.toLocaleString()} ៛</div>
+                                                    </div>
+                                                </div>
+                                                <div className="text-sm font-semibold text-stone-500 mb-2">{order.items.reduce((s,i)=>s+i.quantity,0)} items</div>
+                                                
+                                                <div className="flex flex-wrap gap-1 mb-4">
+                                                    {order.items.map((item, idx) => (
+                                                        <span key={idx} className="text-[10px] bg-stone-100 text-stone-600 px-2 py-1 rounded border border-stone-200">
+                                                            {item.quantity}x {item.name}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                                
+                                                {renderProgressBar(order.status)}
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         }
@@ -752,7 +948,15 @@
         }
 
         // --- 3. Admin Dashboard Container ---
-        function AdminDashboard({ products, categories, tables, orders, admins, currentUser, onLogout, onBack }) {
+        function AdminDashboard({ products, categories, tables, orders, currentUser, onLogout, onBack }) {
+            const [admins, setAdmins] = useState([]);
+
+            useEffect(() => {
+                const { onSnapshot } = window.FirebaseApp;
+                const unsubA = onSnapshot(getColRef('admins'), snap => setAdmins(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                return () => unsubA();
+            }, []);
+
             const navs = [
                 { id: 'pos', icon: 'fa-cash-register', label: 'POS & Orders' },
                 { id: 'kds', icon: 'fa-tv', label: 'Kitchen Screen' },
@@ -1054,7 +1258,13 @@
 
             const updateStatus = async (order, newStatus) => {
                 const { doc, updateDoc } = window.FirebaseApp;
-                await updateDoc(doc(getColRef('orders'), order.id), { status: newStatus });
+                const updateData = { status: newStatus };
+                
+                if (newStatus === 'Served' || newStatus === 'Cancelled') {
+                    updateData.completedAt = Date.now();
+                }
+
+                await updateDoc(doc(getColRef('orders'), order.id), updateData);
                 
                 // If moving to a final state, check if the table should be freed
                 if (newStatus === 'Served' || newStatus === 'Cancelled') {
@@ -1153,6 +1363,10 @@
                     dateString: today,
                     createdAt: Date.now()
                 };
+
+                if (targetStatus === 'Served' || targetStatus === 'Cancelled') {
+                    orderData.completedAt = Date.now();
+                }
 
                 try {
                     await addDoc(getColRef('orders'), orderData);
@@ -1408,7 +1622,13 @@
 
             const updateStatus = async (order, newStatus) => {
                 const { doc, updateDoc } = window.FirebaseApp;
-                await updateDoc(doc(getColRef('orders'), order.id), { status: newStatus });
+                const updateData = { status: newStatus };
+                
+                if (newStatus === 'Served' || newStatus === 'Cancelled') {
+                    updateData.completedAt = Date.now();
+                }
+
+                await updateDoc(doc(getColRef('orders'), order.id), updateData);
                 
                 // Usually Kitchen doesn't Serve or Cancel, but just in case
                 if (newStatus === 'Served' || newStatus === 'Cancelled') {
