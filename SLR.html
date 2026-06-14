@@ -173,8 +173,8 @@
             return R * c; // Distance in meters
         };
 
-        const deductInventory = async (cart, products, orderShopId) => {
-            const { doc, updateDoc, increment } = window.FirebaseApp;
+        const deductInventory = async (cart, products, orderShopId, orderQueueNo) => {
+            const { doc, updateDoc, increment, addDoc, collection } = window.FirebaseApp;
             const stockUpdates = {}; 
 
             cart.forEach(item => {
@@ -198,6 +198,15 @@
                 try {
                     await updateDoc(doc(db, 'ingredients', ingredientId), {
                         [`stockByShop.${orderShopId}`]: increment(-amount)
+                    });
+                    
+                    await addDoc(collection(db, 'inventory_logs'), {
+                        ingredientId: ingredientId,
+                        shopId: orderShopId,
+                        amount: -amount,
+                        type: 'Usage',
+                        reference: `Order ${orderQueueNo || 'Unknown'}`,
+                        timestamp: Date.now()
                     });
                 } catch (err) {
                     console.warn("Failed to deduct stock for ", ingredientId, err);
@@ -1391,7 +1400,7 @@
 
                 try {
                     await addDoc(getColRef('orders'), orderData);
-                    await deductInventory(cart, products, sessionInfo.shopId);
+                    await deductInventory(cart, products, sessionInfo.shopId, queueString);
                     
                     if (actualOrderType === 'DINE_IN' && sessionInfo.tableId) {
                         try {
@@ -2907,7 +2916,7 @@
 
                     // Unified try execution block
                     await addDoc(getColRef('orders'), orderData);
-                    await deductInventory(cart, products, cartShopId);
+                    await deductInventory(cart, products, cartShopId, queueString);
                     
                     setCart([]);
                     setCustomerName('');
@@ -3271,12 +3280,56 @@
             const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
             const [filterShop, setFilterShop] = useState(isSuper ? '' : currentAdminRecord?.shopId);
             const [isModalOpen, setIsModalOpen] = useState(false);
-            const [formData, setFormData] = useState({ name: '', unit: '' });
+            const [formData, setFormData] = useState({ name: '', unit: '', usageS: '', usageL: '' });
             const [editingId, setEditingId] = useState(null);
+
+            // Smart Restock State
+            const [restockModalOpen, setRestockModalOpen] = useState(false);
+            const [restockData, setRestockData] = useState({ id: null, name: '', qty: '', cost: '' });
+
+            // History State
+            const [historyTab, setHistoryTab] = useState('stock');
+            const [logs, setLogs] = useState([]);
+            const [logFilter, setLogFilter] = useState('today');
 
             useEffect(() => {
                 if (shops.length > 0 && !filterShop && isSuper) setFilterShop(shops[0].id);
             }, [shops, filterShop, isSuper]);
+
+            // Fetch History Logs
+            useEffect(() => {
+                if (historyTab !== 'logs') return;
+                const { onSnapshot, collection } = window.FirebaseApp;
+                const unsub = onSnapshot(collection(db, 'inventory_logs'), snap => {
+                    setLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return () => unsub();
+            }, [historyTab]);
+
+            const filteredLogs = useMemo(() => {
+                let result = logs;
+                if (filterShop && filterShop !== 'All') {
+                    result = result.filter(l => l.shopId === filterShop);
+                }
+                
+                const now = new Date();
+                const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+                
+                if (logFilter === 'today') {
+                    result = result.filter(l => l.timestamp >= startOfToday);
+                } else if (logFilter === 'yesterday') {
+                    const startOfYesterday = startOfToday - (24 * 60 * 60 * 1000);
+                    result = result.filter(l => l.timestamp >= startOfYesterday && l.timestamp < startOfToday);
+                } else if (logFilter === 'week') {
+                    const weekAgo = startOfToday - (7 * 24 * 60 * 60 * 1000);
+                    result = result.filter(l => l.timestamp >= weekAgo);
+                } else if (logFilter === 'month') {
+                    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                    result = result.filter(l => l.timestamp >= startOfMonth);
+                }
+                
+                return result.sort((a, b) => b.timestamp - a.timestamp);
+            }, [logs, filterShop, logFilter]);
 
             const handleSubmit = async (e) => {
                 e.preventDefault();
@@ -3284,10 +3337,12 @@
                 const { doc, updateDoc, addDoc } = window.FirebaseApp;
                 const data = { 
                     name: formData.name, 
-                    unit: formData.unit 
+                    unit: formData.unit,
+                    usageS: Number(formData.usageS || 0),
+                    usageL: Number(formData.usageL || 0)
                 };
                 if (editingId) await updateDoc(doc(getColRef('ingredients'), editingId), data);
-                else await addDoc(getColRef('ingredients'), { ...data, stockByShop: {} });
+                else await addDoc(getColRef('ingredients'), { ...data, stockByShop: {}, costPerUnit: 0 });
                 setIsModalOpen(false);
             };
 
@@ -3300,20 +3355,71 @@
 
             const adjustStock = async (id, amount) => {
                 if (!filterShop || filterShop === 'All') return alert("Please select a specific shop branch first.");
-                const { doc, updateDoc, increment } = window.FirebaseApp;
+                const { doc, updateDoc, increment, addDoc, collection } = window.FirebaseApp;
                 await updateDoc(doc(getColRef('ingredients'), id), {
                     [`stockByShop.${filterShop}`]: increment(amount)
                 });
+                
+                await addDoc(collection(db, 'inventory_logs'), {
+                    ingredientId: id,
+                    shopId: filterShop,
+                    amount: amount,
+                    type: 'Adjustment',
+                    reference: 'Manual Adjustment',
+                    timestamp: Date.now()
+                });
+            };
+
+            const handleRestockSubmit = async (e) => {
+                e.preventDefault();
+                if (!filterShop || filterShop === 'All') return alert("Please select a specific shop branch first.");
+                const { doc, updateDoc, increment, addDoc, collection } = window.FirebaseApp;
+                
+                const addedQty = Number(restockData.qty);
+                const totalCost = Number(restockData.cost);
+                const costPerUnit = addedQty > 0 ? (totalCost / addedQty) : 0;
+
+                await updateDoc(doc(getColRef('ingredients'), restockData.id), {
+                    [`stockByShop.${filterShop}`]: increment(addedQty),
+                    costPerUnit: costPerUnit
+                });
+                
+                await addDoc(collection(db, 'inventory_logs'), {
+                    ingredientId: restockData.id,
+                    shopId: filterShop,
+                    amount: addedQty,
+                    cost: totalCost,
+                    type: 'Restock',
+                    reference: 'Smart Restock',
+                    timestamp: Date.now()
+                });
+
+                setRestockModalOpen(false);
             };
 
             return (
-                <div className="max-w-6xl">
-                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
+                <div className="max-w-6xl h-full flex flex-col">
+                    <div className="flex gap-2 mb-6 border-b border-stone-200 pb-2 shrink-0">
+                        <button onClick={() => setHistoryTab('stock')} className={`px-5 py-2 font-bold transition-colors ${historyTab === 'stock' ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}>Current Stock</button>
+                        <button onClick={() => setHistoryTab('logs')} className={`px-5 py-2 font-bold transition-colors ${historyTab === 'logs' ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}>Usage History</button>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4 shrink-0">
                         <div>
-                            <h2 className="text-2xl font-bold">Inventory Management</h2>
-                            <p className="text-sm text-stone-500 mt-1">Track branch-specific ingredient stock.</p>
+                            <h2 className="text-2xl font-bold">{historyTab === 'stock' ? 'Inventory Management' : 'Stock Usage History'}</h2>
+                            <p className="text-sm text-stone-500 mt-1">{historyTab === 'stock' ? 'Track branch-specific ingredient stock.' : 'Review restocks and order deductions over time.'}</p>
                         </div>
                         <div className="flex gap-2 w-full sm:w-auto">
+                            {historyTab === 'logs' && (
+                                <select className="border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-white font-medium text-stone-600" value={logFilter} onChange={e=>setLogFilter(e.target.value)}>
+                                    <option value="today">Today</option>
+                                    <option value="yesterday">Yesterday</option>
+                                    <option value="week">Last 7 Days</option>
+                                    <option value="month">This Month</option>
+                                    <option value="all">All Time</option>
+                                </select>
+                            )}
+                            
                             {isSuper ? (
                                 <select className="border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-white font-bold text-stone-700 flex-1 sm:flex-none" value={filterShop} onChange={e=>setFilterShop(e.target.value)}>
                                     <option value="" disabled>Select Branch...</option>
@@ -3325,55 +3431,157 @@
                                     {shops.find(s => s.id === currentAdminRecord?.shopId)?.name || 'Branch'}
                                 </div>
                             )}
-                            {isSuper && (
-                                <button onClick={() => { setFormData({ name: '', unit: '' }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap">
+                            {isSuper && historyTab === 'stock' && (
+                                <button onClick={() => { setFormData({ name: '', unit: '', usageS: '', usageL: '' }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap">
                                     <i className="fa-solid fa-plus mr-2"></i> Add Item
                                 </button>
                             )}
                         </div>
                     </div>
 
-                    <div className="bg-white rounded-2xl border shadow-sm p-4 overflow-auto">
-                        <table className="w-full min-w-[700px] text-left text-sm border-collapse border border-stone-300">
-                            <thead>
-                                <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
-                                    <th className="p-3 font-bold border border-stone-300">Ingredient Name</th>
-                                    <th className="p-3 font-bold border border-stone-300">Unit</th>
-                                    <th className="p-3 font-bold border border-stone-300 text-center bg-amber-50">Branch Stock</th>
-                                    {isSuper && <th className="p-3 font-bold border border-stone-300 text-right">Global Actions</th>}
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {ingredients.map(ing => {
-                                    const currentStock = ing.stockByShop?.[filterShop] || 0;
-                                    return (
-                                        <tr key={ing.id} className="hover:bg-stone-50 bg-white">
-                                            <td className="p-3 border border-stone-300 font-bold text-stone-800">{ing.name}</td>
-                                            <td className="p-3 border border-stone-300 font-medium text-stone-600">{ing.unit}</td>
-                                            <td className="p-3 border border-stone-300 text-center bg-amber-50/30">
-                                                <div className="flex items-center justify-center gap-3">
-                                                    <button onClick={() => adjustStock(ing.id, -10)} className="w-6 h-6 rounded bg-stone-200 text-stone-600 hover:bg-red-100 hover:text-red-600 flex items-center justify-center transition"><i className="fa-solid fa-minus text-[10px]"></i></button>
-                                                    <span className={`font-black text-lg w-12 text-center ${currentStock < 20 ? 'text-red-600' : 'text-stone-800'}`}>{currentStock}</span>
-                                                    <button onClick={() => adjustStock(ing.id, 10)} className="w-6 h-6 rounded bg-stone-200 text-stone-600 hover:bg-green-100 hover:text-green-600 flex items-center justify-center transition"><i className="fa-solid fa-plus text-[10px]"></i></button>
-                                                </div>
-                                            </td>
-                                            {isSuper && (
-                                                <td className="p-3 border border-stone-300 text-right">
-                                                    <button onClick={() => { setFormData(ing); setEditingId(ing.id); setIsModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Global Item"><i className="fa-solid fa-pen"></i></button>
-                                                    <button onClick={() => del(ing.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Global Item"><i className="fa-solid fa-trash"></i></button>
+                    {historyTab === 'stock' ? (
+                        <div className="bg-white rounded-2xl border shadow-sm p-4 flex-1 overflow-auto">
+                            <table className="w-full min-w-[900px] text-left text-sm border-collapse border border-stone-300">
+                                <thead>
+                                    <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
+                                        <th className="p-3 font-bold border border-stone-300">Ingredient Details</th>
+                                        <th className="p-3 font-bold border border-stone-300 text-center bg-amber-50">Branch Stock & Restock</th>
+                                        <th className="p-3 font-bold border border-stone-300">Smart Yield Calculation</th>
+                                        {isSuper && <th className="p-3 font-bold border border-stone-300 text-right">Global Actions</th>}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {ingredients.map(ing => {
+                                        const currentStock = ing.stockByShop?.[filterShop] || 0;
+                                        const yieldS = ing.usageS ? Math.floor(currentStock / ing.usageS) : '-';
+                                        const yieldL = ing.usageL ? Math.floor(currentStock / ing.usageL) : '-';
+                                        return (
+                                            <tr key={ing.id} className="hover:bg-stone-50 bg-white">
+                                                <td className="p-3 border border-stone-300">
+                                                    <div className="font-bold text-stone-800 text-base">{ing.name}</div>
+                                                    <div className="text-xs text-stone-500 font-medium mt-1">
+                                                        <span className="bg-stone-100 px-1.5 py-0.5 rounded border border-stone-200 mr-2">Unit: {ing.unit}</span>
+                                                        <span className="bg-green-50 text-green-700 px-1.5 py-0.5 rounded border border-green-200">Cost: {(ing.costPerUnit || 0).toLocaleString()} ៛/{ing.unit}</span>
+                                                    </div>
                                                 </td>
-                                            )}
-                                        </tr>
-                                    );
-                                })}
-                                {ingredients.length === 0 && <tr><td colSpan="4" className="text-center py-6 text-stone-400 border border-stone-300">No ingredients added yet.</td></tr>}
-                            </tbody>
-                        </table>
-                    </div>
+                                                <td className="p-3 border border-stone-300 text-center bg-amber-50/30">
+                                                    <div className="font-black text-2xl text-stone-800">{currentStock.toLocaleString()} <span className="text-sm font-normal text-stone-500">{ing.unit}</span></div>
+                                                    <div className="flex items-center justify-center gap-2 mt-2">
+                                                        <button onClick={() => adjustStock(ing.id, -10)} className="w-7 h-7 rounded bg-stone-200 text-stone-600 hover:bg-red-100 hover:text-red-600 flex items-center justify-center transition"><i className="fa-solid fa-minus text-xs"></i></button>
+                                                        <button onClick={() => { setRestockData({ id: ing.id, name: ing.name, qty: '', cost: '' }); setRestockModalOpen(true); }} className="px-3 py-1.5 text-[10px] font-bold bg-amber-200 text-amber-800 hover:bg-amber-300 rounded shadow-sm transition uppercase tracking-wider"><i className="fa-solid fa-box-open mr-1"></i> Restock</button>
+                                                        <button onClick={() => adjustStock(ing.id, 10)} className="w-7 h-7 rounded bg-stone-200 text-stone-600 hover:bg-green-100 hover:text-green-600 flex items-center justify-center transition"><i className="fa-solid fa-plus text-xs"></i></button>
+                                                    </div>
+                                                </td>
+                                                <td className="p-3 border border-stone-300 bg-stone-50/50">
+                                                    <div className="flex flex-col gap-2 text-xs w-56">
+                                                        <div className="flex justify-between items-center bg-white px-3 py-1.5 rounded-lg border border-stone-200 shadow-sm">
+                                                            <span className="font-bold text-stone-600">S Cup ({ing.usageS || 0}{ing.unit}):</span>
+                                                            <span className={`font-black ${yieldS > 10 || yieldS === '-' ? 'text-stone-800' : 'text-red-600'}`}>{yieldS} cups</span>
+                                                        </div>
+                                                        <div className="flex justify-between items-center bg-white px-3 py-1.5 rounded-lg border border-stone-200 shadow-sm">
+                                                            <span className="font-bold text-stone-600">L Cup ({ing.usageL || 0}{ing.unit}):</span>
+                                                            <span className={`font-black ${yieldL > 10 || yieldL === '-' ? 'text-stone-800' : 'text-red-600'}`}>{yieldL} cups</span>
+                                                        </div>
+                                                    </div>
+                                                </td>
+                                                {isSuper && (
+                                                    <td className="p-3 border border-stone-300 text-right">
+                                                        <button onClick={() => { setFormData({name: ing.name, unit: ing.unit, usageS: ing.usageS||'', usageL: ing.usageL||''}); setEditingId(ing.id); setIsModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Global Item"><i className="fa-solid fa-pen"></i></button>
+                                                        <button onClick={() => del(ing.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Global Item"><i className="fa-solid fa-trash"></i></button>
+                                                    </td>
+                                                )}
+                                            </tr>
+                                        );
+                                    })}
+                                    {ingredients.length === 0 && <tr><td colSpan="4" className="text-center py-6 text-stone-400 border border-stone-300">No ingredients added yet.</td></tr>}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <div className="bg-white rounded-2xl border shadow-sm p-4 flex-1 overflow-auto">
+                            <table className="w-full min-w-[800px] text-left text-sm border-collapse border border-stone-300">
+                                <thead>
+                                    <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
+                                        <th className="p-3 font-bold border border-stone-300">Date & Time</th>
+                                        <th className="p-3 font-bold border border-stone-300">Ingredient</th>
+                                        <th className="p-3 font-bold border border-stone-300">Type</th>
+                                        <th className="p-3 font-bold border border-stone-300">Amount</th>
+                                        <th className="p-3 font-bold border border-stone-300">Reference</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {filteredLogs.map(log => {
+                                        const ing = ingredients.find(i => i.id === log.ingredientId);
+                                        const unit = ing ? ing.unit : '';
+                                        const ingName = ing ? ing.name : 'Deleted Item';
+                                        
+                                        let typeColor = 'bg-stone-100 text-stone-700';
+                                        let amtColor = 'text-stone-800';
+                                        if (log.type === 'Restock') { typeColor = 'bg-green-100 text-green-700'; amtColor = 'text-green-600'; }
+                                        if (log.type === 'Usage') { typeColor = 'bg-red-100 text-red-700'; amtColor = 'text-red-500'; }
+                                        if (log.type === 'Adjustment') { typeColor = 'bg-amber-100 text-amber-700'; amtColor = 'text-amber-600'; }
+
+                                        return (
+                                            <tr key={log.id} className="hover:bg-stone-50 bg-white transition-colors">
+                                                <td className="p-3 border border-stone-300 font-medium text-stone-600">{new Date(log.timestamp).toLocaleString()}</td>
+                                                <td className="p-3 border border-stone-300 font-bold text-stone-800">{ingName}</td>
+                                                <td className="p-3 border border-stone-300">
+                                                    <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${typeColor}`}>{log.type}</span>
+                                                </td>
+                                                <td className="p-3 border border-stone-300">
+                                                    <span className={`font-black ${amtColor}`}>
+                                                        {log.amount > 0 && log.type !== 'Usage' ? '+' : ''}{log.amount.toLocaleString()} {unit}
+                                                    </span>
+                                                    {log.cost && <div className="text-[10px] text-stone-400 mt-1">Cost: {log.cost.toLocaleString()} ៛</div>}
+                                                </td>
+                                                <td className="p-3 border border-stone-300 text-stone-500 font-medium">
+                                                    {log.reference}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                    {filteredLogs.length === 0 && (
+                                        <tr><td colSpan="5" className="text-center py-10 text-stone-400 border border-stone-300 font-medium">No usage history found for this period.</td></tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+
+                    {restockModalOpen && (
+                        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                            <form onSubmit={handleRestockSubmit} className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl animate-fade-in relative">
+                                <button type="button" onClick={() => setRestockModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700"><i className="fa-solid fa-xmark text-lg"></i></button>
+                                <h3 className="text-xl font-bold mb-1">Smart Restock</h3>
+                                <p className="text-sm font-medium text-amber-600 mb-6"><i className="fa-solid fa-box-open mr-1"></i> {restockData.name} ({shops.find(s=>s.id===filterShop)?.name})</p>
+                                
+                                <div className="space-y-4 mb-6">
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Quantity Added (in Base Unit)</label>
+                                        <input type="number" required placeholder="e.g. 1000 for 1Kg" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={restockData.qty} onChange={e => setRestockData({...restockData, qty: e.target.value})} autoFocus />
+                                    </div>
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Total Cost (៛)</label>
+                                        <input type="number" required placeholder="e.g. 20000" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={restockData.cost} onChange={e => setRestockData({...restockData, cost: e.target.value})} />
+                                    </div>
+                                    {restockData.qty > 0 && restockData.cost > 0 && (
+                                        <div className="bg-green-50 text-green-800 p-3 rounded-xl border border-green-200 text-sm font-bold flex items-center justify-between">
+                                            <span>Calculated Unit Cost:</span>
+                                            <span>{(restockData.cost / restockData.qty).toFixed(2)} ៛ / unit</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button type="button" onClick={() => setRestockModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                    <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-amber-600 text-white hover:bg-amber-700 shadow-md transition">Confirm Restock</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
 
                     {isModalOpen && isSuper && (
                         <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                            <form onSubmit={handleSubmit} className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl animate-fade-in relative">
+                            <form onSubmit={handleSubmit} className="bg-white rounded-3xl w-full max-w-md p-6 shadow-2xl animate-fade-in relative">
                                 <button type="button" onClick={() => setIsModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700"><i className="fa-solid fa-xmark text-lg"></i></button>
                                 <h3 className="text-xl font-bold mb-4">{editingId ? 'Edit Global Ingredient' : 'Add Global Ingredient'}</h3>
                                 <p className="text-xs text-amber-600 font-bold mb-4 p-2 bg-amber-50 rounded border border-amber-200">
@@ -3382,11 +3590,21 @@
                                 <div className="space-y-4 mb-6">
                                     <div>
                                         <label className="block text-sm font-semibold text-stone-700 mb-1">Ingredient Name</label>
-                                        <input type="text" required placeholder="e.g. Coffee Beans" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} autoFocus />
+                                        <input type="text" required placeholder="e.g. Matcha" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} autoFocus />
                                     </div>
                                     <div>
-                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Unit (e.g. g, ml, cup)</label>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Base Unit</label>
                                         <input type="text" required placeholder="e.g. g" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.unit} onChange={e => setFormData({...formData, unit: e.target.value})} />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3 pt-2">
+                                        <div>
+                                            <label className="block text-xs font-semibold text-stone-700 mb-1">Usage per Small (S)</label>
+                                            <input type="number" step="any" placeholder="e.g. 5" className="w-full border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.usageS} onChange={e => setFormData({...formData, usageS: e.target.value})} />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-semibold text-stone-700 mb-1">Usage per Large (L)</label>
+                                            <input type="number" step="any" placeholder="e.g. 8" className="w-full border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.usageL} onChange={e => setFormData({...formData, usageL: e.target.value})} />
+                                        </div>
                                     </div>
                                 </div>
                                 <div className="flex justify-end gap-2">
@@ -3405,20 +3623,133 @@
             const [activeTab, setActiveTab] = useState('products');
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [viewingProduct, setViewingProduct] = useState(null);
-            const [formData, setFormData] = useState({ name: '', category: '', costSmall: '', priceSmall: '', costLarge: '', priceLarge: '', image: '', isAvailable: true, description: '', hasSugarOption: false, hasIceOption: false, recipeSmall: [], recipeLarge: [] });
+            const [formData, setFormData] = useState({ name: '', category: '', costSmall: '', priceSmall: '', costLarge: '', priceLarge: '', image: '', isAvailable: true, description: '', hasSugarOption: false, hasIceOption: false, recipe: [] });
             const [editingId, setEditingId] = useState(null);
 
-            const handleUpload = async (e) => {
-                if(e.target.files[0]) setFormData({...formData, image: await resizeImage(e.target.files[0])});
+            // --- Image Crop States ---
+            const [selectedImageSrc, setSelectedImageSrc] = useState(null);
+            const [cropModalOpen, setCropModalOpen] = useState(false);
+            const [zoom, setZoom] = useState(1);
+            const [offset, setOffset] = useState({ x: 0, y: 0 });
+            const [isDragging, setIsDragging] = useState(false);
+            const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+            
+            const imageRef = useRef(null);
+            const canvasRef = useRef(null);
+
+            const handleFileChange = (e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        setSelectedImageSrc(e.target.result);
+                        setZoom(1);
+                        setOffset({ x: 0, y: 0 });
+                        setCropModalOpen(true);
+                    };
+                    reader.readAsDataURL(e.target.files[0]);
+                }
+            };
+
+            const handleMouseDown = (e) => {
+                setIsDragging(true);
+                setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
+            };
+            const handleTouchStart = (e) => {
+                setIsDragging(true);
+                setDragStart({ x: e.touches[0].clientX - offset.x, y: e.touches[0].clientY - offset.y });
+            };
+
+            const handleMouseMove = (e) => {
+                if (isDragging) {
+                    setOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+                }
+            };
+            const handleTouchMove = (e) => {
+                if (isDragging) {
+                    setOffset({ x: e.touches[0].clientX - dragStart.x, y: e.touches[0].clientY - dragStart.y });
+                }
+            };
+
+            const handleMouseUp = () => setIsDragging(false);
+
+            const generateCroppedImage = () => {
+                if (!imageRef.current || !canvasRef.current) return;
+                
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                
+                // Final output size increased to 250px for better quality
+                const SIZE = 250; 
+                canvas.width = SIZE;
+                canvas.height = SIZE;
+
+                const image = imageRef.current;
+                
+                // BUG FIX: Must use natural dimensions, not CSS-rendered dimensions
+                const natWidth = image.naturalWidth;
+                const natHeight = image.naturalHeight;
+                
+                if (!natWidth || !natHeight) return; // Prevent saving empty image if not loaded
+
+                const minDim = Math.min(natWidth, natHeight);
+                
+                // Base scale to cover the output area based on the smallest dimension
+                const baseScale = SIZE / minDim;
+                const totalScale = baseScale * zoom;
+
+                // Calculate center points
+                const cx = canvas.width / 2;
+                const cy = canvas.height / 2;
+
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.save();
+                ctx.translate(cx, cy); // Move to center
+                
+                // Map screen drag pixels to canvas coordinate system
+                const offsetScale = SIZE / 256;
+                ctx.translate(offset.x * offsetScale, offset.y * offsetScale);
+                
+                ctx.scale(totalScale, totalScale);
+                // Draw image centered at the origin
+                ctx.drawImage(image, -natWidth / 2, -natHeight / 2);
+                ctx.restore();
+
+                const finalDataUrl = canvas.toDataURL('image/webp', 0.85);
+                setFormData({ ...formData, image: finalDataUrl });
+                setCropModalOpen(false);
+                setSelectedImageSrc(null);
             };
 
             const handleSubmit = async (e) => {
                 e.preventDefault();
                 if (!isSuper) return;
                 const { doc, updateDoc, addDoc } = window.FirebaseApp;
-                const data = { ...formData, costSmall: Number(formData.costSmall || 0), priceSmall: Number(formData.priceSmall || 0), costLarge: Number(formData.costLarge || 0), priceLarge: Number(formData.priceLarge || 0), updatedAt: Date.now() };
-                if (editingId) await updateDoc(doc(getColRef('products'), editingId), data);
-                else await addDoc(getColRef('products'), { ...data, createdAt: Date.now() });
+                
+                // Process unified recipe back into Small and Large arrays
+                const recipeSmall = (formData.recipe || []).map(r => ({ ingredientId: r.ingredientId, qty: Number(r.qtyS) })).filter(r => r.ingredientId && r.qty > 0);
+                const recipeLarge = (formData.recipe || []).map(r => ({ ingredientId: r.ingredientId, qty: Number(r.qtyL) })).filter(r => r.ingredientId && r.qty > 0);
+
+                const dataToSave = { 
+                    name: formData.name,
+                    category: formData.category,
+                    image: formData.image,
+                    isAvailable: formData.isAvailable,
+                    description: formData.description,
+                    hasSugarOption: formData.hasSugarOption,
+                    hasIceOption: formData.hasIceOption,
+                    costSmall: Number(formData.costSmall || 0), 
+                    priceSmall: Number(formData.priceSmall || 0), 
+                    costLarge: Number(formData.costLarge || 0), 
+                    priceLarge: Number(formData.priceLarge || 0),
+                    recipeSmall: recipeSmall,
+                    recipeLarge: recipeLarge,
+                    updatedAt: Date.now() 
+                };
+
+                if (editingId) await updateDoc(doc(getColRef('products'), editingId), dataToSave);
+                else await addDoc(getColRef('products'), { ...dataToSave, createdAt: Date.now() });
                 setIsModalOpen(false);
             };
 
@@ -3448,59 +3779,135 @@
                                     <p className="text-sm text-stone-500 mt-1">Manage your menu items and prices.</p>
                                 </div>
                                 {isSuper && (
-                                    <button onClick={()=>{setFormData({name: '', category: categories[0]?.name||'', costSmall:'', priceSmall:'', costLarge:'', priceLarge:'', image:'', isAvailable:true, description:'', hasSugarOption: false, hasIceOption: false, recipeSmall: [], recipeLarge: []}); setEditingId(null); setIsModalOpen(true);}} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md"><i className="fa-solid fa-plus mr-2"></i> Add Product</button>
+                                    <button onClick={()=>{setFormData({name: '', category: categories[0]?.name||'', costSmall:'', priceSmall:'', costLarge:'', priceLarge:'', image:'', isAvailable:true, description:'', hasSugarOption: false, hasIceOption: false, recipe: []}); setEditingId(null); setIsModalOpen(true);}} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md"><i className="fa-solid fa-plus mr-2"></i> Add Product</button>
                                 )}
                             </div>
                             <div className="bg-white rounded-2xl border shadow-sm p-4 overflow-auto">
                                 <table className="w-full min-w-[900px] text-left text-sm border-collapse border border-stone-300">
                                     <thead>
                                         <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
-                                            <th className="p-3 font-bold border border-stone-300">Product</th>
-                                            <th className="p-3 font-bold border border-stone-300">Category</th>
-                                            <th className="p-3 font-bold border border-stone-300">Price (S/L)</th>
+                                            <th className="p-3 font-bold border border-stone-300">Product Info</th>
+                                            <th className="p-3 font-bold border border-stone-300">Size S (Margin)</th>
+                                            <th className="p-3 font-bold border border-stone-300">Size L (Margin)</th>
                                             <th className="p-3 font-bold border border-stone-300">Modifiers</th>
-                                            <th className="p-3 font-bold border border-stone-300">Status</th>
+                                            <th className="p-3 font-bold border border-stone-300 text-center">Status</th>
                                             <th className="p-3 font-bold text-right border border-stone-300">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {products.map(p => (
+                                        {products.map(p => {
+                                            const marginS = p.priceSmall > 0 ? Math.round(((p.priceSmall - (p.costSmall || 0)) / p.priceSmall) * 100) : 0;
+                                            const marginL = p.priceLarge > 0 ? Math.round(((p.priceLarge - (p.costLarge || 0)) / p.priceLarge) * 100) : 0;
+                                            
+                                            return (
                                             <tr key={p.id} className="hover:bg-stone-50 bg-white">
                                                 <td className="p-3 border border-stone-300 align-top">
-                                                    <div className="flex items-center gap-3">
-                                                        {p.image ? <img src={p.image} className="w-10 h-10 rounded-lg object-cover" alt={p.name} /> : <div className="w-10 h-10 rounded-lg bg-stone-100 flex items-center justify-center shrink-0"><i className="fa-solid fa-image text-stone-300"></i></div>}
+                                                    <div className="flex gap-3 items-start">
+                                                        <div className="w-12 h-12 rounded-lg bg-stone-100 shrink-0 overflow-hidden border border-stone-200">
+                                                            {p.image ? <img src={p.image} className="w-full h-full object-cover" alt={p.name} loading="lazy" /> : <i className="fa-solid fa-image text-stone-300 w-full h-full flex items-center justify-center"></i>}
+                                                        </div>
                                                         <div>
-                                                            <div className="font-bold text-stone-800">{p.name}</div>
-                                                            <div className="text-[10px] text-stone-500 line-clamp-1">{p.description}</div>
+                                                            <div className="font-bold text-stone-800 text-base leading-tight">{p.name}</div>
+                                                            <div className="mt-1 flex items-center gap-2">
+                                                                <span className="text-[10px] font-bold bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded uppercase tracking-wider">{p.category}</span>
+                                                            </div>
+                                                            {p.description && <div className="text-xs text-stone-500 mt-1 line-clamp-1 max-w-xs">{p.description}</div>}
                                                         </div>
                                                     </div>
                                                 </td>
-                                                <td className="p-3 border border-stone-300 align-top font-medium text-stone-600">{p.category}</td>
-                                                <td className="p-3 border border-stone-300 align-top whitespace-nowrap">
-                                                    {p.priceSmall > 0 && <div className="text-xs">S: <span className="font-bold">{p.priceSmall.toLocaleString()} ៛</span></div>}
-                                                    {p.priceLarge > 0 && <div className="text-xs">L: <span className="font-bold">{p.priceLarge.toLocaleString()} ៛</span></div>}
+                                                <td className="p-3 border border-stone-300 align-top">
+                                                    {p.priceSmall > 0 ? (
+                                                        <div className="flex flex-col gap-1 w-32">
+                                                            <div className="flex justify-between items-center text-xs">
+                                                                <span className="text-stone-500">Cost:</span>
+                                                                <span className="font-bold text-red-500">{(p.costSmall || 0).toLocaleString()} ៛</span>
+                                                            </div>
+                                                            <div className="flex justify-between items-center text-xs">
+                                                                <span className="text-stone-500">Price:</span>
+                                                                <span className="font-bold text-green-600">{p.priceSmall.toLocaleString()} ៛</span>
+                                                            </div>
+                                                            <div className="mt-1 bg-stone-100 rounded px-2 py-1 flex justify-between items-center text-[10px] font-bold shadow-inner border border-stone-200">
+                                                                <span className="text-stone-500 uppercase tracking-wider">Margin</span>
+                                                                <span className={marginS >= 50 ? 'text-green-600' : marginS > 20 ? 'text-amber-600' : 'text-red-600'}>{marginS}%</span>
+                                                            </div>
+                                                        </div>
+                                                    ) : <span className="text-stone-400 text-xs italic">N/A</span>}
                                                 </td>
                                                 <td className="p-3 border border-stone-300 align-top">
-                                                    <div className="flex gap-1 flex-wrap">
-                                                        {p.hasSugarOption && <span className="text-[10px] bg-stone-100 px-1.5 py-0.5 rounded font-bold text-stone-600">Sugar</span>}
-                                                        {p.hasIceOption && <span className="text-[10px] bg-blue-50 px-1.5 py-0.5 rounded font-bold text-blue-600">Ice</span>}
-                                                        {!p.hasSugarOption && !p.hasIceOption && <span className="text-stone-400 text-xs">None</span>}
+                                                    {p.priceLarge > 0 ? (
+                                                        <div className="flex flex-col gap-1 w-32">
+                                                            <div className="flex justify-between items-center text-xs">
+                                                                <span className="text-stone-500">Cost:</span>
+                                                                <span className="font-bold text-red-500">{(p.costLarge || 0).toLocaleString()} ៛</span>
+                                                            </div>
+                                                            <div className="flex justify-between items-center text-xs">
+                                                                <span className="text-stone-500">Price:</span>
+                                                                <span className="font-bold text-green-600">{p.priceLarge.toLocaleString()} ៛</span>
+                                                            </div>
+                                                            <div className="mt-1 bg-stone-100 rounded px-2 py-1 flex justify-between items-center text-[10px] font-bold shadow-inner border border-stone-200">
+                                                                <span className="text-stone-500 uppercase tracking-wider">Margin</span>
+                                                                <span className={marginL >= 50 ? 'text-green-600' : marginL > 20 ? 'text-amber-600' : 'text-red-600'}>{marginL}%</span>
+                                                            </div>
+                                                        </div>
+                                                    ) : <span className="text-stone-400 text-xs italic">N/A</span>}
+                                                </td>
+                                                <td className="p-3 border border-stone-300 align-top">
+                                                    <div className="flex flex-col gap-1.5">
+                                                        <div className="flex gap-1 flex-wrap">
+                                                            {p.hasSugarOption && <span className="text-[10px] bg-stone-100 px-1.5 py-0.5 rounded font-bold text-stone-600">Sugar</span>}
+                                                            {p.hasIceOption && <span className="text-[10px] bg-blue-50 px-1.5 py-0.5 rounded font-bold text-blue-600">Ice</span>}
+                                                            {!p.hasSugarOption && !p.hasIceOption && <span className="text-stone-400 text-xs">No Customizations</span>}
+                                                        </div>
+                                                        {(!p.recipeSmall || p.recipeSmall.length === 0) && (!p.recipeLarge || p.recipeLarge.length === 0) ? (
+                                                            <span className="text-[10px] bg-red-50 text-red-600 px-1.5 py-0.5 rounded font-bold border border-red-200 inline-block w-fit" title="Stock won't deduct automatically"><i className="fa-solid fa-link-slash mr-1"></i>No Recipe Linked</span>
+                                                        ) : (
+                                                            <span className="text-[10px] bg-green-50 text-green-700 px-1.5 py-0.5 rounded font-bold border border-green-200 inline-block w-fit" title="Inventory linked correctly"><i className="fa-solid fa-link mr-1"></i>Recipe Linked</span>
+                                                        )}
                                                     </div>
                                                 </td>
-                                                <td className="p-3 border border-stone-300 align-top">{p.isAvailable ? '✅' : '❌'}</td>
+                                                <td className="p-3 border border-stone-300 align-top text-center">
+                                                    <span className={`px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider rounded-lg ${p.isAvailable ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                        {p.isAvailable ? 'Available' : 'Hidden'}
+                                                    </span>
+                                                </td>
                                                 <td className="p-3 border border-stone-300 align-top text-right">
                                                     <div className="flex justify-end items-center gap-1">
                                                         <button onClick={()=>setViewingProduct(p)} className="p-2 text-stone-500 hover:text-stone-800" title="View Details"><i className="fa-solid fa-eye"></i></button>
                                                         {isSuper && (
                                                             <>
-                                                                <button onClick={()=>{setFormData({costSmall: '', costLarge: '', ...p, hasSugarOption: !!p.hasSugarOption, hasIceOption: !!p.hasIceOption, recipeSmall: p.recipeSmall || [], recipeLarge: p.recipeLarge || []}); setEditingId(p.id); setIsModalOpen(true);}} className="p-2 text-blue-500"><i className="fa-solid fa-pen"></i></button>
+                                                                <button onClick={()=>{
+                                                                    const unifiedRecipe = [];
+                                                                    const allIngIds = new Set([
+                                                                        ...(p.recipeSmall || []).map(r => r.ingredientId),
+                                                                        ...(p.recipeLarge || []).map(r => r.ingredientId)
+                                                                    ]);
+                                                                    allIngIds.forEach(id => {
+                                                                        const s = (p.recipeSmall || []).find(r => r.ingredientId === id);
+                                                                        const l = (p.recipeLarge || []).find(r => r.ingredientId === id);
+                                                                        unifiedRecipe.push({ ingredientId: id, qtyS: s ? s.qty : '', qtyL: l ? l.qty : '' });
+                                                                    });
+                                                                    
+                                                                    // BUG FIX: Explicitly map the cost properties to guarantee they load into the modal correctly
+                                                                    setFormData({
+                                                                        ...p, 
+                                                                        costSmall: p.costSmall || '', 
+                                                                        costLarge: p.costLarge || '', 
+                                                                        priceSmall: p.priceSmall || '',
+                                                                        priceLarge: p.priceLarge || '',
+                                                                        hasSugarOption: !!p.hasSugarOption, 
+                                                                        hasIceOption: !!p.hasIceOption, 
+                                                                        recipe: unifiedRecipe
+                                                                    }); 
+                                                                    setEditingId(p.id); 
+                                                                    setIsModalOpen(true);
+                                                                }} className="p-2 text-blue-500"><i className="fa-solid fa-pen"></i></button>
                                                                 <button onClick={()=>del(p.id)} className="p-2 text-red-500"><i className="fa-solid fa-trash"></i></button>
                                                             </>
                                                         )}
                                                     </div>
                                                 </td>
                                             </tr>
-                                        ))}
+                                        )})}
                                         {products.length === 0 && <tr><td colSpan="6" className="text-center py-4 text-stone-400 border border-stone-300">No products found.</td></tr>}
                                     </tbody>
                                 </table>
@@ -3510,10 +3917,10 @@
 
                     {viewingProduct && (
                         <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                            <div className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl animate-fade-in relative">
+                            <div className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl animate-fade-in relative max-h-[90vh] flex flex-col">
                                 <button onClick={() => setViewingProduct(null)} className="absolute top-4 right-4 text-white bg-black/40 hover:bg-black/60 rounded-full w-8 h-8 flex items-center justify-center z-10 transition"><i className="fa-solid fa-xmark"></i></button>
                                 
-                                <div className="w-full h-64 bg-stone-100 relative">
+                                <div className="w-full h-64 bg-stone-100 relative shrink-0">
                                     {viewingProduct.image ? (
                                         <img src={viewingProduct.image} className="w-full h-full object-cover" alt={viewingProduct.name} decoding="async" />
                                     ) : (
@@ -3521,7 +3928,7 @@
                                     )}
                                 </div>
                                 
-                                <div className="p-6">
+                                <div className="p-6 overflow-y-auto flex-1">
                                     <div className="flex justify-between items-start mb-2">
                                         <div>
                                             <h3 className="text-2xl font-bold text-stone-900 leading-tight">{viewingProduct.name}</h3>
@@ -3539,15 +3946,132 @@
                                     <div className="mt-5 grid grid-cols-2 gap-3">
                                         {viewingProduct.priceSmall > 0 && (
                                             <div className="bg-stone-50 p-3 rounded-xl border border-stone-100">
-                                                <p className="text-xs text-stone-400 font-bold uppercase tracking-wider mb-1">Small Size</p>
-                                                <p className="font-black text-amber-600">{viewingProduct.priceSmall.toLocaleString()} ៛</p>
+                                                <p className="text-xs text-stone-400 font-bold uppercase tracking-wider mb-2">Small Size</p>
+                                                <div className="flex justify-between items-center mb-1">
+                                                    <span className="text-xs text-stone-500">Cost:</span>
+                                                    <span className="font-bold text-red-500 text-xs">{(viewingProduct.costSmall || 0).toLocaleString()} ៛</span>
+                                                </div>
+                                                <div className="flex justify-between items-center pt-1 border-t border-stone-200/60">
+                                                    <span className="text-xs text-stone-500">Price:</span>
+                                                    <span className="font-black text-green-600">{(viewingProduct.priceSmall || 0).toLocaleString()} ៛</span>
+                                                </div>
                                             </div>
                                         )}
-                                        <div className="mt-5 flex gap-2">
+                                        {viewingProduct.priceLarge > 0 && (
+                                            <div className="bg-stone-50 p-3 rounded-xl border border-stone-100">
+                                                <p className="text-xs text-stone-400 font-bold uppercase tracking-wider mb-2">Large Size</p>
+                                                <div className="flex justify-between items-center mb-1">
+                                                    <span className="text-xs text-stone-500">Cost:</span>
+                                                    <span className="font-bold text-red-500 text-xs">{(viewingProduct.costLarge || 0).toLocaleString()} ៛</span>
+                                                </div>
+                                                <div className="flex justify-between items-center pt-1 border-t border-stone-200/60">
+                                                    <span className="text-xs text-stone-500">Price:</span>
+                                                    <span className="font-black text-green-600">{(viewingProduct.priceLarge || 0).toLocaleString()} ៛</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {(viewingProduct.hasSugarOption || viewingProduct.hasIceOption) && (
+                                        <div className="mt-4 flex gap-2">
                                             {viewingProduct.hasSugarOption && <span className="bg-stone-900 text-white px-3 py-1.5 rounded-lg text-xs font-bold"><i className="fa-solid fa-cubes-stacked mr-1.5"></i>Sugar Options</span>}
                                             {viewingProduct.hasIceOption && <span className="bg-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-bold"><i className="fa-solid fa-snowflake mr-1.5"></i>Ice Options</span>}
                                         </div>
+                                    )}
+
+                                    {/* Recipe Table */}
+                                    <div className="mt-6 pt-5 border-t border-stone-200">
+                                        <h4 className="font-bold text-stone-800 mb-3"><i className="fa-solid fa-blender mr-2 text-stone-400"></i>Recipe Information</h4>
+                                        
+                                        {(() => {
+                                            const allIngIds = new Set([
+                                                ...(viewingProduct.recipeSmall || []).map(r => r.ingredientId),
+                                                ...(viewingProduct.recipeLarge || []).map(r => r.ingredientId)
+                                            ]);
+                                            
+                                            if (allIngIds.size === 0) {
+                                                return <p className="text-sm text-stone-500 italic bg-stone-50 p-3 rounded-xl border border-stone-100">No recipe linked for this product.</p>;
+                                            }
+
+                                            return (
+                                                <div className="border border-stone-200 rounded-xl overflow-hidden shadow-sm">
+                                                    <table className="w-full text-left text-sm">
+                                                        <thead className="bg-stone-50 border-b border-stone-200">
+                                                            <tr>
+                                                                <th className="px-3 py-2 font-bold text-stone-600">Ingredient</th>
+                                                                <th className="px-3 py-2 font-bold text-stone-600 text-center">S Qty</th>
+                                                                <th className="px-3 py-2 font-bold text-stone-600 text-center">L Qty</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody className="divide-y divide-stone-100">
+                                                            {Array.from(allIngIds).map(id => {
+                                                                const ing = ingredients.find(i => i.id === id);
+                                                                const s = (viewingProduct.recipeSmall || []).find(r => r.ingredientId === id);
+                                                                const l = (viewingProduct.recipeLarge || []).find(r => r.ingredientId === id);
+                                                                return (
+                                                                    <tr key={id} className="hover:bg-stone-50 transition-colors">
+                                                                        <td className="px-3 py-2.5 font-medium text-stone-800">
+                                                                            {ing ? ing.name : 'Unknown'} {ing && <span className="text-stone-400 text-[10px] ml-1 uppercase tracking-wider font-bold bg-white border border-stone-200 px-1 rounded">{ing.unit}</span>}
+                                                                        </td>
+                                                                        <td className="px-3 py-2.5 text-center text-stone-600 font-bold">{s ? s.qty : '-'}</td>
+                                                                        <td className="px-3 py-2.5 text-center text-stone-600 font-bold">{l ? l.qty : '-'}</td>
+                                                                    </tr>
+                                                                );
+                                                            })}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {cropModalOpen && selectedImageSrc && (
+                        <div className="fixed inset-0 bg-stone-900/95 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl animate-fade-in flex flex-col items-center">
+                                <h3 className="text-xl font-bold mb-4 text-stone-900">Crop Product Photo</h3>
+                                
+                                <div className="relative w-64 h-64 border-4 border-stone-200 rounded-2xl overflow-hidden bg-stone-100 mb-6 cursor-grab active:cursor-grabbing shadow-inner"
+                                     onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+                                     onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleMouseUp}>
+                                    
+                                    <div className="absolute inset-0 pointer-events-none z-10 shadow-[inset_0_0_0_9999px_rgba(255,255,255,0.4)]">
+                                        <div className="absolute inset-0 m-auto w-full h-full shadow-[0_0_0_9999px_rgba(0,0,0,0.4)] pointer-events-none rounded-xl" style={{boxShadow: '0 0 0 9999px rgba(0,0,0,0.5), inset 0 0 0 2px rgba(255,255,255,0.8)'}}></div>
+                                    </div>
+
+                                    <img 
+                                        ref={imageRef}
+                                        src={selectedImageSrc} 
+                                        draggable="false"
+                                        style={{
+                                            transform: `translate(calc(-50% + ${offset.x}px), calc(-50% + ${offset.y}px)) scale(${zoom})`,
+                                            position: 'absolute',
+                                            top: '50%',
+                                            left: '50%',
+                                            transformOrigin: 'center center',
+                                            maxWidth: 'none',
+                                            maxHeight: 'none',
+                                            width: '100%',
+                                            height: 'auto',
+                                            objectFit: 'contain'
+                                        }}
+                                        className="transition-transform duration-75 ease-out"
+                                    />
+                                </div>
+                                
+                                <canvas ref={canvasRef} style={{ display: 'none' }}></canvas>
+
+                                <div className="w-full mb-6 px-4">
+                                    <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 text-center">Zoom <i className="fa-solid fa-magnifying-glass text-[10px] ml-1"></i></label>
+                                    <input type="range" min="1" max="3" step="0.05" value={zoom} onChange={(e) => setZoom(parseFloat(e.target.value))} className="w-full h-2 bg-stone-200 rounded-lg appearance-none cursor-pointer accent-amber-600" />
+                                </div>
+
+                                <div className="flex w-full gap-3">
+                                    <button onClick={() => { setCropModalOpen(false); setSelectedImageSrc(null); document.getElementById('product-image-upload').value = ''; }} className="flex-1 px-4 py-3 bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold rounded-xl transition">Cancel</button>
+                                    <button onClick={generateCroppedImage} className="flex-1 px-4 py-3 bg-stone-900 hover:bg-stone-800 text-white font-bold rounded-xl transition shadow-md"><i className="fa-solid fa-crop-simple mr-2"></i> Save Crop</button>
                                 </div>
                             </div>
                         </div>
@@ -3555,8 +4079,34 @@
 
                     {isModalOpen && isSuper && (
                         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-                            <form onSubmit={handleSubmit} className="bg-white p-6 rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto space-y-3 shadow-2xl animate-fade-in">
+                            <form onSubmit={handleSubmit} className="bg-white p-6 rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto space-y-3 shadow-2xl animate-fade-in relative">
                                 <h3 className="font-bold text-lg">{editingId ? 'Edit Product' : 'Add Product'}</h3>
+                                
+                                <div className="flex justify-center my-4">
+                                    <input 
+                                        type="file" 
+                                        id="product-image-upload" 
+                                        accept="image/*" 
+                                        onChange={handleFileChange} 
+                                        className="hidden"
+                                    />
+                                    <label htmlFor="product-image-upload" className="cursor-pointer group">
+                                        {formData.image ? (
+                                            <div className="w-24 h-24 rounded-2xl overflow-hidden border-2 border-amber-500 relative shadow-md">
+                                                <img src={formData.image} className="w-full h-full object-cover group-hover:scale-110 transition duration-300" />
+                                                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                                    <i className="fa-solid fa-pen text-white"></i>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="w-24 h-24 rounded-2xl border-2 border-dashed border-stone-300 bg-stone-50 hover:bg-stone-100 hover:border-amber-400 transition-all flex flex-col items-center justify-center text-stone-400 hover:text-amber-600 group text-center">
+                                                <i className="fa-solid fa-plus text-2xl mb-1 group-hover:scale-125 transition-transform"></i>
+                                                <span className="text-[10px] font-bold uppercase tracking-wider">Photo</span>
+                                            </div>
+                                        )}
+                                    </label>
+                                </div>
+
                                 <input type="text" required placeholder="Name" className="w-full border rounded p-2 text-[16px]" value={formData.name} onChange={e=>setFormData({...formData, name: e.target.value})}/>
                                 <select className="w-full border rounded p-2 text-[16px]" value={formData.category} onChange={e=>setFormData({...formData, category: e.target.value})}>
                                     <option value="" disabled>Select Category</option>
@@ -3565,11 +4115,13 @@
                                 <div className="grid grid-cols-2 gap-3 bg-stone-50 p-3 rounded-lg border border-stone-200">
                                     <div className="space-y-2">
                                         <label className="text-xs font-bold text-stone-500 uppercase tracking-wider">Size S</label>
-                                        <input type="number" step="100" placeholder="Price" className="w-full border rounded p-2 text-[16px]" value={formData.priceSmall} onChange={e=>setFormData({...formData, priceSmall: e.target.value})}/>
+                                        <input type="number" step="100" placeholder="Cost (៛)" className="w-full border rounded p-2 text-[16px] border-red-200 focus:border-red-400" value={formData.costSmall} onChange={e=>setFormData({...formData, costSmall: e.target.value})}/>
+                                        <input type="number" step="100" placeholder="Price (៛)" className="w-full border rounded p-2 text-[16px] border-green-200 focus:border-green-400" value={formData.priceSmall} onChange={e=>setFormData({...formData, priceSmall: e.target.value})}/>
                                     </div>
                                     <div className="space-y-2">
                                         <label className="text-xs font-bold text-stone-500 uppercase tracking-wider">Size L</label>
-                                        <input type="number" step="100" placeholder="Price" className="w-full border rounded p-2 text-[16px]" value={formData.priceLarge} onChange={e=>setFormData({...formData, priceLarge: e.target.value})}/>
+                                        <input type="number" step="100" placeholder="Cost (៛)" className="w-full border rounded p-2 text-[16px] border-red-200 focus:border-red-400" value={formData.costLarge} onChange={e=>setFormData({...formData, costLarge: e.target.value})}/>
+                                        <input type="number" step="100" placeholder="Price (៛)" className="w-full border rounded p-2 text-[16px] border-green-200 focus:border-green-400" value={formData.priceLarge} onChange={e=>setFormData({...formData, priceLarge: e.target.value})}/>
                                     </div>
                                 </div>
                                 <textarea placeholder="Description" className="w-full border rounded p-2 text-[16px]" value={formData.description} onChange={e=>setFormData({...formData, description: e.target.value})}></textarea>
@@ -3583,13 +4135,55 @@
                                         <select className="w-full border rounded p-2 bg-stone-50 text-[16px]" value={formData.hasIceOption ? 'true' : 'false'} onChange={e=>setFormData({...formData, hasIceOption: e.target.value==='true'})}><option value="false">Off</option><option value="true">On</option></select>
                                     </div>
                                 </div>
-                                <input type="file" accept="image/*" onChange={handleUpload} className="w-full border rounded p-2 text-[16px]"/>
-                                <select className="w-full border rounded p-2 text-[16px]" value={formData.isAvailable?'true':'false'} onChange={e=>setFormData({...formData, isAvailable: e.target.value==='true'})}>
+                                
+                                <div className="mt-4 pt-4 border-t border-stone-200">
+                                    <div className="flex justify-between items-center mb-3">
+                                        <label className="block text-sm font-semibold text-stone-700">Inventory Recipe <i className="fa-solid fa-link text-amber-500 ml-1"></i></label>
+                                        <button type="button" onClick={() => setFormData({...formData, recipe: [...(formData.recipe||[]), {ingredientId:'', qtyS:'', qtyL:''}]})} className="text-[10px] bg-amber-100 text-amber-800 hover:bg-amber-200 px-2 py-1.5 rounded font-bold uppercase tracking-wider transition shadow-sm"><i className="fa-solid fa-plus mr-1"></i> Add Ingredient</button>
+                                    </div>
+                                    
+                                    {(!formData.recipe || formData.recipe.length === 0) ? (
+                                        <div className="text-center py-4 bg-stone-50 rounded-xl border border-stone-200 border-dashed text-stone-400 text-xs font-medium">
+                                            No ingredients linked. Stock won't auto-deduct for this item.
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-2 max-h-48 overflow-y-auto pr-1 no-scrollbar">
+                                            {formData.recipe.map((row, idx) => (
+                                                <div key={idx} className="flex gap-2 items-center bg-stone-50 p-2.5 rounded-xl border border-stone-200 shadow-sm animate-fade-in">
+                                                    <select 
+                                                        className="flex-1 border border-stone-300 rounded-lg p-2 text-xs font-semibold outline-none bg-white focus:border-amber-500"
+                                                        value={row.ingredientId}
+                                                        onChange={(e) => {
+                                                            const val = e.target.value;
+                                                            const ing = ingredients.find(i => i.id === val);
+                                                            const newRec = [...formData.recipe];
+                                                            newRec[idx].ingredientId = val;
+                                                            if (ing) {
+                                                                // Smart Auto-Fill based on Global Inventory Configuration
+                                                                if (!newRec[idx].qtyS && ing.usageS) newRec[idx].qtyS = ing.usageS;
+                                                                if (!newRec[idx].qtyL && ing.usageL) newRec[idx].qtyL = ing.usageL;
+                                                            }
+                                                            setFormData({...formData, recipe: newRec});
+                                                        }}
+                                                    >
+                                                        <option value="" disabled>Select Material...</option>
+                                                        {ingredients.map(ing => <option key={ing.id} value={ing.id}>{ing.name} ({ing.unit})</option>)}
+                                                    </select>
+                                                    <input type="number" step="any" placeholder="S Qty" title="Usage for Small Size" className="w-14 sm:w-16 border border-stone-300 rounded-lg p-2 text-xs font-bold outline-none bg-white focus:border-amber-500" value={row.qtyS} onChange={e => { const newRec = [...formData.recipe]; newRec[idx].qtyS = e.target.value; setFormData({...formData, recipe: newRec}); }} />
+                                                    <input type="number" step="any" placeholder="L Qty" title="Usage for Large Size" className="w-14 sm:w-16 border border-stone-300 rounded-lg p-2 text-xs font-bold outline-none bg-white focus:border-amber-500" value={row.qtyL} onChange={e => { const newRec = [...formData.recipe]; newRec[idx].qtyL = e.target.value; setFormData({...formData, recipe: newRec}); }} />
+                                                    <button type="button" onClick={() => { const newRec = [...formData.recipe]; newRec.splice(idx, 1); setFormData({...formData, recipe: newRec}); }} className="w-8 h-8 flex items-center justify-center text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"><i className="fa-solid fa-xmark"></i></button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <select className="w-full border rounded p-2 text-[16px] mt-4" value={formData.isAvailable?'true':'false'} onChange={e=>setFormData({...formData, isAvailable: e.target.value==='true'})}>
                                     <option value="true">Available</option><option value="false">Hidden</option>
                                 </select>
-                                <div className="flex justify-end gap-2 pt-2">
-                                    <button type="button" onClick={()=>setIsModalOpen(false)} className="px-4 py-2 border rounded hover:bg-stone-100 transition">Cancel</button>
-                                    <button type="submit" className="px-4 py-2 bg-stone-900 text-white rounded hover:bg-stone-800 transition">Save</button>
+                                <div className="flex justify-end gap-2 pt-2 border-t border-stone-100 mt-2">
+                                    <button type="button" onClick={()=>setIsModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                    <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-stone-900 text-white hover:bg-stone-800 shadow-md transition">Save Product</button>
                                 </div>
                             </form>
                         </div>
