@@ -68,14 +68,14 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
         window.FirebaseApp = {
             initializeApp, getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, 
             onAuthStateChanged, signOut, signInAnonymously,
             getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, 
             collection, doc, setDoc, getDoc, getDocs, onSnapshot, 
-            addDoc, updateDoc, deleteDoc, increment
+            addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit
         };
         window.dispatchEvent(new Event('firebase-loaded'));
     </script>
@@ -428,25 +428,45 @@
                     setLoadingTables(false);
                 });
                 
-                const unsubInv = onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                // REDUNDANCY FIX: Do not load heavy staff/kitchen data for customers. 
+                // Only load if the user is actively viewing the admin dashboard.
+                let unsubInv, unsubShifts;
+                if (view === 'admin_dashboard') {
+                    unsubInv = onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                    unsubShifts = onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                }
                 
                 const unsubShops = onSnapshot(getColRef('shops'), snap => {
                     setShops(snap.docs.map(d => ({ id: d.id, ...d.data() })));
                     setLoadingShops(false);
                 });
                 
-                const unsubShifts = onSnapshot(getColRef('shifts'), snap => {
-                    setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-                });
-                
                 // PRIORITY 2: Heavy Order History (Background Sync)
                 // This loads silently in the background. The user is never blocked waiting for this.
-                const unsubO = onSnapshot(getColRef('orders'), snap => {
-                    setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
-                });
+                let unsubO;
+                if (view === 'customer') {
+                    // REDUNDANCY FIX: Only load today's orders for customers to save network data
+                    const { query, where } = window.FirebaseApp;
+                    const todayStr = getTodayString();
+                    const q = query(getColRef('orders'), where('dateString', '==', todayStr));
+                    unsubO = onSnapshot(q, snap => {
+                        setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
+                    });
+                } else {
+                    // Admins get the full list for reporting and POS sync
+                    unsubO = onSnapshot(getColRef('orders'), snap => {
+                        setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
+                    });
+                }
 
-                return () => { unsubP(); unsubC(); unsubS(); unsubI(); unsubT(); unsubO(); unsubInv(); unsubShops(); unsubShifts(); };
-            }, [user]);
+                return () => { 
+                    unsubP(); unsubC(); unsubS(); unsubI(); unsubT(); 
+                    if(unsubO) unsubO(); 
+                    if(unsubInv) unsubInv(); 
+                    if(unsubShifts) unsubShifts();
+                    unsubShops(); 
+                };
+            }, [user, view]);
 
             return (
                 <div className="min-h-screen">
@@ -778,21 +798,56 @@
             const [locStatus, setLocStatus] = useState('idle');
             const [locMsg, setLocMsg] = useState('');
 
-            // Identify Existing Customer automatically
-            const isExisting = useMemo(() => {
-                if (!phone || phone.length < 8) return false;
-                return orders.some(o => o.customerPhone === phone && o.customerName);
-            }, [phone, orders]);
-
-            const pastCustomerName = useMemo(() => {
-                if (!isExisting) return '';
-                const pastOrder = orders.find(o => o.customerPhone === phone && o.customerName);
-                return pastOrder ? pastOrder.customerName : '';
-            }, [isExisting, phone, orders]);
+            // Identify Existing Customer automatically via Targeted Query
+            const [isExisting, setIsExisting] = useState(false);
+            const [pastCustomerName, setPastCustomerName] = useState('');
+            const [isCheckingPhone, setIsCheckingPhone] = useState(false);
 
             useEffect(() => {
-                if (isExisting && pastCustomerName) setName(pastCustomerName);
-            }, [isExisting, pastCustomerName]);
+                const checkPhone = async () => {
+                    const cleanedPhone = phone.replace(/\D/g, '');
+                    if (!cleanedPhone || cleanedPhone.length < 8) {
+                        setIsExisting(false);
+                        setPastCustomerName('');
+                        return;
+                    }
+                    
+                    // 1. Check local loaded orders first (fast path)
+                    const localMatch = orders.find(o => o.customerPhone && o.customerPhone.replace(/\D/g, '') === cleanedPhone && o.customerName);
+                    if (localMatch) {
+                        setIsExisting(true);
+                        setPastCustomerName(localMatch.customerName);
+                        if (!name) setName(localMatch.customerName);
+                        return;
+                    }
+
+                    // 2. Query Firestore if not found locally (Optimization: No full orders download)
+                    setIsCheckingPhone(true);
+                    try {
+                        const { query, where, getDocs, limit } = window.FirebaseApp;
+                        const q = query(getColRef('orders'), where('customerPhone', '==', phone), limit(1));
+                        const snap = await getDocs(q);
+                        if (!snap.empty) {
+                            const data = snap.docs[0].data();
+                            if (data.customerName) {
+                                setIsExisting(true);
+                                setPastCustomerName(data.customerName);
+                                if (!name) setName(data.customerName);
+                            }
+                        } else {
+                            setIsExisting(false);
+                            setPastCustomerName('');
+                        }
+                    } catch (err) {
+                        console.warn("Phone check failed:", err);
+                    } finally {
+                        setIsCheckingPhone(false);
+                    }
+                };
+
+                const timeoutId = setTimeout(checkPhone, 500); // Debounce
+                return () => clearTimeout(timeoutId);
+            }, [phone]);
 
             const handleDetectLocation = () => {
                 setLocStatus('locating');
@@ -906,6 +961,7 @@
                                 <div className="space-y-3">
                                     <div>
                                         <input type="tel" required placeholder="Phone Number (e.g. 012 345 678)" className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-white text-[16px] font-bold" value={phone} onChange={e => setPhone(formatPhoneNumber(e.target.value))} />
+                                        {isCheckingPhone && <p className="text-xs text-stone-400 mt-1.5 animate-pulse"><i className="fa-solid fa-spinner fa-spin mr-1"></i> Checking history...</p>}
                                     </div>
                                     
                                     {phone.replace(/\D/g, '').length >= 9 && isExisting && (
@@ -1212,12 +1268,37 @@
         function CustomerPortal({ products, categories, tables, orders, shops, currentUser, isMenuLoading, isSetupLoading, sugarOptions, iceOptions, onAdminClick }) {
             const [activeCategory, setActiveCategory] = useState('All');
             const [searchQuery, setSearchQuery] = useState('');
-            const [cart, setCart] = useState([]);
+            
+            // REDUNDANCY FIX: Lazy load cart from localStorage to survive page refresh
+            const [cart, setCart] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('solaris_cart');
+                    return saved ? JSON.parse(saved) : [];
+                } catch(e) {
+                    return [];
+                }
+            });
+            
             const [isCartOpen, setIsCartOpen] = useState(false);
             const [isSubmitting, setIsSubmitting] = useState(false);
             const [submittedOrder, setSubmittedOrder] = useState(null);
             
             const [selectedItemForOptions, setSelectedItemForOptions] = useState(null);
+            const [customerHistory, setCustomerHistory] = useState([]);
+            
+            // NATIVE FEEL: Detect network drops instantly
+            const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+            useEffect(() => {
+                const handleOffline = () => setIsOffline(true);
+                const handleOnline = () => setIsOffline(false);
+                window.addEventListener('offline', handleOffline);
+                window.addEventListener('online', handleOnline);
+                return () => {
+                    window.removeEventListener('offline', handleOffline);
+                    window.removeEventListener('online', handleOnline);
+                };
+            }, []);
 
             const queryParams = new URLSearchParams(window.location.search);
             const tableIdParam = queryParams.get('table');
@@ -1249,17 +1330,40 @@
                 setQrError(errorMsg);
             }, [isSetupLoading, shopIdParam, tableIdParam, detectedShop, qrDetectedTable]);
 
-            // Added sessionTimestamp to track when the session was created
-            const [sessionInfo, setSessionInfo] = useState({
-                isSetup: false,
-                mode: qrDetectedTable ? 'QR' : null, 
-                tableId: qrDetectedTable ? qrDetectedTable.id : null,
-                tableName: qrDetectedTable ? qrDetectedTable.name : null,
-                shopId: qrDetectedTable ? qrDetectedTable.shopId : (detectedShop ? detectedShop.id : null),
-                customerName: '',
-                customerPhone: '',
-                sessionTimestamp: Date.now() 
+            // REDUNDANCY FIX: Lazy load sessionInfo to preserve identity and table info on refresh
+            const [sessionInfo, setSessionInfo] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('solaris_session');
+                    if (saved) {
+                        const parsed = JSON.parse(saved);
+                        // Ensure session hasn't expired (30 mins limit)
+                        if (Date.now() - parsed.sessionTimestamp <= 30 * 60 * 1000) {
+                            return parsed; // Keep existing session if valid
+                        }
+                    }
+                } catch(e) {}
+                
+                // Fallback to fresh session
+                return {
+                    isSetup: false,
+                    mode: qrDetectedTable ? 'QR' : null, 
+                    tableId: qrDetectedTable ? qrDetectedTable.id : null,
+                    tableName: qrDetectedTable ? qrDetectedTable.name : null,
+                    shopId: qrDetectedTable ? qrDetectedTable.shopId : (detectedShop ? detectedShop.id : null),
+                    customerName: '',
+                    customerPhone: '',
+                    sessionTimestamp: Date.now() 
+                };
             });
+
+            // REDUNDANCY FIX: Sync changes to localStorage continuously
+            useEffect(() => {
+                localStorage.setItem('solaris_cart', JSON.stringify(cart));
+            }, [cart]);
+
+            useEffect(() => {
+                localStorage.setItem('solaris_session', JSON.stringify(sessionInfo));
+            }, [sessionInfo]);
 
             // Auto-sync sessionInfo when shop/table completely finishes loading
             useEffect(() => {
@@ -1297,6 +1401,29 @@
                 if (lower.includes('smoothie') || lower.includes('frappe') || lower.includes('blend')) return 'fa-blender';
                 return 'fa-star';
             };
+
+            // Effect to query past orders based on phone search independently of global orders sync
+            useEffect(() => {
+                const fetchHistory = async () => {
+                    const cleanedQuery = phoneSearchQuery.replace(/\D/g, '');
+                    if (!cleanedQuery || cleanedQuery.length < 8) {
+                        setCustomerHistory([]);
+                        return;
+                    }
+                    try {
+                        const { query, where, getDocs } = window.FirebaseApp;
+                        const q = query(getColRef('orders'), where('customerPhone', '==', phoneSearchQuery));
+                        const snap = await getDocs(q);
+                        const history = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt);
+                        setCustomerHistory(history);
+                    } catch (err) {
+                        console.warn("History fetch failed:", err);
+                    }
+                };
+
+                const timeoutId = setTimeout(fetchHistory, 600);
+                return () => clearTimeout(timeoutId);
+            }, [phoneSearchQuery]);
 
             // Effect to monitor session timeout
             useEffect(() => {
@@ -1347,8 +1474,9 @@
 
             const { myActiveOrders, myPastOrders } = useMemo(() => {
                 const active = [];
-                const past = [];
+                const pastMap = new Map();
                 
+                // 1. Process local (today's/active) orders
                 orders.forEach(o => {
                     const isMyAuth = currentUser && o.userId === currentUser.uid;
                     const cleanedSearchQuery = phoneSearchQuery.replace(/\D/g, '');
@@ -1356,18 +1484,27 @@
                     
                     if (isMyAuth || isMyPhone) {
                         if (['Served', 'Cancelled'].includes(o.status)) {
-                            past.push(o);
+                            pastMap.set(o.id, o);
                         } else {
                             active.push(o);
                         }
                     }
                 });
                 
+                // 2. Add fetched history to past orders
+                customerHistory.forEach(o => {
+                    if (['Served', 'Cancelled'].includes(o.status)) {
+                        pastMap.set(o.id, o);
+                    } else if (!active.find(a => a.id === o.id)) {
+                        active.push(o); // edge case: active order from history that wasn't in local orders
+                    }
+                });
+                
                 return {
                     myActiveOrders: active.sort((a, b) => b.createdAt - a.createdAt),
-                    myPastOrders: past.sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
+                    myPastOrders: Array.from(pastMap.values()).sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
                 };
-            }, [orders, currentUser, phoneSearchQuery]);
+            }, [orders, currentUser, phoneSearchQuery, customerHistory]);
 
             const filteredProducts = useMemo(() => {
                 const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once outside the loop
@@ -1402,6 +1539,9 @@
             };
 
             const addToCart = (product, size, price, sugar, ice, editCartIndex = undefined) => {
+                // NATIVE FEEL: Subtle physical vibration on mobile phones when adding items
+                if (navigator.vibrate) navigator.vibrate(50);
+                
                 // Update timestamp on interaction to prevent timeout while ordering
                 setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
                 setCart(prev => {
@@ -1463,6 +1603,9 @@
             };
 
             const updateCartQty = (idx, delta) => {
+                // NATIVE FEEL: Micro-vibration when modifying cart
+                if (navigator.vibrate) navigator.vibrate(30);
+                
                 setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
                 setCart(prev => {
                     const newCart = [...prev];
@@ -1671,6 +1814,14 @@
 
             return (
                 <div className="pb-28 lg:pb-8 relative min-h-screen bg-stone-50">
+                    {/* NATIVE FEEL: Offline Awareness Banner */}
+                    {isOffline && (
+                        <div className="bg-red-500 text-white text-xs font-bold text-center py-1.5 w-full z-50 fixed top-0 left-0 right-0 flex items-center justify-center gap-2 shadow-md animate-slide-in-top">
+                            <i className="fa-solid fa-wifi text-white/70" style={{textDecoration: 'line-through'}}></i> 
+                            No Internet Connection. App is running offline.
+                        </div>
+                    )}
+                    
                     {/* Floating Toast Message */}
                     {customMessage && (
                         <div className="fixed top-6 left-1/2 -translate-x-1/2 bg-stone-900/95 backdrop-blur text-white px-6 py-3 rounded-full shadow-2xl z-50 flex items-center gap-3 border border-stone-700 animate-fade-in transition-all">
@@ -1790,6 +1941,7 @@
                                         
                                         <div className="flex flex-row gap-2.5 mt-auto">
                                             <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-xl bg-stone-100 shrink-0 overflow-hidden relative">
+                                                {/* REDUNDANCY FIX: Lazy load images so the browser only downloads them when scrolled into view */}
                                                 {product.image ? <img src={product.image} className="w-full h-full object-cover absolute inset-0 group-hover:scale-110 transition-transform duration-500" alt={product.name} loading="lazy" decoding="async" /> : <i className="fa-solid fa-image text-xl text-stone-300 w-full h-full flex items-center justify-center absolute inset-0"></i>}
                                             </div>
                                             <div className="flex-1 flex flex-col justify-end gap-1.5 min-w-0">
@@ -4632,8 +4784,9 @@
                                 <button onClick={() => setViewingProduct(null)} className="absolute top-4 right-4 text-white bg-black/40 hover:bg-black/60 rounded-full w-8 h-8 flex items-center justify-center z-10 transition"><i className="fa-solid fa-xmark"></i></button>
                                 
                                 <div className="w-full h-64 bg-stone-100 relative shrink-0">
+                                    {/* REDUNDANCY FIX: Apply lazy loading to modal images as well */}
                                     {viewingProduct.image ? (
-                                        <img src={viewingProduct.image} className="w-full h-full object-cover" alt={viewingProduct.name} decoding="async" />
+                                        <img src={viewingProduct.image} className="w-full h-full object-cover" alt={viewingProduct.name} loading="lazy" decoding="async" />
                                     ) : (
                                         <div className="w-full h-full flex items-center justify-center text-stone-300"><i className="fa-solid fa-image text-5xl"></i></div>
                                     )}
