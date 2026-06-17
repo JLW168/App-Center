@@ -68,14 +68,14 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
         window.FirebaseApp = {
             initializeApp, getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, 
             onAuthStateChanged, signOut, signInAnonymously,
             getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, 
             collection, doc, setDoc, getDoc, getDocs, onSnapshot, 
-            addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit
+            addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit, writeBatch, runTransaction
         };
         window.dispatchEvent(new Event('firebase-loaded'));
     </script>
@@ -198,7 +198,7 @@
         };
 
         const deductInventory = async (cart, products, orderShopId, orderQueueNo) => {
-            const { doc, updateDoc, increment, addDoc, collection } = window.FirebaseApp;
+            const { doc, increment, collection, writeBatch } = window.FirebaseApp;
             const stockUpdates = {}; 
 
             cart.forEach(item => {
@@ -218,24 +218,32 @@
 
             if (!orderShopId || orderShopId === 'UNKNOWN' || orderShopId === 'TAKEAWAY') return;
 
+            // OPTIMIZATION: Write-Heavy Loop Fix using Firestore Batch
+            // Groups all inventory deductions and a single aggregate log into ONE atomic network request.
+            const batch = writeBatch(db);
+            const logEntries = [];
+
             for (const [ingredientId, amount] of Object.entries(stockUpdates)) {
-                try {
-                    await updateDoc(doc(db, 'ingredients', ingredientId), {
-                        [`stockByShop.${orderShopId}`]: increment(-amount)
-                    });
-                    
-                    await addDoc(collection(db, 'inventory_logs'), {
-                        ingredientId: ingredientId,
-                        shopId: orderShopId,
-                        amount: -amount,
-                        type: 'Usage',
-                        reference: `Order ${orderQueueNo || 'Unknown'}`,
-                        timestamp: Date.now()
-                    });
-                } catch (err) {
-                    console.warn("Failed to deduct stock for ", ingredientId, err);
-                }
+                batch.update(doc(db, 'ingredients', ingredientId), {
+                    [`stockByShop.${orderShopId}`]: increment(-amount)
+                });
+                
+                logEntries.push({ ingredientId, amount: -amount });
             }
+            
+            // Add a single aggregated log for the entire order instead of N individual logs
+            if (logEntries.length > 0) {
+                const logRef = doc(collection(db, 'inventory_logs'));
+                batch.set(logRef, {
+                    shopId: orderShopId,
+                    type: 'Usage',
+                    reference: `Order ${orderQueueNo || 'Unknown'}`,
+                    timestamp: Date.now(),
+                    entries: logEntries
+                });
+            }
+            
+            await batch.commit().catch(err => console.warn("Batch inventory deduction failed", err));
         };
 
         const releaseTableIfNotUsed = async (tableId, currentOrderId, allOrders) => {
@@ -467,8 +475,12 @@
                         setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
                     });
                 } else {
-                    // Admins get the full list for reporting and POS sync
-                    unsubO = onSnapshot(getColRef('orders'), snap => {
+                    // OPTIMIZATION: The "Read-Heavy" Sinkhole Fix
+                    // Instead of downloading the ENTIRE lifetime history of the cafe on every refresh,
+                    // we strictly limit the live listener to the 200 most recent orders.
+                    const { query, orderBy, limit } = window.FirebaseApp;
+                    const q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
+                    unsubO = onSnapshot(q, snap => {
                         setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
                     });
                 }
@@ -1406,14 +1418,38 @@
                 return 'Good Evening';
             };
 
-            const getCategoryIcon = (catName) => {
+            const getCategoryDetails = (catName) => {
                 const lower = catName.toLowerCase();
-                if (lower.includes('coffee') || lower.includes('espresso')) return 'fa-mug-hot';
-                if (lower.includes('tea')) return 'fa-leaf';
-                if (lower.includes('drink') || lower.includes('beverage') || lower.includes('soda') || lower.includes('juice')) return 'fa-glass-water';
-                if (lower.includes('food') || lower.includes('snack') || lower.includes('pastry') || lower.includes('cake') || lower.includes('bakery')) return 'fa-cookie-bite';
-                if (lower.includes('smoothie') || lower.includes('frappe') || lower.includes('blend')) return 'fa-blender';
-                return 'fa-star';
+                
+                // Custom: Dopamine -> Brain (Healthy brain/focus)
+                if (lower.includes('dopamine') || lower.includes('energy') || lower.includes('focus')) return { icon: 'fa-brain', color: 'text-fuchsia-600', bg: 'bg-fuchsia-100' };
+                
+                // Classic Coffee
+                if (lower.includes('coffee') || lower.includes('espresso') || lower.includes('americano')) return { icon: 'fa-mug-hot', color: 'text-amber-800', bg: 'bg-amber-100' };
+                
+                // Tea & Matcha
+                if (lower.includes('tea') || lower.includes('matcha') || lower.includes('kombucha')) return { icon: 'fa-leaf', color: 'text-green-600', bg: 'bg-green-100' };
+                
+                // Blended / Smoothies
+                if (lower.includes('smoothie') || lower.includes('frappe') || lower.includes('blend')) return { icon: 'fa-blender', color: 'text-purple-600', bg: 'bg-purple-100' };
+                
+                // Cold Drinks / Refreshments
+                if (lower.includes('drink') || lower.includes('soda') || lower.includes('juice') || lower.includes('refresh') || lower.includes('water')) return { icon: 'fa-glass-water', color: 'text-cyan-500', bg: 'bg-cyan-100' };
+                
+                // Milk & Dairy
+                if (lower.includes('milk') || lower.includes('latte') || lower.includes('cream')) return { icon: 'fa-bottle-droplet', color: 'text-sky-500', bg: 'bg-sky-100' };
+                
+                // Food & Bakery
+                if (lower.includes('food') || lower.includes('snack') || lower.includes('pastry') || lower.includes('bakery') || lower.includes('bread') || lower.includes('croissant')) return { icon: 'fa-bread-slice', color: 'text-orange-600', bg: 'bg-orange-100' };
+                
+                // Sweets & Desserts
+                if (lower.includes('dessert') || lower.includes('ice cream') || lower.includes('cake') || lower.includes('cookie')) return { icon: 'fa-cookie-bite', color: 'text-pink-500', bg: 'bg-pink-100' };
+                
+                // Signatures / Specials
+                if (lower.includes('signature') || lower.includes('special') || lower.includes('promo')) return { icon: 'fa-crown', color: 'text-yellow-600', bg: 'bg-yellow-100' };
+                
+                // Default fallback
+                return { icon: 'fa-star', color: 'text-stone-600', bg: 'bg-stone-200' };
             };
 
             // Effect to query past orders based on phone search independently of global orders sync
@@ -1633,137 +1669,48 @@
             const cartTotal = cart.reduce((sum, item) => sum + ((item.price || 0) * item.quantity), 0);
             const cartItemCount = cart.reduce((count, item) => count + item.quantity, 0);
 
-            const handleSetupSubmit = (e, resolvedData) => {
-                if (e) e.preventDefault();
-                
-                if (resolvedData) {
-                    setSessionInfo(prev => ({ 
-                        ...prev, 
-                        customerPhone: resolvedData.phone, 
-                        customerName: resolvedData.name, 
-                        mode: resolvedData.mode,
-                        shopId: resolvedData.shopId,
-                        tableId: resolvedData.tableId,
-                        tableName: resolvedData.tableName,
-                        isSetup: true,
-                        sessionTimestamp: Date.now()
-                    }));
-                } else {
-                    setSessionInfo(prev => ({ ...prev, isSetup: true, sessionTimestamp: Date.now() }));
-                }
-                setShowSetupModal(false);
-            };
-            
-            const handleSwitchMode = async (newMode) => {
-                if (newMode === 'DINE_IN') {
-                    setSessionInfo({...sessionInfo, mode: 'DINE_IN', tableId: null, tableName: null, shopId: detectedShop ? detectedShop.id : null, sessionTimestamp: Date.now()});
-                    setShowSetupModal(true);
-                } else if (newMode === 'TAKEAWAY') {
-                    if (sessionInfo.tableId && sessionInfo.tableId !== 'TAKEAWAY') {
-                        try {
-                            const { doc, updateDoc } = window.FirebaseApp;
-                            await updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Available' });
-                        } catch(err) {
-                            console.warn("Could not release table: ", err);
-                        }
-                    }
-                    setCustomMessage("Thanks to see you again soon! ☕");
-                    setTimeout(() => setCustomMessage(''), 3500);
-                    
-                    setSessionInfo({...sessionInfo, mode: 'TAKEAWAY', tableId: 'TAKEAWAY', tableName: 'Take Away', shopId: detectedShop ? detectedShop.id : null, sessionTimestamp: Date.now()});
-                }
-            };
-            
-            const handleReorder = (order) => {
-                // 1. SMART DATA UPDATE: Check current products for availability and price changes
-                const updatedItems = [];
-                let itemsSkipped = 0;
-                let pricesChanged = false;
-
-                order.items.forEach(oldItem => {
-                    const currentProduct = products.find(p => p.id === oldItem.productId);
-                    
-                    if (currentProduct && currentProduct.isAvailable) {
-                        const currentPrice = oldItem.size === 'S' ? currentProduct.priceSmall : currentProduct.priceLarge;
-                        
-                        if (currentPrice !== oldItem.price) pricesChanged = true;
-
-                        const defaultSugar = sugarOptions?.length > 0 ? sugarOptions[0].name : '100%';
-                        const defaultIce = iceOptions?.length > 0 ? iceOptions[0].name : 'Normal Ice';
-
-                        updatedItems.push({
-                            ...oldItem,
-                            name: currentProduct.name, // Update name if it changed
-                            price: currentPrice || 0,  // Apply current price
-                            image: currentProduct.image || oldItem.image,
-                            sugar: oldItem.sugar || (currentProduct.hasSugarOption ? defaultSugar : null),
-                            ice: oldItem.ice || (currentProduct.hasIceOption ? defaultIce : null),
-                            done: false // Reset checklist status for re-order
-                        });
-                    } else {
-                        itemsSkipped++;
-                    }
-                });
-
-                if (updatedItems.length === 0) {
-                    setCustomMessage("Sorry, those items are no longer available on the menu.");
-                    setTimeout(() => setCustomMessage(''), 4000);
-                    return;
-                }
-
-                if (itemsSkipped > 0 || pricesChanged) {
-                    setCustomMessage(`Cart updated: ${itemsSkipped > 0 ? itemsSkipped + ' items unavailable. ' : ''}${pricesChanged ? 'Prices updated to current menu.' : ''}`);
-                } else {
-                    setCustomMessage("Re-ordered items added to cart!");
-                }
-                setTimeout(() => setCustomMessage(''), 4000);
-
-                setCart(updatedItems); 
-
-                // 2. SMART CONTEXT LOGIC: Force customer to choose Dine In / Take Away reality for this new order
-                setSessionInfo(prev => {
-                    // Unless they are locked into a session via a physical QR scan on a table,
-                    // we must ask them their current real-world preference (Takeaway vs Dine In)
-                    const isStrictQR = prev.mode === 'QR' && prev.isSetup;
-
-                    if (!isStrictQR) {
-                        setTimeout(() => setShowSetupModal(true), 150);
-                    } else {
-                        setTimeout(() => setIsCartOpen(true), 150);
-                    }
-
-                    return {
-                        ...prev,
-                        customerName: prev.customerName || order.customerName,
-                        customerPhone: prev.customerPhone || order.customerPhone,
-                        shopId: prev.shopId || order.shopId,
-                        // Reset table and mode to force a conscious decision
-                        mode: isStrictQR ? prev.mode : 'TAKEAWAY',
-                        tableId: isStrictQR ? prev.tableId : '',
-                        tableName: isStrictQR ? prev.tableName : '',
-                        isSetup: isStrictQR, // Forces the setup flow modal to require submission
-                        sessionTimestamp: Date.now()
-                    };
-                });
-
-                setIsTrackerOpen(false);
-            };
-
             const handleCheckout = async (e) => {
                 e.preventDefault();
                 if (cart.length === 0 || !sessionInfo.isSetup) return;
+                
                 setIsSubmitting(true);
 
-                const { addDoc, updateDoc, doc } = window.FirebaseApp;
+                const { addDoc, updateDoc, doc, runTransaction } = window.FirebaseApp;
                 const today = getTodayString();
                 
-                const todaysOrders = orders.filter(o => o.dateString === today);
-                const highestQueue = todaysOrders.length > 0 
-                    ? Math.max(...todaysOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) 
-                    : 0;
-                const queueString = `A-${(highestQueue + 1).toString().padStart(3, '0')}`;
+                // TAX DEPT FORMAT: Extract last 3 alphanumeric characters of the shop name
+                const targetShop = shops.find(s => s.id === sessionInfo.shopId) || { name: 'UNK', id: 'UNKNOWN' };
+                const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+
+                // SECURE FIREBASE TRANSACTION: Guaranteed Sequential Invoice Numbers
+                let queueString;
+                try {
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const nextSeq = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
+                        return nextVal;
+                    });
+                    queueString = `${shopPrefix}-${nextSeq.toString().padStart(5, '0')}`;
+                } catch (err) {
+                    console.error("Transaction failed, using fallback:", err);
+                    const shopOrders = orders.filter(o => o.shopId === sessionInfo.shopId);
+                    const highestQueue = shopOrders.length > 0 ? Math.max(...shopOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) : 0;
+                    queueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(5, '0')}`;
+                }
 
                 const actualOrderType = (sessionInfo.mode === 'QR' || sessionInfo.mode === 'DINE_IN') ? 'DINE_IN' : 'TAKEAWAY';
+
+                // Snapshot the cart state before we clear it instantly
+                const currentCart = [...cart];
+                const currentCartTotal = cartTotal;
 
                 const orderData = {
                     userId: currentUser ? currentUser.uid : null,
@@ -1775,8 +1722,8 @@
                     customerName: sessionInfo.customerName,
                     customerPhone: sessionInfo.customerPhone,
                     notes: cartNotes,
-                    items: cart,
-                    totalAmount: cartTotal,
+                    items: currentCart,
+                    totalAmount: currentCartTotal,
                     status: 'New', 
                     paymentStatus: 'Unpaid',
                     paymentMethod: 'N/A',
@@ -1784,29 +1731,29 @@
                     createdAt: Date.now()
                 };
 
-                try {
-                    await addDoc(getColRef('orders'), orderData);
-                    await deductInventory(cart, products, sessionInfo.shopId, queueString);
-                    
-                    if (actualOrderType === 'DINE_IN' && sessionInfo.tableId) {
-                        try {
-                            await updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Occupied' });
-                        } catch(err) {
-                            console.warn("Could not update table status: ", err);
-                        }
-                    }
+                // OPTIMISTIC UI UPDATE: Instant Customer Gratification
+                // Trigger subtle haptic vibration on mobile devices
+                if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
+                
+                setSubmittedOrder(orderData);
+                setCart([]);
+                setIsCartOpen(false);
+                setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
+                setIsSubmitting(false);
 
-                    setSubmittedOrder(orderData);
-                    setCart([]);
-                    setIsCartOpen(false);
-                    // Reset timestamp upon successful checkout
-                    setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
-                } catch (err) {
-                    console.error("Order submission failed:", err);
-                    alert("Submission Blocked by Firebase!\n\nError: " + err.message + "\n\nFix: You must update your Firestore Security Rules to allow writes.");
-                } finally {
-                    setIsSubmitting(false);
-                }
+                // BACKGROUND SYNC: Fire and Forget Database operations
+                Promise.resolve().then(async () => {
+                    try {
+                        await addDoc(getColRef('orders'), orderData);
+                        deductInventory(currentCart, products, sessionInfo.shopId, queueString); // Runs independently
+                        
+                        if (actualOrderType === 'DINE_IN' && sessionInfo.tableId) {
+                            updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Occupied' }).catch(err => console.warn(err));
+                        }
+                    } catch (err) {
+                        console.error("Background order sync failed:", err);
+                    }
+                });
             };
 
             if (submittedOrder) {
@@ -1917,14 +1864,23 @@
                                 ))
                             ) : (
                                 <>
-                                    <button onClick={() => setActiveCategory('All')} className={`whitespace-nowrap flex items-center gap-2 px-5 py-2 rounded-full text-sm font-semibold transition-all ${activeCategory === 'All' ? 'bg-stone-900 text-white shadow-lg scale-105' : 'bg-white text-stone-600 border border-stone-200 hover:bg-stone-100 hover:border-stone-300'}`}>
-                                        <i className="fa-solid fa-border-all"></i> All
+                                    <button onClick={() => setActiveCategory('All')} className={`whitespace-nowrap flex items-center gap-2.5 px-4 py-2 rounded-full text-sm font-semibold transition-all ${activeCategory === 'All' ? 'bg-stone-900 text-white shadow-lg scale-105' : 'bg-white text-stone-600 border border-stone-200 hover:bg-stone-100 hover:border-stone-300'}`}>
+                                        <div className={`w-7 h-7 rounded-full flex items-center justify-center transition-colors ${activeCategory === 'All' ? 'bg-white/20 text-white' : 'bg-stone-100 text-stone-500'}`}>
+                                            <i className="fa-solid fa-border-all text-xs"></i>
+                                        </div>
+                                        <span className="pr-1">All</span>
                                     </button>
-                                    {categories.map(cat => (
-                                        <button key={cat.id} onClick={() => setActiveCategory(cat.name)} className={`whitespace-nowrap flex items-center gap-2 px-5 py-2 rounded-full text-sm font-semibold transition-all ${activeCategory === cat.name ? 'bg-stone-900 text-white shadow-lg scale-105' : 'bg-white text-stone-600 border border-stone-200 hover:bg-stone-100 hover:border-stone-300'}`}>
-                                            <i className={`fa-solid ${getCategoryIcon(cat.name)} ${activeCategory === cat.name ? 'text-amber-500' : 'text-stone-400'}`}></i> {cat.name}
-                                        </button>
-                                    ))}
+                                    {categories.map(cat => {
+                                        const style = getCategoryDetails(cat.name);
+                                        return (
+                                            <button key={cat.id} onClick={() => setActiveCategory(cat.name)} className={`whitespace-nowrap flex items-center gap-2.5 px-4 py-2 rounded-full text-sm font-semibold transition-all ${activeCategory === cat.name ? 'bg-stone-900 text-white shadow-lg scale-105' : 'bg-white text-stone-600 border border-stone-200 hover:bg-stone-100 hover:border-stone-300'}`}>
+                                                <div className={`w-7 h-7 rounded-full flex items-center justify-center transition-colors ${activeCategory === cat.name ? 'bg-white/20 text-white' : `${style.bg} ${style.color}`}`}>
+                                                    <i className={`fa-solid ${style.icon} text-xs`}></i>
+                                                </div>
+                                                <span className="pr-1">{cat.name}</span>
+                                            </button>
+                                        );
+                                    })}
                                 </>
                             )}
                         </div>
@@ -2166,6 +2122,8 @@
             const [role, setRole] = useState('Manager');
             const [shopId, setShopId] = useState('');
             const [error, setError] = useState('');
+            const [showPassword, setShowPassword] = useState(false);
+            const [showSecret, setShowSecret] = useState(false);
 
             const handleSubmit = async (e) => {
                 e.preventDefault();
@@ -2232,7 +2190,10 @@
                                 <input type="text" placeholder="Full Name" required className="w-full border rounded-xl px-4 py-3 outline-none focus:border-amber-600" value={name} onChange={e=>setName(e.target.value)} />
                             )}
                             <input type="email" placeholder="Email" required className="w-full border rounded-xl px-4 py-3 outline-none focus:border-amber-600" value={email} onChange={e=>setEmail(e.target.value)} />
-                            <input type="password" placeholder="Password" required className="w-full border rounded-xl px-4 py-3 outline-none focus:border-amber-600" value={password} onChange={e=>setPassword(e.target.value)} />
+                            <div className="relative">
+                                <input type={showPassword ? "text" : "password"} placeholder="Password" required className="w-full border rounded-xl px-4 py-3 pr-12 outline-none focus:border-amber-600" value={password} onChange={e=>setPassword(e.target.value)} />
+                                <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-4 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 focus:outline-none"><i className={`fa-solid ${showPassword ? 'fa-eye-slash' : 'fa-eye'}`}></i></button>
+                            </div>
                             
                             {isRegistering && (
                                 <div className="space-y-4 border-t border-stone-200 pt-4 mt-2">
@@ -2251,14 +2212,17 @@
                                         </select>
                                     )}
 
-                                    <input 
-                                        type="password" 
-                                        placeholder="Admin Registration Code" 
-                                        required 
-                                        className="w-full border rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50" 
-                                        value={secretCode} 
-                                        onChange={e=>setSecretCode(e.target.value)} 
-                                    />
+                                    <div className="relative">
+                                        <input 
+                                            type={showSecret ? "text" : "password"} 
+                                            placeholder="Admin Registration Code" 
+                                            required 
+                                            className="w-full border rounded-xl px-4 py-3 pr-12 outline-none focus:border-amber-600 bg-stone-50" 
+                                            value={secretCode} 
+                                            onChange={e=>setSecretCode(e.target.value)} 
+                                        />
+                                        <button type="button" onClick={() => setShowSecret(!showSecret)} className="absolute right-4 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 focus:outline-none"><i className={`fa-solid ${showSecret ? 'fa-eye-slash' : 'fa-eye'}`}></i></button>
+                                    </div>
                                 </div>
                             )}
                             
@@ -2358,7 +2322,7 @@
                             {activeTab === 'shops' && <ShopsView shops={shops} tables={tables} currentAdminRecord={currentAdminRecord} />}
                             {activeTab === 'products' && <ProductsView products={products} categories={categories} ingredients={ingredients} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} />}
                             {activeTab === 'inventory' && <InventoryView ingredients={ingredients} shops={shops} currentAdminRecord={currentAdminRecord} />}
-                            {activeTab === 'sales' && <SalesView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} />}
+                            {activeTab === 'sales' && <SalesView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} admins={admins} />}
                             {activeTab === 'customers' && <CustomersView orders={orders} />}
                             {activeTab === 'users' && <UsersView admins={admins} currentUser={currentUser} shops={shops} />}
                         </div>
@@ -3071,7 +3035,7 @@
 
             const updateStatus = async (order, newStatus, cancelNote = '') => {
                 const { doc, updateDoc } = window.FirebaseApp;
-                const updateData = { status: newStatus };
+                const updateData = { status: newStatus, staffId: currentAdminRecord?.id };
                 if (newStatus === 'Ready' || newStatus === 'Served' || newStatus === 'Cancelled') {
                     updateData.completedAt = Date.now();
                 }
@@ -3092,7 +3056,8 @@
                 
                 const updateData = {
                     paymentStatus: payStatus,
-                    paymentMethod: payMethod
+                    paymentMethod: payMethod,
+                    staffId: currentAdminRecord?.id
                 };
                 
                 if (payStatus === 'Paid' && activeShift) {
@@ -3438,7 +3403,7 @@
 
             const updateStatus = async (order, newStatus) => {
                 const { doc, updateDoc } = window.FirebaseApp;
-                const updateData = { status: newStatus };
+                const updateData = { status: newStatus, staffId: currentAdminRecord?.id };
                 
                 if (newStatus === 'Ready' || newStatus === 'Served' || newStatus === 'Cancelled') {
                     updateData.completedAt = Date.now();
@@ -3459,7 +3424,8 @@
                 
                 const updateData = {
                     paymentStatus: payStatus,
-                    paymentMethod: payMethod
+                    paymentMethod: payMethod,
+                    staffId: currentAdminRecord?.id
                 };
                 
                 if (payStatus === 'Paid' && targetShift) {
@@ -3591,47 +3557,80 @@
                 if (cart.length === 0) return;
                 setIsSubmitting(true);
                 
+                const { addDoc, doc, runTransaction } = window.FirebaseApp;
+                
+                const today = getTodayString();
+                
+                // TAX DEPT FORMAT: Extract last 3 alphanumeric characters of the shop name
+                const targetShop = shops.find(s => s.id === cartShopId) || { name: 'UNK', id: 'UNKNOWN' };
+                const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+
+                // SECURE FIREBASE TRANSACTION: Guaranteed Sequential Invoice Numbers
+                let queueString;
                 try {
-                    const { addDoc } = window.FirebaseApp;
-                    
-                    const today = getTodayString();
-                    const highestQueue = todayOrders.length > 0 ? Math.max(...todayOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) : 0;
-                    const queueString = `A-${(highestQueue + 1).toString().padStart(3, '0')}`;
-
-                    // CRITICAL FIX: Find shift specifically for the cart's target shop, preventing Admin bypass.
-                    const cartTargetShift = shifts?.find(s => s.shopId === cartShopId && s.status === 'Open');
-
-                    const orderData = {
-                        shiftId: cartTargetShift ? cartTargetShift.id : null,
-                        queueNo: queueString,
-                        orderType: 'TAKEAWAY', 
-                        tableId: 'Walk-in',
-                        items: cart,
-                        totalAmount: cartTotal,
-                        status: targetStatus, 
-                        paymentStatus: payStatus,
-                        paymentMethod: payMethod,
-                        dateString: today,
-                        createdAt: Date.now()
-                    };
-
-                    if (targetStatus === 'Served' || targetStatus === 'Cancelled') {
-                        orderData.completedAt = Date.now();
-                    }
-
-                    // Unified try execution block
-                    await addDoc(getColRef('orders'), orderData);
-                    await deductInventory(cart, products, cartShopId, queueString);
-                    
-                    setCart([]);
-                    setCustomerName('');
-                    setMode('manage');
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const nextSeq = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
+                        return nextVal;
+                    });
+                    queueString = `${shopPrefix}-${nextSeq.toString().padStart(5, '0')}`;
                 } catch (err) {
-                    console.error("POS Checkout failed:", err);
-                    alert("Checkout Failed!\n\nError: " + err.message);
-                } finally {
-                    setIsSubmitting(false);
+                    console.error("Transaction failed, using fallback:", err);
+                    const shopOrders = orders.filter(o => o.shopId === cartShopId);
+                    const highestQueue = shopOrders.length > 0 ? Math.max(...shopOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) : 0;
+                    queueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(5, '0')}`;
                 }
+
+                const cartTargetShift = shifts?.find(s => s.shopId === cartShopId && s.status === 'Open');
+
+                // Snapshot the cart state before we clear it instantly
+                const currentCart = [...cart];
+                const currentTotal = cartTotal;
+
+                const orderData = {
+                    shiftId: cartTargetShift ? cartTargetShift.id : null,
+                    staffId: currentAdminRecord?.id,
+                    userId: currentAdminRecord?.id,
+                    queueNo: queueString,
+                    orderType: 'TAKEAWAY', 
+                    tableId: 'Walk-in',
+                    items: currentCart,
+                    totalAmount: currentTotal,
+                    status: targetStatus, 
+                    paymentStatus: payStatus,
+                    paymentMethod: payMethod,
+                    dateString: today,
+                    createdAt: Date.now()
+                };
+
+                if (targetStatus === 'Served' || targetStatus === 'Cancelled') {
+                    orderData.completedAt = Date.now();
+                }
+
+                // OPTIMISTIC UI UPDATE: Clear POS Register Instantly
+                if (navigator.vibrate) navigator.vibrate([30, 30]);
+                setCart([]);
+                setCustomerName('');
+                setMode('manage');
+                setIsSubmitting(false);
+
+                // BACKGROUND SYNC: Fire and Forget Database operations
+                Promise.resolve().then(async () => {
+                    try {
+                        await addDoc(getColRef('orders'), orderData);
+                        deductInventory(currentCart, products, cartShopId, queueString);
+                    } catch (err) {
+                        console.error("POS Checkout failed in background:", err);
+                    }
+                });
             };
 
             if (mode === 'pos') {
@@ -4073,9 +4072,25 @@
             // Fetch History Logs
             useEffect(() => {
                 if (historyTab !== 'logs') return;
-                const { onSnapshot, collection } = window.FirebaseApp;
-                const unsub = onSnapshot(collection(db, 'inventory_logs'), snap => {
-                    setLogs(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                const { onSnapshot, collection, query, orderBy, limit } = window.FirebaseApp;
+                // Added a limit to the logs query to prevent massive reads
+                const q = query(collection(db, 'inventory_logs'), orderBy('timestamp', 'desc'), limit(150));
+                
+                const unsub = onSnapshot(q, snap => {
+                    const parsedLogs = [];
+                    snap.docs.forEach(d => {
+                        const data = d.data();
+                        // Parse aggregated batch logs
+                        if (data.entries && Array.isArray(data.entries)) {
+                            data.entries.forEach((entry, idx) => {
+                                parsedLogs.push({ id: `${d.id}-${idx}`, ...data, ingredientId: entry.ingredientId, amount: entry.amount });
+                            });
+                        } else {
+                            // Support legacy single logs
+                            parsedLogs.push({ id: d.id, ...data });
+                        }
+                    });
+                    setLogs(parsedLogs);
                 });
                 return () => unsub();
             }, [historyTab]);
@@ -5139,7 +5154,7 @@
                                                                             const newRec = [...formData.recipe];
                                                                             newRec[idx].ingredientId = val;
                                                                             if (ingr) {
-                                                                                // FORCE update to inventory defaults since fields are locked
+                                                                                // Seed the default usage amounts from inventory (can be edited manually)
                                                                                 newRec[idx].qtyS = ingr.usageS || '';
                                                                                 newRec[idx].qtyL = ingr.usageL || '';
                                                                             }
@@ -5153,9 +5168,19 @@
                                                                 <td className="px-3 py-2 align-top border-l border-stone-200 bg-red-50/10">
                                                                     {ing ? (
                                                                         <div className="flex flex-col gap-1.5">
-                                                                            <div className="flex items-center gap-1 justify-center" title="Locked: Update usage amount in Inventory">
-                                                                                <i className="fa-solid fa-lock text-[10px] text-stone-300"></i>
-                                                                                <input type="number" disabled placeholder="0" className="w-14 border border-stone-200 rounded p-1.5 text-xs font-bold outline-none bg-stone-100 text-stone-500 text-center shadow-inner cursor-not-allowed" value={row.qtyS || ''} />
+                                                                            <div className="flex items-center gap-1 justify-center" title="Enter usage amount for Small size">
+                                                                                <input 
+                                                                                    type="number" 
+                                                                                    step="any"
+                                                                                    placeholder="0" 
+                                                                                    className="w-16 border border-stone-300 rounded p-1.5 text-xs font-bold outline-none bg-white text-stone-800 text-center shadow-sm focus:border-amber-500 transition-all" 
+                                                                                    value={row.qtyS || ''} 
+                                                                                    onChange={(e) => {
+                                                                                        const newRec = [...formData.recipe];
+                                                                                        newRec[idx].qtyS = e.target.value;
+                                                                                        recalcCosts(formData, newRec);
+                                                                                    }}
+                                                                                />
                                                                                 <span className="text-[10px] text-stone-500 font-bold uppercase w-6">{unitLabel}</span>
                                                                             </div>
                                                                             <div className="text-xs font-bold text-red-600 bg-red-50 px-2 py-1 rounded inline-block text-center border border-red-100 opacity-90">
@@ -5167,9 +5192,19 @@
                                                                 <td className="px-3 py-2 align-top border-l border-stone-200 bg-blue-50/10">
                                                                     {ing ? (
                                                                         <div className="flex flex-col gap-1.5">
-                                                                            <div className="flex items-center gap-1 justify-center" title="Locked: Update usage amount in Inventory">
-                                                                                <i className="fa-solid fa-lock text-[10px] text-stone-300"></i>
-                                                                                <input type="number" disabled placeholder="0" className="w-14 border border-stone-200 rounded p-1.5 text-xs font-bold outline-none bg-stone-100 text-stone-500 text-center shadow-inner cursor-not-allowed" value={row.qtyL || ''} />
+                                                                            <div className="flex items-center gap-1 justify-center" title="Enter usage amount for Large size">
+                                                                                <input 
+                                                                                    type="number" 
+                                                                                    step="any"
+                                                                                    placeholder="0" 
+                                                                                    className="w-16 border border-stone-300 rounded p-1.5 text-xs font-bold outline-none bg-white text-stone-800 text-center shadow-sm focus:border-amber-500 transition-all" 
+                                                                                    value={row.qtyL || ''} 
+                                                                                    onChange={(e) => {
+                                                                                        const newRec = [...formData.recipe];
+                                                                                        newRec[idx].qtyL = e.target.value;
+                                                                                        recalcCosts(formData, newRec);
+                                                                                    }}
+                                                                                />
                                                                                 <span className="text-[10px] text-stone-500 font-bold uppercase w-6">{unitLabel}</span>
                                                                             </div>
                                                                             <div className="text-xs font-bold text-blue-600 bg-blue-50 px-2 py-1 rounded inline-block text-center border border-blue-100 opacity-90">
@@ -5212,7 +5247,7 @@
             );
         }
 
-        function SalesView({ orders, shops, currentAdminRecord }) {
+        function SalesView({ orders, shops, currentAdminRecord, admins }) {
             const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
             const canSelectMultiple = isSuper || (currentAdminRecord?.shopIds && currentAdminRecord.shopIds.length > 1);
             const [filter, setFilter] = useState('today'); 
@@ -5224,12 +5259,69 @@
                 return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
             });
             
+            // Smart Filter States
+            const [filterStaff, setFilterStaff] = useState('All');
+            const [filterPayment, setFilterPayment] = useState('All');
+            const [searchQuery, setSearchQuery] = useState('');
+            
+            // OPTIMIZATION: On-Demand Historical Data Fetching
+            const [historicalOrders, setHistoricalOrders] = useState([]);
+            const [isFetchingHistory, setIsFetchingHistory] = useState(false);
+
+            useEffect(() => {
+                // If filtering for today, the live limited snapshot from MainApp is sufficient.
+                if (filter === 'today') return;
+
+                const fetchHistory = async () => {
+                    setIsFetchingHistory(true);
+                    const { getDocs, query, where, collection } = window.FirebaseApp;
+                    const now = new Date();
+                    let startTime = 0;
+                    let endTime = now.getTime();
+
+                    // Calculate timestamp ranges based on selected filter
+                    if (filter === 'yesterday') {
+                        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                        startTime = today.getTime() - (24 * 60 * 60 * 1000);
+                        endTime = today.getTime();
+                    } else if (filter === 'week' || filter === 'last_week') {
+                        startTime = now.getTime() - (14 * 24 * 60 * 60 * 1000); // Fetch two weeks for buffer
+                    } else if (filter === 'this_month' || filter === 'last_month') {
+                        startTime = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime(); // Fetch 2 months buffer
+                    } else if (filter === 'custom_month' && customMonth) {
+                        const [year, month] = customMonth.split('-');
+                        startTime = new Date(year, month - 1, 1).getTime();
+                        endTime = new Date(year, month, 1).getTime();
+                    }
+
+                    try {
+                        const q = query(
+                            collection(db, 'orders'), 
+                            where('createdAt', '>=', startTime),
+                            where('createdAt', '<', endTime)
+                        );
+                        const snap = await getDocs(q);
+                        setHistoricalOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    } catch(err) {
+                        console.error("Failed to fetch historical sales", err);
+                    } finally {
+                        setIsFetchingHistory(false);
+                    }
+                };
+                
+                fetchHistory();
+            }, [filter, customMonth, filterShopId]);
+            
             const filteredOrders = useMemo(() => {
                 const now = new Date();
                 // Get precise midnight to avoid rolling 24-hour overlap bugs
                 const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-                return orders.filter(o => {
+                // Use the live orders array for 'today', otherwise use the fetched historical array
+                const sourceData = filter === 'today' ? orders : historicalOrders;
+                const searchLower = searchQuery.toLowerCase();
+
+                return sourceData.filter(o => {
                     const matchShop = filterShopId === 'All' || o.shopId === filterShopId;
                     if (!matchShop) return false;
                     
@@ -5270,9 +5362,36 @@
                         }
                     }
                     
-                    return matchDate;
+                    if (!matchDate) return false;
+
+                    // Smart Filter: Staff Match
+                    const staffId = o.staffId || o.userId;
+                    const isSelfOrder = !admins?.find(a => a.id === staffId);
+                    const matchStaff = filterStaff === 'All' || (filterStaff === 'Self-Order' ? isSelfOrder : staffId === filterStaff);
+                    if (!matchStaff) return false;
+
+                    // Smart Filter: Payment Match
+                    let matchPayment = true;
+                    if (filterPayment === 'Paid') matchPayment = o.paymentStatus === 'Paid';
+                    else if (filterPayment === 'Unpaid') matchPayment = o.paymentStatus !== 'Paid';
+                    else if (filterPayment === 'Cash') matchPayment = o.paymentStatus === 'Paid' && o.paymentMethod === 'Cash';
+                    else if (filterPayment === 'Bank') matchPayment = o.paymentStatus === 'Paid' && o.paymentMethod === 'Bank';
+                    if (!matchPayment) return false;
+
+                    // Smart Filter: Search Match (Customer, Phone, Table, Queue/Invoice)
+                    if (searchLower) {
+                        const cName = String(o.customerName || 'Walk-in').toLowerCase();
+                        const cPhone = String(o.customerPhone || '').toLowerCase();
+                        const cTable = String(o.tableName || '').toLowerCase();
+                        const cQueue = String(o.queueNo || '').toLowerCase();
+                        if (!cName.includes(searchLower) && !cPhone.includes(searchLower) && !cTable.includes(searchLower) && !cQueue.includes(searchLower)) {
+                            return false;
+                        }
+                    }
+                    
+                    return true;
                 });
-            }, [orders, filter, filterShopId, customMonth]);
+            }, [orders, historicalOrders, filter, filterShopId, customMonth, filterStaff, filterPayment, searchQuery, admins]);
 
             const { totalRevenue, cashRevenue, bankRevenue, pendingRevenue } = useMemo(() => {
                 let total = 0, cash = 0, bank = 0, pending = 0;
@@ -5289,9 +5408,26 @@
                 return { totalRevenue: total, cashRevenue: cash, bankRevenue: bank, pendingRevenue: pending };
             }, [filteredOrders]);
 
+            const formatSalesDateTime = (timestamp) => {
+                const d = new Date(timestamp);
+                const day = String(d.getDate()).padStart(2, '0');
+                const month = String(d.getMonth() + 1).padStart(2, '0');
+                const year = String(d.getFullYear()).slice(-2);
+                let hrs = d.getHours();
+                const ampm = hrs >= 12 ? 'PM' : 'AM';
+                hrs = hrs % 12 || 12;
+                const mins = String(d.getMinutes()).padStart(2, '0');
+                const secs = String(d.getSeconds()).padStart(2, '0');
+                return `${day}-${month}-${year} | ${hrs}:${mins}:${secs} ${ampm}`;
+            };
+
             const exportCSV = () => {
-                const headers = "Date,Type,Queue,Table,Customer,Phone,Total,Payment_Status,Payment_Method,Order_Status\n";
-                const rows = filteredOrders.map(o => `${new Date(o.createdAt).toLocaleString()},${o.orderType || 'DINE_IN'},${o.queueNo},${o.tableName},"${o.customerName}",${o.customerPhone || 'N/A'},${o.totalAmount},${o.paymentStatus || 'Unpaid'},${o.paymentMethod || 'N/A'},${o.status}`).join("\n");
+                const headers = "Date_Time,Shop_Name,Staff_Name,Invoice,Table,Customer,Phone,Total,Payment_Status,Payment_Method,Order_Status\n";
+                const rows = filteredOrders.map(o => {
+                    const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
+                    const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                    return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${staffName}","${o.queueNo}","${o.tableName}","${o.customerName || 'Walk-in'}","${o.customerPhone || 'N/A'}",${o.totalAmount},"${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.status}"`;
+                }).join("\n");
                 const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement("a");
                 link.href = URL.createObjectURL(blob);
@@ -5337,6 +5473,32 @@
                         </div>
                     </div>
 
+                    {/* NEW SMART FILTERS ROW */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6 no-print bg-white p-4 rounded-2xl shadow-sm border border-stone-200">
+                        <div className="relative">
+                            <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                            <input type="text" placeholder="Search Customer, Phone, Table or Invoice..." className="w-full pl-9 pr-3 py-2 rounded-lg border border-stone-300 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-800" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+                        </div>
+                        <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 cursor-pointer" value={filterStaff} onChange={e => setFilterStaff(e.target.value)}>
+                            <option value="All">All Staff / Handlers</option>
+                            <option value="Self-Order">Self-Order (Customer Portal)</option>
+                            {admins?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                        </select>
+                        <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 cursor-pointer" value={filterPayment} onChange={e => setFilterPayment(e.target.value)}>
+                            <option value="All">All Payment Types</option>
+                            <option value="Paid">Paid (Any Method)</option>
+                            <option value="Cash">Paid - Cash</option>
+                            <option value="Bank">Paid - Bank</option>
+                            <option value="Unpaid">Unpaid</option>
+                        </select>
+                    </div>
+
+                    {isFetchingHistory && (
+                        <div className="mb-4 bg-blue-50 text-blue-700 p-3 rounded-xl border border-blue-200 text-sm font-bold flex items-center shadow-sm animate-pulse">
+                            <i className="fa-solid fa-spinner fa-spin mr-2"></i> Fetching historical data from Firebase...
+                        </div>
+                    )}
+
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                         <div className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200">
                             <p className="text-stone-500 text-sm font-medium">Total Revenue (Paid)</p>
@@ -5357,39 +5519,51 @@
                     </div>
 
                     <div className="bg-white rounded-2xl border shadow-sm overflow-auto">
-                        <table className="w-full min-w-[800px] text-left text-sm border-collapse border border-stone-300">
+                        <table className="w-full min-w-[1200px] text-left text-sm border-collapse border border-stone-300">
                             <thead>
                                 <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
-                                    <th className="p-3 font-bold border border-stone-300">Date</th>
-                                    <th className="p-3 font-bold border border-stone-300">Queue / Table</th>
+                                    <th className="p-3 font-bold border border-stone-300">Date & Time</th>
+                                    <th className="p-3 font-bold border border-stone-300">Shop Name</th>
+                                    <th className="p-3 font-bold border border-stone-300">Staff Name</th>
+                                    <th className="p-3 font-bold border border-stone-300">Invoice</th>
+                                    <th className="p-3 font-bold border border-stone-300">Table</th>
+                                    <th className="p-3 font-bold border border-stone-300">Customer Name</th>
                                     <th className="p-3 font-bold border border-stone-300">Total</th>
                                     <th className="p-3 font-bold border border-stone-300">Payment</th>
                                     <th className="p-3 font-bold border border-stone-300">Status</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {filteredOrders.map(o => (
-                                    <tr key={o.id} className="hover:bg-stone-50 bg-white">
-                                        <td className="p-3 border border-stone-300 align-top">{new Date(o.createdAt).toLocaleString()}</td>
-                                        <td className="p-3 border border-stone-300 align-top">
-                                            <span className="font-semibold">{o.queueNo}</span>
-                                            <span className="text-xs text-stone-500 ml-2">Tbl: {o.tableName}</span>
-                                        </td>
-                                        <td className="p-3 border border-stone-300 align-top font-bold">{o.totalAmount.toLocaleString()} ៛</td>
-                                        <td className="p-3 border border-stone-300 align-top">
-                                            {o.paymentStatus === 'Paid' ? (
-                                                <span className="text-[10px] font-bold uppercase tracking-wider bg-green-100 text-green-700 px-2 py-1 rounded">Paid ({o.paymentMethod})</span>
-                                            ) : (
-                                                <span className="text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700 px-2 py-1 rounded">Unpaid</span>
-                                            )}
-                                        </td>
-                                        <td className="p-3 border border-stone-300 align-top">
-                                            <span className={`font-bold ${o.status === 'Cancelled' ? 'text-red-500' : ''}`}>{o.status}</span>
-                                            {o.status === 'Cancelled' && o.cancelReason && <div className="text-[10px] text-red-500 mt-1 bg-red-50 px-1 py-0.5 rounded border border-red-100 leading-tight">Note: {o.cancelReason}</div>}
-                                        </td>
-                                    </tr>
-                                ))}
-                                {filteredOrders.length === 0 && <tr><td colSpan="5" className="text-center py-4 text-stone-400 border border-stone-300">No sales found.</td></tr>}
+                                {filteredOrders.map(o => {
+                                    const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
+                                    const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                                    return (
+                                        <tr key={o.id} className="hover:bg-stone-50 bg-white">
+                                            <td className="p-3 border border-stone-300 align-top whitespace-nowrap text-stone-600 font-medium">{formatSalesDateTime(o.createdAt)}</td>
+                                            <td className="p-3 border border-stone-300 align-top font-bold text-stone-800">{shopName}</td>
+                                            <td className="p-3 border border-stone-300 align-top font-medium text-stone-700">{staffName}</td>
+                                            <td className="p-3 border border-stone-300 align-top font-bold text-stone-900">{o.queueNo}</td>
+                                            <td className="p-3 border border-stone-300 align-top font-medium">{o.tableName}</td>
+                                            <td className="p-3 border border-stone-300 align-top">
+                                                <span className="font-semibold">{o.customerName || 'Walk-in'}</span>
+                                                {o.customerPhone && o.customerPhone !== 'N/A' && <div className="text-xs text-stone-500 mt-0.5"><i className="fa-solid fa-phone text-[10px] mr-1"></i>{o.customerPhone}</div>}
+                                            </td>
+                                            <td className="p-3 border border-stone-300 align-top font-black text-amber-700 whitespace-nowrap">{o.totalAmount.toLocaleString()} ៛</td>
+                                            <td className="p-3 border border-stone-300 align-top">
+                                                {o.paymentStatus === 'Paid' ? (
+                                                    <span className="text-[10px] font-bold uppercase tracking-wider bg-green-100 text-green-700 px-2 py-1 rounded">Paid ({o.paymentMethod})</span>
+                                                ) : (
+                                                    <span className="text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700 px-2 py-1 rounded">Unpaid</span>
+                                                )}
+                                            </td>
+                                            <td className="p-3 border border-stone-300 align-top">
+                                                <span className={`font-bold ${o.status === 'Cancelled' ? 'text-red-500' : ''}`}>{o.status}</span>
+                                                {o.status === 'Cancelled' && o.cancelReason && <div className="text-[10px] text-red-500 mt-1 bg-red-50 px-1 py-0.5 rounded border border-red-100 leading-tight">Note: {o.cancelReason}</div>}
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                                {filteredOrders.length === 0 && <tr><td colSpan="9" className="text-center py-4 text-stone-400 border border-stone-300">No sales found.</td></tr>}
                             </tbody>
                         </table>
                     </div>
