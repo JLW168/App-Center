@@ -1504,6 +1504,7 @@
             const shopIdParam = queryParams.get('shop');
             
             const [qrError, setQrError] = useState('');
+            const [geoDetectedShop, setGeoDetectedShop] = useState(null);
 
             const detectedShop = useMemo(() => {
                 if (!shopIdParam) return null;
@@ -1535,10 +1536,18 @@
                     const saved = localStorage.getItem('solaris_session');
                     if (saved) {
                         const parsed = JSON.parse(saved);
-                        // Ensure session hasn't expired (30 mins limit)
-                        if (Date.now() - parsed.sessionTimestamp <= 30 * 60 * 1000) {
-                            return parsed; // Keep existing session if valid
+                        // SMART PERSISTENCE: Keep Identity forever. 
+                        // Only clear the Table/Context if 30 minutes have passed to prevent ghost dine-in orders.
+                        if (Date.now() - parsed.sessionTimestamp > 30 * 60 * 1000) {
+                            return {
+                                ...parsed,
+                                mode: 'TAKEAWAY',
+                                tableId: null,
+                                tableName: null,
+                                sessionTimestamp: Date.now()
+                            };
                         }
+                        return parsed;
                     }
                 } catch(e) {}
                 
@@ -1576,6 +1585,68 @@
                     }));
                 }
             }, [isSetupLoading, qrDetectedTable, detectedShop, sessionInfo.isSetup]);
+
+            // SILENT GPS HYDRATION: Detect branch if they didn't scan a QR code
+            useEffect(() => {
+                if (shops.length > 0 && navigator.geolocation) {
+                    try {
+                        // Only try if permission is already granted to avoid annoying the user immediately
+                        navigator.permissions?.query({ name: 'geolocation' }).then((result) => {
+                            if (result.state === 'granted') {
+                                navigator.geolocation.getCurrentPosition((pos) => {
+                                    const userLat = pos.coords.latitude;
+                                    const userLng = pos.coords.longitude;
+                                    const userPoint = { lat: userLat, lng: userLng };
+                                    
+                                    let foundShop = null;
+                                    
+                                    // 1. Check territory polygons first
+                                    for (const shop of shops) {
+                                        if (shop.territory && Array.isArray(shop.territory) && shop.territory.length > 2) {
+                                            if (isPointInPolygon(userPoint, shop.territory)) {
+                                                foundShop = shop;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 2. Check radius fallback
+                                    if (!foundShop) {
+                                        let minDistance = Infinity;
+                                        shops.forEach(shop => {
+                                            if (shop.lat && shop.lng) {
+                                                const dist = calculateDistance(userLat, userLng, Number(shop.lat), Number(shop.lng));
+                                                if (dist < minDistance && dist <= (Number(shop.radius) || 2000)) {
+                                                    minDistance = dist;
+                                                    foundShop = shop;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    
+                                    if (foundShop) {
+                                        setGeoDetectedShop(foundShop);
+                                        // ACTIVE AUTO-ROUTING: Automatically switch their active shop if they walked into a new branch!
+                                        setSessionInfo(prev => {
+                                            if (prev.shopId !== foundShop.id) {
+                                                return {
+                                                    ...prev,
+                                                    shopId: foundShop.id,
+                                                    mode: 'TAKEAWAY', // Reset to takeaway to prevent table collisions
+                                                    tableId: null,
+                                                    tableName: null,
+                                                    sessionTimestamp: Date.now()
+                                                };
+                                            }
+                                            return prev;
+                                        });
+                                    }
+                                }, () => {}, { enableHighAccuracy: false, maximumAge: 300000 }); // Low accuracy to save battery, 5 min cache
+                            }
+                        }).catch(() => {});
+                    } catch (e) {}
+                }
+            }, [shops]); // Removed sessionInfo.shopId dependency so it can actively override
 
             const [showSetupModal, setShowSetupModal] = useState(false);
             const [cartNotes, setCartNotes] = useState('');
@@ -1685,26 +1756,24 @@
                 const checkTimeout = () => {
                     const thirtyMinutes = 30 * 60 * 1000;
                     if (Date.now() - sessionInfo.sessionTimestamp > thirtyMinutes) {
-                        // KICK OUT logic
-                        setSessionInfo({
-                            isSetup: false,
-                            mode: null,
-                            tableId: null,
-                            tableName: null,
-                            customerName: '',
-                            customerPhone: '',
-                            sessionTimestamp: Date.now()
-                        });
-                        setCart([]); // Clear cart
-                        setCustomMessage("Session expired. Please scan QR or start over.");
-                        setTimeout(() => setCustomMessage(''), 5000);
-                        setShowSetupModal(true); // Force them to set up again
+                        // SMART TIMEOUT: Don't kick them out. Just reset context to Takeaway to protect the kitchen.
+                        if (sessionInfo.mode !== 'TAKEAWAY') {
+                            setSessionInfo(prev => ({
+                                ...prev,
+                                mode: 'TAKEAWAY',
+                                tableId: null,
+                                tableName: null,
+                                sessionTimestamp: Date.now()
+                            }));
+                            setCustomMessage("Inactive for 30m. Switched to Take Away to protect your table reservation.");
+                            setTimeout(() => setCustomMessage(''), 5000);
+                        }
                     }
                 };
 
                 const interval = setInterval(checkTimeout, 60000); // Check every minute
                 return () => clearInterval(interval);
-            }, [sessionInfo.isSetup, sessionInfo.sessionTimestamp]);
+            }, [sessionInfo.isSetup, sessionInfo.sessionTimestamp, sessionInfo.mode]);
 
             useEffect(() => {
                 if (qrDetectedTable && !sessionInfo.isSetup && !qrError) {
@@ -2236,11 +2305,16 @@
                             )}
                         </div>
                         
-                        {/* Auto-detected / Selected Shop - Bottom Right */}
-                        <div className="absolute bottom-4 right-4 z-20 bg-stone-900/80 backdrop-blur text-stone-200 px-3 py-1.5 rounded-lg text-xs font-bold shadow-lg border border-stone-700/50 flex items-center gap-1.5">
-                            <i className="fa-solid fa-location-crosshairs text-amber-500"></i> 
-                            {sessionInfo.shopId ? (shops.find(s => s.id === sessionInfo.shopId)?.name || 'Unknown Branch') : (detectedShop ? detectedShop.name : 'Detecting Branch...')}
-                        </div>
+                        {/* Auto-detected / Selected Shop - Bottom Right (NOW CLICKABLE) */}
+                        <button 
+                            onClick={() => setShowSetupModal(true)}
+                            className="absolute bottom-4 right-4 z-20 bg-stone-900/80 backdrop-blur text-stone-200 px-3 py-1.5 rounded-lg text-xs font-bold shadow-lg border border-stone-700/50 flex items-center gap-1.5 hover:bg-stone-800 hover:border-amber-500/50 transition cursor-pointer group/branch"
+                            title="Click to change branch"
+                        >
+                            <i className="fa-solid fa-location-crosshairs text-amber-500 group-hover/branch:animate-spin"></i> 
+                            {sessionInfo.shopId ? (shops.find(s => s.id === sessionInfo.shopId)?.name || 'Unknown Branch') : (detectedShop ? detectedShop.name : (geoDetectedShop ? geoDetectedShop.name : 'Select a Branch'))}
+                            <i className="fa-solid fa-chevron-down text-[9px] opacity-50 ml-1"></i>
+                        </button>
                     </div>
 
                     {/* MAIN CONTENT WRAPPER */}
@@ -2830,7 +2904,7 @@
                                     <i className="fa-solid fa-user-tie text-xl"></i>
                                 </div>
                                 <div>
-                                   <h1 className="text-xl font-black tracking-tight text-stone-900 leading-tight">Solaris Managment System</h1>
+                                    <h1 className="text-xl font-black tracking-tight text-stone-900 leading-tight">Solaris Management System</h1>
                                     <p className="text-stone-500 font-medium text-xs mt-0.5">Welcome back, {currentAdminRecord?.name?.split(' ')[0] || 'Admin'}</p>
                                 </div>
                             </div>
