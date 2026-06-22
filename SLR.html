@@ -996,8 +996,8 @@
             );
         }
 
-        function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem, customerLoyalty, globalPoints, updateRedeemedQty }) {
-            const canCheckout = !isSubmitting && sessionInfo.shopId && (sessionInfo.mode === 'TAKEAWAY' || (sessionInfo.mode === 'DINE_IN' && sessionInfo.tableId));
+        function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem, customerLoyalty, globalPoints, updateRedeemedQty, liveLocationStatus }) {
+            const canCheckout = !isSubmitting && sessionInfo.shopId && (sessionInfo.mode === 'TAKEAWAY' || (sessionInfo.mode === 'DINE_IN' && sessionInfo.tableId)) && !liveLocationStatus?.isForbidden;
             const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
             const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
 
@@ -1155,12 +1155,26 @@
                         </div>
 
                         <div className="p-5 bg-stone-50 border-t border-stone-200">
+                            {liveLocationStatus?.isForbidden && (
+                                <div className="mb-4 bg-red-50 p-3 rounded-xl border border-red-200 text-red-700 text-xs font-bold flex items-start gap-2 shadow-sm animate-pulse">
+                                    <i className="fa-solid fa-location-crosshairs mt-0.5"></i>
+                                    <div>
+                                        <p>Checkout Disabled: Outside Delivery Zone</p>
+                                        <p className="font-medium text-[10px] mt-0.5 opacity-80">
+                                            {liveLocationStatus.distance === null 
+                                                ? "GPS location required." 
+                                                : `You are ${(liveLocationStatus.distance > 1000 ? (liveLocationStatus.distance/1000).toFixed(1) + 'km' : Math.round(liveLocationStatus.distance) + 'm')} away (Limit: ${liveLocationStatus.limit > 1000 ? (liveLocationStatus.limit/1000).toFixed(1) + 'km' : Math.round(liveLocationStatus.limit) + 'm'})`
+                                            }
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
                             <div className="flex justify-between items-center mb-4">
                                 <span className="text-stone-500 font-medium">Total Amount</span>
                                 <span className="text-2xl font-black text-stone-900">{cartTotal.toLocaleString()} ៛</span>
                             </div>
                             <button onClick={handleCheckout} disabled={!canCheckout} className="w-full bg-amber-600 text-white font-bold py-4 rounded-xl hover:bg-amber-700 transition shadow-lg disabled:opacity-50 text-sm">
-                                {isSubmitting ? 'Processing...' : (!sessionInfo.shopId ? 'Select Branch First' : (sessionInfo.mode === 'DINE_IN' && !sessionInfo.tableId ? 'Select Table First' : 'Send to Kitchen'))}
+                                {isSubmitting ? 'Processing...' : (!sessionInfo.shopId ? 'Select Branch First' : (sessionInfo.mode === 'DINE_IN' && !sessionInfo.tableId ? 'Select Table First' : (liveLocationStatus?.isForbidden ? 'Too Far to Order' : 'Send to Kitchen')))}
                             </button>
                         </div>
                     </div>
@@ -1325,9 +1339,49 @@
             const [activeCategory, setActiveCategory] = useState('All');
             const [searchQuery, setSearchQuery] = useState('');
             
+            // REDUNDANCY FIX: Lazy load sessionInfo FIRST so we can use it to determine the shop's session duration
+            const [sessionInfo, setSessionInfo] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('solaris_session');
+                    if (saved) {
+                        const parsed = JSON.parse(saved);
+                        // We will perform a strict expiration check later when shops load, 
+                        // but for initial load, keep the data.
+                        return parsed;
+                    }
+                } catch(e) {}
+                
+                // Fallback to fresh session
+                return {
+                    isSetup: false,
+                    mode: 'TAKEAWAY', 
+                    tableId: null,
+                    tableName: null,
+                    shopId: null,
+                    customerName: '',
+                    customerPhone: '',
+                    customerSex: 'M',
+                    sessionTimestamp: Date.now() 
+                };
+            });
+
             // REDUNDANCY FIX: Lazy load cart from localStorage to survive page refresh
             const [cart, setCart] = useState(() => {
                 try {
+                    // ZOMBIE CART FIX: Verify session hasn't expired before allowing cart load.
+                    // If shops are not loaded yet, fallback to 30 mins (1800000 ms).
+                    const savedSession = localStorage.getItem('solaris_session');
+                    if (savedSession) {
+                        const parsedSession = JSON.parse(savedSession);
+                        const targetShop = shops?.find(s => s.id === parsedSession.shopId);
+                        const limitMinutes = targetShop?.sessionDuration ? Number(targetShop.sessionDuration) : 30;
+                        
+                        if (Date.now() - parsedSession.sessionTimestamp > limitMinutes * 60 * 1000) {
+                            localStorage.removeItem('solaris_cart'); // Clear zombie cart storage
+                            return []; // Load empty cart
+                        }
+                    }
+
                     const saved = localStorage.getItem('solaris_cart');
                     return saved ? JSON.parse(saved) : [];
                 } catch(e) {
@@ -1398,33 +1452,31 @@
                 setQrError(errorMsg);
             }, [isSetupLoading, shopIdParam, tableIdParam, detectedShop, qrDetectedTable]);
 
-            // REDUNDANCY FIX: Lazy load sessionInfo to preserve identity and table info on refresh
-            const [sessionInfo, setSessionInfo] = useState(() => {
-                try {
-                    const saved = localStorage.getItem('solaris_session');
-                    if (saved) {
-                        const parsed = JSON.parse(saved);
-                        // Ensure session hasn't expired (30 mins limit)
-                        if (Date.now() - parsed.sessionTimestamp <= 30 * 60 * 1000) {
-                            return parsed; // Keep existing session if valid
-                        }
-                    }
-                } catch(e) {}
+            // Re-evaluate session validity once shops are loaded
+            useEffect(() => {
+                if (isSetupLoading || !sessionInfo.isSetup) return;
                 
-                // Fallback to fresh session
-                return {
-                    isSetup: false,
-                    // DEFAULT TO TAKEAWAY: Changed from null to 'TAKEAWAY' so walk-ins don't have to select it
-                    mode: qrDetectedTable ? 'QR' : 'TAKEAWAY', 
-                    tableId: qrDetectedTable ? qrDetectedTable.id : null,
-                    tableName: qrDetectedTable ? qrDetectedTable.name : null,
-                    shopId: qrDetectedTable ? qrDetectedTable.shopId : (detectedShop ? detectedShop.id : null),
-                    customerName: '',
-                    customerPhone: '',
-                    customerSex: 'M', // NEW
-                    sessionTimestamp: Date.now() 
-                };
-            });
+                const targetShop = shops.find(s => s.id === sessionInfo.shopId);
+                const limitMinutes = targetShop?.sessionDuration ? Number(targetShop.sessionDuration) : 30;
+                
+                if (Date.now() - sessionInfo.sessionTimestamp > limitMinutes * 60 * 1000) {
+                    setSessionInfo({
+                        isSetup: false,
+                        mode: 'TAKEAWAY', 
+                        tableId: null,
+                        tableName: null,
+                        shopId: null,
+                        customerName: '',
+                        customerPhone: '',
+                        customerSex: 'M',
+                        sessionTimestamp: Date.now()
+                    });
+                    setCart([]);
+                    setCustomMessage("Session expired. Please start over.");
+                    setTimeout(() => setCustomMessage(''), 5000);
+                    setShowSetupModal(true);
+                }
+            }, [isSetupLoading, shops]);
 
             // REDUNDANCY FIX: Sync changes to localStorage continuously
             useEffect(() => {
@@ -1687,8 +1739,11 @@
                 if (!sessionInfo.isSetup) return; // Only monitor active setups
                 
                 const checkTimeout = () => {
-                    const thirtyMinutes = 30 * 60 * 1000;
-                    if (Date.now() - sessionInfo.sessionTimestamp > thirtyMinutes) {
+                    const targetShop = shops.find(s => s.id === sessionInfo.shopId);
+                    const limitMinutes = targetShop?.sessionDuration ? Number(targetShop.sessionDuration) : 30;
+                    const limitMs = limitMinutes * 60 * 1000;
+
+                    if (Date.now() - sessionInfo.sessionTimestamp > limitMs) {
                         // KICK OUT logic
                         setSessionInfo({
                             isSetup: false,
@@ -1709,7 +1764,7 @@
 
                 const interval = setInterval(checkTimeout, 60000); // Check every minute
                 return () => clearInterval(interval);
-            }, [sessionInfo.isSetup, sessionInfo.sessionTimestamp]);
+            }, [sessionInfo.isSetup, sessionInfo.sessionTimestamp, sessionInfo.shopId, shops]);
 
             useEffect(() => {
                 if (qrDetectedTable && !sessionInfo.isSetup && !qrError) {
@@ -2117,6 +2172,37 @@
                 return { processedCart: processed, cartTotal: total, cartItemCount: count };
             }, [cart, branchLoyalty]);
 
+            // LIVE DISTANCE & TERRITORY CHECK (Synchronized instantly with Firestore)
+            const liveLocationStatus = useMemo(() => {
+                const targetShop = shops.find(s => s.id === sessionInfo.shopId);
+                if (!targetShop) return { isForbidden: false, distance: null, limit: 0, phone: '' };
+                
+                let orderDistance = null;
+                let inTerritory = false;
+                
+                if (userLocation) {
+                    if (targetShop.territory && Array.isArray(targetShop.territory) && targetShop.territory.length > 2) {
+                        inTerritory = isPointInPolygon(userLocation, targetShop.territory);
+                    }
+                    if (targetShop.lat && targetShop.lng) {
+                        orderDistance = calculateDistance(userLocation.lat, userLocation.lng, Number(targetShop.lat), Number(targetShop.lng));
+                    }
+                }
+
+                const maxDist = Number(targetShop.forbiddenDistance);
+                if (maxDist > 0 && !inTerritory) {
+                    if (orderDistance === null || orderDistance > maxDist) {
+                        return {
+                            isForbidden: true,
+                            distance: orderDistance,
+                            limit: maxDist,
+                            phone: targetShop.phone || 'Phone number not available'
+                        };
+                    }
+                }
+                return { isForbidden: false, distance: orderDistance, limit: maxDist, phone: '' };
+            }, [shops, sessionInfo.shopId, userLocation]);
+
             const handleCheckout = async (e) => {
                 e.preventDefault();
                 if (cart.length === 0 || !sessionInfo.isSetup) return;
@@ -2145,31 +2231,19 @@
                 const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                // TRACK FAKE ORDERS: Calculate exact distance to the chosen branch
-                let orderDistance = null;
-                let inTerritory = false;
-                if (userLocation) {
-                    if (targetShop.territory && Array.isArray(targetShop.territory) && targetShop.territory.length > 2) {
-                        inTerritory = isPointInPolygon(userLocation, targetShop.territory);
-                    }
-                    if (targetShop.lat && targetShop.lng) {
-                        orderDistance = calculateDistance(userLocation.lat, userLocation.lng, Number(targetShop.lat), Number(targetShop.lng));
-                    }
+                // ANTI-FAKE ORDER CHECK (Uses Live Status)
+                if (liveLocationStatus.isForbidden) {
+                    setIsSubmitting(false);
+                    setForbiddenError({
+                        distance: liveLocationStatus.distance,
+                        limit: liveLocationStatus.limit,
+                        phone: liveLocationStatus.phone
+                    });
+                    return;
                 }
-
-                // ANTI-FAKE ORDER CHECK
-                const maxDist = Number(targetShop.forbiddenDistance);
-                if (maxDist > 0 && !inTerritory) {
-                    if (orderDistance === null || orderDistance > maxDist) {
-                        setIsSubmitting(false);
-                        setForbiddenError({
-                            distance: orderDistance,
-                            limit: maxDist,
-                            phone: targetShop.phone || 'Phone number not available'
-                        });
-                        return;
-                    }
-                }
+                
+                // TRACK FAKE ORDERS: Save exact distance to DB
+                const orderDistance = liveLocationStatus.distance;
 
                 // OPTIMISTIC QUEUE GENERATION FOR INSTANT UI
                 const shopOrders = orders.filter(o => o.shopId === sessionInfo.shopId);
@@ -2751,6 +2825,7 @@
                                 customerLoyalty={customerLoyalty}
                                 globalPoints={globalPoints}
                                 updateRedeemedQty={updateRedeemedQty}
+                                liveLocationStatus={liveLocationStatus}
                             />
                         )}
                     </div>
@@ -3189,7 +3264,7 @@
             const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
             const [activeTab, setActiveTab] = useState('branches');
             const [isModalOpen, setIsModalOpen] = useState(false);
-            const [formData, setFormData] = useState({ name: '', phone: '', location: '', lat: '', lng: '', radius: '', territory: '', forbiddenDistance: '' });
+            const [formData, setFormData] = useState({ name: '', phone: '', location: '', lat: '', lng: '', radius: '', territory: '', forbiddenDistance: '', sessionDuration: 30 });
             const [editingId, setEditingId] = useState(null);
             const [qrShop, setQrShop] = useState(null);
 
@@ -3413,6 +3488,7 @@
                     lng: formData.lng,
                     radius: formData.radius ? Number(formData.radius) : '',
                     forbiddenDistance: formData.forbiddenDistance ? Number(formData.forbiddenDistance) : '',
+                    sessionDuration: formData.sessionDuration ? Number(formData.sessionDuration) : 30,
                     territory: parsedTerritory,
                     shopCode: shopCode,
                     shopStatus: 'Active',
@@ -3451,7 +3527,7 @@
                                     <p className="text-sm text-stone-500 mt-1">Manage multiple store locations.</p>
                                 </div>
                                 {isSuper && (
-                                    <button onClick={() => { setFormData({ name: '', phone: '', location: '', lat: '', lng: '', radius: '', territory: '', forbiddenDistance: '' }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md">
+                                    <button onClick={() => { setFormData({ name: '', phone: '', location: '', lat: '', lng: '', radius: '', territory: '', forbiddenDistance: '', sessionDuration: 30 }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md">
                                         <i className="fa-solid fa-plus mr-2"></i> Add Shop
                                     </button>
                                 )}
@@ -3464,6 +3540,8 @@
                                             <th className="p-3 font-bold border border-stone-300">Shop Name</th>
                                             <th className="p-3 font-bold border border-stone-300">Location Details</th>
                                             <th className="p-3 font-bold border border-stone-300 text-center">Coordinates</th>
+                                            <th className="p-3 font-bold border border-stone-300 text-center">Session Limit</th>
+                                            <th className="p-3 font-bold border border-stone-300 text-center">Block Radius</th>
                                             <th className="p-3 font-bold border border-stone-300 text-right">Actions</th>
                                         </tr>
                                     </thead>
@@ -3479,18 +3557,24 @@
                                                     {shop.lat && shop.lng ? `${shop.lat}, ${shop.lng}` : 'N/A'}
                                                     {shop.radius ? <div className="text-[10px] text-amber-600 font-bold mt-0.5">Radius: {shop.radius}m</div> : null}
                                                 </td>
+                                                <td className="p-3 border border-stone-300 text-center font-bold text-stone-600">
+                                                    {shop.sessionDuration ? `${shop.sessionDuration} mins` : '30 mins'}
+                                                </td>
+                                                <td className="p-3 border border-stone-300 text-center font-bold text-stone-600">
+                                                    {shop.forbiddenDistance ? `${shop.forbiddenDistance}m` : <span className="text-stone-400 italic font-normal">N/A</span>}
+                                                </td>
                                                 <td className="p-3 border border-stone-300 text-right">
                                                     <button onClick={() => setQrShop(shop)} className="p-2 text-stone-500 hover:text-stone-800 transition" title="View QR Code"><i className="fa-solid fa-qrcode text-lg"></i></button>
                                                     {isSuper && (
                                                         <>
-                                                            <button onClick={() => { setFormData({ ...shop, phone: shop.phone || '', radius: shop.radius || '', forbiddenDistance: shop.forbiddenDistance || '', territory: shop.territory && shop.territory.length > 0 ? JSON.stringify(shop.territory) : '' }); setEditingId(shop.id); setIsModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Shop"><i className="fa-solid fa-pen"></i></button>
+                                                            <button onClick={() => { setFormData({ ...shop, phone: shop.phone || '', radius: shop.radius || '', forbiddenDistance: shop.forbiddenDistance || '', sessionDuration: shop.sessionDuration || 30, territory: shop.territory && shop.territory.length > 0 ? JSON.stringify(shop.territory) : '' }); setEditingId(shop.id); setIsModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Shop"><i className="fa-solid fa-pen"></i></button>
                                                             <button onClick={() => del(shop.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Shop"><i className="fa-solid fa-trash"></i></button>
                                                         </>
                                                     )}
                                                 </td>
                                             </tr>
                                         ))}
-                                        {shops.length === 0 && <tr><td colSpan="4" className="text-center py-6 text-stone-400 border border-stone-300">No shops added yet.</td></tr>}
+                                        {shops.length === 0 && <tr><td colSpan="6" className="text-center py-6 text-stone-400 border border-stone-300">No shops added yet.</td></tr>}
                                     </tbody>
                                 </table>
                             </div>
@@ -3536,6 +3620,12 @@
                                                     <input type="number" placeholder="e.g. 50" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.forbiddenDistance || ''} onChange={e => setFormData({...formData, forbiddenDistance: e.target.value})} />
                                                     <p className="text-xs text-stone-400 mt-1.5"><i className="fa-solid fa-circle-info mr-1"></i>Anti-fake order block area.</p>
                                                 </div>
+                                            </div>
+
+                                            <div className="mt-4">
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Active Session Duration (Minutes)</label>
+                                                <input type="number" placeholder="e.g. 30" required className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.sessionDuration} onChange={e => setFormData({...formData, sessionDuration: e.target.value})} />
+                                                <p className="text-xs text-stone-400 mt-1.5"><i className="fa-solid fa-clock mr-1"></i>Time before a customer's cart resets automatically due to inactivity.</p>
                                             </div>
                                             
                                             <TerritoryMapEditor 
