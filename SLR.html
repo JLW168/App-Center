@@ -996,8 +996,10 @@
             );
         }
 
-        function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem }) {
+        function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem, customerLoyalty, globalPoints, updateRedeemedQty }) {
             const canCheckout = !isSubmitting && sessionInfo.shopId && (sessionInfo.mode === 'TAKEAWAY' || (sessionInfo.mode === 'DINE_IN' && sessionInfo.tableId));
+            const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+            const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
 
             return (
                 <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex justify-end">
@@ -1058,6 +1060,20 @@
                                 </div>
                             </div>
 
+                            {globalPoints?.pointsEnabled && sessionInfo.isSetup && (
+                                <div className="bg-gradient-to-r from-amber-50 to-orange-50 p-3 rounded-xl border border-amber-200 shadow-sm mb-3">
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className="text-xs font-bold text-amber-800 uppercase tracking-wider"><i className="fa-solid fa-star text-amber-500 mr-1"></i> Your Loyalty Points</span>
+                                        <span className="font-black text-amber-600 text-lg">{customerLoyalty?.activePoints || 0} Pts</span>
+                                    </div>
+                                    {customerLoyalty?.freeClaims > 0 ? (
+                                        <p className="text-[11px] text-amber-700 font-medium">You have <b className="text-rose-600">{customerLoyalty.freeClaims} Free Product{customerLoyalty.freeClaims > 1 ? 's' : ''}</b> available! <span className="font-bold underline text-rose-600">Claim 1 now!</span></p>
+                                    ) : (
+                                        <p className="text-[10px] text-amber-600/80">Earn points with every purchase to unlock free products.</p>
+                                    )}
+                                </div>
+                            )}
+
                             {cart.map((item, idx) => (
                                 <div key={idx} className="flex gap-4 items-start border-b border-stone-100 pb-4">
                                     <div className="w-16 h-16 bg-stone-100 rounded-xl overflow-hidden shrink-0 mt-1">
@@ -1113,6 +1129,21 @@
                                                 <button onClick={() => updateCartQty(idx, 1)} className="w-7 h-7 flex items-center justify-center text-stone-500 hover:bg-white hover:shadow-sm rounded transition"><i className="fa-solid fa-plus text-xs"></i></button>
                                             </div>
                                         </div>
+                                        {(() => {
+                                            const product = products.find(p => p.id === item.productId);
+                                            const isEligible = globalPoints?.pointsEnabled && globalPoints?.redeemableCategories?.includes(product?.category);
+                                            if (!isEligible || (customerLoyalty?.freeClaims <= 0 && !item.redeemedQty)) return null;
+                                            return (
+                                                <div className="mt-2 flex items-center justify-between bg-rose-50/50 p-1.5 rounded-lg border border-rose-100">
+                                                    <span className="text-[10px] font-bold text-rose-600 uppercase tracking-wider"><i className="fa-solid fa-gift mr-1"></i> Loyalty Claim</span>
+                                                    <div className="flex items-center gap-1 bg-white rounded border border-rose-200">
+                                                        <button onClick={() => updateRedeemedQty(idx, -1)} disabled={!item.redeemedQty} className="w-6 h-6 flex items-center justify-center text-rose-500 hover:bg-rose-50 disabled:opacity-30 rounded-l transition"><i className="fa-solid fa-minus text-[10px]"></i></button>
+                                                        <span className="w-4 text-center font-bold text-xs text-rose-700">{item.redeemedQty || 0}</span>
+                                                        <button onClick={() => updateRedeemedQty(idx, 1)} disabled={availableClaims <= 0 || (item.redeemedQty || 0) >= item.quantity} className="w-6 h-6 flex items-center justify-center text-rose-500 hover:bg-rose-50 disabled:opacity-30 rounded-r transition"><i className="fa-solid fa-plus text-[10px]"></i></button>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
                                 </div>
                             ))}
@@ -1319,6 +1350,9 @@
             const [nearestShopInfo, setNearestShopInfo] = useState({ shop: null, distance: null, status: 'idle' });
             const [userLocation, setUserLocation] = useState(null);
 
+            const [globalPoints, setGlobalPoints] = useState(null);
+            const [customerLoyalty, setCustomerLoyalty] = useState({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
+
             // DYNAMIC BADGES STATE
             const [branchLoyalty, setBranchLoyalty] = useState(null);
             const [topSellers, setTopSellers] = useState([]);
@@ -1400,6 +1434,48 @@
             useEffect(() => {
                 localStorage.setItem('solaris_session', JSON.stringify(sessionInfo));
             }, [sessionInfo]);
+
+            // FETCH GLOBAL POINTS CONFIG
+            useEffect(() => {
+                const fetchGlobalPoints = async () => {
+                    try {
+                        const { doc, getDoc } = window.FirebaseApp;
+                        const snap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
+                        if (snap.exists()) setGlobalPoints(snap.data());
+                    } catch(e) { console.warn("Failed to load loyalty settings", e); }
+                };
+                fetchGlobalPoints();
+            }, []);
+
+            // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
+            useEffect(() => {
+                if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
+
+                const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                // Only pull orders matching this exact customer to save reads!
+                const q = query(collection(db, 'orders'), where('customerPhone', '==', sessionInfo.customerPhone));
+
+                const unsub = onSnapshot(q, snap => {
+                    let spent = 0;
+                    let redeemed = 0;
+                    snap.forEach(d => {
+                        const o = d.data();
+                        if (o.status !== 'Cancelled') {
+                            spent += o.totalAmount;
+                        }
+                        if (o.status !== 'Cancelled' && o.redeemedPoints) {
+                            redeemed += o.redeemedPoints;
+                        }
+                    });
+
+                    const earned = Math.floor(spent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                    const active = Math.max(0, earned - redeemed);
+                    const free = Math.floor(active / (globalPoints.redeemPoints || 10));
+
+                    setCustomerLoyalty({ activePoints: active, freeClaims: free, totalSpent: spent, totalRedeemed: redeemed });
+                });
+                return () => unsub();
+            }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
 
             // SMART GPS DETECTION ON MOUNT (Continuous Live Tracking)
             useEffect(() => {
@@ -1856,7 +1932,31 @@
                     const newCart = [...prev];
                     // BUG FIX: Prevent direct state mutation
                     newCart[idx] = { ...newCart[idx], quantity: newCart[idx].quantity + delta };
+                    if ((newCart[idx].redeemedQty || 0) > newCart[idx].quantity) {
+                        newCart[idx].redeemedQty = newCart[idx].quantity;
+                    }
                     if (newCart[idx].quantity <= 0) newCart.splice(idx, 1);
+                    return newCart;
+                });
+            };
+
+            const updateRedeemedQty = (idx, delta) => {
+                setCart(prev => {
+                    const newCart = [...prev];
+                    const currentRedeemed = newCart[idx].redeemedQty || 0;
+                    const newRedeemed = Math.max(0, Math.min(newCart[idx].quantity, currentRedeemed + delta));
+
+                    if (delta > 0) {
+                        const totalRedeemedInCart = prev.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+                        if (totalRedeemedInCart >= 1) {
+                            setCustomMessage('You can only claim 1 free product per order.');
+                            if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+                            toastTimerRef.current = setTimeout(() => setCustomMessage(''), 2500);
+                            return prev;
+                        }
+                    }
+
+                    newCart[idx] = { ...newCart[idx], redeemedQty: newRedeemed };
                     return newCart;
                 });
             };
@@ -1974,7 +2074,14 @@
                     let freeQty = 0;
                     let totalQtyForKDS = item.quantity;
 
-                    if (promo) {
+                    // Apply Loyalty Claim Override First
+                    if (item.redeemedQty > 0) {
+                        lineTotal = item.price * (item.quantity - item.redeemedQty);
+                        promoName = item.redeemedQty === item.quantity ? 'Loyalty Reward' : `Loyalty Reward (${item.redeemedQty})`;
+                        effectiveUnitPrice = item.quantity > 0 ? lineTotal / item.quantity : 0;
+                    } 
+                    // Fallback to normal promotions if no loyalty claim applied
+                    else if (promo) {
                         promoName = promo.name;
                         if (promo.type === 'DISCOUNT_PCT') {
                             const discountAmt = item.price * (promo.discountValue / 100);
@@ -2040,13 +2147,19 @@
 
                 // TRACK FAKE ORDERS: Calculate exact distance to the chosen branch
                 let orderDistance = null;
-                if (userLocation && targetShop.lat && targetShop.lng) {
-                    orderDistance = calculateDistance(userLocation.lat, userLocation.lng, Number(targetShop.lat), Number(targetShop.lng));
+                let inTerritory = false;
+                if (userLocation) {
+                    if (targetShop.territory && Array.isArray(targetShop.territory) && targetShop.territory.length > 2) {
+                        inTerritory = isPointInPolygon(userLocation, targetShop.territory);
+                    }
+                    if (targetShop.lat && targetShop.lng) {
+                        orderDistance = calculateDistance(userLocation.lat, userLocation.lng, Number(targetShop.lat), Number(targetShop.lng));
+                    }
                 }
 
                 // ANTI-FAKE ORDER CHECK
                 const maxDist = Number(targetShop.forbiddenDistance);
-                if (maxDist > 0) {
+                if (maxDist > 0 && !inTerritory) {
                     if (orderDistance === null || orderDistance > maxDist) {
                         setIsSubmitting(false);
                         setForbiddenError({
@@ -2065,8 +2178,13 @@
 
                 const actualOrderType = (sessionInfo.mode === 'QR' || sessionInfo.mode === 'DINE_IN') ? 'DINE_IN' : 'TAKEAWAY';
 
-                // Snapshot the processed cart state
+                // Aggregate Redeemed Points Info
                 const currentCart = [...processedCart];
+                const totalRedeemedInCart = currentCart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+                const pointsToRedeem = totalRedeemedInCart * (globalPoints?.redeemPoints || 10);
+                const redeemedItemNames = currentCart.filter(i => i.redeemedQty > 0).map(i => `${i.redeemedQty}x ${i.name}`).join(', ');
+
+                // Snapshot the processed cart state
                 const currentCartTotal = cartTotal;
 
                 const orderData = {
@@ -2082,6 +2200,8 @@
                     notes: cartNotes,
                     items: currentCart,
                     totalAmount: currentCartTotal,
+                    redeemedPoints: pointsToRedeem > 0 ? pointsToRedeem : null,
+                    redeemedItemName: pointsToRedeem > 0 ? redeemedItemNames : null,
                     status: 'New', 
                     paymentStatus: 'Unpaid',
                     paymentMethod: 'N/A',
@@ -2460,16 +2580,20 @@
                                                 </div>
                                             </div>
                                         </div>
+                                    </div>
+                                )}
 
-                                        {/* Friendly UX Note */}
-                                        <div className="mt-3 flex items-start gap-2 bg-blue-50/50 p-2 rounded-lg border border-blue-100">
-                                            <i className="fa-solid fa-lightbulb text-amber-500 text-[10px] mt-0.5 animate-pulse"></i>
-                                            <p className="text-[9px] text-stone-600 leading-tight">
-                                                {sessionInfo.mode === 'TAKEAWAY' 
-                                                    ? "Help us prepare perfectly! Takeaway ensures safe, travel-ready packaging." 
-                                                    : "Help us prepare perfectly! Dine-in helps us reduce single-use waste."}
-                                            </p>
+                                {globalPoints?.pointsEnabled && sessionInfo.isSetup && (
+                                    <div className="bg-gradient-to-r from-amber-50 to-orange-50 p-3 rounded-xl border border-amber-200 shadow-sm">
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="text-xs font-bold text-amber-800 uppercase tracking-wider"><i className="fa-solid fa-star text-amber-500 mr-1"></i> Your Loyalty Points</span>
+                                            <span className="font-black text-amber-600 text-lg">{customerLoyalty?.activePoints || 0} Pts</span>
                                         </div>
+                                        {customerLoyalty?.freeClaims > 0 ? (
+                                            <p className="text-[11px] text-amber-700 font-medium">You have <b className="text-rose-600">{customerLoyalty.freeClaims} Free Product{customerLoyalty.freeClaims > 1 ? 's' : ''}</b> available! <span className="font-bold underline text-rose-600">Claim 1 now!</span></p>
+                                        ) : (
+                                            <p className="text-[10px] text-amber-600/80">Earn points with every purchase to unlock free products.</p>
+                                        )}
                                     </div>
                                 )}
 
@@ -2531,6 +2655,24 @@
                                                             <button onClick={() => updateCartQty(idx, 1)} className="w-6 h-6 flex items-center justify-center text-stone-500 hover:bg-white hover:shadow-sm rounded transition"><i className="fa-solid fa-plus text-[10px]"></i></button>
                                                         </div>
                                                     </div>
+                                                    {(() => {
+                                                        const product = products.find(p => p.id === item.productId);
+                                                        const isEligible = globalPoints?.pointsEnabled && globalPoints?.redeemableCategories?.includes(product?.category);
+                                                        if (!isEligible || (customerLoyalty?.freeClaims <= 0 && !item.redeemedQty)) return null;
+                                                        const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+                                                        const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
+
+                                                        return (
+                                                            <div className="mt-2 flex items-center justify-between bg-rose-50/50 p-1.5 rounded-lg border border-rose-100">
+                                                                <span className="text-[10px] font-bold text-rose-600 uppercase tracking-wider"><i className="fa-solid fa-gift mr-1"></i> Loyalty Claim</span>
+                                                                <div className="flex items-center gap-1 bg-white rounded border border-rose-200">
+                                                                    <button onClick={() => updateRedeemedQty(idx, -1)} disabled={!item.redeemedQty} className="w-6 h-6 flex items-center justify-center text-rose-500 hover:bg-rose-50 disabled:opacity-30 rounded-l transition"><i className="fa-solid fa-minus text-[10px]"></i></button>
+                                                                    <span className="w-4 text-center font-bold text-xs text-rose-700">{item.redeemedQty || 0}</span>
+                                                                    <button onClick={() => updateRedeemedQty(idx, 1)} disabled={availableClaims <= 0 || (item.redeemedQty || 0) >= item.quantity} className="w-6 h-6 flex items-center justify-center text-rose-500 hover:bg-rose-50 disabled:opacity-30 rounded-r transition"><i className="fa-solid fa-plus text-[10px]"></i></button>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
                                                 </div>
                                             </div>
                                         ))}
@@ -2606,6 +2748,9 @@
                                 isSubmitting={isSubmitting}
                                 onClose={() => setIsCartOpen(false)}
                                 onEditItem={handleEditCartItem}
+                                customerLoyalty={customerLoyalty}
+                                globalPoints={globalPoints}
+                                updateRedeemedQty={updateRedeemedQty}
                             />
                         )}
                     </div>
@@ -2617,10 +2762,10 @@
                                 <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4 shadow-inner">
                                     <i className={`fa-solid ${forbiddenError.distance === null ? 'fa-location-crosshairs' : 'fa-route'} text-3xl animate-pulse`}></i>
                                 </div>
-                                <h3 className="text-xl font-black text-stone-900 mb-2">Order Forbidden</h3>
+                                <h3 className="text-xl font-black text-stone-900 mb-2">{forbiddenError.distance === null ? 'Location Required' : 'Order Forbidden'}</h3>
                                 <p className="text-stone-500 text-sm mb-5 leading-relaxed">
                                     {forbiddenError.distance === null 
-                                        ? "We are sorry ! Your distance order is too far! Contact us now to continue your order." 
+                                        ? "We cannot verify your GPS location. Please ensure Location Services are enabled on your device to order from this branch." 
                                         : <>Your distance is <strong className="text-stone-800">{forbiddenError.distance > 1000 ? (forbiddenError.distance/1000).toFixed(1) + 'km' : Math.round(forbiddenError.distance) + 'm'}</strong> away, which exceeds the allowed ordering radius of <strong className="text-stone-800">{forbiddenError.limit > 1000 ? (forbiddenError.limit/1000).toFixed(1) + 'km' : Math.round(forbiddenError.limit) + 'm'}</strong>.</>
                                     }
                                 </p>
@@ -6380,11 +6525,12 @@
             };
 
             const exportCSV = () => {
-                const headers = "Date_Time,Shop_Name,Staff_Name,Invoice,Table,Customer,Phone,Total,Payment_Status,Payment_Method,Order_Status\n";
+                const headers = "Date_Time,Shop_Name,Staff_Name,Invoice,Table,Customer,Phone,Total,Redeemed_Points,Promotions,Payment_Status,Payment_Method,Order_Status\n";
                 const rows = filteredOrders.map(o => {
                     const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
                     const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
-                    return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${staffName}","${o.queueNo}","${o.tableName}","${o.customerName || 'Walk-in'}","${o.customerPhone || 'N/A'}",${o.totalAmount},"${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.status}"`;
+                    const promos = [...new Set(o.items?.map(i => i.promoName).filter(Boolean))].join('; ');
+                    return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${staffName}","${o.queueNo}","${o.tableName}","${o.customerName || 'Walk-in'}","${o.customerPhone || 'N/A'}",${o.totalAmount},${o.redeemedPoints || 0},"${promos}","${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.status}"`;
                 }).join("\n");
                 const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement("a");
@@ -6506,7 +6652,25 @@
                                                 <span className="font-semibold">{o.customerName || 'Walk-in'}</span>
                                                 {o.customerPhone && o.customerPhone !== 'N/A' && <div className="text-xs text-stone-500 mt-0.5"><i className="fa-solid fa-phone text-[10px] mr-1"></i>{o.customerPhone}</div>}
                                             </td>
-                                            <td className="p-3 border border-stone-300 align-top font-black text-amber-700 whitespace-nowrap">{o.totalAmount.toLocaleString()} ៛</td>
+                                            <td className="p-3 border border-stone-300 align-top whitespace-nowrap">
+                                                <div className="font-black text-amber-700 text-base">{o.totalAmount.toLocaleString()} ៛</div>
+                                                {o.redeemedPoints > 0 && (
+                                                    <div className="text-[10px] text-rose-600 font-bold mt-1 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-100 w-fit shadow-sm">
+                                                        <i className="fa-solid fa-star mr-1"></i>-{o.redeemedPoints} Pts
+                                                    </div>
+                                                )}
+                                                {(() => {
+                                                    const promos = [...new Set(o.items?.map(i => i.promoName).filter(Boolean).filter(n => !n.includes('Loyalty') && !n.includes('Redeemed')))];
+                                                    if (promos.length > 0) {
+                                                        return promos.map((pName, idx) => (
+                                                            <div key={idx} className="text-[10px] text-indigo-700 font-bold mt-1 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 w-fit truncate max-w-[120px] shadow-sm" title={pName}>
+                                                                <i className="fa-solid fa-tag mr-1"></i>{pName}
+                                                            </div>
+                                                        ));
+                                                    }
+                                                    return null;
+                                                })()}
+                                            </td>
                                             <td className="p-3 border border-stone-300 align-top">
                                                 {o.paymentStatus === 'Paid' ? (
                                                     <span className="text-[10px] font-bold uppercase tracking-wider bg-green-100 text-green-700 px-2 py-1 rounded">Paid ({o.paymentMethod})</span>
@@ -6667,6 +6831,7 @@
                             phone: o.customerPhone,
                             name: o.customerName || 'Unknown',
                             totalSpent: 0,
+                            totalRedeemed: 0,
                             orderCount: 0,
                             lastVisit: o.createdAt,
                             lastShopId: o.shopId,
@@ -6677,6 +6842,7 @@
                     
                     const c = map.get(o.customerPhone);
                     c.totalSpent += o.totalAmount;
+                    if (o.redeemedPoints) c.totalRedeemed += o.redeemedPoints;
                     c.orderCount += 1;
                     if (o.createdAt > c.lastVisit) {
                         c.lastVisit = o.createdAt;
@@ -6723,7 +6889,8 @@
                 orders.forEach(o => {
                     if (o.status === 'Cancelled') return;
                     o.items.forEach((item, idx) => {
-                        if (item.promoName) {
+                        // FIX: Exclude 'Loyalty Reward' so this report ONLY tracks BOGO, Fixed, and Percentage promos
+                        if (item.promoName && !item.promoName.includes('Loyalty Reward')) {
                             usages.push({
                                 id: `${o.id}-${item.productId}-${idx}`,
                                 date: o.createdAt,
@@ -6839,14 +7006,14 @@
 
                             <div className="flex flex-wrap gap-2 mb-4 shrink-0">
                                 <button onClick={() => setReportTab('points')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'points' ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Point Earn Report</button>
-                                <button onClick={() => setReportTab('redemptions')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'redemptions' ? 'bg-rose-100 text-rose-800 border-rose-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Redemption Report</button>
-                                <button onClick={() => setReportTab('promos')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'promos' ? 'bg-indigo-100 text-indigo-800 border-indigo-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Active Promotions</button>
+                                <button onClick={() => setReportTab('redemptions')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'redemptions' ? 'bg-rose-100 text-rose-800 border-rose-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Free Product Claims</button>
+                                <button onClick={() => setReportTab('promos')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'promos' ? 'bg-indigo-100 text-indigo-800 border-indigo-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Active Promo Usage</button>
                             </div>
 
                             <div className="bg-white rounded-2xl shadow-sm border border-stone-200 flex-1 overflow-hidden flex flex-col">
                                 <div className="flex-1 overflow-auto p-4">
                                     {reportTab === 'points' && (
-                                        <table className="w-full min-w-[900px] text-left text-sm border-collapse border border-stone-300">
+                                        <table className="w-full min-w-[1000px] text-left text-sm border-collapse border border-stone-300">
                                             <thead>
                                                 <tr className="bg-stone-100 text-stone-700 uppercase tracking-wider border-b border-stone-300 text-[11px]">
                                                     <th className="p-3 font-bold border border-stone-300 w-12 text-center">No.</th>
@@ -6854,12 +7021,17 @@
                                                     <th className="p-3 font-bold border border-stone-300">Contact Number</th>
                                                     <th className="p-3 font-bold border border-stone-300">Footprint No.</th>
                                                     <th className="p-3 font-bold border border-stone-300">Total Expensed</th>
-                                                    <th className="p-3 font-bold border border-stone-300 text-amber-600">Total Point</th>
+                                                    <th className="p-3 font-bold border border-stone-300 text-amber-600">Active Points</th>
+                                                    <th className="p-3 font-bold border border-stone-300 text-rose-600">Free Product Claim</th>
                                                 </tr>
                                             </thead>
                                             <tbody>
                                                 {customersData.map((c, idx) => {
-                                                    const pts = Math.floor(c.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                                                    const earnedPts = Math.floor(c.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                                                    const activePts = Math.max(0, earnedPts - c.totalRedeemed);
+                                                    const redeemPtsReq = globalPoints.redeemPoints || 10;
+                                                    const freeItems = Math.floor(activePts / redeemPtsReq);
+                                                    
                                                     return (
                                                         <tr key={c.phone} className="hover:bg-stone-50 bg-white">
                                                             <td className="p-3 border border-stone-300 font-bold text-stone-500 text-center">{idx + 1}</td>
@@ -6883,7 +7055,13 @@
                                                                     {Object.keys(c.shopBreakdown).length > 1 && <div className="pt-1 border-t border-stone-100 font-black text-stone-800">Total: {c.totalSpent.toLocaleString()} ៛</div>}
                                                                 </div>
                                                             </td>
-                                                            <td className="p-3 border border-stone-300 font-black text-amber-600 text-base">{pts} Pts</td>
+                                                            <td className="p-3 border border-stone-300 font-black text-amber-600 text-base">
+                                                                {activePts} Pts
+                                                                <span className="text-[10px] font-medium text-stone-400 block tracking-normal mt-0.5">Earned: {earnedPts} | Used: {c.totalRedeemed}</span>
+                                                            </td>
+                                                            <td className="p-3 border border-stone-300 font-black text-rose-600 text-base">
+                                                                {freeItems > 0 ? <><i className="fa-solid fa-gift mr-1"></i> {freeItems}</> : <span className="text-stone-400 font-medium text-sm">0</span>}
+                                                            </td>
                                                         </tr>
                                                     );
                                                 })}
@@ -6898,8 +7076,8 @@
                                                     <th className="p-3 font-bold border border-stone-300">Date & Time</th>
                                                     <th className="p-3 font-bold border border-stone-300">Shop Name</th>
                                                     <th className="p-3 font-bold border border-stone-300">Customer Name</th>
-                                                    <th className="p-3 font-bold border border-stone-300">Redeem No.</th>
-                                                    <th className="p-3 font-bold border border-stone-300">Product Item</th>
+                                                    <th className="p-3 font-bold border border-stone-300">Points Spent</th>
+                                                    <th className="p-3 font-bold border border-stone-300">Free Item Claimed</th>
                                                 </tr>
                                             </thead>
                                             <tbody>
