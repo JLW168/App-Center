@@ -7742,6 +7742,35 @@
 
             // Recipe Modal State
             const [viewingRecipe, setViewingRecipe] = useState(null);
+            
+            // KDS Claim Modal State
+            const [claimOrder, setClaimOrder] = useState(null);
+            const [isClaiming, setIsClaiming] = useState(false);
+
+            // NEW: Fetch Global Points for Loyalty Calculation
+            const [globalPoints, setGlobalPoints] = useState(null);
+            useEffect(() => {
+                const { doc, getDoc } = window.FirebaseApp;
+                getDoc(doc(db, 'loyalty_settings', 'global_points')).then(snap => {
+                    if (snap.exists()) setGlobalPoints(snap.data());
+                }).catch(e => console.warn(e));
+            }, []);
+
+            const getLoyalty = (phone) => {
+                if (!phone || phone === 'N/A' || !globalPoints?.pointsEnabled) return null;
+                let spent = 0;
+                let redeemed = 0;
+                orders.forEach(o => {
+                    if (o.customerPhone === phone && o.status !== 'Cancelled') {
+                        spent += o.totalAmount;
+                        if (o.redeemedPoints) redeemed += o.redeemedPoints;
+                    }
+                });
+                const earnedPts = Math.floor(spent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                const activePts = Math.max(0, earnedPts - redeemed);
+                const freeClaims = Math.floor(activePts / (globalPoints.redeemPoints || 10));
+                return { activePts, freeClaims };
+            };
 
             // Keep screen awake while KDS is open
             useEffect(() => {
@@ -7803,6 +7832,16 @@
                 if (newStatus === 'Ready' || newStatus === 'Served' || newStatus === 'Cancelled') {
                     updateData.completedAt = Date.now();
                 }
+                
+                // AUTO-PAY 0៛ ORDERS: Clear it instantly when the kitchen serves it
+                if (newStatus === 'Served' && order.totalAmount === 0 && order.paymentStatus !== 'Paid') {
+                    updateData.paymentStatus = 'Paid';
+                    updateData.paymentMethod = 'Free Claim';
+                    
+                    const targetShift = shifts?.find(s => s.shopId === order.shopId && s.status === 'Open');
+                    if (targetShift) updateData.shiftId = targetShift.id;
+                }
+                
                 if (reason) updateData.cancelReason = reason;
                 await updateDoc(doc(getColRef('orders'), order.id), updateData);
             };
@@ -7826,6 +7865,47 @@
                 const newItems = [...order.items];
                 newItems[idx].done = !newItems[idx].done;
                 await updateDoc(doc(getColRef('orders'), order.id), { items: newItems });
+            };
+
+            const handleKDSClaim = async (product, size) => {
+                if (isClaiming) return;
+                setIsClaiming(true);
+                try {
+                    const { doc, updateDoc } = window.FirebaseApp;
+                    const newItems = [...claimOrder.items, {
+                        productId: product.id,
+                        name: product.name,
+                        size: size,
+                        price: 0,
+                        quantity: 1,
+                        paidQuantity: 0,
+                        freeQuantity: 1,
+                        redeemedQty: 1,
+                        promoName: 'Loyalty Reward (KDS)',
+                        done: false
+                    }];
+                    const ptsToDeduct = globalPoints?.redeemPoints || 10;
+                    const newPoints = (claimOrder.redeemedPoints || 0) + ptsToDeduct;
+                    const newNames = claimOrder.redeemedItemName ? `${claimOrder.redeemedItemName}, 1x ${product.name}` : `1x ${product.name}`;
+
+                    // 1. Deduct Inventory (using the globally available deductInventory)
+                    const fakeCart = [{productId: product.id, quantity: 1, size: size}];
+                    await deductInventory(fakeCart, products, claimOrder.shopId, claimOrder.queueNo);
+
+                    // 2. Update Order with new items and points
+                    await updateDoc(doc(getColRef('orders'), claimOrder.id), {
+                        items: newItems,
+                        redeemedPoints: newPoints,
+                        redeemedItemName: newNames
+                    });
+
+                    setClaimOrder(null);
+                } catch (err) {
+                    console.error("Failed to claim product:", err);
+                    alert("Failed to claim product: " + err.message);
+                } finally {
+                    setIsClaiming(false);
+                }
             };
 
             return (
@@ -7878,10 +7958,37 @@
 
                                 {/* 2 & 3. Customer & Order Info */}
                                 <div className="p-4 bg-white shrink-0 space-y-3 border-b border-stone-100">
-                                    <div className="flex justify-between items-start gap-2">
-                                        <div className="font-medium text-stone-800 truncate text-lg">{order.customerName || 'Walk-in'}</div>
-                                        <div className="text-xs text-stone-500 whitespace-nowrap pt-1">
-                                            <i className="fa-solid fa-phone text-[10px] mr-1 opacity-60"></i> {order.customerPhone || 'N/A'}
+                                    <div className="flex flex-col gap-2">
+                                        <div className="font-medium text-stone-800 text-lg flex items-center flex-wrap gap-x-2 gap-y-1">
+                                            <span>{order.customerName || 'Walk-in'}</span>
+                                            
+                                            {order.customerPhone && order.customerPhone !== 'N/A' && (
+                                                <>
+                                                    <span className="text-stone-300">|</span>
+                                                    <a href={`tel:${order.customerPhone.replace(/\D/g, '')}`} className="text-stone-500 hover:text-amber-600 transition flex items-center text-sm font-bold bg-stone-50 px-2 py-0.5 rounded border border-stone-200 shadow-sm" title="Click to call customer">
+                                                        <i className="fa-solid fa-phone text-[10px] mr-1.5 opacity-60"></i> {order.customerPhone}
+                                                    </a>
+                                                </>
+                                            )}
+
+                                            {(() => {
+                                                const loyalty = getLoyalty(order.customerPhone);
+                                                if (!loyalty) return null;
+                                                return (
+                                                    <>
+                                                        <span className="text-stone-300">|</span>
+                                                        <span className="text-amber-600 font-bold text-sm">{loyalty.activePts}P</span>
+                                                        <span className="text-stone-300">|</span>
+                                                        {loyalty.freeClaims > 0 ? (
+                                                            <button onClick={() => setClaimOrder(order)} className="text-rose-600 font-bold text-sm bg-rose-50 px-2 py-0.5 rounded hover:bg-rose-100 transition shadow-sm border border-rose-200 cursor-pointer active:scale-95 flex items-center gap-1">
+                                                                <i className="fa-solid fa-gift"></i> {loyalty.freeClaims} Claim
+                                                            </button>
+                                                        ) : (
+                                                            <span className="text-rose-400 font-bold text-sm"><i className="fa-solid fa-gift mr-1"></i> {loyalty.freeClaims}</span>
+                                                        )}
+                                                    </>
+                                                );
+                                            })()}
                                         </div>
                                     </div>
                                     
@@ -7964,8 +8071,8 @@
                                     
                                     <div className="flex justify-between items-center">
                                         <div className="text-stone-500 text-sm">Status:</div>
-                                        <div className={`text-[11px] tracking-wider uppercase px-2.5 py-1 rounded-md border ${order.paymentStatus === 'Paid' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'}`}>
-                                            {order.paymentStatus === 'Paid' ? <><i className="fa-solid fa-check-circle mr-1 opacity-80"></i> PAID ({order.paymentMethod})</> : <><i className="fa-solid fa-circle-exclamation mr-1 opacity-80"></i> UNPAID</>}
+                                        <div className={`text-[11px] tracking-wider uppercase px-2.5 py-1 rounded-md border ${order.paymentStatus === 'Paid' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : order.totalAmount === 0 ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-rose-50 text-rose-700 border-rose-200'}`}>
+                                            {order.paymentStatus === 'Paid' ? <><i className="fa-solid fa-check-circle mr-1 opacity-80"></i> PAID ({order.paymentMethod})</> : order.totalAmount === 0 ? <><i className="fa-solid fa-gift mr-1 opacity-80"></i> FREE CLAIM</> : <><i className="fa-solid fa-circle-exclamation mr-1 opacity-80"></i> UNPAID</>}
                                         </div>
                                     </div>
 
@@ -7974,6 +8081,10 @@
                                         <button onClick={() => updatePayment(order.id, 'Unpaid', 'N/A', order.shopId)} className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-600 rounded-lg text-xs transition border border-stone-200 flex items-center justify-center gap-2" title="Undo Payment">
                                             <i className="fa-solid fa-rotate-left opacity-70"></i> Revert Payment to Unpaid
                                         </button>
+                                    ) : order.totalAmount === 0 ? (
+                                        <div className="w-full py-2 bg-amber-50 text-amber-600 rounded-lg text-xs border border-amber-100 flex items-center justify-center gap-2 font-medium">
+                                            <i className="fa-solid fa-wand-magic-sparkles"></i> Auto-pays when served
+                                        </div>
                                     ) : (
                                         <div className="flex gap-2 mt-1">
                                             <button onClick={() => updatePayment(order.id, 'Paid', 'Cash', order.shopId)} className="flex-1 bg-stone-100 hover:bg-stone-200 text-stone-700 border border-stone-200 py-2 rounded-lg text-sm transition flex items-center justify-center font-medium">
@@ -8062,6 +8173,50 @@
                                     </ul>
                                 );
                             })()}
+                        </div>
+                    )}
+
+                    {/* Floating Claim Reward Modal */}
+                    {claimOrder && (
+                        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-[110] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-3xl w-full max-w-md shadow-2xl animate-fade-in relative flex flex-col max-h-[85vh]">
+                                <div className="p-5 border-b border-stone-200 flex justify-between items-center bg-stone-50 rounded-t-3xl shrink-0">
+                                    <div>
+                                        <h3 className="text-xl font-bold text-stone-900 flex items-center"><i className="fa-solid fa-gift text-rose-500 mr-2"></i> Claim Free Product</h3>
+                                        <p className="text-sm font-medium text-stone-500 mt-1">For: {claimOrder.customerName || 'Walk-in'}</p>
+                                    </div>
+                                    <button onClick={() => setClaimOrder(null)} className="w-8 h-8 rounded-full bg-stone-200 flex items-center justify-center text-stone-600 hover:bg-stone-300 transition">
+                                        <i className="fa-solid fa-xmark"></i>
+                                    </button>
+                                </div>
+                                <div className="p-5 overflow-y-auto flex-1 bg-stone-100">
+                                    <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-800 p-3 rounded-xl shadow-sm text-sm font-medium">
+                                        <i className="fa-solid fa-circle-info mr-1.5"></i>
+                                        Select an eligible product to add to this order for free. This instantly deducts <b>{globalPoints?.redeemPoints || 10} points</b>.
+                                    </div>
+                                    
+                                    <div className="space-y-3">
+                                        {products.filter(p => globalPoints?.redeemableCategories?.includes(p.category) && p.isAvailable !== false && p.visibilityMode !== 'Hidden').map(p => (
+                                            <div key={p.id} className="border border-stone-200 rounded-xl p-3 flex items-center gap-3 bg-white hover:border-rose-300 transition shadow-sm">
+                                                <div className="w-12 h-12 rounded-lg bg-stone-50 overflow-hidden shrink-0 border border-stone-200">
+                                                    {p.image ? <img src={p.image} className="w-full h-full object-cover" /> : <i className="fa-solid fa-image text-stone-300 w-full h-full flex items-center justify-center"></i>}
+                                                </div>
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="font-bold text-stone-800 text-sm truncate">{p.name}</div>
+                                                    <div className="text-[10px] text-stone-500 uppercase tracking-wider font-bold">{p.category}</div>
+                                                </div>
+                                                <div className="flex flex-col gap-1.5 shrink-0">
+                                                    {p.priceSmall > 0 && <button onClick={() => handleKDSClaim(p, 'S')} disabled={isClaiming} className="text-[10px] bg-rose-50 text-rose-700 hover:bg-rose-600 hover:text-white border border-rose-200 px-3 py-1.5 rounded-lg font-bold transition shadow-sm active:scale-95 disabled:opacity-50">Claim S</button>}
+                                                    {p.priceLarge > 0 && <button onClick={() => handleKDSClaim(p, 'L')} disabled={isClaiming} className="text-[10px] bg-rose-50 text-rose-700 hover:bg-rose-600 hover:text-white border border-rose-200 px-3 py-1.5 rounded-lg font-bold transition shadow-sm active:scale-95 disabled:opacity-50">Claim L</button>}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {products.filter(p => globalPoints?.redeemableCategories?.includes(p.category) && p.isAvailable !== false && p.visibilityMode !== 'Hidden').length === 0 && (
+                                            <div className="text-center py-6 text-stone-500 font-medium">No eligible products available for claiming.</div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>
