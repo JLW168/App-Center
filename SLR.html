@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1584,6 +1583,7 @@
             const [userLocation, setUserLocation] = useState(null);
 
             const [globalPoints, setGlobalPoints] = useState(null);
+            const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
             const [customerLoyalty, setCustomerLoyalty] = useState({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
 
             // DYNAMIC BADGES STATE
@@ -1666,16 +1666,19 @@
                 localStorage.setItem('solaris_session', JSON.stringify(sessionInfo));
             }, [sessionInfo]);
 
-            // FETCH GLOBAL POINTS CONFIG
+            // FETCH GLOBAL POINTS CONFIG & SPECIAL EVENTS
             useEffect(() => {
-                const fetchGlobalPoints = async () => {
+                const fetchLoyaltySettings = async () => {
                     try {
                         const { doc, getDoc } = window.FirebaseApp;
-                        const snap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
-                        if (snap.exists()) setGlobalPoints(snap.data());
+                        const snapPoints = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
+                        if (snapPoints.exists()) setGlobalPoints(snapPoints.data());
+                        
+                        const snapEvents = await getDoc(doc(db, 'loyalty_settings', 'special_events'));
+                        if (snapEvents.exists()) setSpecialEvents(snapEvents.data().events || []);
                     } catch(e) { console.warn("Failed to load loyalty settings", e); }
                 };
-                fetchGlobalPoints();
+                fetchLoyaltySettings();
             }, []);
 
             // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
@@ -2361,6 +2364,16 @@
                     return true;
                 });
 
+                // LIVE SPECIAL EVENTS FILTERING
+                const activeSpecialEvents = specialEvents.filter(e => {
+                    if (!e.isActive) return false;
+                    if (e.shopId !== 'All' && e.shopId !== sessionInfo.shopId) return false;
+                    if (e.startDate && e.startDate > todayStr) return false;
+                    if (e.endDate && e.endDate < todayStr) return false;
+                    return true;
+                });
+                const activeEvent = activeSpecialEvents.length > 0 ? activeSpecialEvents[0] : null;
+
                 const processed = cart.map(item => {
                     const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
                     
@@ -2387,11 +2400,25 @@
                             effectiveUnitPrice = Math.max(0, item.price - promo.discountValue);
                             lineTotal = effectiveUnitPrice * item.quantity;
                         } else if (promo.type === 'BOGO') {
-                            freeQty = Math.floor(item.quantity / promo.requiredQty) * promo.rewardQty;
-                            totalQtyForKDS = item.quantity + freeQty;
-                            if (freeQty > 0) {
-                                promoName = `${promo.name} (+${freeQty} Free)`;
+                            const bogoFreeQty = Math.floor(item.quantity / promo.requiredQty) * promo.rewardQty;
+                            totalQtyForKDS = item.quantity + bogoFreeQty;
+                            freeQty += bogoFreeQty;
+                            if (bogoFreeQty > 0) {
+                                promoName = `${promo.name} (+${bogoFreeQty} Free)`;
                             }
+                        }
+                    }
+
+                    // APPLY 1+1 SPECIAL EVENTS LOGIC
+                    if (activeEvent) {
+                        // Apply exclusively to the "paid" portion of the cart, ignoring redeemed loyalty rewards
+                        const paidQtyToDouble = item.quantity - (item.redeemedQty || 0);
+                        if (paidQtyToDouble > 0) {
+                            const eventFree = paidQtyToDouble; // Buy 1 Get 1 = 1 free for every 1 paid
+                            totalQtyForKDS += eventFree;
+                            freeQty += eventFree;
+                            const eventBadge = `🎁 ${activeEvent.eventName} (1+1 Free)`;
+                            promoName = promoName ? `${promoName} | ${eventBadge}` : eventBadge;
                         }
                     }
 
@@ -2411,7 +2438,7 @@
                 });
 
                 return { processedCart: processed, cartTotal: total, cartItemCount: count };
-            }, [cart, branchLoyalty]);
+            }, [cart, branchLoyalty, specialEvents, sessionInfo.shopId]);
 
             // LIVE DISTANCE & TERRITORY CHECK (Synchronized instantly with Firestore)
             const liveLocationStatus = useMemo(() => {
@@ -3618,6 +3645,12 @@
             });
             const [promoSearchText, setPromoSearchText] = useState('');
 
+            // --- NEW: SPECIAL EVENTS (1+1) STATES ---
+            const [specialEvents, setSpecialEvents] = useState([]);
+            const [eventModalOpen, setEventModalOpen] = useState(false);
+            const [editingEventId, setEditingEventId] = useState(null);
+            const [eventFormData, setEventFormData] = useState({ id: '', shopId: 'All', eventName: '', startDate: getTodayString(), endDate: '', note: '', isActive: true });
+
             useEffect(() => {
                 if (activeTab === 'loyalty') {
                     const fetchLoyalty = async () => {
@@ -3638,7 +3671,7 @@
                             const promosSnap = await getDocs(collection(db, 'loyalty_settings'));
                             let loadedPromos = [];
                             promosSnap.forEach(d => {
-                                if (d.id !== 'global_points') {
+                                if (d.id !== 'global_points' && d.id !== 'special_events') {
                                     const data = d.data();
                                     if (data.promotions) {
                                         data.promotions.forEach(p => loadedPromos.push({ ...p, shopId: d.id }));
@@ -3646,6 +3679,12 @@
                                 }
                             });
                             setAllPromotions(loadedPromos);
+
+                            // Fetch Special Events (1+1)
+                            const eventsSnap = await getDoc(doc(db, 'loyalty_settings', 'special_events'));
+                            if (eventsSnap.exists()) {
+                                setSpecialEvents(eventsSnap.data().events || []);
+                            }
                         } catch(e) { console.warn("Failed to fetch loyalty settings."); }
                         setIsLoyaltyLoading(false);
                     };
@@ -3724,6 +3763,48 @@
                             await setDoc(shopRef, shopData);
                         }
                         setAllPromotions(prev => prev.filter(p => p.id !== promo.id));
+                    } catch(e) { alert(e.message); }
+                }
+            };
+
+            const openAddEventModal = () => {
+                setEventFormData({ id: Date.now().toString(), shopId: filterShop === 'All' ? 'All' : filterShop, eventName: '', startDate: getTodayString(), endDate: '', note: '', isActive: true });
+                setEditingEventId(null);
+                setEventModalOpen(true);
+            };
+
+            const openEditEventModal = (ev) => {
+                setEventFormData(ev);
+                setEditingEventId(ev.id);
+                setEventModalOpen(true);
+            };
+
+            const saveEventModal = async (e) => {
+                e.preventDefault();
+                const { doc, setDoc } = window.FirebaseApp;
+                try {
+                    let updatedEvents = [...specialEvents];
+                    if (editingEventId) {
+                        const idx = updatedEvents.findIndex(ev => ev.id === editingEventId);
+                        if (idx >= 0) updatedEvents[idx] = eventFormData;
+                    } else {
+                        updatedEvents.push(eventFormData);
+                    }
+                    await setDoc(doc(db, 'loyalty_settings', 'special_events'), { events: updatedEvents });
+                    setSpecialEvents(updatedEvents);
+                    setEventModalOpen(false);
+                } catch (err) {
+                    alert("Failed to save event: " + err.message);
+                }
+            };
+
+            const deleteEvent = async (id) => {
+                if (confirm('Delete this special event?')) {
+                    const { doc, setDoc } = window.FirebaseApp;
+                    try {
+                        const updatedEvents = specialEvents.filter(ev => ev.id !== id);
+                        await setDoc(doc(db, 'loyalty_settings', 'special_events'), { events: updatedEvents });
+                        setSpecialEvents(updatedEvents);
                     } catch(e) { alert(e.message); }
                 }
             };
@@ -4252,6 +4333,46 @@
                                             );
                                         })()}
                                     </div>
+
+                                    {/* Special Events (1+1 Free) */}
+                                    <div className="bg-gradient-to-br from-indigo-50 to-purple-50 p-6 rounded-2xl shadow-sm border border-indigo-100">
+                                        <div className="flex justify-between items-center mb-4">
+                                            <div>
+                                                <h3 className="text-lg font-bold text-indigo-900 flex items-center"><i className="fa-solid fa-gift text-indigo-500 mr-2"></i> Special Events (1+1 Free)</h3>
+                                                <p className="text-[10px] sm:text-xs text-indigo-700 font-medium mt-1">Applies globally across the entire menu. Used for holidays like Thanksgiving.</p>
+                                            </div>
+                                            <button onClick={openAddEventModal} className="text-sm bg-white text-indigo-700 hover:bg-indigo-100 px-4 py-2 rounded-lg font-bold transition flex items-center shadow-sm border border-indigo-200"><i className="fa-solid fa-plus mr-1.5"></i> Add Event</button>
+                                        </div>
+
+                                        {specialEvents.filter(e => filterShop === 'All' || e.shopId === 'All' || e.shopId === filterShop).length === 0 ? (
+                                            <div className="text-center py-6 text-indigo-400 bg-white/50 rounded-xl border border-dashed border-indigo-200 font-medium">No 1+1 Special Events configured.</div>
+                                        ) : (
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                {specialEvents.filter(e => filterShop === 'All' || e.shopId === 'All' || e.shopId === filterShop).map(ev => (
+                                                    <div key={ev.id} className="bg-white p-4 rounded-xl shadow-sm border border-indigo-100 relative group overflow-hidden">
+                                                        <div className={`absolute top-0 left-0 w-1 h-full ${ev.isActive ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                                                        <div className="flex justify-between items-start mb-2 pl-2">
+                                                            <div>
+                                                                <h4 className="font-bold text-stone-800">{ev.eventName}</h4>
+                                                                <span className="text-[10px] font-bold bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded tracking-wider uppercase">{ev.shopId === 'All' ? 'All Branches' : (shops.find(s=>s.id===ev.shopId)?.name || 'Unknown')}</span>
+                                                            </div>
+                                                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded tracking-wider uppercase ${ev.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                                {ev.isActive ? 'Active' : 'Inactive'}
+                                                            </span>
+                                                        </div>
+                                                        <div className="text-xs text-stone-600 font-medium mb-2 pl-2 flex flex-col gap-1">
+                                                            <span><i className="fa-solid fa-calendar-days mr-1.5 opacity-60"></i>{ev.startDate} to {ev.endDate || 'Ongoing'}</span>
+                                                            {ev.note && <span className="italic opacity-80"><i className="fa-solid fa-note-sticky mr-1.5"></i>{ev.note}</span>}
+                                                        </div>
+                                                        <div className="flex justify-end gap-2 pt-3 border-t border-stone-100 mt-2">
+                                                            <button onClick={() => openEditEventModal(ev)} className="text-xs font-bold text-blue-600 bg-blue-50 px-3 py-1.5 rounded hover:bg-blue-100 transition shadow-sm">Edit</button>
+                                                            <button onClick={() => deleteEvent(ev.id)} className="text-xs font-bold text-red-600 bg-red-50 px-3 py-1.5 rounded hover:bg-red-100 transition shadow-sm">Delete</button>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -4425,6 +4546,73 @@
                                             <i className="fa-solid fa-save mr-2 text-amber-500"></i> Save Promotion
                                         </button>
                                     </div>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {/* --- NEW: Special Event (1+1 Free) Modal --- */}
+                    {eventModalOpen && (
+                        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                            <form onSubmit={saveEventModal} className="bg-white rounded-3xl w-full max-w-md p-6 shadow-2xl animate-fade-in relative">
+                                <button type="button" onClick={() => setEventModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700 w-8 h-8 flex items-center justify-center rounded-full hover:bg-stone-100 transition"><i className="fa-solid fa-xmark text-xl"></i></button>
+                                
+                                <h3 className="text-xl font-bold text-indigo-900 mb-6 flex items-center">
+                                    <i className="fa-solid fa-gift text-indigo-500 mr-2"></i> 
+                                    {editingEventId ? 'Edit Special Event' : 'Add 1+1 Special Event'}
+                                </h3>
+
+                                <div className="space-y-4 mb-6">
+                                    <div className="bg-indigo-50 p-3 rounded-xl border border-indigo-100 text-xs text-indigo-800 font-medium mb-2 shadow-sm">
+                                        <i className="fa-solid fa-circle-info mr-1"></i> This event applies a "Buy 1 Get 1 Free" rule to ALL menu items globally across the selected branch(es).
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Target Branch *</label>
+                                        <select required className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-400 bg-white font-bold text-stone-800 shadow-sm" value={eventFormData.shopId} onChange={e => setEventFormData({...eventFormData, shopId: e.target.value})}>
+                                            {isSuper && <option value="All">All Branches Globally</option>}
+                                            {shops.filter(s => isSuper || currentAdminRecord?.shopIds?.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                        </select>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Event Name *</label>
+                                        <input type="text" required placeholder="e.g. Thanksgiving Special" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-400 bg-white font-bold shadow-sm" value={eventFormData.eventName} onChange={e => setEventFormData({...eventFormData, eventName: e.target.value})} autoFocus />
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Start Date *</label>
+                                            <input type="date" required className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-400 bg-white font-bold shadow-sm text-sm" value={eventFormData.startDate} onChange={e => setEventFormData({...eventFormData, startDate: e.target.value})} />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">End Date</label>
+                                            <input type="date" className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-400 bg-white font-bold shadow-sm text-sm" value={eventFormData.endDate || ''} onChange={e => setEventFormData({...eventFormData, endDate: e.target.value})} />
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Internal Note / Details</label>
+                                        <input type="text" placeholder="Optional notes..." className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-400 bg-white font-medium shadow-sm" value={eventFormData.note || ''} onChange={e => setEventFormData({...eventFormData, note: e.target.value})} />
+                                    </div>
+
+                                    <div>
+                                        <label className="flex items-center cursor-pointer bg-stone-50 p-3 rounded-xl border border-stone-200 shadow-sm">
+                                            <div className="relative">
+                                                <input type="checkbox" className="sr-only" checked={eventFormData.isActive} onChange={e => setEventFormData({...eventFormData, isActive: e.target.checked})} />
+                                                <div className={`block w-10 h-6 rounded-full transition ${eventFormData.isActive ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${eventFormData.isActive ? 'translate-x-4' : ''}`}></div>
+                                            </div>
+                                            <div className="ml-3 text-sm font-bold text-stone-700">{eventFormData.isActive ? 'Event is Active' : 'Event is Disabled'}</div>
+                                        </label>
+                                    </div>
+                                </div>
+
+                                <div className="flex justify-end gap-2 pt-4 border-t border-stone-100">
+                                    <button type="button" onClick={() => setEventModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                    <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-indigo-600 text-white hover:bg-indigo-700 shadow-md transition flex items-center">
+                                        <i className="fa-solid fa-save mr-2"></i> Save Event
+                                    </button>
                                 </div>
                             </form>
                         </div>
@@ -4753,13 +4941,21 @@
 
             const [showSetupModal, setShowSetupModal] = useState(false);
             
-            // NEW: Fetch Global Points for Loyalty Calculation
+            // NEW: Fetch Global Points & Special Events for Loyalty/Promo Calculation
             const [globalPoints, setGlobalPoints] = useState(null);
+            const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
             useEffect(() => {
-                const { doc, getDoc } = window.FirebaseApp;
-                getDoc(doc(db, 'loyalty_settings', 'global_points')).then(snap => {
-                    if (snap.exists()) setGlobalPoints(snap.data());
-                }).catch(e => console.warn(e));
+                const fetchLoyaltyData = async () => {
+                    try {
+                        const { doc, getDoc } = window.FirebaseApp;
+                        const snapPoints = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
+                        if (snapPoints.exists()) setGlobalPoints(snapPoints.data());
+                        
+                        const snapEvents = await getDoc(doc(db, 'loyalty_settings', 'special_events'));
+                        if (snapEvents.exists()) setSpecialEvents(snapEvents.data().events || []);
+                    } catch(e) { console.warn(e); }
+                };
+                fetchLoyaltyData();
             }, []);
 
             const customerLoyalty = useMemo(() => {
@@ -4908,6 +5104,16 @@
                 
                 const activePromos = allPromotions.filter(p => p.shopId === cartShopId && p.isActive && (!p.startDate || p.startDate <= todayStr) && (!p.endDate || p.endDate >= todayStr));
 
+                // LIVE SPECIAL EVENTS FILTERING
+                const activeSpecialEvents = specialEvents.filter(e => {
+                    if (!e.isActive) return false;
+                    if (e.shopId !== 'All' && e.shopId !== cartShopId) return false;
+                    if (e.startDate && e.startDate > todayStr) return false;
+                    if (e.endDate && e.endDate < todayStr) return false;
+                    return true;
+                });
+                const activeEvent = activeSpecialEvents.length > 0 ? activeSpecialEvents[0] : null;
+
                 const processed = cart.map(item => {
                     const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
                     
@@ -4927,12 +5133,22 @@
                             effectiveUnitPrice = Math.max(0, item.price - promo.discountValue);
                             lineTotal = effectiveUnitPrice * item.quantity;
                         } else if (promo.type === 'BOGO') {
-                            freeQty = Math.floor(item.quantity / promo.requiredQty) * promo.rewardQty;
-                            totalQtyForKDS = item.quantity + freeQty;
-                            if (freeQty > 0) {
-                                promoName = `${promo.name} (+${freeQty} Free)`;
+                            const bogoFreeQty = Math.floor(item.quantity / promo.requiredQty) * promo.rewardQty;
+                            totalQtyForKDS = item.quantity + bogoFreeQty;
+                            freeQty += bogoFreeQty;
+                            if (bogoFreeQty > 0) {
+                                promoName = `${promo.name} (+${bogoFreeQty} Free)`;
                             }
                         }
+                    }
+
+                    // APPLY 1+1 SPECIAL EVENTS LOGIC
+                    if (activeEvent) {
+                        const eventFree = item.quantity; // Buy 1 Get 1
+                        totalQtyForKDS += eventFree;
+                        freeQty += eventFree;
+                        const eventBadge = `🎁 ${activeEvent.eventName} (1+1 Free)`;
+                        promoName = promoName ? `${promoName} | ${eventBadge}` : eventBadge;
                     }
 
                     total += lineTotal;
@@ -4950,7 +5166,7 @@
                 });
 
                 return { processedCart: processed, cartTotal: total };
-            }, [cart, allPromotions, cartShopId]);
+            }, [cart, allPromotions, specialEvents, cartShopId]);
 
             const handleCheckout = async (targetStatus, payStatus, payMethod) => {
                 if (cart.length === 0) return;
@@ -5448,7 +5664,6 @@
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Payment</th>
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Status</th>
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Prog.Status</th>
-                                                <th className="p-3 font-bold text-center border border-stone-300 bg-stone-100">Action</th>
                                             </tr>
                                         </thead>
                                         <tbody>
@@ -5518,14 +5733,9 @@
                                                         </select>
                                                         {order.status === 'Cancelled' && order.cancelReason && <div className="text-[10px] text-red-500 mt-1.5 bg-red-50 px-1 py-0.5 rounded border border-red-100 leading-tight">Note: {order.cancelReason}</div>}
                                                     </td>
-                                                    <td className="p-3 border border-stone-300 align-top text-center">
-                                                        <button onClick={() => deleteOrder(order)} className="w-8 h-8 rounded-md bg-red-50 text-red-600 hover:bg-red-100 flex items-center justify-center transition border border-red-100 shadow-sm mx-auto" title="Delete Order">
-                                                            <i className="fa-solid fa-trash text-sm"></i>
-                                                        </button>
-                                                    </td>
                                                 </tr>
                                             )})}
-                                            {displayedOrders.length === 0 && <tr><td colSpan="12" className="text-center py-8 text-stone-400 border border-stone-300">No matching orders found.</td></tr>}
+                                            {displayedOrders.length === 0 && <tr><td colSpan="11" className="text-center py-8 text-stone-400 border border-stone-300">No matching orders found.</td></tr>}
                                         </tbody>
                                     </table>
                                 </div>
