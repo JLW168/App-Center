@@ -358,6 +358,60 @@
             }
         };
 
+        const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig) => {
+            if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null };
+
+            const validOrders = customerOrders.filter(o => o.customerPhone === phone && o.status !== 'Cancelled').sort((a, b) => a.createdAt - b.createdAt);
+            let totalRedeemed = validOrders.reduce((sum, o) => sum + (o.redeemedPoints || 0), 0);
+            
+            // FIFO Queue Engine for Points Expiration
+            const pointBatches = [];
+            validOrders.forEach(o => {
+                const earned = Math.floor(o.totalAmount / (globalPointsConfig.spendAmount || 4000)) * (globalPointsConfig.pointsEarned || 1);
+                if (earned > 0) {
+                    pointBatches.push({
+                        points: earned,
+                        earnedAt: o.createdAt,
+                        expiresAt: globalPointsConfig.expirationDays ? o.createdAt + (globalPointsConfig.expirationDays * 24 * 60 * 60 * 1000) : null
+                    });
+                }
+            });
+
+            // Process Redemptions (Deducting oldest points first)
+            let remainingToRedeem = totalRedeemed;
+            for (let i = 0; i < pointBatches.length; i++) {
+                if (remainingToRedeem <= 0) break;
+                if (pointBatches[i].points <= remainingToRedeem) {
+                    remainingToRedeem -= pointBatches[i].points;
+                    pointBatches[i].points = 0;
+                } else {
+                    pointBatches[i].points -= remainingToRedeem;
+                    remainingToRedeem = 0;
+                }
+            }
+
+            // Process Expirations based on Current Time
+            const now = Date.now();
+            let activePts = 0;
+            let earliestExpiration = null;
+
+            pointBatches.forEach(batch => {
+                if (batch.points > 0) {
+                    if (batch.expiresAt && batch.expiresAt < now) {
+                        batch.points = 0; // Point expired and is completely lost
+                    } else {
+                        activePts += batch.points;
+                        if (batch.expiresAt && (!earliestExpiration || batch.expiresAt < earliestExpiration)) {
+                            earliestExpiration = batch.expiresAt;
+                        }
+                    }
+                }
+            });
+
+            const freeClaims = Math.floor(activePts / (globalPointsConfig.redeemPoints || 10));
+            return { activePoints: activePts, activePts, freeClaims, expiringSoon: earliestExpiration };
+        };
+
         // --- Root & Data Fetching ---
         function RootApp() {
             const [isReady, setIsReady] = useState(!!window.FirebaseApp);
@@ -1218,17 +1272,24 @@
                                                 <span className="text-amber-600">{customerLoyalty?.activePoints || 0}P</span>
                                                 <span className="text-stone-300">|</span>
                                                 <span className="text-rose-600"><i className="fa-solid fa-gift mr-1"></i>{customerLoyalty?.freeClaims || 0}</span>
-                                            </>
-                                        )}
-                                        {onEditProfile && (
-                                            <button onClick={onEditProfile} className="text-stone-400 hover:text-blue-500 transition ml-2" title="Edit Profile">
-                                                <i className="fa-solid fa-pen"></i>
-                                            </button>
-                                        )}
-                                    </div>
-                                </div>
-                                
-                                <div className="flex bg-stone-200/50 p-1 rounded-xl relative overflow-hidden mb-3">
+                                    </>
+                                )}
+                                {onEditProfile && (
+                                    <button onClick={onEditProfile} className="text-stone-400 hover:text-blue-500 transition ml-2" title="Edit Profile">
+                                        <i className="fa-solid fa-pen"></i>
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+
+                        {customerLoyalty?.expiringSoon && (
+                            <div className="mb-3 bg-rose-50 text-rose-700 text-[10px] p-2 rounded-xl border border-rose-200 font-bold flex items-center shadow-sm w-full">
+                                <i className="fa-solid fa-clock mr-1.5 animate-pulse text-rose-500"></i> 
+                                Some points will expire on {new Date(customerLoyalty.expiringSoon).toLocaleDateString()}
+                            </div>
+                        )}
+                        
+                        <div className="flex bg-stone-200/50 p-1 rounded-xl relative overflow-hidden mb-3">
                                     <div className={`absolute top-1 bottom-1 w-[calc(50%-4px)] bg-white rounded-lg shadow transition-transform duration-300 ease-out border border-stone-200 ${sessionInfo.mode === 'DINE_IN' ? 'translate-x-[calc(100%+8px)]' : 'translate-x-0'}`}></div>
                                     <button 
                                         onClick={() => setSessionInfo(prev => ({...prev, mode: 'TAKEAWAY', tableId: '', tableName: ''}))} 
@@ -1616,6 +1677,22 @@
             const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
             const [customerLoyalty, setCustomerLoyalty] = useState({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
 
+            // NEW: Fetch Secure Customer Profile for VIP Tiering in Customer Portal
+            const [customerProfile, setCustomerProfile] = useState(null);
+            useEffect(() => {
+                if (!sessionInfo.isSetup || !sessionInfo.customerPhone) {
+                    setCustomerProfile(null);
+                    return;
+                }
+                const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                const q = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
+                const unsub = onSnapshot(q, snap => {
+                    if (!snap.empty) setCustomerProfile({ id: snap.docs[0].id, ...snap.docs[0].data() });
+                    else setCustomerProfile(null);
+                });
+                return () => unsub();
+            }, [sessionInfo.customerPhone, sessionInfo.isSetup]);
+
             // DYNAMIC BADGES STATE
             const [branchLoyalty, setBranchLoyalty] = useState(null);
             const [topSellers, setTopSellers] = useState([]);
@@ -1723,23 +1800,11 @@
                 const q = query(collection(db, 'orders'), where('customerPhone', '==', sessionInfo.customerPhone));
 
                 const unsub = onSnapshot(q, snap => {
-                    let spent = 0;
-                    let redeemed = 0;
-                    snap.forEach(d => {
-                        const o = d.data();
-                        if (o.status !== 'Cancelled') {
-                            spent += o.totalAmount;
-                        }
-                        if (o.status !== 'Cancelled' && o.redeemedPoints) {
-                            redeemed += o.redeemedPoints;
-                        }
-                    });
-
-                    const earned = Math.floor(spent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
-                    const active = Math.max(0, earned - redeemed);
-                    const free = Math.floor(active / (globalPoints.redeemPoints || 10));
-
-                    setCustomerLoyalty({ activePoints: active, freeClaims: free, totalSpent: spent, totalRedeemed: redeemed });
+                    const customerOrders = [];
+                    snap.forEach(d => customerOrders.push({ id: d.id, ...d.data() }));
+                    
+                    const loyaltyData = calculateCustomerLoyalty(customerOrders, sessionInfo.customerPhone, globalPoints);
+                    setCustomerLoyalty(loyaltyData);
                 });
                 return () => unsub();
             }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
@@ -2424,6 +2489,8 @@
                 });
                 const activeEvent = activeSpecialEvents.length > 0 ? activeSpecialEvents[0] : null;
 
+                const customerChargeStatus = customerProfile?.chargeStatus || 'Normal';
+
                 const processed = cart.map(item => {
                     const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
                     
@@ -2469,6 +2536,41 @@
                             freeQty += eventFree;
                             const eventBadge = `🎁 ${activeEvent.eventName} (1+1 Free)`;
                             promoName = promoName ? `${promoName} | ${eventBadge}` : eventBadge;
+                        }
+                    }
+
+                    // 3. OVERRIDE WITH VIP CHARGE STATUS (Customer Portal)
+                    if (customerChargeStatus !== 'Normal') {
+                        const isGlobalVIP = !customerProfile?.chargeStatusScope || customerProfile?.chargeStatusScope === 'All' || customerProfile?.chargeStatusScope === 'Global';
+                        const isShopEligible = isGlobalVIP || (customerProfile?.chargeStatusShopIds && customerProfile.chargeStatusShopIds.includes(sessionInfo.shopId));
+
+                        if (isShopEligible) {
+                            if (customerChargeStatus === 'FOC') {
+                                effectiveUnitPrice = 0;
+                                lineTotal = 0;
+                                promoName = promoName ? `FOC Member | ${promoName}` : 'FOC Member (Free)';
+                            } else if (customerChargeStatus === 'COG') {
+                                let itemCost = 0;
+                                const product = products.find(p => p.id === item.productId);
+                                if (product) {
+                                    if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
+                                    else if (item.size === 'L') itemCost = product.costLarge || 0;
+                                    else itemCost = product.costSmall || 0; 
+                                }
+                                effectiveUnitPrice = itemCost;
+                                lineTotal = effectiveUnitPrice * item.quantity;
+                                promoName = promoName ? `COG Member | ${promoName}` : 'COG Member (Cost Price)';
+                            } else if (customerChargeStatus.includes('% Dis')) {
+                                const pct = parseInt(customerChargeStatus);
+                                if (!isNaN(pct)) {
+                                    const memberDiscountedPrice = item.price * (1 - (pct / 100));
+                                    if (memberDiscountedPrice < effectiveUnitPrice) {
+                                        effectiveUnitPrice = memberDiscountedPrice;
+                                        lineTotal = effectiveUnitPrice * item.quantity;
+                                        promoName = `${pct}% Member Discount`;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2591,6 +2693,7 @@
                     customerSex: sessionInfo.customerSex || 'M',
                     customerDistance: orderDistance,
                     notes: cartNotes,
+                    chargeStatus: customerProfile?.chargeStatus || 'Normal',
                     items: currentCart,
                     totalAmount: currentCartTotal,
                     redeemedPoints: pointsToRedeem > 0 ? pointsToRedeem : null,
@@ -3693,7 +3796,7 @@
 
             // --- REVISED: LOYALTY & PROMOTIONS STATE ---
             const [globalPoints, setGlobalPoints] = useState({
-                pointsEnabled: false, spendAmount: 4000, pointsEarned: 1, redeemPoints: 10, redeemableCategories: []
+                pointsEnabled: false, spendAmount: 4000, pointsEarned: 1, redeemPoints: 10, redeemableCategories: [], expirationDays: 0
             });
             const [allPromotions, setAllPromotions] = useState([]);
             const [isLoyaltyLoading, setIsLoyaltyLoading] = useState(true);
@@ -4317,6 +4420,18 @@
                                                     <input type="number" className="w-20 border border-stone-300 rounded-lg px-3 py-1.5 text-center font-bold text-amber-600 outline-none focus:border-amber-500" value={globalPoints.redeemPoints} onChange={e=>setGlobalPoints({...globalPoints, redeemPoints: e.target.value === '' ? '' : Number(e.target.value)})} onBlur={()=>saveGlobalPoints(globalPoints)} />
                                                     <span className="text-sm font-medium">Points for</span>
                                                     <span className="font-bold text-rose-600 bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-200 shadow-sm">1 Free Product</span>
+                                                </div>
+
+                                                <div className="flex items-center gap-3 mb-4 pt-3 border-t border-stone-200">
+                                                    <span className="text-sm font-bold text-stone-600 uppercase tracking-wider">Expiration</span>
+                                                    <select className="flex-1 border border-stone-300 rounded-lg px-2 py-1.5 text-xs font-bold text-stone-700 outline-none focus:border-amber-500 shadow-sm" value={globalPoints.expirationDays || 0} onChange={e => { const newCfg = {...globalPoints, expirationDays: Number(e.target.value)}; saveGlobalPoints(newCfg); }}>
+                                                        <option value={0}>Never Expire</option>
+                                                        <option value={7}>1 Week</option>
+                                                        <option value={30}>1 Month</option>
+                                                        <option value={90}>3 Months</option>
+                                                        <option value={180}>6 Months</option>
+                                                        <option value={365}>1 Year</option>
+                                                    </select>
                                                 </div>
                                                 
                                                 <div className="bg-white p-3 rounded-xl border border-stone-200">
@@ -5156,18 +5271,7 @@
 
             const customerLoyalty = useMemo(() => {
                 if (!customerPhone || !globalPoints?.pointsEnabled) return null;
-                let spent = 0;
-                let redeemed = 0;
-                orders.forEach(o => {
-                    if (o.customerPhone === customerPhone && o.status !== 'Cancelled') {
-                        spent += o.totalAmount;
-                        if (o.redeemedPoints) redeemed += o.redeemedPoints;
-                    }
-                });
-                const earnedPts = Math.floor(spent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
-                const activePts = Math.max(0, earnedPts - redeemed);
-                const freeClaims = Math.floor(activePts / (globalPoints.redeemPoints || 10));
-                return { activePts, freeClaims };
+                return calculateCustomerLoyalty(orders, customerPhone, globalPoints);
             }, [orders, customerPhone, globalPoints]);
 
             useEffect(() => {
@@ -5362,29 +5466,35 @@
 
                     // 3. OVERRIDE WITH VIP CHARGE STATUS (Applies Best Price Guarantee)
                     if (customerChargeStatus !== 'Normal') {
-                        if (customerChargeStatus === 'FOC') {
-                            effectiveUnitPrice = 0;
-                            lineTotal = 0;
-                            promoName = promoName ? `FOC Member | ${promoName}` : 'FOC Member (Free)';
-                        } else if (customerChargeStatus === 'COG') {
-                            let itemCost = 0;
-                            if (product) {
-                                if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
-                                else if (item.size === 'L') itemCost = product.costLarge || 0;
-                                else itemCost = product.costSmall || 0; 
-                            }
-                            effectiveUnitPrice = itemCost;
-                            lineTotal = effectiveUnitPrice * item.quantity;
-                            promoName = promoName ? `COG Member | ${promoName}` : 'COG Member (Cost Price)';
-                        } else if (customerChargeStatus.includes('% Dis')) {
-                            const pct = parseInt(customerChargeStatus);
-                            if (!isNaN(pct)) {
-                                const memberDiscountedPrice = item.price * (1 - (pct / 100));
-                                // Only apply if the member discount is better than the standard active promotion
-                                if (memberDiscountedPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = memberDiscountedPrice;
-                                    lineTotal = effectiveUnitPrice * item.quantity;
-                                    promoName = `${pct}% Member Discount`;
+                        // NEW: Validate if the VIP charge status applies to the current checkout branch
+                        const isGlobalVIP = !customerData?.chargeStatusScope || customerData?.chargeStatusScope === 'All' || customerData?.chargeStatusScope === 'Global';
+                        const isShopEligible = isGlobalVIP || (customerData?.chargeStatusShopIds && customerData.chargeStatusShopIds.includes(cartShopId));
+
+                        if (isShopEligible) {
+                            if (customerChargeStatus === 'FOC') {
+                                effectiveUnitPrice = 0;
+                                lineTotal = 0;
+                                promoName = promoName ? `FOC Member | ${promoName}` : 'FOC Member (Free)';
+                            } else if (customerChargeStatus === 'COG') {
+                                let itemCost = 0;
+                                if (product) {
+                                    if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
+                                    else if (item.size === 'L') itemCost = product.costLarge || 0;
+                                    else itemCost = product.costSmall || 0; 
+                                }
+                                effectiveUnitPrice = itemCost;
+                                lineTotal = effectiveUnitPrice * item.quantity;
+                                promoName = promoName ? `COG Member | ${promoName}` : 'COG Member (Cost Price)';
+                            } else if (customerChargeStatus.includes('% Dis')) {
+                                const pct = parseInt(customerChargeStatus);
+                                if (!isNaN(pct)) {
+                                    const memberDiscountedPrice = item.price * (1 - (pct / 100));
+                                    // Only apply if the member discount is better than the standard active promotion
+                                    if (memberDiscountedPrice < effectiveUnitPrice) {
+                                        effectiveUnitPrice = memberDiscountedPrice;
+                                        lineTotal = effectiveUnitPrice * item.quantity;
+                                        promoName = `${pct}% Member Discount`;
+                                    }
                                 }
                             }
                         }
@@ -5443,6 +5553,7 @@
                     customerName: customerName || 'Walk-in',
                     customerPhone: customerPhone || '',
                     customerSex: customerData ? customerSex : 'M',
+                    chargeStatus: customerData?.chargeStatus || 'Normal',
                     items: currentCart,
                     totalAmount: currentTotal,
                     status: targetStatus, 
@@ -5653,21 +5764,29 @@
                                         </div>
                                         
                                         {(customerPhone && customerData) && (
-                                            <div className="flex justify-between items-center bg-stone-50 p-2.5 rounded-xl border border-stone-200 mb-2">
-                                                <div className="flex items-center gap-1.5 font-bold text-stone-800 text-sm">
-                                                    <span>{customerSex === 'F' ? 'Ms. ' : 'Mr. '}{customerName}</span>
-                                                    {globalPoints?.pointsEnabled && customerLoyalty && (
-                                                        <>
-                                                            <span className="text-stone-300">|</span>
-                                                            <span className="text-amber-600">{customerLoyalty.activePts}P</span>
-                                                            <span className="text-stone-300">|</span>
-                                                            <span className="text-rose-600"><i className="fa-solid fa-gift mr-1"></i> {customerLoyalty.freeClaims}</span>
-                                                        </>
-                                                    )}
+                                            <div className="flex flex-col bg-stone-50 p-2.5 rounded-xl border border-stone-200 mb-2">
+                                                <div className="flex justify-between items-center w-full">
+                                                    <div className="flex items-center gap-1.5 font-bold text-stone-800 text-sm">
+                                                        <span>{customerSex === 'F' ? 'Ms. ' : 'Mr. '}{customerName}</span>
+                                                        {globalPoints?.pointsEnabled && customerLoyalty && (
+                                                            <>
+                                                                <span className="text-stone-300">|</span>
+                                                                <span className="text-amber-600">{customerLoyalty.activePts}P</span>
+                                                                <span className="text-stone-300">|</span>
+                                                                <span className="text-rose-600"><i className="fa-solid fa-gift mr-1"></i> {customerLoyalty.freeClaims}</span>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                    <button onClick={() => { setCustomerPhone(''); setCustomerName(''); setCustomerSex('M'); setCustomerData(null); }} className="text-stone-400 hover:text-red-500 transition w-6 h-6 flex items-center justify-center rounded-full hover:bg-red-50">
+                                                        <i className="fa-solid fa-xmark"></i>
+                                                    </button>
                                                 </div>
-                                                <button onClick={() => { setCustomerPhone(''); setCustomerName(''); setCustomerSex('M'); setCustomerData(null); }} className="text-stone-400 hover:text-red-500 transition w-6 h-6 flex items-center justify-center rounded-full hover:bg-red-50">
-                                                    <i className="fa-solid fa-xmark"></i>
-                                                </button>
+                                                {customerLoyalty?.expiringSoon && (
+                                                    <div className="mt-2 bg-rose-100 text-rose-700 text-[10px] p-1.5 rounded font-bold flex items-center shadow-sm w-fit border border-rose-200">
+                                                        <i className="fa-solid fa-clock mr-1.5 animate-pulse text-rose-600"></i> 
+                                                        Points expire: {new Date(customerLoyalty.expiringSoon).toLocaleDateString()}
+                                                    </div>
+                                                )}
                                             </div>
                                         )}
                                         
@@ -8135,6 +8254,8 @@
                         status: c.status || 'Active',
                         customerType: c.customerType || 'Normal',
                         chargeStatus: c.chargeStatus || 'Normal',
+                        chargeStatusScope: c.chargeStatusScope || 'All',
+                        chargeStatusShopIds: c.chargeStatusShopIds || [],
                         totalSpent: 0,
                         totalRedeemed: 0,
                         orderCount: 0,
@@ -8158,6 +8279,8 @@
                             status: 'Active',
                             customerType: 'Normal',
                             chargeStatus: 'Normal',
+                            chargeStatusScope: 'All',
+                            chargeStatusShopIds: [],
                             totalSpent: 0,
                             totalRedeemed: 0,
                             orderCount: 0,
@@ -8242,19 +8365,49 @@
                         await updateDoc(doc(db, 'customers', customer.id), { [field]: value });
                     } else {
                         // Auto-create a secure profile if modifying a legacy order-based customer
-                        await addDoc(collection(db, 'customers'), {
+                        const payload = {
                             name: customer.name,
                             phone: customer.phone,
                             sex: customer.sex,
                             status: 'Active',
                             customerType: field === 'customerType' ? value : 'Normal',
                             chargeStatus: field === 'chargeStatus' ? value : 'Normal',
+                            chargeStatusScope: field === 'chargeStatusScope' ? value : 'All',
+                            chargeStatusShopIds: field === 'chargeStatusShopIds' ? value : [],
                             createdAt: Date.now(),
                             lastVisit: Date.now()
-                        });
+                        };
+                        await addDoc(collection(db, 'customers'), payload);
                     }
                 } catch (e) {
                     alert(`Error updating ${field}: ` + e.message);
+                }
+            };
+            
+            const updateCustomerFields = async (customer, updates) => {
+                if (!isSuper) return alert("Only System Admins can change customer attributes.");
+                try {
+                    const { doc, updateDoc, addDoc, collection } = window.FirebaseApp;
+                    if (customer.id) {
+                        await updateDoc(doc(db, 'customers', customer.id), updates);
+                    } else {
+                         const payload = {
+                            name: customer.name,
+                            phone: customer.phone,
+                            sex: customer.sex,
+                            status: 'Active',
+                            customerType: 'Normal',
+                            chargeStatus: 'Normal',
+                            chargeStatusScope: 'All',
+                            chargeStatusShopIds: [],
+                            createdAt: Date.now(),
+                            lastVisit: Date.now(),
+                            ...updates
+                        };
+                        await addDoc(collection(db, 'customers'), payload);
+                    }
+                } catch (e) {
+                    alert("Error updating customer: " + e.message);
                 }
             };
 
@@ -8306,6 +8459,8 @@
                         status: editCustomerData.status,
                         customerType: editCustomerData.customerType || 'Normal',
                         chargeStatus: editCustomerData.chargeStatus || 'Normal',
+                        chargeStatusScope: editCustomerData.chargeStatusScope || 'All',
+                        chargeStatusShopIds: editCustomerData.chargeStatusShopIds || [],
                         updatedAt: Date.now()
                     };
 
@@ -8527,23 +8682,23 @@
                                                 <th className="p-3 font-bold border border-stone-300">Lifetime Value</th>
                                                 <th className="p-3 font-bold border border-stone-300">Total Visits</th>
                                                 <th className="p-3 font-bold border border-stone-300 text-center">Current Tier</th>
-                                                <th className="p-3 font-bold border border-stone-300 text-center">Charge Status</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-center">Charge Status Scope</th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {filteredCustomers.map(customer => (
                                                 <tr key={customer.phone} className="hover:bg-amber-50 transition-colors bg-white">
-                                                    <td className="p-3 border border-stone-300">
+                                                    <td className="p-3 border border-stone-300 align-top">
                                                         <div className="font-bold text-stone-900 text-base">{customer.name}</div>
                                                         <div className="text-stone-500 font-medium text-xs mt-0.5"><i className="fa-solid fa-phone mr-1"></i>{customer.phone}</div>
                                                     </td>
-                                                    <td className="p-3 border border-stone-300 font-black text-amber-700">
+                                                    <td className="p-3 border border-stone-300 font-black text-amber-700 align-top">
                                                         {customer.totalSpent.toLocaleString()} ៛
                                                     </td>
-                                                    <td className="p-3 border border-stone-300 font-bold text-stone-700">
+                                                    <td className="p-3 border border-stone-300 font-bold text-stone-700 align-top">
                                                         {customer.orderCount} Orders
                                                     </td>
-                                                    <td className="p-3 border border-stone-300 text-center">
+                                                    <td className="p-3 border border-stone-300 text-center align-top">
                                                         <select 
                                                             className={`border rounded-lg px-3 py-1.5 font-bold outline-none shadow-sm transition-colors text-xs uppercase tracking-wider cursor-pointer ${
                                                                 customer.customerType === 'VVIP' ? 'bg-purple-100 text-purple-800 border-purple-300' :
@@ -8561,26 +8716,70 @@
                                                             <option value="VVIP">VVIP</option>
                                                         </select>
                                                     </td>
-                                                    <td className="p-3 border border-stone-300 text-center">
-                                                        <select 
-                                                            className={`border rounded-lg px-3 py-1.5 font-bold outline-none shadow-sm transition-colors text-xs uppercase tracking-wider cursor-pointer ${
-                                                                customer.chargeStatus === 'FOC' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
-                                                                customer.chargeStatus === 'COG' ? 'bg-blue-100 text-blue-800 border-blue-300' :
-                                                                (customer.chargeStatus && customer.chargeStatus.includes('%')) ? 'bg-rose-100 text-rose-800 border-rose-300' :
-                                                                'bg-white text-stone-600 border-stone-200'
-                                                            }`}
-                                                            value={customer.chargeStatus || 'Normal'}
-                                                            onChange={(e) => updateCustomerField(customer, 'chargeStatus', e.target.value)}
-                                                            disabled={!isSuper}
-                                                        >
-                                                            <option value="Normal">Normal Price</option>
-                                                            <option value="FOC">FOC (Free)</option>
-                                                            <option value="COG">COG (Cost Only)</option>
-                                                            <option value="10% Dis">10% Dis</option>
-                                                            <option value="20% Dis">20% Dis</option>
-                                                            <option value="30% Dis">30% Dis</option>
-                                                            <option value="50% Dis">50% Dis</option>
-                                                        </select>
+                                                    <td className="p-3 border border-stone-300 align-top">
+                                                        <div className="flex flex-col gap-2 max-w-[280px] mx-auto">
+                                                            <select 
+                                                                className={`border rounded-lg px-3 py-1.5 font-bold outline-none shadow-sm transition-colors text-xs uppercase tracking-wider cursor-pointer w-full text-center ${
+                                                                    customer.chargeStatus === 'FOC' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
+                                                                    customer.chargeStatus === 'COG' ? 'bg-blue-100 text-blue-800 border-blue-300' :
+                                                                    (customer.chargeStatus && customer.chargeStatus.includes('%')) ? 'bg-rose-100 text-rose-800 border-rose-300' :
+                                                                    'bg-white text-stone-600 border-stone-200'
+                                                                }`}
+                                                                value={customer.chargeStatus || 'Normal'}
+                                                                onChange={(e) => updateCustomerField(customer, 'chargeStatus', e.target.value)}
+                                                                disabled={!isSuper}
+                                                            >
+                                                                <option value="Normal">Normal Price</option>
+                                                                <option value="FOC">FOC (Free)</option>
+                                                                <option value="COG">COG (Cost Only)</option>
+                                                                <option value="10% Dis">10% Dis</option>
+                                                                <option value="20% Dis">20% Dis</option>
+                                                                <option value="30% Dis">30% Dis</option>
+                                                                <option value="50% Dis">50% Dis</option>
+                                                            </select>
+                                                            
+                                                            {customer.chargeStatus && customer.chargeStatus !== 'Normal' && (
+                                                                <div className="bg-stone-50 p-2 rounded-lg border border-stone-200 mt-1">
+                                                                    <select 
+                                                                        className="w-full border border-stone-300 rounded-md px-2 py-1 outline-none focus:border-amber-600 bg-white text-[11px] font-bold text-stone-700 mb-2 cursor-pointer shadow-sm" 
+                                                                        value={customer.chargeStatusScope || 'All'} 
+                                                                        onChange={e => {
+                                                                            updateCustomerFields(customer, {
+                                                                                chargeStatusScope: e.target.value,
+                                                                                chargeStatusShopIds: (e.target.value === 'All' || e.target.value === 'Global') ? [] : (customer.chargeStatusShopIds || [])
+                                                                            });
+                                                                        }}
+                                                                        disabled={!isSuper}
+                                                                    >
+                                                                        <option value="All">Global (All Branches)</option>
+                                                                        <option value="Specific">Specific Branches Only</option>
+                                                                    </select>
+                                                                    
+                                                                    {(customer.chargeStatusScope === 'Specific' || (!['All', 'Global'].includes(customer.chargeStatusScope))) && (
+                                                                        <div className="grid grid-cols-1 gap-1.5 max-h-32 overflow-y-auto pr-1">
+                                                                            {shops.map(s => (
+                                                                                <label key={s.id} className={`flex items-center gap-2 p-1.5 bg-white border rounded-md transition shadow-sm cursor-pointer hover:border-amber-400 ${
+                                                                                    (customer.chargeStatusShopIds || []).includes(s.id) ? 'border-amber-400 bg-amber-50/50' : 'border-stone-200'
+                                                                                } ${!isSuper ? 'opacity-70 pointer-events-none' : ''}`}>
+                                                                                    <input 
+                                                                                        type="checkbox" 
+                                                                                        className="w-3.5 h-3.5 accent-amber-600 rounded cursor-pointer" 
+                                                                                        checked={(customer.chargeStatusShopIds || []).includes(s.id)} 
+                                                                                        disabled={!isSuper}
+                                                                                        onChange={(e) => {
+                                                                                            const currentIds = customer.chargeStatusShopIds || [];
+                                                                                            const newIds = e.target.checked ? [...currentIds, s.id] : currentIds.filter(id => id !== s.id);
+                                                                                            updateCustomerField(customer, 'chargeStatusShopIds', newIds);
+                                                                                        }} 
+                                                                                    />
+                                                                                    <span className="text-[10px] font-bold text-stone-700 line-clamp-1">{s.name}</span>
+                                                                                </label>
+                                                                            ))}
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
                                                     </td>
                                                 </tr>
                                             ))}
@@ -8886,11 +9085,48 @@
                                             </select>
                                         </div>
                                     </div>
-                                </div>
 
-                                <div className="flex gap-2">
-                                    <button type="button" onClick={() => { setEditCustomerModalOpen(false); setEditCustomerData(null); }} className="flex-1 px-5 py-3 rounded-xl font-semibold text-stone-600 bg-stone-100 hover:bg-stone-200 transition">Cancel</button>
-                                    <button type="submit" className="flex-1 px-5 py-3 rounded-xl font-bold bg-amber-600 text-white hover:bg-amber-700 shadow-md transition">Save Changes</button>
+                                    {/* Edit Modal Branch Scope Options */}
+                                    {editCustomerData.chargeStatus && editCustomerData.chargeStatus !== 'Normal' && (
+                                        <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 shadow-sm animate-fade-in mt-2">
+                                            <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2">Benefit Scope</label>
+                                            <select 
+                                                className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-white text-[14px] font-bold text-stone-700 mb-3 cursor-pointer shadow-sm" 
+                                                value={editCustomerData.chargeStatusScope || 'All'} 
+                                                onChange={e => setEditCustomerData({
+                                                    ...editCustomerData, 
+                                                    chargeStatusScope: e.target.value,
+                                                    chargeStatusShopIds: (e.target.value === 'All' || e.target.value === 'Global') ? [] : (editCustomerData.chargeStatusShopIds || [])
+                                                })}
+                                            >
+                                                <option value="All">Global (Valid at All Branches)</option>
+                                                <option value="Specific">Specific Branches Only</option>
+                                            </select>
+                                            
+                                            {(editCustomerData.chargeStatusScope === 'Specific' || (!['All', 'Global'].includes(editCustomerData.chargeStatusScope))) && (
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-32 overflow-y-auto pr-1 animate-fade-in">
+                                                    {shops.map(s => (
+                                                        <label key={s.id} className={`flex items-center gap-2 p-2 bg-white border rounded-lg transition shadow-sm cursor-pointer hover:border-amber-400 ${
+                                                            (editCustomerData.chargeStatusShopIds || []).includes(s.id) ? 'border-amber-400 bg-amber-50/50' : 'border-stone-200'
+                                                        }`}>
+                                                            <input 
+                                                                type="checkbox" 
+                                                                className="w-4 h-4 accent-amber-600 rounded cursor-pointer" 
+                                                                checked={(editCustomerData.chargeStatusShopIds || []).includes(s.id)} 
+                                                                onChange={(e) => {
+                                                                    const currentIds = editCustomerData.chargeStatusShopIds || [];
+                                                                    const newIds = e.target.checked ? [...currentIds, s.id] : currentIds.filter(id => id !== s.id);
+                                                                    setEditCustomerData({...editCustomerData, chargeStatusShopIds: newIds});
+                                                                }} 
+                                                            />
+                                                            <span className="text-xs font-bold text-stone-700 line-clamp-1">{s.name}</span>
+                                                        </label>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
                                 </div>
                             </form>
                         </div>
@@ -9157,6 +9393,16 @@
                                                 `${order.customerSex === 'F' ? 'Ms. ' : (order.customerSex === 'M' ? 'Mr. ' : '')}${order.customerName}`}
                                             </span>
                                             
+                                            {order.chargeStatus && order.chargeStatus !== 'Normal' && (
+                                                <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider shadow-sm border ml-1 ${
+                                                    order.chargeStatus === 'FOC' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
+                                                    order.chargeStatus === 'COG' ? 'bg-blue-100 text-blue-800 border-blue-300' :
+                                                    'bg-purple-100 text-purple-800 border-purple-300'
+                                                }`}>
+                                                    <i className="fa-solid fa-crown mr-0.5"></i> {order.chargeStatus}
+                                                </span>
+                                            )}
+
                                             {order.customerPhone && order.customerPhone !== 'N/A' && (
                                                 <>
                                                     <span className="text-stone-300">|</span>
