@@ -567,7 +567,9 @@
             const [loadingTables, setLoadingTables] = useState(() => !localStorage.getItem('solaris_tables'));
             
             const isMenuLoading = loadingProducts || loadingCategories;
-            const isSetupLoading = loadingShops || loadingTables;
+            // OPTIMIZATION: Removed loadingTables from blocking the main setup phase.
+            // Customers don't need to wait for tables to download just to view the menu.
+            const isSetupLoading = loadingShops; 
 
             useEffect(() => {
                 const hideAddressBar = () => {
@@ -599,13 +601,11 @@
                 return () => unsub();
             }, []);
 
+            // OPTIMIZATION 1: Decouple Public Data Fetching from Auth
+            // Fetch products, categories, and shops immediately, regardless of user login status.
             useEffect(() => {
-                if (!user) return;
                 const { onSnapshot } = window.FirebaseApp;
 
-                // OPTIMIZATION: Deep Equality Check to prevent React from re-rendering the entire 
-                // application twice (once for Firestore local cache, once for server sync).
-                // This eliminates the jitter/lag spike experienced when loading heavy Base64 product lists.
                 const syncToState = (cacheKey, freshData, setState, setLoader) => {
                     const freshStr = JSON.stringify(freshData);
                     if (localStorage.getItem(cacheKey) !== freshStr) {
@@ -616,75 +616,79 @@
                 };
 
                 // PRIORITY 1: Customer Catalog (Fast Paint)
-                // We turn off the loading skeleton the exact millisecond the products arrive.
-                // This guarantees the customer is instantly allowed to browse the menu.
                 const unsubP = onSnapshot(getColRef('products'), snap => {
                     const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
                     syncToState('solaris_products', freshProducts, setProducts, setLoadingProducts);
                 });
                 
-                const unsubC = onSnapshot(getColRef('categories'), snap => {
+                window.FirebaseApp.getDocs(getColRef('categories')).then(snap => {
                     const freshCats = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
                     syncToState('solaris_categories', freshCats, setCategories, setLoadingCategories);
-                });
-                
-                const unsubS = onSnapshot(getColRef('sugar_options'), snap => {
-                    const freshSugar = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
-                    syncToState('solaris_sugar', freshSugar, setSugarOptions, null);
-                });
-                
-                const unsubI = onSnapshot(getColRef('ice_options'), snap => {
-                    const freshIce = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
-                    syncToState('solaris_ice', freshIce, setIceOptions, null);
-                });
-                
-                const unsubT = onSnapshot(getColRef('tables'), snap => {
-                    const freshTables = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    syncToState('solaris_tables', freshTables, setTables, setLoadingTables);
-                });
-                
-                // REDUNDANCY FIX: Do not load heavy staff/kitchen data for customers. 
-                // Only load if the user is actively viewing the admin dashboard.
-                let unsubInv, unsubShifts;
-                if (view === 'admin_dashboard') {
-                    unsubInv = onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                    unsubShifts = onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                }
+                }).catch(e => console.warn("Failed fetching categories", e));
                 
                 const unsubShops = onSnapshot(getColRef('shops'), snap => {
                     const freshShops = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                     syncToState('solaris_shops', freshShops, setShops, setLoadingShops);
                 });
 
-                // PRIORITY 2: Heavy Order History (Background Sync)
-                // This loads silently in the background. The user is never blocked waiting for this.
-                let unsubO;
-                if (view === 'customer') {
-                    // CRITICAL REDUNDANCY FIX: Stop downloading the entire restaurant's daily orders!
-                    // Only download active orders tied to THIS specific device's session.
-                    // This prevents downloading hundreds of other people's orders in the background.
-                    const { query, where } = window.FirebaseApp;
-                    const q = query(getColRef('orders'), where('userId', '==', user.uid));
-                    unsubO = onSnapshot(q, snap => {
-                        setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
+                let unsubT, unsubInv, unsubShifts;
+                
+                const deferTimer = setTimeout(() => {
+                    window.FirebaseApp.getDocs(getColRef('sugar_options')).then(snap => {
+                        const freshSugar = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
+                        syncToState('solaris_sugar', freshSugar, setSugarOptions, null);
+                    }).catch(e => console.warn(e));
+                    
+                    window.FirebaseApp.getDocs(getColRef('ice_options')).then(snap => {
+                        const freshIce = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
+                        syncToState('solaris_ice', freshIce, setIceOptions, null);
+                    }).catch(e => console.warn(e));
+                    
+                    unsubT = onSnapshot(getColRef('tables'), snap => {
+                        const freshTables = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                        syncToState('solaris_tables', freshTables, setTables, setLoadingTables);
                     });
-                } else {
-                    // OPTIMIZATION: The "Read-Heavy" Sinkhole Fix
-                    // Instead of downloading the ENTIRE lifetime history of the cafe on every refresh,
-                    // we strictly limit the live listener to the 200 most recent orders.
-                    const { query, orderBy, limit } = window.FirebaseApp;
-                    const q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
-                    unsubO = onSnapshot(q, snap => {
-                        setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
-                    });
-                }
+                    
+                    if (view === 'admin_dashboard') {
+                        unsubInv = onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                        unsubShifts = onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                    }
+                }, 800);
 
                 return () => { 
-                    unsubP(); unsubC(); unsubS(); unsubI(); unsubT(); 
-                    if(unsubO) unsubO(); 
+                    clearTimeout(deferTimer);
+                    unsubP(); unsubShops(); 
+                    if(unsubT) unsubT(); 
                     if(unsubInv) unsubInv(); 
                     if(unsubShifts) unsubShifts();
-                    unsubShops(); 
+                };
+            }, [view]);
+
+            // OPTIMIZATION 1.5: Private Data Fetching (Orders)
+            useEffect(() => {
+                if (!user) return;
+                const { onSnapshot } = window.FirebaseApp;
+                let unsubO;
+
+                const deferTimer = setTimeout(() => {
+                    if (view === 'customer') {
+                        const { query, where } = window.FirebaseApp;
+                        const q = query(getColRef('orders'), where('userId', '==', user.uid));
+                        unsubO = onSnapshot(q, snap => {
+                            setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
+                        });
+                    } else {
+                        const { query, orderBy, limit } = window.FirebaseApp;
+                        const q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
+                        unsubO = onSnapshot(q, snap => {
+                            setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
+                        });
+                    }
+                }, 800);
+
+                return () => { 
+                    clearTimeout(deferTimer);
+                    if(unsubO) unsubO(); 
                 };
             }, [user, view]);
 
@@ -1836,41 +1840,49 @@
                 localStorage.setItem('solaris_session', JSON.stringify(sessionInfo));
             }, [sessionInfo]);
 
-            // FETCH GLOBAL POINTS CONFIG & SPECIAL EVENTS
+            // OPTIMIZATION 2: CONSOLIDATED LOYALTY & SPECIAL EVENTS FETCH
+            // This prevents duplicate re-renders and network requests by merging the 
+            // points config, dynamic badges, and special events listeners.
             useEffect(() => {
+                const targetId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
+                if (!targetId) return;
+
                 const { doc, onSnapshot, getDoc } = window.FirebaseApp;
                 
-                let unsubPoints = () => {};
-                const targetId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null);
+                let unsubLoyalty = () => {};
+                let unsubEvents = () => {};
                 
-                const loadPoints = async () => {
-                    if (targetId) {
-                        unsubPoints = onSnapshot(doc(db, 'loyalty_settings', targetId), async snap => {
-                            if (snap.exists() && snap.data().pointsConfig && snap.data().pointsConfig.pointsEnabled !== undefined) {
-                                setGlobalPoints(snap.data().pointsConfig);
+                // Defer heavy background configuration fetches by 1.5 seconds.
+                const deferTimer = setTimeout(() => {
+                    unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetId), async snap => {
+                        if (snap.exists()) {
+                            const data = snap.data();
+                            setBranchLoyalty(data); // Replaces the duplicate Dynamic Badges fetch
+                            
+                            if (data.pointsConfig && data.pointsConfig.pointsEnabled !== undefined) {
+                                setGlobalPoints(data.pointsConfig);
                             } else {
                                 const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
                                 if (gSnap.exists()) setGlobalPoints(gSnap.data());
                             }
-                        }, e => console.warn(e));
-                    } else {
-                        unsubPoints = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
-                            if (snap.exists()) setGlobalPoints(snap.data());
-                        }, e => console.warn(e));
-                    }
-                };
-                
-                loadPoints();
-                
-                const unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
-                    if (snap.exists()) setSpecialEvents(snap.data().events || []);
-                }, e => console.warn("Failed to load special events", e));
+                        } else {
+                            setBranchLoyalty(null);
+                            const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
+                            if (gSnap.exists()) setGlobalPoints(gSnap.data());
+                        }
+                    }, e => console.warn("Failed fetching loyalty data", e));
+                    
+                    unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
+                        if (snap.exists()) setSpecialEvents(snap.data().events || []);
+                    }, e => console.warn("Failed to load special events", e));
+                }, 1500);
                 
                 return () => {
-                    unsubPoints();
+                    clearTimeout(deferTimer);
+                    unsubLoyalty();
                     unsubEvents();
                 };
-            }, [sessionInfo.shopId, detectedShop]);
+            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops]);
 
             // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
             useEffect(() => {
@@ -1890,11 +1902,13 @@
                 return () => unsub();
             }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
 
-            // SMART GPS DETECTION ON MOUNT (Continuous Live Tracking)
+            // OPTIMIZATION 3: DEFERRED GPS TRACKING
+            // Delay the GPS location request so it doesn't block the UI thread during the initial menu render.
             useEffect(() => {
                 if (isSetupLoading || shops.length === 0) return;
 
                 let watchId;
+                let startTimer;
 
                 const startLiveTracking = () => {
                     if (!sessionInfo.isSetup && !detectedShop) {
@@ -1908,8 +1922,6 @@
                         return;
                     }
 
-                    // Critically Evaluated: watchPosition natively updates approx. every second 
-                    // and efficiently shuts down when the component unmounts.
                     watchId = navigator.geolocation.watchPosition(
                         (position) => {
                             const userLat = position.coords.latitude;
@@ -1976,22 +1988,24 @@
                     );
                 };
 
-                // Try silently first if permissions API is supported, otherwise run fallback
-                if (navigator.permissions && navigator.permissions.query) {
-                    navigator.permissions.query({ name: 'geolocation' }).then((result) => {
-                        if (result.state === 'granted' || result.state === 'prompt') {
-                            startLiveTracking();
-                        } else {
-                            if (!sessionInfo.isSetup && !detectedShop) {
-                                setNearestShopInfo({ shop: null, distance: null, status: 'denied' });
+                startTimer = setTimeout(() => {
+                    if (navigator.permissions && navigator.permissions.query) {
+                        navigator.permissions.query({ name: 'geolocation' }).then((result) => {
+                            if (result.state === 'granted' || result.state === 'prompt') {
+                                startLiveTracking();
+                            } else {
+                                if (!sessionInfo.isSetup && !detectedShop) {
+                                    setNearestShopInfo({ shop: null, distance: null, status: 'denied' });
+                                }
                             }
-                        }
-                    }).catch(() => startLiveTracking());
-                } else {
-                    startLiveTracking();
-                }
+                        }).catch(() => startLiveTracking());
+                    } else {
+                        startLiveTracking();
+                    }
+                }, 1500); // 1.5 second delay to let the initial layout breathe
 
                 return () => {
+                    clearTimeout(startTimer);
                     if (watchId !== undefined && navigator.geolocation) {
                         navigator.geolocation.clearWatch(watchId);
                     }
@@ -2168,26 +2182,7 @@
                 }
             }, [qrDetectedTable, sessionInfo.isSetup, qrError]);
 
-            // FETCH DYNAMIC BADGES: Active Promos
-            useEffect(() => {
-                // IMPROVEMENT: Strict fallback hierarchy ensures badges display instantly even before GPS lock or Session Login
-                const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
-                if (!targetShopId) return;
-
-                const { doc, onSnapshot } = window.FirebaseApp;
-
-                const unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetShopId), snapLoyalty => {
-                    if (snapLoyalty.exists()) {
-                        setBranchLoyalty(snapLoyalty.data());
-                    } else {
-                        setBranchLoyalty(null);
-                    }
-                }, e => console.warn("Failed fetching dynamic badge data", e));
-
-                return () => {
-                    unsubLoyalty();
-                };
-            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops]);
+            // Dynamic Badges fetch consolidated with Global Points fetch above
 
             if (qrError) {
                 return (
