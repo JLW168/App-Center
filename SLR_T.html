@@ -1750,8 +1750,17 @@
             const [nearestShopInfo, setNearestShopInfo] = useState({ shop: null, distance: null, status: 'idle' });
             const [userLocation, setUserLocation] = useState(null);
 
-            const [globalPoints, setGlobalPoints] = useState(null);
-            const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
+            // OPTIMIZATION: Instant Cache Hydration for Loyalty & Promos to eliminate the 1.5s Layout Shift on load
+            const [globalPoints, setGlobalPoints] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('solaris_cust_global_pts')) || null; } catch(e) { return null; }
+            });
+            const [specialEvents, setSpecialEvents] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('solaris_cust_events')) || []; } catch(e) { return []; }
+            });
+            const [branchLoyalty, setBranchLoyalty] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('solaris_cust_loyalty')) || null; } catch(e) { return null; }
+            });
+            
             const [customerLoyalty, setCustomerLoyalty] = useState({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
 
             // NEW: Fetch Secure Customer Profile for VIP Tiering in Customer Portal
@@ -1769,9 +1778,6 @@
                 });
                 return () => unsub();
             }, [sessionInfo.customerPhone, sessionInfo.isSetup]);
-
-            // DYNAMIC BADGES STATE
-            const [branchLoyalty, setBranchLoyalty] = useState(null);
 
             // NEW: Prevent Mobile Background Scrolling when Modals are open
             useEffect(() => {
@@ -1872,30 +1878,41 @@
                 let unsubLoyalty = () => {};
                 let unsubEvents = () => {};
                 
-                // Defer heavy background configuration fetches by 1.5 seconds.
+                // OPTIMIZATION: Reduced defer timer from 1500ms to 100ms because cache hydration already painted the UI.
                 const deferTimer = setTimeout(() => {
                     unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetId), async snap => {
                         if (snap.exists()) {
                             const data = snap.data();
-                            setBranchLoyalty(data); // Replaces the duplicate Dynamic Badges fetch
+                            setBranchLoyalty(data);
+                            localStorage.setItem('solaris_cust_loyalty', JSON.stringify(data));
                             
                             if (data.pointsConfig && data.pointsConfig.pointsEnabled !== undefined) {
                                 setGlobalPoints(data.pointsConfig);
+                                localStorage.setItem('solaris_cust_global_pts', JSON.stringify(data.pointsConfig));
                             } else {
                                 const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
-                                if (gSnap.exists()) setGlobalPoints(gSnap.data());
+                                if (gSnap.exists()) {
+                                    setGlobalPoints(gSnap.data());
+                                    localStorage.setItem('solaris_cust_global_pts', JSON.stringify(gSnap.data()));
+                                }
                             }
                         } else {
                             setBranchLoyalty(null);
                             const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
-                            if (gSnap.exists()) setGlobalPoints(gSnap.data());
+                            if (gSnap.exists()) {
+                                setGlobalPoints(gSnap.data());
+                                localStorage.setItem('solaris_cust_global_pts', JSON.stringify(gSnap.data()));
+                            }
                         }
                     }, e => console.warn("Failed fetching loyalty data", e));
                     
                     unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
-                        if (snap.exists()) setSpecialEvents(snap.data().events || []);
+                        if (snap.exists()) {
+                            setSpecialEvents(snap.data().events || []);
+                            localStorage.setItem('solaris_cust_events', JSON.stringify(snap.data().events || []));
+                        }
                     }, e => console.warn("Failed to load special events", e));
-                }, 1500);
+                }, 100);
                 
                 return () => {
                     clearTimeout(deferTimer);
@@ -2257,37 +2274,54 @@
                 };
             }, [myUnifiedOrders]);
 
-            const filteredProducts = useMemo(() => {
-                const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once outside the loop
-                // IMPROVEMENT: Match the exact same fallback hierarchy as the dynamic badges
+            // OPTIMIZATION: Pre-calculate complex business rules (Promos, New Items, Store Availability) ONCE.
+            // This decouples heavy date/array operations from the keystroke text search.
+            const sortedCatalog = useMemo(() => {
                 const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
-                
-                // Pre-calculate active promotions for fast sorting
                 const todayStr = getTodayString();
-                const activePromos = (branchLoyalty?.promotions || []).filter(p => {
-                    if (!p.isActive) return false;
-                    if (p.startDate && p.startDate > todayStr) return false;
-                    if (p.endDate && p.endDate < todayStr) return false;
+                
+                const activePromos = (branchLoyalty?.promotions || []).filter(p => p.isActive && (!p.startDate || p.startDate <= todayStr) && (!p.endDate || p.endDate >= todayStr));
+
+                const todayDate = new Date();
+                todayDate.setHours(0,0,0,0);
+                
+                const validProducts = products.filter(p => {
+                    if (p.isAvailable === false || p.visibilityMode === 'Hidden') return false;
+                    if (p.visibilityMode === 'Specific' && (!targetShopId || !p.availableShopIds?.includes(targetShopId))) return false;
                     return true;
                 });
 
-                // Pre-calculate New Products for fast sorting
-                const todayDate = new Date();
-                todayDate.setHours(0,0,0,0);
-                const newProductIds = new Set();
-                products.forEach(p => {
+                return validProducts.map(p => {
+                    const activePromo = activePromos.find(promo => !promo.applicableProductIds || promo.applicableProductIds.length === 0 || promo.applicableProductIds.includes(p.id));
+                    
+                    let isNew = false;
                     if (p.isNewProduct && p.newProductEffectiveDate && p.newProductDuration) {
                         const effectiveDate = new Date(p.newProductEffectiveDate);
                         const expiryDate = new Date(effectiveDate);
                         expiryDate.setDate(expiryDate.getDate() + p.newProductDuration);
-                        if (todayDate >= effectiveDate && todayDate <= expiryDate) {
-                            newProductIds.add(p.id);
-                        }
+                        if (todayDate >= effectiveDate && todayDate <= expiryDate) isNew = true;
                     }
+                    
+                    return { ...p, activePromo, isNew };
+                }).sort((a, b) => {
+                    if (a.activePromo && !b.activePromo) return -1;
+                    if (!a.activePromo && b.activePromo) return 1;
+                    if (a.isNew && !b.isNew) return -1;
+                    if (!a.isNew && b.isNew) return 1;
+                    
+                    const aCatOrder = categories.find(c => c.name === a.category)?.order ?? 999;
+                    const bCatOrder = categories.find(c => c.name === b.category)?.order ?? 999;
+                    if (aCatOrder !== bCatOrder) return aCatOrder - bCatOrder;
+                    
+                    return (a.name || '').localeCompare(b.name || '');
                 });
+            }, [products, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, branchLoyalty, categories]);
+
+            // OPTIMIZATION: Lightning-fast text search filter based on the pre-sorted catalog
+            const filteredProducts = useMemo(() => {
+                const searchLower = (searchQuery || '').toLowerCase();
                 
-                return products.filter(p => {
-                    // CRASH FIX: Added safe fallbacks to prevent undefined.toLowerCase() errors
+                return sortedCatalog.filter(p => {
                     const safeName = p.name || '';
                     const safeCode = p.productCode || '';
                     const safeBarcodeS = p.barcodeSmall || '';
@@ -2300,39 +2334,9 @@
                                           
                     const matchesCategory = activeCategory === 'All' || p.category === activeCategory;
                     
-                    if (!matchesSearch || !matchesCategory) return false;
-                    
-                    // Phase 3: Smart Storefront Logic (Customer Portal)
-                    if (p.isAvailable === false || p.visibilityMode === 'Hidden') return false;
-                    
-                    if (p.visibilityMode === 'Specific') {
-                        // Strict filter: Match the dynamically resolved targetShopId
-                        if (!targetShopId || !p.availableShopIds || !p.availableShopIds.includes(targetShopId)) {
-                            return false;
-                        }
-                    }
-                    return true;
-                }).sort((a, b) => {
-                    // 1. Priority: Promotion Active
-                    const checkPromo = (p) => activePromos.some(promo => !promo.applicableProductIds || promo.applicableProductIds.length === 0 || promo.applicableProductIds.includes(p.id));
-                    const aPromo = checkPromo(a) ? 1 : 0;
-                    const bPromo = checkPromo(b) ? 1 : 0;
-                    if (aPromo !== bPromo) return bPromo - aPromo;
-
-                    // 2. Priority: New Product
-                    const aNew = newProductIds.has(a.id) ? 1 : 0;
-                    const bNew = newProductIds.has(b.id) ? 1 : 0;
-                    if (aNew !== bNew) return bNew - aNew;
-
-                    // 3. Priority: Category Order Number
-                    const aCatOrder = categories.find(c => c.name === a.category)?.order ?? 999;
-                    const bCatOrder = categories.find(c => c.name === b.category)?.order ?? 999;
-                    if (aCatOrder !== bCatOrder) return aCatOrder - bCatOrder;
-
-                    // 4. Fallback: Alphabetical
-                    return (a.name || '').localeCompare(b.name || '');
+                    return matchesSearch && matchesCategory;
                 });
-            }, [products, searchQuery, activeCategory, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, branchLoyalty, categories]);
+            }, [sortedCatalog, searchQuery, activeCategory]);
 
             const handleSizeClick = (product, size, price) => {
                 if (!sessionInfo.isSetup) {
@@ -3092,32 +3096,22 @@
                             ) : filteredProducts.length > 0 ? (
                                 filteredProducts.map(product => {
                                     const badges = [];
-                                    if (branchLoyalty && branchLoyalty.promotions) {
-                                        const todayStr = getTodayString();
-                                        const activePromos = branchLoyalty.promotions.filter(p => {
-                                            if (!p.isActive) return false;
-                                            if (p.startDate && p.startDate > todayStr) return false;
-                                            if (p.endDate && p.endDate < todayStr) return false;
-                                            return true;
-                                        });
-                                        const activePromo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(product.id));
-                                        if (activePromo) {
-                                            badges.push(<div key="promo" className="bg-red-600 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-red-500 animate-bounce flex items-center gap-1 max-w-[120px]" title={activePromo.name}><i className="fa-solid fa-tag shrink-0"></i> <span className="truncate">{activePromo.name || 'Promo'}</span></div>);
-                                        }
+                                    
+                                    // OPTIMIZATION: Render badges instantly using pre-calculated catalog properties
+                                    if (product.activePromo) {
+                                        badges.push(
+                                            <div key="promo" className="bg-red-600 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-red-500 animate-bounce flex items-center gap-1 max-w-[120px]" title={product.activePromo.name}>
+                                                <i className="fa-solid fa-tag shrink-0"></i> <span className="truncate">{product.activePromo.name || 'Promo'}</span>
+                                            </div>
+                                        );
                                     }
                                     
-                                    // New Product Advertising Logic
-                                    if (product.isNewProduct && product.newProductEffectiveDate && product.newProductDuration) {
-                                        const effectiveDate = new Date(product.newProductEffectiveDate);
-                                        const expiryDate = new Date(effectiveDate);
-                                        expiryDate.setDate(expiryDate.getDate() + product.newProductDuration);
-                                        
-                                        const todayDate = new Date();
-                                        todayDate.setHours(0,0,0,0);
-                                        
-                                        if (todayDate >= effectiveDate && todayDate <= expiryDate) {
-                                            badges.push(<div key="new" className="bg-indigo-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-indigo-400 animate-pulse flex items-center gap-1"><i className="fa-solid fa-sparkles"></i> New</div>);
-                                        }
+                                    if (product.isNew) {
+                                        badges.push(
+                                            <div key="new" className="bg-indigo-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-indigo-400 animate-pulse flex items-center gap-1">
+                                                <i className="fa-solid fa-sparkles"></i> New
+                                            </div>
+                                        );
                                     }
 
                                     return (
