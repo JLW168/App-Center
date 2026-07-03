@@ -672,11 +672,9 @@
 
                 const deferTimer = setTimeout(() => {
                     if (view === 'customer') {
-                        const { query, where } = window.FirebaseApp;
-                        const q = query(getColRef('orders'), where('userId', '==', user.uid));
-                        unsubO = onSnapshot(q, snap => {
-                            setOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt));
-                        });
+                        // OPTIMIZATION: CustomerPortal handles its own hyper-targeted queries.
+                        // No need to download global orders here.
+                        setOrders([]);
                     } else {
                         const { query, orderBy, limit } = window.FirebaseApp;
                         const q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
@@ -1740,8 +1738,10 @@
             const [submittedOrder, setSubmittedOrder] = useState(null);
             
             const [selectedItemForOptions, setSelectedItemForOptions] = useState(null);
-            const [customerHistory, setCustomerHistory] = useState([]);
             const [forbiddenError, setForbiddenError] = useState(null);
+            
+            // OPTIMIZATION: Unified Orders State to prevent redundant queries
+            const [myUnifiedOrders, setMyUnifiedOrders] = useState([]);
             
             // NATIVE FEEL: Detect network drops instantly
             const [isOffline, setIsOffline] = useState(!navigator.onLine);
@@ -1948,8 +1948,14 @@
                             const userLng = position.coords.longitude;
                             const userPoint = { lat: userLat, lng: userLng };
                             
-                            // ALWAYS update user location to ensure live validation logic works for returning sessions
-                            setUserLocation(userPoint);
+                            // OPTIMIZATION: Throttle location updates to prevent micro-renders.
+                            // Only trigger a React re-render if the user moves more than 10 meters.
+                            setUserLocation(prev => {
+                                if (prev && calculateDistance(prev.lat, prev.lng, userPoint.lat, userPoint.lng) < 10) {
+                                    return prev;
+                                }
+                                return userPoint;
+                            });
 
                             if (!sessionInfo.isSetup && !detectedShop) {
                                 let foundTerritoryShop = null;
@@ -2132,37 +2138,53 @@
                 return { icon: 'fa-star', color: 'text-stone-600', bg: 'bg-stone-200' };
             };
 
-            // Effect to query past orders based on phone search independently of global orders sync
+            // OPTIMIZATION: Unified Data Fetching Engine
+            // Combines Loyalty, Order History, and Live Tracking into a single smart listener to eliminate redundant queries
             useEffect(() => {
-                let unsub = null; // Store unsubscribe function for the live listener
-
-                const fetchHistory = () => {
-                    const cleanedQuery = String(phoneSearchQuery).replace(/\D/g, '');
-                    if (!cleanedQuery || cleanedQuery.length < 8) {
-                        setCustomerHistory([]);
-                        return;
-                    }
-                    try {
-                        const { query, where, onSnapshot } = window.FirebaseApp; 
-                        const q = query(getColRef('orders'), where('customerPhone', '==', phoneSearchQuery));
-                        
-                        // Live Sync: Automatically update customer history when KDS staff changes status
-                        unsub = onSnapshot(q, snap => {
-                            const history = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt);
-                            setCustomerHistory(history);
-                        });
-                    } catch (err) {
-                        console.warn("History fetch failed:", err);
-                    }
-                };
-
-                const timeoutId = setTimeout(fetchHistory, 600);
+                const phonesToWatch = new Set();
+                const cleanSessionPhone = String(sessionInfo.customerPhone || '').replace(/\D/g, '');
+                const cleanSearchPhone = String(phoneSearchQuery || '').replace(/\D/g, '');
                 
+                if (cleanSessionPhone.length >= 8) phonesToWatch.add(cleanSessionPhone);
+                if (cleanSearchPhone.length >= 8) phonesToWatch.add(cleanSearchPhone);
+
+                if (phonesToWatch.size === 0) {
+                    setMyUnifiedOrders([]);
+                    return;
+                }
+
+                const unsubs = [];
+                const ordersMap = new Map();
+                const { query, where, onSnapshot } = window.FirebaseApp;
+
+                // Defer to prevent blocking the main thread during render
+                const timeoutId = setTimeout(() => {
+                    phonesToWatch.forEach(phoneRaw => {
+                        const targetPhone = formatPhoneNumber(phoneRaw);
+                        const q = query(getColRef('orders'), where('customerPhone', '==', targetPhone));
+                        
+                        const unsub = onSnapshot(q, snap => {
+                            snap.docs.forEach(d => ordersMap.set(d.id, { id: d.id, ...d.data() }));
+                            setMyUnifiedOrders(Array.from(ordersMap.values()).sort((a,b) => b.createdAt - a.createdAt));
+                        });
+                        unsubs.push(unsub);
+                    });
+                }, 300);
+
                 return () => {
                     clearTimeout(timeoutId);
-                    if (unsub) unsub(); // Detach live listener to prevent memory leaks
+                    unsubs.forEach(fn => fn());
                 };
-            }, [phoneSearchQuery]);
+            }, [sessionInfo.customerPhone, phoneSearchQuery]);
+
+            // Calculate Customer Loyalty from the Unified Engine
+            useEffect(() => {
+                if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
+                const formattedPhone = formatPhoneNumber(sessionInfo.customerPhone);
+                const customerOrders = myUnifiedOrders.filter(o => o.customerPhone === formattedPhone);
+                const loyaltyData = calculateCustomerLoyalty(customerOrders, formattedPhone, globalPoints);
+                setCustomerLoyalty(loyaltyData);
+            }, [myUnifiedOrders, sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
 
             // Effect to monitor session timeout
             useEffect(() => {
@@ -2218,40 +2240,22 @@
             }
 
             const { myActiveOrders, myPastOrders } = useMemo(() => {
-                const activeMap = new Map();
-                const pastMap = new Map();
+                const active = [];
+                const past = [];
                 
-                const processOrder = (o) => {
+                myUnifiedOrders.forEach(o => {
                     if (['Served', 'Cancelled'].includes(o.status)) {
-                        pastMap.set(o.id, o);
+                        past.push(o);
                     } else {
-                        activeMap.set(o.id, o);
+                        active.push(o);
                     }
-                };
-
-                // 1. Process local (today's/active) orders tied to current UID
-                orders.forEach(o => {
-                    const isMyAuth = currentUser && o.userId === currentUser.uid;
-                    const cleanedSearchQuery = String(phoneSearchQuery).replace(/\D/g, '');
-                    const isMyPhone = cleanedSearchQuery && o.customerPhone && String(o.customerPhone).replace(/\D/g, '') === cleanedSearchQuery;
-                    
-                    if (isMyAuth || isMyPhone) {
-                        processOrder(o);
-                    }
-                });
-                
-                // 2. Process Live History from Phone Search
-                // Because customerHistory is driven by onSnapshot, whenever KDS updates an order,
-                // customerHistory updates -> this useMemo re-runs -> UI updates instantly.
-                customerHistory.forEach(o => {
-                     processOrder(o);
                 });
                 
                 return {
-                    myActiveOrders: Array.from(activeMap.values()).sort((a, b) => b.createdAt - a.createdAt),
-                    myPastOrders: Array.from(pastMap.values()).sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
+                    myActiveOrders: active.sort((a, b) => b.createdAt - a.createdAt),
+                    myPastOrders: past.sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
                 };
-            }, [orders, currentUser, phoneSearchQuery, customerHistory]);
+            }, [myUnifiedOrders]);
 
             const filteredProducts = useMemo(() => {
                 const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once outside the loop
@@ -2524,7 +2528,7 @@
                         
                         // OPTIMISTIC UPDATE: Fix stuck button issue for phone-searched orders
                         // Instantly updates the local history state so the button disappears and moves to Past Orders
-                        setCustomerHistory(prev => prev.map(o => 
+                        setMyUnifiedOrders(prev => prev.map(o => 
                             o.id === order.id ? { ...o, status: 'Cancelled', cancelReason: 'Cancelled by customer', completedAt: Date.now() } : o
                         ));
 
@@ -2534,7 +2538,7 @@
                             completedAt: Date.now()
                         });
                         
-                        await releaseTableIfNotUsed(order.tableId, order.id, orders);
+                        await releaseTableIfNotUsed(order.tableId, order.id, myUnifiedOrders);
                         
                         setCustomMessage('Order cancelled successfully.');
                         if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
