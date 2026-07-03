@@ -358,7 +358,7 @@
             }
         };
 
-        const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig) => {
+        const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig, refilledPoints = 0) => {
             if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null };
 
             const validOrders = customerOrders.filter(o => o.customerPhone === phone && o.status !== 'Cancelled').sort((a, b) => a.createdAt - b.createdAt);
@@ -366,6 +366,16 @@
             
             // FIFO Queue Engine for Points Expiration
             const pointBatches = [];
+            
+            // Add manually refilled points as a non-expiring base batch
+            if (refilledPoints > 0) {
+                pointBatches.push({
+                    points: refilledPoints,
+                    earnedAt: 0,
+                    expiresAt: null
+                });
+            }
+            
             validOrders.forEach(o => {
                 const earned = Math.floor(o.totalAmount / (globalPointsConfig.spendAmount || 4000)) * (globalPointsConfig.pointsEarned || 1);
                 if (earned > 0) {
@@ -1933,11 +1943,11 @@
                     const customerOrders = [];
                     snap.forEach(d => customerOrders.push({ id: d.id, ...d.data() }));
                     
-                    const loyaltyData = calculateCustomerLoyalty(customerOrders, sessionInfo.customerPhone, globalPoints);
+                    const loyaltyData = calculateCustomerLoyalty(customerOrders, sessionInfo.customerPhone, globalPoints, customerProfile?.refilledPoints || 0);
                     setCustomerLoyalty(loyaltyData);
                 });
                 return () => unsub();
-            }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
+            }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints, customerProfile]);
 
             // OPTIMIZATION 3: DEFERRED GPS TRACKING
             // Delay the GPS location request so it doesn't block the UI thread during the initial menu render.
@@ -2199,9 +2209,9 @@
                 if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
                 const formattedPhone = formatPhoneNumber(sessionInfo.customerPhone);
                 const customerOrders = myUnifiedOrders.filter(o => o.customerPhone === formattedPhone);
-                const loyaltyData = calculateCustomerLoyalty(customerOrders, formattedPhone, globalPoints);
+                const loyaltyData = calculateCustomerLoyalty(customerOrders, formattedPhone, globalPoints, customerProfile?.refilledPoints || 0);
                 setCustomerLoyalty(loyaltyData);
-            }, [myUnifiedOrders, sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
+            }, [myUnifiedOrders, sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints, customerProfile]);
 
             // Effect to monitor session timeout
             useEffect(() => {
@@ -6456,8 +6466,8 @@
 
             const customerLoyalty = useMemo(() => {
                 if (!customerPhone || !globalPoints?.pointsEnabled) return null;
-                return calculateCustomerLoyalty(orders, customerPhone, globalPoints);
-            }, [orders, customerPhone, globalPoints]);
+                return calculateCustomerLoyalty(orders, customerPhone, globalPoints, customerData?.refilledPoints || 0);
+            }, [orders, customerPhone, globalPoints, customerData]);
 
             useEffect(() => {
                 const checkPhone = async () => {
@@ -9692,6 +9702,10 @@
             const [confirmAction, setConfirmAction] = useState(null);
             const [customerError, setCustomerError] = useState('');
 
+            // --- NEW: Refill Points States ---
+            const [refillModalOpen, setRefillModalOpen] = useState(false);
+            const [refillData, setRefillData] = useState(null);
+
             // --- NEW: Bulk Import/Export States ---
             const [isImporting, setIsImporting] = useState(false);
 
@@ -9809,6 +9823,7 @@
                         name: c.name || 'Unknown',
                         sex: c.sex || 'M',
                         pin: c.pin || null,
+                        refilledPoints: c.refilledPoints || 0,
                         status: c.status || 'Active',
                         customerType: c.customerType || 'Normal',
                         chargeStatus: c.chargeStatus || 'Normal',
@@ -9834,6 +9849,7 @@
                             name: o.customerName || 'Unknown',
                             sex: o.customerSex || 'M',
                             pin: null,
+                            refilledPoints: 0,
                             status: 'Active',
                             customerType: 'Normal',
                             chargeStatus: 'Normal',
@@ -9982,6 +9998,44 @@
                 link.href = URL.createObjectURL(blob);
                 link.download = `customer_import_template.csv`;
                 link.click();
+            };
+
+            const openRefillModal = (customer, activePts) => {
+                if (!customer.id) {
+                     setCustomerError("Cannot refill points. This customer does not have a registered profile yet. Please click 'Edit' in the directory to initialize their profile.");
+                     setTimeout(() => setCustomerError(''), 4000);
+                     return;
+                }
+                setRefillData({
+                    id: customer.id,
+                    name: customer.name,
+                    phone: customer.phone,
+                    currentPts: activePts,
+                    amountToAdd: ''
+                });
+                setRefillModalOpen(true);
+            };
+
+            const handleRefillPoints = async (e) => {
+                e.preventDefault();
+                const { doc, updateDoc, increment } = window.FirebaseApp;
+                const amount = Number(refillData.amountToAdd);
+                if (!amount || amount <= 0) return;
+                
+                try {
+                    await updateDoc(doc(db, 'customers', refillData.id), {
+                        refilledPoints: increment(amount),
+                        updatedAt: Date.now()
+                    });
+                    
+                    setRefillModalOpen(false);
+                    setRefillData(null);
+                    setCustomerError('Points successfully added to customer profile!');
+                    setTimeout(() => setCustomerError(''), 3000);
+                } catch(err) {
+                    setCustomerError('Failed to refill points: ' + err.message);
+                    setTimeout(() => setCustomerError(''), 3000);
+                }
             };
 
             const handleFileUpload = async (e) => {
@@ -10268,7 +10322,8 @@
                                             <tbody>
                                                 {customersData.map((c, idx) => {
                                                     const earnedPts = Math.floor(c.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
-                                                    const activePts = Math.max(0, earnedPts - c.totalRedeemed);
+                                                    const totalEarnedAndRefilled = earnedPts + (c.refilledPoints || 0);
+                                                    const activePts = Math.max(0, totalEarnedAndRefilled - c.totalRedeemed);
                                                     const redeemPtsReq = globalPoints.redeemPoints || 10;
                                                     const freeItems = Math.floor(activePts / redeemPtsReq);
                                                     
@@ -10297,7 +10352,10 @@
                                                             </td>
                                                             <td className="p-3 border border-stone-300 font-black text-amber-600 text-base">
                                                                 {activePts} Pts
-                                                                <span className="text-[10px] font-medium text-stone-400 block tracking-normal mt-0.5">Earned: {earnedPts} | Used: {c.totalRedeemed}</span>
+                                                                <span className="text-[10px] font-medium text-stone-400 block tracking-normal mt-0.5">Earned: {earnedPts} | Refilled: {c.refilledPoints || 0} | Used: {c.totalRedeemed}</span>
+                                                                {isSuper && (
+                                                                    <button onClick={() => openRefillModal(c, activePts)} className="mt-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 text-[10px] px-2 py-1 rounded border border-amber-200 transition shadow-sm active:scale-95"><i className="fa-solid fa-plus mr-1"></i> Refill Points</button>
+                                                                )}
                                                             </td>
                                                             <td className="p-3 border border-stone-300 font-black text-rose-600 text-base">
                                                                 {freeItems > 0 ? <><i className="fa-solid fa-gift mr-1"></i> {freeItems}</> : <span className="text-stone-400 font-medium text-sm">0</span>}
@@ -10590,6 +10648,42 @@
                                     >
                                         {editCustomerData.id ? 'Update Info' : 'Create Profile'}
                                     </button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {/* Refill Points Modal */}
+                    {refillModalOpen && refillData && (
+                        <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+                            <form onSubmit={handleRefillPoints} className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl animate-fade-in relative">
+                                <button type="button" onClick={() => setRefillModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700 w-8 h-8 flex items-center justify-center bg-stone-100 hover:bg-stone-200 rounded-full transition"><i className="fa-solid fa-xmark"></i></button>
+                                
+                                <div className="text-center mb-6">
+                                    <div className="w-16 h-16 bg-amber-100 text-amber-600 rounded-full flex items-center justify-center mx-auto mb-3 shadow-inner">
+                                        <i className="fa-solid fa-coins text-2xl"></i>
+                                    </div>
+                                    <h2 className="text-2xl font-black text-stone-900 mb-1">Refill Points</h2>
+                                    <p className="text-stone-500 text-sm font-medium">For {refillData.name} ({refillData.phone})</p>
+                                </div>
+
+                                <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 mb-6 flex justify-between items-center shadow-sm">
+                                    <span className="text-xs font-bold text-stone-500 uppercase tracking-wider">Current Points</span>
+                                    <span className="font-black text-amber-600 text-xl">{refillData.currentPts} Pts</span>
+                                </div>
+
+                                <div className="mb-6">
+                                    <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 ml-1">Points to Inject *</label>
+                                    <div className="relative">
+                                        <i className="fa-solid fa-plus absolute left-4 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                                        <input type="number" min="1" required placeholder="e.g. 50" className="w-full border border-stone-300 rounded-xl pl-11 pr-4 py-3 outline-none focus:border-amber-600 bg-stone-50 focus:bg-white text-lg font-black text-stone-800 transition-colors shadow-sm" value={refillData.amountToAdd} onChange={e => setRefillData({...refillData, amountToAdd: e.target.value})} autoFocus />
+                                    </div>
+                                    <p className="text-xs text-stone-400 mt-2 font-medium"><i className="fa-solid fa-shield-halved mr-1 text-amber-500"></i> Utilizes atomic increments to prevent database collision.</p>
+                                </div>
+
+                                <div className="flex gap-2">
+                                    <button type="button" onClick={() => setRefillModalOpen(false)} className="flex-1 px-5 py-3 rounded-xl font-semibold text-stone-600 bg-stone-100 hover:bg-stone-200 transition">Cancel</button>
+                                    <button type="submit" className="flex-1 px-5 py-3 rounded-xl font-bold bg-amber-600 text-white hover:bg-amber-700 shadow-md transition">Confirm Refill</button>
                                 </div>
                             </form>
                         </div>
