@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1689,18 +1690,10 @@
 
         // ==========================================
         //         CUSTOMER PORTAL MAIN
+        // ==========================================
         function CustomerPortal({ products, categories, tables, orders, shops, currentUser, isMenuLoading, isSetupLoading, sugarOptions, iceOptions, onAdminClick }) {
             const [activeCategory, setActiveCategory] = useState('All');
-            const [searchInput, setSearchInput] = useState(''); // NEW: Fast state for keyboard input
-            const [searchQuery, setSearchQuery] = useState(''); // ORIGINAL: Debounced state for heavy filtering
-            
-            // NEW: Debounce Search to prevent keyboard lag on low-end mobile devices
-            useEffect(() => {
-                const timer = setTimeout(() => {
-                    setSearchQuery(searchInput);
-                }, 300); // Wait 300ms after the user stops typing before filtering
-                return () => clearTimeout(timer);
-            }, [searchInput]);
+            const [searchQuery, setSearchQuery] = useState('');
             
             // REDUNDANCY FIX: Lazy load sessionInfo FIRST so we can use it to determine the shop's session duration
             const [sessionInfo, setSessionInfo] = useState(() => {
@@ -1757,10 +1750,8 @@
             const [submittedOrder, setSubmittedOrder] = useState(null);
             
             const [selectedItemForOptions, setSelectedItemForOptions] = useState(null);
+            const [customerHistory, setCustomerHistory] = useState([]);
             const [forbiddenError, setForbiddenError] = useState(null);
-            
-            // OPTIMIZATION: Unified Orders State to prevent redundant queries
-            const [myUnifiedOrders, setMyUnifiedOrders] = useState([]);
             
             // NATIVE FEEL: Detect network drops instantly
             const [isOffline, setIsOffline] = useState(!navigator.onLine);
@@ -1769,17 +1760,8 @@
             const [nearestShopInfo, setNearestShopInfo] = useState({ shop: null, distance: null, status: 'idle' });
             const [userLocation, setUserLocation] = useState(null);
 
-            // OPTIMIZATION: Instant Cache Hydration for Loyalty & Promos to eliminate the 1.5s Layout Shift on load
-            const [globalPoints, setGlobalPoints] = useState(() => {
-                try { return JSON.parse(localStorage.getItem('solaris_cust_global_pts')) || null; } catch(e) { return null; }
-            });
-            const [specialEvents, setSpecialEvents] = useState(() => {
-                try { return JSON.parse(localStorage.getItem('solaris_cust_events')) || []; } catch(e) { return []; }
-            });
-            const [branchLoyalty, setBranchLoyalty] = useState(() => {
-                try { return JSON.parse(localStorage.getItem('solaris_cust_loyalty')) || null; } catch(e) { return null; }
-            });
-            
+            const [globalPoints, setGlobalPoints] = useState(null);
+            const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
             const [customerLoyalty, setCustomerLoyalty] = useState({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
 
             // NEW: Fetch Secure Customer Profile for VIP Tiering in Customer Portal
@@ -1792,53 +1774,15 @@
                 const { query, where, onSnapshot, collection } = window.FirebaseApp;
                 const q = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
                 const unsub = onSnapshot(q, snap => {
-                    if (!snap.empty) {
-                        const data = snap.docs[0].data();
-                        setCustomerProfile({ id: snap.docs[0].id, ...data });
-                        
-                        // SYNC LIVE CRM UPDATES TO ACTIVE SESSION (Name & Gender fixes)
-                        setSessionInfo(prev => {
-                            if (prev.customerName !== data.name || prev.customerSex !== data.sex) {
-                                return { ...prev, customerName: data.name || prev.customerName, customerSex: data.sex || prev.customerSex };
-                            }
-                            return prev;
-                        });
-                    }
+                    if (!snap.empty) setCustomerProfile({ id: snap.docs[0].id, ...snap.docs[0].data() });
                     else setCustomerProfile(null);
                 });
                 return () => unsub();
             }, [sessionInfo.customerPhone, sessionInfo.isSetup]);
 
-            // NEW: Prevent Mobile Background Scrolling when Modals are open
-            useEffect(() => {
-                const isModalOpen = showSetupModal || isCartOpen || isTrackerOpen || !!selectedItemForOptions || !!forbiddenError;
-                
-                if (isModalOpen) {
-                    document.body.style.overflow = 'hidden';
-                    document.documentElement.style.overflow = 'hidden'; // CRITICAL: iOS Safari specific lock
-                } else {
-                    // KEYBOARD RETRACTION FIX: Wait for the mobile keyboard to fully slide down 
-                    // before restoring the scroll engine to prevent the viewport calculation freeze.
-                    setTimeout(() => {
-                        document.body.style.overflow = '';
-                        document.documentElement.style.overflow = ''; 
-                        
-                        // Force the browser to recalculate the layout and touch-action zones 
-                        void document.body.offsetHeight; // Force reflow
-                        window.scrollBy(0, 1);
-                        window.scrollBy(0, -1);
-                        document.body.style.touchAction = 'auto'; // Reset touch action temporarily
-                        setTimeout(() => {
-                            document.body.style.touchAction = 'manipulation';
-                        }, 50);
-                    }, 400); // 400ms delay accommodates the slowest keyboard animations
-                }
-                
-                return () => { 
-                    document.body.style.overflow = ''; 
-                    document.documentElement.style.overflow = ''; 
-                };
-            }, [showSetupModal, isCartOpen, isTrackerOpen, selectedItemForOptions, forbiddenError]);
+            // DYNAMIC BADGES STATE
+            const [branchLoyalty, setBranchLoyalty] = useState(null);
+            const [topSellers, setTopSellers] = useState([]);
 
             useEffect(() => {
                 const handleOffline = () => setIsOffline(true);
@@ -1916,68 +1860,47 @@
                 localStorage.setItem('solaris_session', JSON.stringify(sessionInfo));
             }, [sessionInfo]);
 
-            // OPTIMIZATION 2: CONSOLIDATED LOYALTY & SPECIAL EVENTS FETCH
-            // This prevents duplicate re-renders and network requests by merging the 
-            // points config, dynamic badges, and special events listeners.
+            // FETCH GLOBAL POINTS CONFIG & SPECIAL EVENTS
             useEffect(() => {
-                const targetId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
-                if (!targetId) return;
-
-                const { doc, onSnapshot, getDoc } = window.FirebaseApp;
+                const { doc, onSnapshot } = window.FirebaseApp;
                 
-                let unsubLoyalty = () => {};
-                let unsubEvents = () => {};
+                const unsubPoints = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
+                    if (snap.exists()) setGlobalPoints(snap.data());
+                }, e => console.warn("Failed to load global points", e));
                 
-                // OPTIMIZATION: Reduced defer timer from 1500ms to 100ms because cache hydration already painted the UI.
-                const deferTimer = setTimeout(() => {
-                    unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetId), async snap => {
-                        if (snap.exists()) {
-                            const data = snap.data();
-                            setBranchLoyalty(data);
-                            localStorage.setItem('solaris_cust_loyalty', JSON.stringify(data));
-                            
-                            if (data.pointsConfig && data.pointsConfig.pointsEnabled !== undefined) {
-                                setGlobalPoints(data.pointsConfig);
-                                localStorage.setItem('solaris_cust_global_pts', JSON.stringify(data.pointsConfig));
-                            } else {
-                                const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
-                                if (gSnap.exists()) {
-                                    setGlobalPoints(gSnap.data());
-                                    localStorage.setItem('solaris_cust_global_pts', JSON.stringify(gSnap.data()));
-                                }
-                            }
-                        } else {
-                            setBranchLoyalty(null);
-                            const gSnap = await getDoc(doc(db, 'loyalty_settings', 'global_points'));
-                            if (gSnap.exists()) {
-                                setGlobalPoints(gSnap.data());
-                                localStorage.setItem('solaris_cust_global_pts', JSON.stringify(gSnap.data()));
-                            }
-                        }
-                    }, e => console.warn("Failed fetching loyalty data", e));
-                    
-                    unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
-                        if (snap.exists()) {
-                            setSpecialEvents(snap.data().events || []);
-                            localStorage.setItem('solaris_cust_events', JSON.stringify(snap.data().events || []));
-                        }
-                    }, e => console.warn("Failed to load special events", e));
-                }, 100);
+                const unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
+                    if (snap.exists()) setSpecialEvents(snap.data().events || []);
+                }, e => console.warn("Failed to load special events", e));
                 
                 return () => {
-                    clearTimeout(deferTimer);
-                    unsubLoyalty();
+                    unsubPoints();
                     unsubEvents();
                 };
-            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops]);
+            }, []);
 
-            // OPTIMIZATION 3: DEFERRED GPS TRACKING
-            // Delay the GPS location request so it doesn't block the UI thread during the initial menu render.
+            // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
+            useEffect(() => {
+                if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
+
+                const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                // Only pull orders matching this exact customer to save reads!
+                const q = query(collection(db, 'orders'), where('customerPhone', '==', sessionInfo.customerPhone));
+
+                const unsub = onSnapshot(q, snap => {
+                    const customerOrders = [];
+                    snap.forEach(d => customerOrders.push({ id: d.id, ...d.data() }));
+                    
+                    const loyaltyData = calculateCustomerLoyalty(customerOrders, sessionInfo.customerPhone, globalPoints);
+                    setCustomerLoyalty(loyaltyData);
+                });
+                return () => unsub();
+            }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints]);
+
+            // SMART GPS DETECTION ON MOUNT (Continuous Live Tracking)
             useEffect(() => {
                 if (isSetupLoading || shops.length === 0) return;
 
                 let watchId;
-                let startTimer;
 
                 const startLiveTracking = () => {
                     if (!sessionInfo.isSetup && !detectedShop) {
@@ -1991,20 +1914,16 @@
                         return;
                     }
 
+                    // Critically Evaluated: watchPosition natively updates approx. every second 
+                    // and efficiently shuts down when the component unmounts.
                     watchId = navigator.geolocation.watchPosition(
                         (position) => {
                             const userLat = position.coords.latitude;
                             const userLng = position.coords.longitude;
                             const userPoint = { lat: userLat, lng: userLng };
                             
-                            // OPTIMIZATION: Throttle location updates to prevent micro-renders.
-                            // Only trigger a React re-render if the user moves more than 10 meters.
-                            setUserLocation(prev => {
-                                if (prev && calculateDistance(prev.lat, prev.lng, userPoint.lat, userPoint.lng) < 10) {
-                                    return prev;
-                                }
-                                return userPoint;
-                            });
+                            // ALWAYS update user location to ensure live validation logic works for returning sessions
+                            setUserLocation(userPoint);
 
                             if (!sessionInfo.isSetup && !detectedShop) {
                                 let foundTerritoryShop = null;
@@ -2063,24 +1982,22 @@
                     );
                 };
 
-                startTimer = setTimeout(() => {
-                    if (navigator.permissions && navigator.permissions.query) {
-                        navigator.permissions.query({ name: 'geolocation' }).then((result) => {
-                            if (result.state === 'granted' || result.state === 'prompt') {
-                                startLiveTracking();
-                            } else {
-                                if (!sessionInfo.isSetup && !detectedShop) {
-                                    setNearestShopInfo({ shop: null, distance: null, status: 'denied' });
-                                }
+                // Try silently first if permissions API is supported, otherwise run fallback
+                if (navigator.permissions && navigator.permissions.query) {
+                    navigator.permissions.query({ name: 'geolocation' }).then((result) => {
+                        if (result.state === 'granted' || result.state === 'prompt') {
+                            startLiveTracking();
+                        } else {
+                            if (!sessionInfo.isSetup && !detectedShop) {
+                                setNearestShopInfo({ shop: null, distance: null, status: 'denied' });
                             }
-                        }).catch(() => startLiveTracking());
-                    } else {
-                        startLiveTracking();
-                    }
-                }, 1500); // 1.5 second delay to let the initial layout breathe
+                        }
+                    }).catch(() => startLiveTracking());
+                } else {
+                    startLiveTracking();
+                }
 
                 return () => {
-                    clearTimeout(startTimer);
                     if (watchId !== undefined && navigator.geolocation) {
                         navigator.geolocation.clearWatch(watchId);
                     }
@@ -2130,12 +2047,6 @@
 
             const handleSetupSubmit = (e, data) => {
                 if (e) e.preventDefault();
-                
-                // BUG FIX: Drop focus to ensure keyboard closes smoothly
-                if (document.activeElement && typeof document.activeElement.blur === 'function') {
-                    document.activeElement.blur();
-                }
-
                 setSessionInfo(prev => ({
                     ...prev,
                     isSetup: true,
@@ -2146,7 +2057,6 @@
                     shopId: prev.shopId || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : ''),
                     sessionTimestamp: Date.now()
                 }));
-                
                 setShowSetupModal(false);
             };
 
@@ -2194,58 +2104,37 @@
                 return { icon: 'fa-star', color: 'text-stone-600', bg: 'bg-stone-200' };
             };
 
-            // OPTIMIZATION: Unified Data Fetching Engine
-            // Combines Loyalty, Order History, and Live Tracking into a single smart listener to eliminate redundant queries
+            // Effect to query past orders based on phone search independently of global orders sync
             useEffect(() => {
-                const phonesToWatch = new Set();
-                const cleanSessionPhone = String(sessionInfo.customerPhone || '').replace(/\D/g, '');
-                const cleanSearchPhone = String(phoneSearchQuery || '').replace(/\D/g, '');
-                
-                if (cleanSessionPhone.length >= 8) phonesToWatch.add(formatPhoneNumber(cleanSessionPhone));
-                if (cleanSearchPhone.length >= 8) phonesToWatch.add(formatPhoneNumber(cleanSearchPhone));
+                let unsub = null; // Store unsubscribe function for the live listener
 
-                if (phonesToWatch.size === 0) {
-                    setMyUnifiedOrders([]);
-                    return;
-                }
-
-                const unsubs = [];
-                const { query, where, onSnapshot } = window.FirebaseApp;
-                
-                // Track orders per phone to prevent ghosting deleted orders
-                const ordersByPhone = {};
-
-                // Defer to prevent blocking the main thread during render
-                const timeoutId = setTimeout(() => {
-                    phonesToWatch.forEach(targetPhone => {
-                        const q = query(getColRef('orders'), where('customerPhone', '==', targetPhone));
+                const fetchHistory = () => {
+                    const cleanedQuery = String(phoneSearchQuery).replace(/\D/g, '');
+                    if (!cleanedQuery || cleanedQuery.length < 8) {
+                        setCustomerHistory([]);
+                        return;
+                    }
+                    try {
+                        const { query, where, onSnapshot } = window.FirebaseApp; 
+                        const q = query(getColRef('orders'), where('customerPhone', '==', phoneSearchQuery));
                         
-                        const unsub = onSnapshot(q, snap => {
-                            ordersByPhone[targetPhone] = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                            
-                            const combined = Object.values(ordersByPhone).flat();
-                            const uniqueOrders = Array.from(new Map(combined.map(o => [o.id, o])).values());
-                            
-                            setMyUnifiedOrders(uniqueOrders.sort((a,b) => b.createdAt - a.createdAt));
+                        // Live Sync: Automatically update customer history when KDS staff changes status
+                        unsub = onSnapshot(q, snap => {
+                            const history = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt);
+                            setCustomerHistory(history);
                         });
-                        unsubs.push(unsub);
-                    });
-                }, 300);
+                    } catch (err) {
+                        console.warn("History fetch failed:", err);
+                    }
+                };
 
+                const timeoutId = setTimeout(fetchHistory, 600);
+                
                 return () => {
                     clearTimeout(timeoutId);
-                    unsubs.forEach(fn => fn());
+                    if (unsub) unsub(); // Detach live listener to prevent memory leaks
                 };
-            }, [sessionInfo.customerPhone, phoneSearchQuery]);
-
-            // Calculate Customer Loyalty from the Unified Engine
-            useEffect(() => {
-                if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
-                const formattedPhone = formatPhoneNumber(sessionInfo.customerPhone);
-                const customerOrders = myUnifiedOrders.filter(o => o.customerPhone === formattedPhone);
-                const loyaltyData = calculateCustomerLoyalty(customerOrders, formattedPhone, globalPoints, customerProfile?.refilledPoints || 0);
-                setCustomerLoyalty(loyaltyData);
-            }, [myUnifiedOrders, sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints, customerProfile]);
+            }, [phoneSearchQuery]);
 
             // Effect to monitor session timeout
             useEffect(() => {
@@ -2285,7 +2174,59 @@
                 }
             }, [qrDetectedTable, sessionInfo.isSetup, qrError]);
 
-            // Dynamic Badges fetch consolidated with Global Points fetch above
+            // FETCH DYNAMIC BADGES: Top Sellers & Active Promos
+            useEffect(() => {
+                // IMPROVEMENT: Strict fallback hierarchy ensures badges display instantly even before GPS lock or Session Login
+                const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
+                if (!targetShopId) return;
+
+                const { doc, onSnapshot, collection, query, where, orderBy, limit } = window.FirebaseApp;
+                let unsubOrders;
+
+                const unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetShopId), snapLoyalty => {
+                    let currentLoyalty = null;
+                    if (snapLoyalty.exists()) {
+                        currentLoyalty = snapLoyalty.data();
+                        setBranchLoyalty(currentLoyalty);
+                    } else {
+                        setBranchLoyalty(null);
+                    }
+
+                    // Configuration Check for Hot Sale Algorithm
+                    const isHotSaleEnabled = currentLoyalty?.hotSaleEnabled === true;
+                    
+                    if (!isHotSaleEnabled) {
+                        setTopSellers([]);
+                        if (unsubOrders) { unsubOrders(); unsubOrders = null; }
+                        return;
+                    }
+
+                    const lookbackCount = currentLoyalty?.hotSaleLookback ? Number(currentLoyalty.hotSaleLookback) : 150;
+                    const maxItems = currentLoyalty?.hotSaleMaxItems ? Number(currentLoyalty.hotSaleMaxItems) : 3;
+
+                    // Re-attach orders live listener with updated config
+                    if (unsubOrders) unsubOrders();
+                    
+                    const qOrders = query(collection(db, 'orders'), where('shopId', '==', targetShopId), orderBy('createdAt', 'desc'), limit(lookbackCount));
+                    
+                    unsubOrders = onSnapshot(qOrders, snapOrders => {
+                        const itemCounts = {};
+                        snapOrders.docs.forEach(d => {
+                            const items = d.data().items || [];
+                            items.forEach(item => {
+                                itemCounts[item.productId] = (itemCounts[item.productId] || 0) + item.quantity;
+                            });
+                        });
+                        const sorted = Object.entries(itemCounts).sort((a,b) => b[1] - a[1]).slice(0, maxItems).map(entry => entry[0]);
+                        setTopSellers(sorted);
+                    }, e => console.warn("Failed fetching top sellers", e));
+                }, e => console.warn("Failed fetching dynamic badge data", e));
+
+                return () => {
+                    unsubLoyalty();
+                    if (unsubOrders) unsubOrders();
+                };
+            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops]);
 
             if (qrError) {
                 return (
@@ -2301,71 +2242,72 @@
             }
 
             const { myActiveOrders, myPastOrders } = useMemo(() => {
-                const active = [];
-                const past = [];
+                const activeMap = new Map();
+                const pastMap = new Map();
                 
-                myUnifiedOrders.forEach(o => {
+                const processOrder = (o) => {
                     if (['Served', 'Cancelled'].includes(o.status)) {
-                        past.push(o);
+                        pastMap.set(o.id, o);
                     } else {
-                        active.push(o);
+                        activeMap.set(o.id, o);
+                    }
+                };
+
+                // 1. Process local (today's/active) orders tied to current UID
+                orders.forEach(o => {
+                    const isMyAuth = currentUser && o.userId === currentUser.uid;
+                    const cleanedSearchQuery = String(phoneSearchQuery).replace(/\D/g, '');
+                    const isMyPhone = cleanedSearchQuery && o.customerPhone && String(o.customerPhone).replace(/\D/g, '') === cleanedSearchQuery;
+                    
+                    if (isMyAuth || isMyPhone) {
+                        processOrder(o);
                     }
                 });
                 
+                // 2. Process Live History from Phone Search
+                // Because customerHistory is driven by onSnapshot, whenever KDS updates an order,
+                // customerHistory updates -> this useMemo re-runs -> UI updates instantly.
+                customerHistory.forEach(o => {
+                     processOrder(o);
+                });
+                
                 return {
-                    myActiveOrders: active.sort((a, b) => b.createdAt - a.createdAt),
-                    myPastOrders: past.sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
+                    myActiveOrders: Array.from(activeMap.values()).sort((a, b) => b.createdAt - a.createdAt),
+                    myPastOrders: Array.from(pastMap.values()).sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
                 };
-            }, [myUnifiedOrders]);
+            }, [orders, currentUser, phoneSearchQuery, customerHistory]);
 
-            // OPTIMIZATION: Pre-calculate complex business rules (Promos, New Items, Store Availability) ONCE.
-            // This decouples heavy date/array operations from the keystroke text search.
-            const sortedCatalog = useMemo(() => {
+            const filteredProducts = useMemo(() => {
+                const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once outside the loop
+                // IMPROVEMENT: Match the exact same fallback hierarchy as the dynamic badges
                 const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
+                
+                // Pre-calculate active promotions for fast sorting
                 const todayStr = getTodayString();
-                
-                const activePromos = (branchLoyalty?.promotions || []).filter(p => p.isActive && (!p.startDate || p.startDate <= todayStr) && (!p.endDate || p.endDate >= todayStr));
-
-                const todayDate = new Date();
-                todayDate.setHours(0,0,0,0);
-                
-                const validProducts = products.filter(p => {
-                    if (p.isAvailable === false || p.visibilityMode === 'Hidden') return false;
-                    if (p.visibilityMode === 'Specific' && (!targetShopId || !p.availableShopIds?.includes(targetShopId))) return false;
+                const activePromos = (branchLoyalty?.promotions || []).filter(p => {
+                    if (!p.isActive) return false;
+                    if (p.startDate && p.startDate > todayStr) return false;
+                    if (p.endDate && p.endDate < todayStr) return false;
                     return true;
                 });
 
-                return validProducts.map(p => {
-                    const activePromo = activePromos.find(promo => !promo.applicableProductIds || promo.applicableProductIds.length === 0 || promo.applicableProductIds.includes(p.id));
-                    
-                    let isNew = false;
+                // Pre-calculate New Products for fast sorting
+                const todayDate = new Date();
+                todayDate.setHours(0,0,0,0);
+                const newProductIds = new Set();
+                products.forEach(p => {
                     if (p.isNewProduct && p.newProductEffectiveDate && p.newProductDuration) {
                         const effectiveDate = new Date(p.newProductEffectiveDate);
                         const expiryDate = new Date(effectiveDate);
                         expiryDate.setDate(expiryDate.getDate() + p.newProductDuration);
-                        if (todayDate >= effectiveDate && todayDate <= expiryDate) isNew = true;
+                        if (todayDate >= effectiveDate && todayDate <= expiryDate) {
+                            newProductIds.add(p.id);
+                        }
                     }
-                    
-                    return { ...p, activePromo, isNew };
-                }).sort((a, b) => {
-                    if (a.activePromo && !b.activePromo) return -1;
-                    if (!a.activePromo && b.activePromo) return 1;
-                    if (a.isNew && !b.isNew) return -1;
-                    if (!a.isNew && b.isNew) return 1;
-                    
-                    const aCatOrder = categories.find(c => c.name === a.category)?.order ?? 999;
-                    const bCatOrder = categories.find(c => c.name === b.category)?.order ?? 999;
-                    if (aCatOrder !== bCatOrder) return aCatOrder - bCatOrder;
-                    
-                    return (a.name || '').localeCompare(b.name || '');
                 });
-            }, [products, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, branchLoyalty, categories]);
-
-            // OPTIMIZATION: Lightning-fast text search filter based on the pre-sorted catalog
-            const filteredProducts = useMemo(() => {
-                const searchLower = (searchQuery || '').toLowerCase();
                 
-                return sortedCatalog.filter(p => {
+                return products.filter(p => {
+                    // CRASH FIX: Added safe fallbacks to prevent undefined.toLowerCase() errors
                     const safeName = p.name || '';
                     const safeCode = p.productCode || '';
                     const safeBarcodeS = p.barcodeSmall || '';
@@ -2378,9 +2320,44 @@
                                           
                     const matchesCategory = activeCategory === 'All' || p.category === activeCategory;
                     
-                    return matchesSearch && matchesCategory;
+                    if (!matchesSearch || !matchesCategory) return false;
+                    
+                    // Phase 3: Smart Storefront Logic (Customer Portal)
+                    if (p.isAvailable === false || p.visibilityMode === 'Hidden') return false;
+                    
+                    if (p.visibilityMode === 'Specific') {
+                        // Strict filter: Match the dynamically resolved targetShopId
+                        if (!targetShopId || !p.availableShopIds || !p.availableShopIds.includes(targetShopId)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }).sort((a, b) => {
+                    // 1. Priority: Hot Sale
+                    const aHot = topSellers.includes(a.id) ? 1 : 0;
+                    const bHot = topSellers.includes(b.id) ? 1 : 0;
+                    if (aHot !== bHot) return bHot - aHot;
+
+                    // 2. Priority: Promotion Active
+                    const checkPromo = (p) => activePromos.some(promo => !promo.applicableProductIds || promo.applicableProductIds.length === 0 || promo.applicableProductIds.includes(p.id));
+                    const aPromo = checkPromo(a) ? 1 : 0;
+                    const bPromo = checkPromo(b) ? 1 : 0;
+                    if (aPromo !== bPromo) return bPromo - aPromo;
+
+                    // 3. Priority: New Product
+                    const aNew = newProductIds.has(a.id) ? 1 : 0;
+                    const bNew = newProductIds.has(b.id) ? 1 : 0;
+                    if (aNew !== bNew) return bNew - aNew;
+
+                    // 4. Priority: Category Order Number
+                    const aCatOrder = categories.find(c => c.name === a.category)?.order ?? 999;
+                    const bCatOrder = categories.find(c => c.name === b.category)?.order ?? 999;
+                    if (aCatOrder !== bCatOrder) return aCatOrder - bCatOrder;
+
+                    // 5. Fallback: Alphabetical
+                    return (a.name || '').localeCompare(b.name || '');
                 });
-            }, [sortedCatalog, searchQuery, activeCategory]);
+            }, [products, searchQuery, activeCategory, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, topSellers, branchLoyalty, categories]);
 
             const handleSizeClick = (product, size, price) => {
                 if (!sessionInfo.isSetup) {
@@ -2576,7 +2553,7 @@
                         
                         // OPTIMISTIC UPDATE: Fix stuck button issue for phone-searched orders
                         // Instantly updates the local history state so the button disappears and moves to Past Orders
-                        setMyUnifiedOrders(prev => prev.map(o => 
+                        setCustomerHistory(prev => prev.map(o => 
                             o.id === order.id ? { ...o, status: 'Cancelled', cancelReason: 'Cancelled by customer', completedAt: Date.now() } : o
                         ));
 
@@ -2586,7 +2563,7 @@
                             completedAt: Date.now()
                         });
                         
-                        await releaseTableIfNotUsed(order.tableId, order.id, myUnifiedOrders);
+                        await releaseTableIfNotUsed(order.tableId, order.id, orders);
                         
                         setCustomMessage('Order cancelled successfully.');
                         if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -3082,14 +3059,9 @@
                         {/* LEFT SIDE: Menu Area */}
                         <div className="flex-1 min-w-0 flex flex-col">
 
-                            <div className="bg-white p-2 rounded-2xl shadow-lg flex items-center mb-6 border border-stone-100 transition-all hover:shadow-xl focus-within:ring-2 ring-amber-500/20 relative">
+                            <div className="bg-white p-2 rounded-2xl shadow-lg flex items-center mb-6 border border-stone-100 transition-all hover:shadow-xl focus-within:ring-2 ring-amber-500/20">
                                 <i className="fa-solid fa-magnifying-glass text-stone-400 ml-3 mr-2"></i>
-                                <input type="text" placeholder="Search menu..." className="flex-1 py-2 px-2 outline-none text-[16px] bg-transparent" value={searchInput} onChange={(e) => setSearchInput(e.target.value)} />
-                                {searchInput && (
-                                    <button onClick={() => { setSearchInput(''); setSearchQuery(''); }} className="w-8 h-8 flex items-center justify-center text-stone-400 hover:text-stone-700 bg-stone-100 rounded-full mr-1 transition active:scale-90 shadow-inner">
-                                        <i className="fa-solid fa-xmark"></i>
-                                    </button>
-                                )}
+                                <input type="text" placeholder="Search menu..." className="flex-1 py-2 px-2 outline-none text-[16px] bg-transparent" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
                             </div>
 
                             <div className="flex gap-3 overflow-x-auto no-scrollbar mb-6 pb-2">
@@ -3140,22 +3112,36 @@
                             ) : filteredProducts.length > 0 ? (
                                 filteredProducts.map(product => {
                                     const badges = [];
-                                    
-                                    // OPTIMIZATION: Render badges instantly using pre-calculated catalog properties
-                                    if (product.activePromo) {
-                                        badges.push(
-                                            <div key="promo" className="bg-red-600 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-red-500 animate-bounce flex items-center gap-1 max-w-[120px]" title={product.activePromo.name}>
-                                                <i className="fa-solid fa-tag shrink-0"></i> <span className="truncate">{product.activePromo.name || 'Promo'}</span>
-                                            </div>
-                                        );
+                                    if (branchLoyalty && branchLoyalty.promotions) {
+                                        const todayStr = getTodayString();
+                                        const activePromos = branchLoyalty.promotions.filter(p => {
+                                            if (!p.isActive) return false;
+                                            if (p.startDate && p.startDate > todayStr) return false;
+                                            if (p.endDate && p.endDate < todayStr) return false;
+                                            return true;
+                                        });
+                                        const activePromo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(product.id));
+                                        if (activePromo) {
+                                            badges.push(<div key="promo" className="bg-red-600 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-red-500 animate-bounce flex items-center gap-1 max-w-[120px]" title={activePromo.name}><i className="fa-solid fa-tag shrink-0"></i> <span className="truncate">{activePromo.name || 'Promo'}</span></div>);
+                                        }
                                     }
                                     
-                                    if (product.isNew) {
-                                        badges.push(
-                                            <div key="new" className="bg-indigo-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-indigo-400 animate-pulse flex items-center gap-1">
-                                                <i className="fa-solid fa-sparkles"></i> New
-                                            </div>
-                                        );
+                                    // New Product Advertising Logic
+                                    if (product.isNewProduct && product.newProductEffectiveDate && product.newProductDuration) {
+                                        const effectiveDate = new Date(product.newProductEffectiveDate);
+                                        const expiryDate = new Date(effectiveDate);
+                                        expiryDate.setDate(expiryDate.getDate() + product.newProductDuration);
+                                        
+                                        const todayDate = new Date();
+                                        todayDate.setHours(0,0,0,0);
+                                        
+                                        if (todayDate >= effectiveDate && todayDate <= expiryDate) {
+                                            badges.push(<div key="new" className="bg-indigo-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-indigo-400 animate-pulse flex items-center gap-1"><i className="fa-solid fa-sparkles"></i> New</div>);
+                                        }
+                                    }
+                                    
+                                    if (topSellers.includes(product.id)) {
+                                        badges.push(<div key="hot" className="bg-amber-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-amber-400 animate-pulse flex items-center gap-1"><i className="fa-solid fa-fire"></i> Hot Sale</div>);
                                     }
 
                                     return (
@@ -3197,14 +3183,9 @@
                                     );
                                 })
                             ) : (
-                                <div className="col-span-2 md:col-span-3 lg:col-span-3 xl:col-span-3 text-center py-12 text-stone-400 font-medium bg-white rounded-2xl shadow-sm border border-stone-100">
-                                    <i className="fa-solid fa-mug-hot text-5xl mb-4 opacity-30 block"></i>
-                                    <p>No products found matching your search.</p>
-                                    {searchInput && (
-                                        <button onClick={() => { setSearchInput(''); setSearchQuery(''); }} className="mt-5 px-6 py-2.5 bg-stone-100 text-stone-600 rounded-xl text-sm font-bold hover:bg-stone-200 transition active:scale-95 shadow-sm">
-                                            Clear Search
-                                        </button>
-                                    )}
+                                <div className="col-span-2 md:col-span-3 lg:col-span-3 xl:col-span-3 text-center py-10 text-stone-400 font-medium">
+                                    <i className="fa-solid fa-mug-hot text-4xl mb-3 opacity-30 block"></i>
+                                    No products found in this category.
                                 </div>
                             )}
                         </div>
@@ -3401,11 +3382,7 @@
                         <SetupModal 
                             sessionInfo={sessionInfo} 
                             onSubmit={handleSetupSubmit} 
-                            onClose={() => { 
-                                if (document.activeElement && typeof document.activeElement.blur === 'function') document.activeElement.blur();
-                                setShowSetupModal(false); 
-                                if(!sessionInfo.isSetup) setSessionInfo({...sessionInfo, mode: null}); 
-                            }} 
+                            onClose={() => { setShowSetupModal(false); if(!sessionInfo.isSetup) setSessionInfo({...sessionInfo, mode: null}); }} 
                         />
                     )}
 
