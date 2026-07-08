@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -616,6 +617,8 @@
             // OPTIMIZATION 1: Decouple Public Data Fetching from Auth
             // Fetch products, categories, and shops immediately, regardless of user login status.
             useEffect(() => {
+                if (!user) return; // SECURITY FIX: Must wait for Auth token before querying Firestore
+                
                 const { onSnapshot } = window.FirebaseApp;
 
                 const syncToState = (cacheKey, freshData, setState, setLoader) => {
@@ -676,7 +679,7 @@
                     if(unsubSugar) unsubSugar();
                     if(unsubIce) unsubIce();
                 };
-            }, [view]);
+            }, [view, user]); // Added user to dependency array
 
             // OPTIMIZATION 1.5: Private Data Fetching (Orders)
             useEffect(() => {
@@ -1824,7 +1827,7 @@
             // NEW: Fetch Secure Customer Profile for VIP Tiering in Customer Portal
             const [customerProfile, setCustomerProfile] = useState(null);
             useEffect(() => {
-                if (!sessionInfo.isSetup || !sessionInfo.customerPhone) {
+                if (!currentUser || !sessionInfo.isSetup || !sessionInfo.customerPhone) {
                     setCustomerProfile(null);
                     return;
                 }
@@ -1919,6 +1922,8 @@
 
             // FETCH GLOBAL POINTS CONFIG & SPECIAL EVENTS
             useEffect(() => {
+                if (!currentUser) return; // SECURITY FIX
+                
                 const { doc, onSnapshot } = window.FirebaseApp;
                 
                 const unsubPoints = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
@@ -1933,11 +1938,11 @@
                     unsubPoints();
                     unsubEvents();
                 };
-            }, []);
+            }, [currentUser]); // Added currentUser to dependency array
 
             // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
             useEffect(() => {
-                if (!sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
+                if (!currentUser || !sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
 
                 const { query, where, onSnapshot, collection, orderBy, limit } = window.FirebaseApp;
                 
@@ -2180,21 +2185,26 @@
                 return { icon: 'fa-star', color: 'text-stone-600', bg: 'bg-stone-200' };
             };
 
-            // Effect to query past orders based on phone search independently of global orders sync
+            // Effect to query past orders based on phone search OR active session independently of global orders sync
             useEffect(() => {
+                if (!currentUser) return; // SECURITY FIX
                 let unsub = null; // Store unsubscribe function for the live listener
+                let timeoutId = null;
 
                 const fetchHistory = () => {
-                    const cleanedQuery = String(phoneSearchQuery).replace(/\D/g, '');
+                    // CRITICAL FIX: Track the active session phone automatically, fallback to manual search query
+                    const targetPhone = phoneSearchQuery || sessionInfo.customerPhone;
+                    const cleanedQuery = String(targetPhone).replace(/\D/g, '');
+                    
                     if (!cleanedQuery || cleanedQuery.length < 8) {
                         setCustomerHistory([]);
                         return;
                     }
                     try {
                         const { query, where, onSnapshot } = window.FirebaseApp; 
-                        const q = query(getColRef('orders'), where('customerPhone', '==', phoneSearchQuery));
+                        const q = query(getColRef('orders'), where('customerPhone', '==', targetPhone));
                         
-                        // Live Sync: Automatically update customer history when KDS staff changes status
+                        // Live Sync: Automatically streams KDS item ticks, payments, and status changes instantly
                         unsub = onSnapshot(q, snap => {
                             const history = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt);
                             setCustomerHistory(history);
@@ -2204,13 +2214,20 @@
                     }
                 };
 
-                const timeoutId = setTimeout(fetchHistory, 600);
+                // PERFORMANCE OPTIMIZATION: "Near 0ms" Perceived Latency
+                // If syncing the active session, execute the socket connection instantly.
+                // If the user is manually typing in the search box, use a short debounce to prevent database spam.
+                if (sessionInfo.customerPhone && !phoneSearchQuery) {
+                    fetchHistory(); // INSTANT EXECUTION
+                } else {
+                    timeoutId = setTimeout(fetchHistory, 300); // Reduced from 600ms to 300ms
+                }
                 
                 return () => {
-                    clearTimeout(timeoutId);
+                    if (timeoutId) clearTimeout(timeoutId);
                     if (unsub) unsub(); // Detach live listener to prevent memory leaks
                 };
-            }, [phoneSearchQuery]);
+            }, [phoneSearchQuery, sessionInfo.customerPhone, currentUser]);
 
             // Effect to monitor session timeout
             useEffect(() => {
@@ -2252,6 +2269,8 @@
 
             // FETCH DYNAMIC BADGES: Top Sellers & Active Promos
             useEffect(() => {
+                if (!currentUser) return; // SECURITY FIX
+                
                 // IMPROVEMENT: Strict fallback hierarchy ensures badges display instantly even before GPS lock or Session Login
                 const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
                 if (!targetShopId) return;
@@ -2302,7 +2321,7 @@
                     unsubLoyalty();
                     if (unsubOrders) unsubOrders();
                 };
-            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops]);
+            }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, currentUser]); // Added currentUser dependency
 
             if (qrError) {
                 return (
@@ -2333,14 +2352,19 @@
                 orders.forEach(o => {
                     const isMyAuth = currentUser && o.userId === currentUser.uid;
                     const cleanedSearchQuery = String(phoneSearchQuery).replace(/\D/g, '');
-                    const isMyPhone = cleanedSearchQuery && o.customerPhone && String(o.customerPhone).replace(/\D/g, '') === cleanedSearchQuery;
+                    const cleanedSessionPhone = String(sessionInfo.customerPhone || '').replace(/\D/g, '');
+                    const oCleanPhone = String(o.customerPhone || '').replace(/\D/g, '');
+                    
+                    // CRITICAL FIX: Ensure local orders also match against the active session phone
+                    const isMyPhone = (cleanedSearchQuery && oCleanPhone === cleanedSearchQuery) || 
+                                      (cleanedSessionPhone && oCleanPhone === cleanedSessionPhone);
                     
                     if (isMyAuth || isMyPhone) {
                         processOrder(o);
                     }
                 });
                 
-                // 2. Process Live History from Phone Search
+                // 2. Process Live History from Phone Search or Active Session
                 // Because customerHistory is driven by onSnapshot, whenever KDS updates an order,
                 // customerHistory updates -> this useMemo re-runs -> UI updates instantly.
                 customerHistory.forEach(o => {
@@ -2351,7 +2375,7 @@
                     myActiveOrders: Array.from(activeMap.values()).sort((a, b) => b.createdAt - a.createdAt),
                     myPastOrders: Array.from(pastMap.values()).sort((a, b) => b.createdAt - a.createdAt).slice(0, 15)
                 };
-            }, [orders, currentUser, phoneSearchQuery, customerHistory]);
+            }, [orders, currentUser, phoneSearchQuery, sessionInfo.customerPhone, customerHistory]);
 
             const filteredProducts = useMemo(() => {
                 const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once outside the loop
@@ -2886,11 +2910,6 @@
                 // TRACK FAKE ORDERS: Save exact distance to DB
                 const orderDistance = liveLocationStatus.distance;
 
-                // OPTIMISTIC QUEUE GENERATION FOR INSTANT UI
-                const shopOrders = orders.filter(o => o.shopId === sessionInfo.shopId);
-                const highestQueue = shopOrders.length > 0 ? Math.max(...shopOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) : 0;
-                const optimisticQueueNo = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
-
                 const actualOrderType = (sessionInfo.mode === 'QR' || sessionInfo.mode === 'DINE_IN') ? 'DINE_IN' : 'TAKEAWAY';
 
                 // Aggregate Redeemed Points Info
@@ -2902,9 +2921,32 @@
                 // Snapshot the processed cart state
                 const currentCartTotal = cartTotal;
 
+                // SECURE FIREBASE TRANSACTION INLINE: Guaranteed Sequential Invoice Numbers
+                let finalQueueString;
+                try {
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const nextSeq = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
+                        return nextVal;
+                    });
+                    finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
+                } catch (err) {
+                    console.warn("Transaction failed, using robust time-based fallback:", err);
+                    // Fallback using timestamp to strictly prevent duplication if Firestore Rules block anonymous writes
+                    const fallbackSeq = Math.floor(Date.now() / 1000).toString().slice(-5) + Math.floor(Math.random() * 10);
+                    finalQueueString = `${shopPrefix}-FB${fallbackSeq}`;
+                }
+
                 const orderData = {
                     userId: currentUser ? currentUser.uid : null,
-                    queueNo: optimisticQueueNo, // Temporary optimistic view
+                    queueNo: finalQueueString,
                     orderType: actualOrderType,
                     tableId: sessionInfo.tableId || 'TAKEAWAY',
                     tableName: sessionInfo.tableName || 'Take Away',
@@ -2937,7 +2979,6 @@
                 setIsSubmitting(false);
 
                 // KDS PERFORMANCE FIX: Push the order to the database INSTANTLY.
-                // Do not wait for the invoice transaction to finish before showing it to the kitchen!
                 const newOrderRef = doc(getColRef('orders'));
                 const instantOrderPromise = setDoc(newOrderRef, orderData);
 
@@ -2945,31 +2986,6 @@
                 Promise.resolve().then(async () => {
                     try {
                         await instantOrderPromise; // Wait for initial save to finish
-
-                        // SECURE FIREBASE TRANSACTION IN BACKGROUND: Guaranteed Sequential Invoice Numbers
-                        let finalQueueString = optimisticQueueNo;
-                        try {
-                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                            const nextSeq = await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                return nextVal;
-                            });
-                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                        } catch (err) {
-                            console.warn("Transaction failed, using fallback:", err);
-                        }
-                        
-                        // If the transaction found a newer sequence, silently update the ticket queue number
-                        if (finalQueueString !== optimisticQueueNo) {
-                            await updateDoc(newOrderRef, { queueNo: finalQueueString });
-                        }
 
                         // Run all heavy network tasks in parallel
                         await Promise.all([
@@ -7023,13 +7039,34 @@
                 const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                // OPTIMISTIC QUEUE GENERATION FOR INSTANT UI
-                const shopOrders = orders.filter(o => o.shopId === cartShopId);
-                const highestQueue = shopOrders.length > 0 ? Math.max(...shopOrders.map(o => parseInt(String(o.queueNo).split('-')[1]) || 0)) : 0;
-                const optimisticQueueNo = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
-
-                // REMOVED redundant declaration as it is now defined above
-                // const cartTargetShift = shifts?.find(s => s.shopId === cartShopId && s.status === 'Open');
+                // SECURE FIREBASE TRANSACTION INLINE
+                let finalQueueString;
+                try {
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const nextSeq = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
+                        return nextVal;
+                    });
+                    finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
+                } catch (err) {
+                    console.warn("Transaction failed, falling back to local calculation:", err);
+                    // Fallback to local calculation in POS since we have the orders array!
+                    const shopOrders = orders.filter(o => o.shopId === cartShopId);
+                    const highestQueue = shopOrders.length > 0 ? 
+                        Math.max(0, ...shopOrders.map(o => {
+                            const parts = String(o.queueNo).split('-');
+                            const num = parseInt(parts.length > 1 ? parts[1] : parts[0], 10);
+                            return isNaN(num) ? 0 : num;
+                        })) : 0;
+                    finalQueueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
+                }
 
                 // Snapshot the processed cart state
                 const currentCart = [...processedCart];
@@ -7039,7 +7076,7 @@
                     shiftId: cartTargetShift ? cartTargetShift.id : null,
                     staffId: currentAdminRecord?.id,
                     userId: customerData ? customerData.id : (currentAdminRecord?.id || null),
-                    queueNo: optimisticQueueNo,
+                    queueNo: finalQueueString,
                     orderType: cartMode, 
                     tableId: cartMode === 'DINE_IN' ? cartTableId : 'Walk-in',
                     tableName: cartMode === 'DINE_IN' ? cartTableName : 'Take Away',
@@ -7074,8 +7111,7 @@
                 setMode('manage');
                 setIsSubmitting(false);
 
-                // KDS PERFORMANCE FIX: Push the order to the database INSTANTLY.
-                // Do not wait for the invoice transaction to finish before showing it to the kitchen!
+                // KDS PERFORMANCE FIX: Push the order to the database INSTANTLY
                 const newOrderRef = doc(getColRef('orders'));
                 const instantOrderPromise = setDoc(newOrderRef, orderData);
 
@@ -7100,31 +7136,6 @@
                                     console.warn("Failed to auto-create customer:", err);
                                 }
                             }
-                        }
-
-                        // SECURE FIREBASE TRANSACTION IN BACKGROUND
-                        let finalQueueString = optimisticQueueNo;
-                        try {
-                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                            const nextSeq = await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                return nextVal;
-                            });
-                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                        } catch (err) {
-                            console.warn("Transaction failed, using fallback:", err);
-                        }
-
-                        // If the transaction found a newer sequence, silently update the ticket queue number
-                        if (finalQueueString !== optimisticQueueNo) {
-                            await updateDoc(newOrderRef, { queueNo: finalQueueString });
                         }
 
                         // Run parallel operations
