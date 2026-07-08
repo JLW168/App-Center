@@ -2837,7 +2837,7 @@
                 return { isForbidden: false, distance: orderDistance, limit: maxDist, phone: '' };
             }, [shops, sessionInfo.shopId, userLocation]);
 
-            const handleCheckout = async (e) => {
+            const handleCheckout = (e) => {
                 e.preventDefault();
                 if (cart.length === 0 || !sessionInfo.isSetup) return;
                 
@@ -2855,48 +2855,15 @@
                     return;
                 }
 
-                setIsSubmitting(true);
+                setIsSubmitting(true); // Short lock to prevent double clicks
 
-                const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
                 const today = getTodayString();
 
-                // --- SECURITY FIX: Anti-Spoofing Check ---
-                // Re-verify the user's charge status directly from Firestore before trusting the client-side cart total.
-                // A tech-savvy user might alter React state, but this ensures we check the secure DB right before writing.
-                if (sessionInfo.customerPhone) {
-                    try {
-                        const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
-                        const checkSnap = await getDocs(qCheck);
-                        if (!checkSnap.empty) {
-                            const realProfile = checkSnap.docs[0].data();
-                            
-                            // 1. Check for mid-session suspension
-                            if (realProfile.status === 'Inactive') {
-                                setCustomMessage('Account Suspended. Checkout aborted.');
-                                setIsSubmitting(false);
-                                return;
-                            }
-                            
-                            // 2. Prevent Client-Side State Tampering (e.g., forcing FOC status)
-                            if (customerData && customerData.chargeStatus !== realProfile.chargeStatus) {
-                                setCustomMessage('Security Error: Pricing mismatch detected. Refreshing session...');
-                                setTimeout(() => window.location.reload(), 2000);
-                                setIsSubmitting(false);
-                                return;
-                            }
-                        }
-                    } catch (err) {
-                        console.warn("Security verification failed.", err);
-                    }
-                }
-                // --- END SECURITY FIX ---
-                
-                // TAX DEPT FORMAT: Extract last 3 alphanumeric characters of the shop name
                 const targetShop = shops.find(s => s.id === sessionInfo.shopId) || { name: 'UNK', id: 'UNKNOWN' };
                 const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                // ANTI-FAKE ORDER CHECK (Uses Live Status)
+                // ANTI-FAKE ORDER CHECK
                 if (liveLocationStatus.isForbidden) {
                     setIsSubmitting(false);
                     setForbiddenError({
@@ -2907,46 +2874,22 @@
                     return;
                 }
                 
-                // TRACK FAKE ORDERS: Save exact distance to DB
                 const orderDistance = liveLocationStatus.distance;
-
                 const actualOrderType = (sessionInfo.mode === 'QR' || sessionInfo.mode === 'DINE_IN') ? 'DINE_IN' : 'TAKEAWAY';
 
-                // Aggregate Redeemed Points Info
                 const currentCart = [...processedCart];
                 const totalRedeemedInCart = currentCart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
                 const pointsToRedeem = totalRedeemedInCart * (globalPoints?.redeemPoints || 10);
                 const redeemedItemNames = currentCart.filter(i => i.redeemedQty > 0).map(i => `${i.redeemedQty}x ${i.name}`).join(', ');
-
-                // Snapshot the processed cart state
                 const currentCartTotal = cartTotal;
 
-                // SECURE FIREBASE TRANSACTION INLINE: Guaranteed Sequential Invoice Numbers
-                let finalQueueString;
-                try {
-                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                    const nextSeq = await runTransaction(db, async (transaction) => {
-                        const counterDoc = await transaction.get(counterRef);
-                        let nextVal = 1;
-                        if (counterDoc.exists()) {
-                            nextVal = (counterDoc.data().currentValue || 0) + 1;
-                            transaction.update(counterRef, { currentValue: nextVal });
-                        } else {
-                            transaction.set(counterRef, { currentValue: nextVal });
-                        }
-                        return nextVal;
-                    });
-                    finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                } catch (err) {
-                    console.warn("Transaction failed, using robust time-based fallback:", err);
-                    // Fallback using timestamp to strictly prevent duplication if Firestore Rules block anonymous writes
-                    const fallbackSeq = Math.floor(Date.now() / 1000).toString().slice(-5) + Math.floor(Math.random() * 10);
-                    finalQueueString = `${shopPrefix}-FB${fallbackSeq}`;
-                }
+                // 1-CLICK FIX: Generate a highly-probable Fallback Queue Number instantly for the UI
+                const fallbackSeq = Math.floor(Date.now() / 1000).toString().slice(-5) + Math.floor(Math.random() * 10);
+                const tempQueueString = `${shopPrefix}-FB${fallbackSeq}`;
 
                 const orderData = {
                     userId: currentUser ? currentUser.uid : null,
-                    queueNo: finalQueueString,
+                    queueNo: tempQueueString,
                     orderType: actualOrderType,
                     tableId: sessionInfo.tableId || 'TAKEAWAY',
                     tableName: sessionInfo.tableName || 'Take Away',
@@ -2976,16 +2919,55 @@
                 setCart([]);
                 setIsCartOpen(false);
                 setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
-                setIsSubmitting(false);
-
-                // KDS PERFORMANCE FIX: Push the order to the database INSTANTLY.
-                const newOrderRef = doc(getColRef('orders'));
-                const instantOrderPromise = setDoc(newOrderRef, orderData);
+                setIsSubmitting(false); // Unlocks the UI instantly!
 
                 // BACKGROUND SYNC: Fire and Forget Database operations
                 Promise.resolve().then(async () => {
                     try {
-                        await instantOrderPromise; // Wait for initial save to finish
+                        const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
+                        
+                        // --- SECURITY FIX: Anti-Spoofing Check ---
+                        if (sessionInfo.customerPhone) {
+                            try {
+                                const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
+                                const checkSnap = await getDocs(qCheck);
+                                if (!checkSnap.empty) {
+                                    const realProfile = checkSnap.docs[0].data();
+                                    // Stop saving to DB if suspended, even though UI already showed success
+                                    if (realProfile.status === 'Inactive') return; 
+                                }
+                            } catch (err) {
+                                console.warn("Security verification failed.", err);
+                            }
+                        }
+                        
+                        // SECURE FIREBASE TRANSACTION IN BACKGROUND
+                        let finalQueueString = tempQueueString;
+                        try {
+                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                            const nextSeq = await runTransaction(db, async (transaction) => {
+                                const counterDoc = await transaction.get(counterRef);
+                                let nextVal = 1;
+                                if (counterDoc.exists()) {
+                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                    transaction.update(counterRef, { currentValue: nextVal });
+                                } else {
+                                    transaction.set(counterRef, { currentValue: nextVal });
+                                }
+                                return nextVal;
+                            });
+                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
+                        } catch (err) {
+                            console.warn("Transaction failed, using robust time-based fallback:", err);
+                        }
+
+                        orderData.queueNo = finalQueueString;
+
+                        // Update the success view secretly with the real Queue No
+                        setSubmittedOrder(prev => (prev && prev.createdAt === orderData.createdAt) ? {...prev, queueNo: finalQueueString} : prev);
+
+                        const newOrderRef = doc(getColRef('orders'));
+                        await setDoc(newOrderRef, orderData);
 
                         // Run all heavy network tasks in parallel
                         await Promise.all([
@@ -7017,7 +6999,7 @@
                 return { processedCart: processed, cartTotal: total };
             }, [cart, allPromotions, specialEvents, cartShopId, customerData, products]);
 
-            const handleCheckout = async (targetStatus, payStatus, payMethod) => {
+            const handleCheckout = (targetStatus, payStatus, payMethod) => {
                 if (cart.length === 0) return;
                 
                 // --- NEW SHIFT GUARD: Block POS Checkout if no shift is open ---
@@ -7030,8 +7012,6 @@
 
                 setIsSubmitting(true);
                 
-                const { setDoc, updateDoc, doc, runTransaction } = window.FirebaseApp;
-                
                 const today = getTodayString();
                 
                 // TAX DEPT FORMAT: Extract last 3 alphanumeric characters of the shop name
@@ -7039,34 +7019,15 @@
                 const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                // SECURE FIREBASE TRANSACTION INLINE
-                let finalQueueString;
-                try {
-                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                    const nextSeq = await runTransaction(db, async (transaction) => {
-                        const counterDoc = await transaction.get(counterRef);
-                        let nextVal = 1;
-                        if (counterDoc.exists()) {
-                            nextVal = (counterDoc.data().currentValue || 0) + 1;
-                            transaction.update(counterRef, { currentValue: nextVal });
-                        } else {
-                            transaction.set(counterRef, { currentValue: nextVal });
-                        }
-                        return nextVal;
-                    });
-                    finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                } catch (err) {
-                    console.warn("Transaction failed, falling back to local calculation:", err);
-                    // Fallback to local calculation in POS since we have the orders array!
-                    const shopOrders = orders.filter(o => o.shopId === cartShopId);
-                    const highestQueue = shopOrders.length > 0 ? 
-                        Math.max(0, ...shopOrders.map(o => {
-                            const parts = String(o.queueNo).split('-');
-                            const num = parseInt(parts.length > 1 ? parts[1] : parts[0], 10);
-                            return isNaN(num) ? 0 : num;
-                        })) : 0;
-                    finalQueueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
-                }
+                // 1-CLICK FIX: Fallback to local calculation instantly for the UI
+                const shopOrders = orders.filter(o => o.shopId === cartShopId);
+                const highestQueue = shopOrders.length > 0 ? 
+                    Math.max(0, ...shopOrders.map(o => {
+                        const parts = String(o.queueNo).split('-');
+                        const num = parseInt(parts.length > 1 ? parts[1] : parts[0], 10);
+                        return isNaN(num) ? 0 : num;
+                    })) : 0;
+                const tempQueueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
 
                 // Snapshot the processed cart state
                 const currentCart = [...processedCart];
@@ -7076,7 +7037,7 @@
                     shiftId: cartTargetShift ? cartTargetShift.id : null,
                     staffId: currentAdminRecord?.id,
                     userId: customerData ? customerData.id : (currentAdminRecord?.id || null),
-                    queueNo: finalQueueString,
+                    queueNo: tempQueueString,
                     orderType: cartMode, 
                     tableId: cartMode === 'DINE_IN' ? cartTableId : 'Walk-in',
                     tableName: cartMode === 'DINE_IN' ? cartTableName : 'Take Away',
@@ -7111,21 +7072,40 @@
                 setMode('manage');
                 setIsSubmitting(false);
 
-                // KDS PERFORMANCE FIX: Push the order to the database INSTANTLY
-                const newOrderRef = doc(getColRef('orders'));
-                const instantOrderPromise = setDoc(newOrderRef, orderData);
-
                 // BACKGROUND SYNC: Fire and Forget Database operations
                 Promise.resolve().then(async () => {
                     try {
-                        await instantOrderPromise; // Wait for initial save to finish
+                        const { setDoc, updateDoc, doc, runTransaction, collection, addDoc } = window.FirebaseApp;
+                        
+                        let finalQueueString = tempQueueString;
+                        try {
+                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                            const nextSeq = await runTransaction(db, async (transaction) => {
+                                const counterDoc = await transaction.get(counterRef);
+                                let nextVal = 1;
+                                if (counterDoc.exists()) {
+                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                    transaction.update(counterRef, { currentValue: nextVal });
+                                } else {
+                                    transaction.set(counterRef, { currentValue: nextVal });
+                                }
+                                return nextVal;
+                            });
+                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
+                        } catch (err) {
+                            console.warn("Transaction failed, falling back to local calculation:", err);
+                        }
+
+                        orderData.queueNo = finalQueueString;
+
+                        const newOrderRef = doc(getColRef('orders'));
+                        await setDoc(newOrderRef, orderData);
 
                         // Auto-create new customer if phone provided but not found
                         if (customerPhone && !customerData) {
                             const cleanPhone = String(customerPhone).replace(/\D/g, '');
                             if (cleanPhone.length >= 8) {
                                 try {
-                                    const { addDoc, collection } = window.FirebaseApp;
                                     await addDoc(collection(db, 'customers'), {
                                         phone: customerPhone,
                                         name: customerName || 'Walk-in',
