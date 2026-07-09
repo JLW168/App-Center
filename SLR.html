@@ -10376,6 +10376,10 @@
 
         function CustomersView({ orders, shops, currentAdminRecord }) {
             const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
+            
+            // --- FIX: Added missing filterShop state for the Smart Filters ---
+            const [filterShop, setFilterShop] = useState(isSuper ? 'All' : (currentAdminRecord?.shopIds?.[0] || currentAdminRecord?.shopId || 'All'));
+            
             const [activeTab, setActiveTab] = useState('directory');
             const [reportTab, setReportTab] = useState('points');
             const [searchQuery, setSearchQuery] = useState('');
@@ -10401,6 +10405,70 @@
 
             // --- NEW: Bulk Import/Export States ---
             const [isImporting, setIsImporting] = useState(false);
+
+            // --- NEW: Loyalty Filter States ---
+            const [loyaltySearchQuery, setLoyaltySearchQuery] = useState('');
+            const [loyaltyDateFilter, setLoyaltyDateFilter] = useState('all');
+            const [loyaltyCustomDate, setLoyaltyCustomDate] = useState(getTodayString());
+            const [loyaltyCustomMonth, setLoyaltyCustomMonth] = useState(() => {
+                const d = new Date();
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+            });
+            const [historicalLoyaltyOrders, setHistoricalLoyaltyOrders] = useState([]);
+            const [isFetchingLoyaltyHistory, setIsFetchingLoyaltyHistory] = useState(false);
+            
+            const getLoyaltyTimeRange = () => {
+                const now = new Date();
+                let startTime = 0; let endTime = now.getTime() + 9999999999;
+                
+                if (loyaltyDateFilter === 'today') {
+                    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                    startTime = startOfToday.getTime();
+                    endTime = startTime + (24 * 60 * 60 * 1000);
+                } else if (loyaltyDateFilter === 'yesterday') {
+                    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                    startTime = startOfToday.getTime() - (24 * 60 * 60 * 1000);
+                    endTime = startOfToday.getTime();
+                } else if (loyaltyDateFilter === 'this_month') {
+                    startTime = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                    endTime = now.getTime() + 9999999999;
+                } else if (loyaltyDateFilter === 'last_month') {
+                    startTime = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime();
+                    endTime = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                } else if (loyaltyDateFilter === 'custom_date' && loyaltyCustomDate) {
+                    const [year, month, day] = loyaltyCustomDate.split('-');
+                    startTime = new Date(year, month - 1, day).getTime();
+                    endTime = startTime + (24 * 60 * 60 * 1000);
+                } else if (loyaltyDateFilter === 'custom_month' && loyaltyCustomMonth) {
+                    const [year, month] = loyaltyCustomMonth.split('-');
+                    startTime = new Date(year, month - 1, 1).getTime();
+                    endTime = new Date(year, month, 1).getTime();
+                }
+                return { startTime, endTime };
+            };
+
+            useEffect(() => {
+                if (loyaltyDateFilter === 'all') return;
+                const fetchHistory = async () => {
+                    setIsFetchingLoyaltyHistory(true);
+                    const { getDocs, query, where, collection } = window.FirebaseApp;
+                    const { startTime, endTime } = getLoyaltyTimeRange();
+                    try {
+                        const q = query(
+                            collection(db, 'orders'),
+                            where('createdAt', '>=', startTime),
+                            where('createdAt', '<', endTime)
+                        );
+                        const snap = await getDocs(q);
+                        setHistoricalLoyaltyOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    } catch(err) {
+                        console.error("Failed to fetch historical loyalty orders", err);
+                    } finally {
+                        setIsFetchingLoyaltyHistory(false);
+                    }
+                };
+                fetchHistory();
+            }, [loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth]);
 
             // --- FIX: MISSING FORM SUBMISSION HANDLER ---
             const handleEditCustomerSubmit = async (e) => {
@@ -10618,13 +10686,15 @@
             }, [customersData, searchQuery]);
 
             // Loyalty Sub-Reports Logic
+            const sourceLoyaltyOrders = loyaltyDateFilter === 'all' ? orders : historicalLoyaltyOrders;
+
             const redemptions = useMemo(() => {
-                return orders.filter(o => o.status !== 'Cancelled' && o.redeemedPoints && o.redeemedPoints > 0).sort((a,b) => b.createdAt - a.createdAt);
-            }, [orders]);
+                return sourceLoyaltyOrders.filter(o => o.status !== 'Cancelled' && o.redeemedPoints && o.redeemedPoints > 0).sort((a,b) => b.createdAt - a.createdAt);
+            }, [sourceLoyaltyOrders]);
 
             const promoUsages = useMemo(() => {
                 const usages = [];
-                orders.forEach(o => {
+                sourceLoyaltyOrders.forEach(o => {
                     if (o.status === 'Cancelled') return;
                     o.items.forEach((item, idx) => {
                         // FIX: Exclude 'Loyalty Reward' so this report ONLY tracks BOGO, Fixed, and Percentage promos
@@ -10634,6 +10704,7 @@
                                 date: o.createdAt,
                                 shopId: o.shopId,
                                 customerName: o.customerName || 'Walk-in',
+                                customerPhone: o.customerPhone || '',
                                 promoName: item.promoName,
                                 productName: item.name
                             });
@@ -10641,7 +10712,56 @@
                     });
                 });
                 return usages.sort((a,b) => b.date - a.date);
-            }, [orders]);
+            }, [sourceLoyaltyOrders]);
+
+            const filteredPointsReport = useMemo(() => {
+                const { startTime, endTime } = getLoyaltyTimeRange();
+                const searchLower = loyaltySearchQuery.toLowerCase();
+                const cleanSearch = searchLower.replace(/\D/g, '');
+
+                return customersData.filter(c => {
+                    if (filterShop !== 'All' && !c.shopBreakdown[filterShop]) return false;
+                    if (loyaltySearchQuery) {
+                        const nameMatch = c.name?.toLowerCase().includes(searchLower);
+                        const phoneMatch = cleanSearch && c.phone?.replace(/\D/g, '').includes(cleanSearch);
+                        if (!nameMatch && !phoneMatch) return false;
+                    }
+                    if (loyaltyDateFilter !== 'all') {
+                        if (c.lastVisit < startTime || c.lastVisit >= endTime) return false;
+                    }
+                    return true;
+                });
+            }, [customersData, filterShop, loyaltySearchQuery, loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth]);
+
+            const filteredRedemptions = useMemo(() => {
+                const searchLower = loyaltySearchQuery.toLowerCase();
+                const cleanSearch = searchLower.replace(/\D/g, '');
+
+                return redemptions.filter(r => {
+                    if (filterShop !== 'All' && r.shopId !== filterShop) return false;
+                    if (loyaltySearchQuery) {
+                        const nameMatch = r.customerName?.toLowerCase().includes(searchLower);
+                        const phoneMatch = cleanSearch && r.customerPhone?.replace(/\D/g, '').includes(cleanSearch);
+                        if (!nameMatch && !phoneMatch) return false;
+                    }
+                    return true;
+                });
+            }, [redemptions, filterShop, loyaltySearchQuery]);
+
+            const filteredPromos = useMemo(() => {
+                const searchLower = loyaltySearchQuery.toLowerCase();
+                const cleanSearch = searchLower.replace(/\D/g, '');
+
+                return promoUsages.filter(p => {
+                    if (filterShop !== 'All' && p.shopId !== filterShop) return false;
+                    if (loyaltySearchQuery) {
+                        const nameMatch = p.customerName?.toLowerCase().includes(searchLower);
+                        const phoneMatch = cleanSearch && p.customerPhone?.replace(/\D/g, '').includes(cleanSearch);
+                        if (!nameMatch && !phoneMatch) return false;
+                    }
+                    return true;
+                });
+            }, [promoUsages, filterShop, loyaltySearchQuery]);
 
             const deleteCustomer = async (customer) => {
                 if (!isSuper) {
@@ -10999,12 +11119,71 @@
 
                     {activeTab === 'loyalty' && (
                         <div className="animate-fade-in flex flex-col h-full">
-                            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4 shrink-0">
+                            <div className="flex flex-col justify-between mb-4 shrink-0 space-y-4">
                                 <div>
                                     <h2 className="text-2xl font-bold text-stone-800">Loyalty Tracking</h2>
                                     <p className="text-sm text-stone-500 font-medium mt-1">Review point accumulations, redemptions, and active promotion usage.</p>
                                 </div>
+                                
+                                {/* Unified Smart Filters Card */}
+                                <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 mb-2 space-y-3">
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className="text-xs font-bold text-stone-500 uppercase tracking-wider"><i className="fa-solid fa-filter mr-1.5"></i> Smart Filter</span>
+                                    </div>
+                                    <div className="flex flex-wrap gap-3 items-end">
+                                        {/* Shop Filter */}
+                                        <div className="flex-1 min-w-[150px]">
+                                            <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Shop Name</label>
+                                            <select className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700" value={filterShop} onChange={e=>setFilterShop(e.target.value)}>
+                                                {isSuper && <option value="All">All Branches</option>}
+                                                {shops.filter(s => isSuper || currentAdminRecord?.shopIds?.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                            </select>
+                                        </div>
+                                        
+                                        {/* Date / Due Time Filter */}
+                                        <div className="flex-1 min-w-[150px]">
+                                            <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Due Time</label>
+                                            <select className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700" value={loyaltyDateFilter} onChange={e=>setLoyaltyDateFilter(e.target.value)}>
+                                                <option value="all">All Time / Lifetime</option>
+                                                <option value="today">Today</option>
+                                                <option value="yesterday">Yesterday</option>
+                                                <option value="this_month">This Month</option>
+                                                <option value="last_month">Last Month</option>
+                                                <option value="custom_date">Custom Date (Date Picker)</option>
+                                                <option value="custom_month">Custom Month (Year & Month)</option>
+                                            </select>
+                                        </div>
+
+                                        {loyaltyDateFilter === 'custom_date' && (
+                                            <div className="flex-1 min-w-[150px] animate-fade-in">
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Select Date</label>
+                                                <input type="date" className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700" value={loyaltyCustomDate} onChange={e=>setLoyaltyCustomDate(e.target.value)} />
+                                            </div>
+                                        )}
+                                        {loyaltyDateFilter === 'custom_month' && (
+                                            <div className="flex-1 min-w-[150px] animate-fade-in">
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Select Year & Month</label>
+                                                <input type="month" className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700" value={loyaltyCustomMonth} onChange={e=>setLoyaltyCustomMonth(e.target.value)} />
+                                            </div>
+                                        )}
+
+                                        {/* Customer Search Box */}
+                                        <div className="flex-[2] min-w-[200px]">
+                                            <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Customer Search Box</label>
+                                            <div className="relative">
+                                                <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                                                <input type="text" placeholder="Search Customer Name or Phone Number..." className="w-full border border-stone-300 rounded-lg pl-9 pr-4 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-800" value={loyaltySearchQuery} onChange={e=>setLoyaltySearchQuery(e.target.value)} />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
+
+                            {isFetchingLoyaltyHistory && (
+                                <div className="mb-4 bg-blue-50 text-blue-700 p-3 rounded-xl border border-blue-200 text-sm font-bold flex items-center shadow-sm animate-pulse shrink-0">
+                                    <i className="fa-solid fa-spinner fa-spin mr-2"></i> Fetching historical data from Firebase...
+                                </div>
+                            )}
 
                             <div className="flex flex-wrap gap-2 mb-4 shrink-0">
                                 <button onClick={() => setReportTab('points')} className={`px-4 py-2 rounded-xl text-sm font-bold transition ${reportTab === 'points' ? 'bg-amber-100 text-amber-800 border-amber-300' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'} border`}>Point Earn Report</button>
@@ -11033,11 +11212,11 @@
                                                             )}
                                                         </div>
                                                     </th>
-                                                    <th className="p-3 font-bold border border-stone-300 text-rose-600">Free Product Claim</th>
+                                                    <th className="p-3 font-bold border-b border-stone-300 text-rose-600">Free Product Claim</th>
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                {customersData.map((c, idx) => {
+                                                {filteredPointsReport.map((c, idx) => {
                                                     const lifetimeEarnedPts = Math.floor(c.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
                                                     
                                                     // FIX: Use shared calculator to apply expiration and exact batch logic
@@ -11076,6 +11255,9 @@
                                                         </tr>
                                                     );
                                                 })}
+                                                {filteredPointsReport.length === 0 && (
+                                                    <tr><td colSpan="7" className="p-8 text-center text-stone-400 font-medium">No records found matching the filters.</td></tr>
+                                                )}
                                             </tbody>
                                         </table>
                                     )}
@@ -11092,7 +11274,7 @@
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                {redemptions.map(r => {
+                                                {filteredRedemptions.map(r => {
                                                     const shopName = shops?.find(s => s.id === r.shopId)?.name || 'Unknown';
                                                     return (
                                                         <tr key={r.id} className="hover:bg-stone-50 bg-white">
@@ -11106,7 +11288,7 @@
                                                         </tr>
                                                     );
                                                 })}
-                                                {redemptions.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-stone-400 font-medium">No point redemptions recorded yet.</td></tr>}
+                                                {filteredRedemptions.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-stone-400 font-medium">No point redemptions recorded yet.</td></tr>}
                                             </tbody>
                                         </table>
                                     )}
@@ -11123,7 +11305,7 @@
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                {promoUsages.map(p => {
+                                                {filteredPromos.map(p => {
                                                     const shopName = shops?.find(s => s.id === p.shopId)?.name || 'Unknown';
                                                     return (
                                                         <tr key={p.id} className="hover:bg-stone-50 bg-white">
@@ -11135,7 +11317,7 @@
                                                         </tr>
                                                     );
                                                 })}
-                                                {promoUsages.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-stone-400 font-medium">No active promotions have been utilized yet.</td></tr>}
+                                                {filteredPromos.length === 0 && <tr><td colSpan="5" className="p-8 text-center text-stone-400 font-medium">No active promotions have been utilized yet.</td></tr>}
                                             </tbody>
                                         </table>
                                     )}
