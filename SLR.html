@@ -6433,8 +6433,9 @@
             }, []);
 
             const currentShift = useMemo(() => {
-                return shifts?.find(s => s.shopId === posShopId && s.status === 'Open');
-            }, [shifts, posShopId]);
+                // FIX: Tie currentShift strictly to the cartShopId so the Close Shift modal reflects the active cart context.
+                return shifts?.find(s => s.shopId === cartShopId && s.status === 'Open');
+            }, [shifts, cartShopId]);
 
             const [startingCashInput, setStartingCashInput] = useState('');
             const [openShiftModal, setOpenShiftModal] = useState(false);
@@ -6442,51 +6443,72 @@
             const [actualCash, setActualCash] = useState('');
             const [actualBank, setActualBank] = useState('');
 
-            // Shift Totals Calculation
-            const shiftOrders = useMemo(() => {
-                if (!currentShift) return [];
-                return orders.filter(o => o.shiftId === currentShift.id && o.paymentStatus === 'Paid');
-            }, [orders, currentShift]);
+            // FIX: Robust Server-Side Shift Data Fetching
+            // Prevents Data Loss if shift exceeds 150 orders (which drop off the local array).
+            const [shiftSalesData, setShiftSalesData] = useState(null);
+            const [isFetchingShiftData, setIsFetchingShiftData] = useState(false);
 
-            const cashSales = shiftOrders.filter(o => o.paymentMethod === 'Cash').reduce((s,o)=>s+o.totalAmount,0);
-            const bankSales = shiftOrders.filter(o => o.paymentMethod === 'Bank').reduce((s,o)=>s+o.totalAmount,0);
-            const expectedCash = (currentShift?.startingCash || 0) + cashSales;
-            const expectedBank = bankSales;
-
-            let shiftGrossSale = 0;
-            let shiftTotalCost = 0;
-            shiftOrders.forEach(o => {
-                (o.items || []).forEach(i => {
-                    shiftGrossSale += (i.originalPrice || i.price || 0) * (i.quantity || 1);
+            const openCloseShiftModal = async () => {
+                if (!currentShift) return;
+                setIsFetchingShiftData(true);
+                try {
+                    const { getDocs, query, where, collection } = window.FirebaseApp;
+                    const q = query(collection(db, 'orders'), where('shiftId', '==', currentShift.id), where('paymentStatus', '==', 'Paid'));
+                    const snap = await getDocs(q);
                     
-                    const product = products.find(p => p.id === i.productId);
-                    if (product) {
-                        // Smart Product Cost Extraction
-                        let cost = 0;
-                        if (i.size === 'S') {
-                            cost = product.costSmall || 0;
-                        } else if (i.size === 'L') {
-                            cost = product.costLarge || 0;
-                        } else if (i.price && i.price === product.priceSmall) {
-                            cost = product.costSmall || 0;
-                        } else if (i.price && i.price === product.priceLarge) {
-                            cost = product.costLarge || 0;
-                        } else {
-                            cost = product.costSmall || product.costLarge || 0; // Safe fallback
-                        }
-                        
-                        shiftTotalCost += cost * (i.quantity || 1);
-                    }
-                });
-            });
-            const shiftNetSale = shiftOrders.reduce((s,o)=>s+o.totalAmount,0);
-            const shiftDiscountPromo = Math.max(0, shiftGrossSale - shiftNetSale);
-            const shiftNetProfit = shiftNetSale - shiftTotalCost;
+                    let sGross = 0;
+                    let sCost = 0;
+                    let cSales = 0;
+                    let bSales = 0;
+                    let sNet = 0;
 
-            // Calculate Discount Impact & Retention percentages
-            const discountRate = shiftGrossSale > 0 ? ((shiftDiscountPromo / shiftGrossSale) * 100).toFixed(1) : 0;
-            const retentionRate = shiftGrossSale > 0 ? ((shiftNetSale / shiftGrossSale) * 100).toFixed(1) : 0;
-            const marginRate = shiftNetSale > 0 ? ((shiftNetProfit / shiftNetSale) * 100).toFixed(1) : 0;
+                    snap.forEach(docSnap => {
+                        const o = docSnap.data();
+                        sNet += o.totalAmount;
+                        if (o.paymentMethod === 'Cash') cSales += o.totalAmount;
+                        if (o.paymentMethod === 'Bank') bSales += o.totalAmount;
+                        
+                        (o.items || []).forEach(i => {
+                            const paidQty = i.paidQuantity !== undefined ? i.paidQuantity : (i.quantity || 1);
+                            sGross += (i.originalPrice || i.price || 0) * paidQty;
+                            
+                            const product = products.find(p => p.id === i.productId);
+                            if (product) {
+                                let cost = 0;
+                                if (i.size === 'S' || i.size === 'Standard') cost = product.costSmall || 0;
+                                else if (i.size === 'L') cost = product.costLarge || 0;
+                                else cost = product.costSmall || product.costLarge || 0;
+                                sCost += cost * (i.quantity || 1);
+                            }
+                        });
+                    });
+
+                    // Failsafe for discounts pushing gross below net
+                    if (sGross < sNet) sGross = sNet;
+
+                    setShiftSalesData({
+                        shiftGrossSale: sGross,
+                        shiftTotalCost: sCost,
+                        cashSales: cSales,
+                        bankSales: bSales,
+                        expectedCash: (currentShift.startingCash || 0) + cSales,
+                        expectedBank: bSales,
+                        shiftNetSale: sNet,
+                        shiftDiscountPromo: Math.max(0, sGross - sNet),
+                        shiftNetProfit: sNet - sCost
+                    });
+                    
+                    setCloseShiftModal(true);
+                } catch (err) {
+                    setPosError("Failed to fetch accurate shift data: " + err.message);
+                    setTimeout(() => setPosError(''), 4000);
+                } finally {
+                    setIsFetchingShiftData(false);
+                }
+            };
+
+            const discountRate = shiftSalesData?.shiftGrossSale > 0 ? ((shiftSalesData.shiftDiscountPromo / shiftSalesData.shiftGrossSale) * 100).toFixed(1) : 0;
+            const marginRate = shiftSalesData?.shiftNetSale > 0 ? ((shiftSalesData.shiftNetProfit / shiftSalesData.shiftNetSale) * 100).toFixed(1) : 0;
 
             const handleOpenShift = async (e) => {
                 e.preventDefault();
@@ -6494,12 +6516,19 @@
                     const startingCashValue = Number(startingCashInput);
                     if (isNaN(startingCashValue) || startingCashValue < 0) {
                          setPosError("Starting cash must be a valid positive number.");
+                         setTimeout(() => setPosError(''), 4000);
                          return;
+                    }
+
+                    if (!cartShopId || cartShopId === 'All') {
+                        setPosError("Please select a specific branch in the cart before opening a shift.");
+                        setTimeout(() => setPosError(''), 4000);
+                        return;
                     }
 
                     const { addDoc, updateDoc, doc } = window.FirebaseApp;
                     
-                    const targetShopId = cartShopId || posShopId;
+                    const targetShopId = cartShopId;
                     
                     // 1. Create the new shift
                     const shiftRef = await addDoc(getColRef('shifts'), {
@@ -6538,55 +6567,55 @@
 
             const handleCloseShift = async (e) => {
                 e.preventDefault();
+                if (!shiftSalesData) return;
+
                 try {
                     const actualCashValue = Number(actualCash);
-                    const finalActualBank = actualBank !== '' ? Number(actualBank) : expectedBank;
+                    const finalActualBank = actualBank !== '' ? Number(actualBank) : shiftSalesData.expectedBank;
                     
                     if (isNaN(actualCashValue) || actualCashValue < 0) {
                          setPosError("Actual cash counted must be a valid positive number.");
+                         setTimeout(() => setPosError(''), 4000);
                          return;
                     }
 
-                    // SECURITY: Server-side validation math replica
-                    // This mirrors what the Firestore rules should enforce
-                    const calculatedCashVar = actualCashValue - expectedCash;
-                    const calculatedBankVar = finalActualBank - expectedBank;
+                    const calculatedCashVar = actualCashValue - shiftSalesData.expectedCash;
+                    const calculatedBankVar = finalActualBank - shiftSalesData.expectedBank;
 
-                    // STRICT VALIDATION: Require manager notes if variance exceeds threshold (e.g. 100,000 KHR / ~$25)
                     const VARIANCE_THRESHOLD = 100000; 
                     if (Math.abs(calculatedCashVar) > VARIANCE_THRESHOLD || Math.abs(calculatedBankVar) > VARIANCE_THRESHOLD) {
                         const note = prompt(`High variance detected (Cash: ${calculatedCashVar} ៛, Bank: ${calculatedBankVar} ៛).\nPlease provide a reason for this discrepancy:`);
                         if (!note || note.trim().length < 5) {
                             setPosError("Shift close aborted. A detailed explanation is required for high variance drops.");
+                            setTimeout(() => setPosError(''), 4000);
                             return;
                         }
-                        // In a full implementation, you would attach this 'note' to the shift document
                     }
 
                     const { updateDoc, doc } = window.FirebaseApp;
                     
-                    // Using an atomic transaction or batched write here would be ideal for a production environment 
-                    // to prevent orders from sneaking in between the time we calculate `expectedCash` and when we close the shift.
                     await updateDoc(doc(getColRef('shifts'), currentShift.id), {
                         status: 'Closed',
                         closedAt: Date.now(),
                         closedBy: currentAdminRecord?.name || currentAdminRecord?.email || 'Unknown',
-                        cashSales: cashSales,
-                        bankSales: bankSales,
-                        totalSales: cashSales + bankSales,
-                        expectedCash: expectedCash,
+                        cashSales: shiftSalesData.cashSales,
+                        bankSales: shiftSalesData.bankSales,
+                        totalSales: shiftSalesData.shiftNetSale,
+                        expectedCash: shiftSalesData.expectedCash,
                         actualCash: actualCashValue,
-                        cashVariance: calculatedCashVar, // Let the rules validate this math
-                        expectedBank: expectedBank,
+                        cashVariance: calculatedCashVar,
+                        expectedBank: shiftSalesData.expectedBank,
                         actualBank: finalActualBank,
-                        bankVariance: calculatedBankVar // Let the rules validate this math
+                        bankVariance: calculatedBankVar
                     });
                     
                     setCloseShiftModal(false);
                     setActualCash('');
                     setActualBank('');
+                    setShiftSalesData(null);
                 } catch (err) {
                     setPosError("Failed to close shift: " + err.message);
+                    setTimeout(() => setPosError(''), 4000);
                 }
             };
 
@@ -7348,14 +7377,15 @@
                             <div className="w-full md:w-80 lg:w-96 bg-white rounded-2xl shadow-sm border border-stone-200 flex flex-col shrink-0 h-full">
                                 <div className="p-4 border-b border-stone-200 bg-stone-50 font-bold text-stone-800 flex justify-between items-center">
                                     <div><i className="fa-solid fa-cart-shopping mr-2 text-amber-600"></i> Current Order</div>
-                                    {!currentShift && posShopId !== 'All' && (
+                                    {!currentShift && cartShopId && cartShopId !== 'All' && (
                                         <button onClick={() => setOpenShiftModal(true)} className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded font-bold hover:bg-green-200 transition shadow-sm">
                                             <i className="fa-solid fa-lock-open mr-1"></i> Open Shift
                                         </button>
                                     )}
                                     {currentShift && (
-                                        <button onClick={() => setCloseShiftModal(true)} className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded font-bold hover:bg-red-200 transition shadow-sm">
-                                            <i className="fa-solid fa-lock mr-1"></i> Close Shift
+                                        <button onClick={openCloseShiftModal} disabled={isFetchingShiftData} className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded font-bold hover:bg-red-200 transition shadow-sm flex items-center">
+                                            {isFetchingShiftData ? <i className="fa-solid fa-spinner fa-spin mr-1"></i> : <i className="fa-solid fa-lock mr-1"></i>}
+                                            Close Shift
                                         </button>
                                     )}
                                 </div>
@@ -7806,7 +7836,7 @@
                     )}
 
                     {/* CLOSE SHIFT MODAL */}
-                    {closeShiftModal && (
+                    {closeShiftModal && shiftSalesData && (
                         <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-[150] flex items-center justify-center p-4">
                             <form onSubmit={handleCloseShift} className="bg-white rounded-3xl w-full max-w-md p-4 sm:p-6 shadow-2xl animate-fade-in relative max-h-[90vh] flex flex-col">
                                 
@@ -7842,24 +7872,24 @@
                                         <h4 className="text-[11px] font-bold text-stone-800 mb-2 uppercase tracking-wider flex items-center"><i className="fa-solid fa-chart-pie text-amber-500 mr-1.5"></i>Sales Summary</h4>
                                         <div className="bg-white rounded-xl border border-stone-200 shadow-sm p-3 text-xs space-y-2">
                                             <div className="flex justify-between items-center text-stone-600 font-medium">
-                                                <span>Gross Sales</span> <span>{shiftGrossSale.toLocaleString()} ៛</span>
+                                                <span>Gross Sales</span> <span>{shiftSalesData.shiftGrossSale.toLocaleString()} ៛</span>
                                             </div>
                                             <div className="flex justify-between items-center text-rose-500 font-medium">
                                                 <div className="flex items-center gap-1.5">
                                                     <span>Discounts</span>
-                                                    {shiftDiscountPromo > 0 && <span className="text-[9px] bg-rose-50 text-rose-600 px-1 py-0.5 rounded font-bold border border-rose-100">{discountRate}%</span>}
+                                                    {shiftSalesData.shiftDiscountPromo > 0 && <span className="text-[9px] bg-rose-50 text-rose-600 px-1 py-0.5 rounded font-bold border border-rose-100">{discountRate}%</span>}
                                                 </div>
-                                                <span>-{shiftDiscountPromo.toLocaleString()} ៛</span>
+                                                <span>-{shiftSalesData.shiftDiscountPromo.toLocaleString()} ៛</span>
                                             </div>
                                             <div className="flex justify-between items-center text-stone-500 font-medium border-b border-stone-100 pb-2">
-                                                <span>Est. Cost</span> <span>-{shiftTotalCost.toLocaleString()} ៛</span>
+                                                <span>Est. Cost</span> <span>-{shiftSalesData.shiftTotalCost.toLocaleString()} ៛</span>
                                             </div>
                                             <div className="flex justify-between items-center pt-1 font-bold text-stone-800">
-                                                <span>Net Revenue</span> <span className="text-sm">{shiftNetSale.toLocaleString()} ៛</span>
+                                                <span>Net Revenue</span> <span className="text-sm">{shiftSalesData.shiftNetSale.toLocaleString()} ៛</span>
                                             </div>
-                                            <div className={`flex justify-between items-center p-2 rounded-lg mt-1 border ${shiftNetProfit >= 0 ? 'bg-emerald-50 border-emerald-100 text-emerald-800' : 'bg-rose-50 border-rose-100 text-rose-800'}`}>
+                                            <div className={`flex justify-between items-center p-2 rounded-lg mt-1 border ${shiftSalesData.shiftNetProfit >= 0 ? 'bg-emerald-50 border-emerald-100 text-emerald-800' : 'bg-rose-50 border-rose-100 text-rose-800'}`}>
                                                 <span className="font-bold text-[11px]">Net Margin ({marginRate}%)</span>
-                                                <span className="font-black">{shiftNetProfit >= 0 ? '+' : ''}{shiftNetProfit.toLocaleString()} ៛</span>
+                                                <span className="font-black">{shiftSalesData.shiftNetProfit >= 0 ? '+' : ''}{shiftSalesData.shiftNetProfit.toLocaleString()} ៛</span>
                                             </div>
                                         </div>
                                     </div>
@@ -7872,7 +7902,7 @@
                                             <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden flex flex-col">
                                                 <div className="bg-stone-50 border-b border-stone-200 px-3 py-2 flex justify-between items-center">
                                                     <span className="font-bold text-stone-800 text-[11px]"><i className="fa-solid fa-money-bill-wave text-green-600 mr-1.5"></i>Cash Drawer</span>
-                                                    <span className="text-[10px] font-bold text-stone-500">Exp: {expectedCash.toLocaleString()} ៛</span>
+                                                    <span className="text-[10px] font-bold text-stone-500">Exp: {shiftSalesData.expectedCash.toLocaleString()} ៛</span>
                                                 </div>
                                                 <div className="p-3 flex items-center gap-3">
                                                     <div className="flex-1 relative">
@@ -7882,8 +7912,8 @@
                                                     <div className="w-24 shrink-0 text-right border-l border-stone-100 pl-3">
                                                         <div className="text-[9px] font-bold text-stone-400 uppercase mb-1">Variance</div>
                                                         {actualCash !== '' ? (
-                                                            <div className={`text-xs font-black ${Number(actualCash) === expectedCash ? 'text-emerald-600' : 'text-red-600'}`}>
-                                                                {(Number(actualCash) - expectedCash).toLocaleString()} ៛
+                                                            <div className={`text-xs font-black ${Number(actualCash) === shiftSalesData.expectedCash ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                                {(Number(actualCash) - shiftSalesData.expectedCash).toLocaleString()} ៛
                                                             </div>
                                                         ) : <div className="text-xs text-stone-300 font-bold">-</div>}
                                                     </div>
@@ -7894,18 +7924,18 @@
                                             <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden flex flex-col">
                                                 <div className="bg-stone-50 border-b border-stone-200 px-3 py-2 flex justify-between items-center">
                                                     <span className="font-bold text-stone-800 text-[11px]"><i className="fa-solid fa-building-columns text-blue-600 mr-1.5"></i>Bank Transfers</span>
-                                                    <span className="text-[10px] font-bold text-stone-500">Exp: {expectedBank.toLocaleString()} ៛</span>
+                                                    <span className="text-[10px] font-bold text-stone-500">Exp: {shiftSalesData.expectedBank.toLocaleString()} ៛</span>
                                                 </div>
                                                 <div className="p-3 flex items-center gap-3">
                                                     <div className="flex-1 relative">
                                                         <label className="block text-[9px] font-bold text-stone-400 uppercase mb-1">Actual Count *</label>
-                                                        <input type="number" required min="0" placeholder={expectedBank.toString()} className="w-full border border-stone-300 rounded-lg px-2 py-1.5 outline-none focus:border-amber-500 font-black text-right text-sm bg-stone-50 focus:bg-white shadow-inner transition-colors" value={actualBank} onChange={e=>setActualBank(e.target.value)} />
+                                                        <input type="number" required min="0" placeholder={shiftSalesData.expectedBank.toString()} className="w-full border border-stone-300 rounded-lg px-2 py-1.5 outline-none focus:border-amber-500 font-black text-right text-sm bg-stone-50 focus:bg-white shadow-inner transition-colors" value={actualBank} onChange={e=>setActualBank(e.target.value)} />
                                                     </div>
                                                     <div className="w-24 shrink-0 text-right border-l border-stone-100 pl-3">
                                                         <div className="text-[9px] font-bold text-stone-400 uppercase mb-1">Variance</div>
                                                         {actualBank !== '' ? (
-                                                            <div className={`text-xs font-black ${Number(actualBank) === expectedBank ? 'text-emerald-600' : 'text-red-600'}`}>
-                                                                {(Number(actualBank) - expectedBank).toLocaleString()} ៛
+                                                            <div className={`text-xs font-black ${Number(actualBank) === shiftSalesData.expectedBank ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                                {(Number(actualBank) - shiftSalesData.expectedBank).toLocaleString()} ៛
                                                             </div>
                                                         ) : <div className="text-xs text-stone-300 font-bold">-</div>}
                                                     </div>
@@ -7915,7 +7945,7 @@
                                     </div>
                                     
                                     {/* High Variance Warning */}
-                                    {(Math.abs(Number(actualCash) - expectedCash) > 100000 || (actualBank !== '' && Math.abs(Number(actualBank) - expectedBank) > 100000)) && (
+                                    {(Math.abs(Number(actualCash) - shiftSalesData.expectedCash) > 100000 || (actualBank !== '' && Math.abs(Number(actualBank) - shiftSalesData.expectedBank) > 100000)) && (
                                         <div className="bg-red-50 p-3 rounded-xl border border-red-200 flex items-start gap-2.5 shadow-sm animate-pulse">
                                             <i className="fa-solid fa-triangle-exclamation text-red-500 text-sm mt-0.5"></i>
                                             <p className="text-[11px] text-red-800 font-bold leading-tight">High variance detected! An explanation note will be required to proceed.</p>
