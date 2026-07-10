@@ -361,59 +361,81 @@
         };
 
         const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig, refilledPoints = 0) => {
-            if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null };
+            if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null, activeBatches: [] };
 
-            // FIX: Only count PAID orders to prevent Unpaid/Cancelled orders from granting points
-            const validOrders = customerOrders.filter(o => o.customerPhone === phone && o.paymentStatus === 'Paid').sort((a, b) => a.createdAt - b.createdAt);
+            // FIX: Strict Type Casting & Filtering
+            // Only count 'Paid' orders. Unsettled or pending orders shouldn't prematurely alter math.
+            const validOrders = customerOrders
+                .filter(o => o.customerPhone === phone && o.paymentStatus === 'Paid')
+                .sort((a, b) => Number(a.createdAt) - Number(b.createdAt));
             
-            let totalRedeemed = validOrders.reduce((sum, o) => sum + (o.redeemedPoints || 0), 0);
-            
-            // FIFO Queue Engine for Points Expiration
             const pointBatches = [];
             
-            // Add manually refilled points as a non-expiring base batch
-            if (refilledPoints > 0) {
+            // Add manually refilled points as a non-expiring base batch, enforcing Number type
+            const safeRefill = Number(refilledPoints) || 0;
+            if (safeRefill > 0) {
                 pointBatches.push({
-                    points: refilledPoints,
+                    points: safeRefill,
                     earnedAt: 0,
                     expiresAt: null
                 });
             }
             
-            // FIX: Running remainder algorithm ensures small purchases aggregate to earn points (matching CRM exactly)
             let runningSpend = 0;
-            const spendReq = globalPointsConfig.spendAmount || 4000;
-            const ptsEarned = globalPointsConfig.pointsEarned || 1;
+            const spendReq = Number(globalPointsConfig.spendAmount) || 4000;
+            const ptsEarned = Number(globalPointsConfig.pointsEarned) || 1;
+            const expDays = Number(globalPointsConfig.expirationDays) || 0;
 
+            // BUG FIX: Chronological Processing ensures expired points cannot be redeemed later
             validOrders.forEach(o => {
-                runningSpend += o.totalAmount;
-                const batchesEarned = Math.floor(runningSpend / spendReq);
+                const orderTime = Number(o.createdAt) || 0;
+
+                // 1. Expire batches that passed their lifespan BEFORE this specific order
+                pointBatches.forEach(b => {
+                    if (b.points > 0 && b.expiresAt && b.expiresAt < orderTime) {
+                        b.points = 0;
+                    }
+                });
+
+                // 2. Process Redemption (Deducting oldest valid points first)
+                let redeemedHere = Number(o.redeemedPoints) || 0;
+                if (redeemedHere > 0) {
+                    for (let i = 0; i < pointBatches.length; i++) {
+                        if (redeemedHere <= 0) break;
+                        if (pointBatches[i].points > 0) {
+                            if (pointBatches[i].points <= redeemedHere) {
+                                redeemedHere -= pointBatches[i].points;
+                                pointBatches[i].points = 0;
+                            } else {
+                                pointBatches[i].points -= redeemedHere;
+                                redeemedHere = 0;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Earn Points for this order safely
+                const amountSpent = Number(o.totalAmount) || 0;
+                runningSpend += amountSpent;
                 
-                if (batchesEarned > 0) {
-                    const earned = batchesEarned * ptsEarned;
-                    pointBatches.push({
-                        points: earned,
-                        earnedAt: o.createdAt,
-                        expiresAt: globalPointsConfig.expirationDays ? o.createdAt + (globalPointsConfig.expirationDays * 24 * 60 * 60 * 1000) : null
-                    });
-                    runningSpend -= (batchesEarned * spendReq);
+                // Prevent division by zero or NaN
+                if (spendReq > 0) {
+                    const batchesEarned = Math.floor(runningSpend / spendReq);
+                    
+                    if (batchesEarned > 0) {
+                        const earned = batchesEarned * ptsEarned;
+                        pointBatches.push({
+                            points: earned,
+                            earnedAt: orderTime,
+                            expiresAt: expDays > 0 ? orderTime + (expDays * 24 * 60 * 60 * 1000) : null
+                        });
+                        // Subtract exactly what was converted, leaving remainder for next purchase
+                        runningSpend -= (batchesEarned * spendReq);
+                    }
                 }
             });
 
-            // Process Redemptions (Deducting oldest points first)
-            let remainingToRedeem = totalRedeemed;
-            for (let i = 0; i < pointBatches.length; i++) {
-                if (remainingToRedeem <= 0) break;
-                if (pointBatches[i].points <= remainingToRedeem) {
-                    remainingToRedeem -= pointBatches[i].points;
-                    pointBatches[i].points = 0;
-                } else {
-                    pointBatches[i].points -= remainingToRedeem;
-                    remainingToRedeem = 0;
-                }
-            }
-
-            // Process Expirations based on Current Time
+            // 4. Process final Expirations based on Current Time
             const now = Date.now();
             let activePts = 0;
             let earliestExpiration = null;
@@ -427,16 +449,29 @@
                         activePts += batch.points;
                         if (batch.expiresAt) {
                             activeBatches.push({ points: batch.points, expiresAt: batch.expiresAt });
-                        }
-                        if (batch.expiresAt && (!earliestExpiration || batch.expiresAt < earliestExpiration)) {
-                            earliestExpiration = batch.expiresAt;
+                            if (!earliestExpiration || batch.expiresAt < earliestExpiration) {
+                                earliestExpiration = batch.expiresAt;
+                            }
                         }
                     }
                 }
             });
 
-            const freeClaims = Math.floor(activePts / (globalPointsConfig.redeemPoints || 10));
-            return { activePoints: activePts, activePts, freeClaims, expiringSoon: earliestExpiration, activeBatches };
+            // BUG FIX: Secure Redemption Math
+            // Prevent division by zero, string coercion issues, or NaN creating 0 gifts
+            const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
+            let freeClaims = 0;
+            if (redemptionCost > 0 && activePts > 0) {
+                freeClaims = Math.floor(activePts / redemptionCost);
+            }
+            
+            return { 
+                activePoints: activePts, 
+                activePts, 
+                freeClaims, 
+                expiringSoon: earliestExpiration, 
+                activeBatches 
+            };
         };
 
         // --- Root & Data Fetching ---
@@ -1404,7 +1439,14 @@
                         {customerLoyalty?.expiringSoon && (
                             <div className="mb-3 bg-rose-50 text-rose-700 text-[10px] p-2 rounded-xl border border-rose-200 font-bold flex items-center shadow-sm w-full">
                                 <i className="fa-solid fa-clock mr-1.5 animate-pulse text-rose-500"></i> 
-                                Some points will expire on {new Date(customerLoyalty.expiringSoon).toLocaleDateString()}
+                                Some points will expire on {(() => {
+                                    const d = new Date(customerLoyalty.expiringSoon);
+                                    // BUG FIX: Format date strictly as DD-MM-YYYY to match local standards
+                                    const day = String(d.getDate()).padStart(2, '0');
+                                    const month = String(d.getMonth() + 1).padStart(2, '0');
+                                    const year = d.getFullYear();
+                                    return `${day}-${month}-${year}`;
+                                })()}
                             </div>
                         )}
                         
@@ -1554,7 +1596,7 @@
             );
         }
 
-        function OrderTrackerModal({ myActiveOrders, myPastOrders, phoneSearchQuery, setPhoneSearchQuery, onReorder, onCancelOrder, onClose, shops, customerLoyalty }) {
+        function OrderTrackerModal({ myActiveOrders, myPastOrders, phoneSearchQuery, setPhoneSearchQuery, onReorder, onCancelOrder, onClose, shops, customerLoyalty, globalPoints }) {
             return (
                 <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex justify-end">
                     <div className="bg-white w-full max-w-md h-dvh flex flex-col shadow-2xl animate-slide-in-right">
@@ -1571,38 +1613,61 @@
                                     <input type="tel" placeholder="e.g. 012 345 678" className="w-full border border-stone-300 rounded-xl pl-10 pr-4 py-2.5 text-[16px] outline-none focus:border-amber-500 bg-white shadow-sm" value={phoneSearchQuery} onChange={e=>setPhoneSearchQuery(formatPhoneNumber(e.target.value))} />
                                 </div>
                             </div>
-                            {customerLoyalty?.activeBatches && customerLoyalty.activeBatches.length > 0 && (
-                                <div className="mt-3 bg-rose-50 text-rose-700 text-xs p-3 rounded-xl border border-rose-200 shadow-sm w-full">
-                                    <div className="font-black flex items-center mb-2">
-                                        <i className="fa-solid fa-clock mr-2 text-rose-500 animate-pulse text-sm"></i> 
-                                        Your Reward List:
+
+                            {/* CLEAR UI FOR POINTS & CLAIMS VS EXPIRATION */}
+                            {customerLoyalty && (
+                                <div className="mt-4 space-y-3">
+                                    <div className="bg-amber-50 p-3.5 rounded-xl border border-amber-200 flex justify-between items-center shadow-sm">
+                                        <div>
+                                            <div className="text-[10px] font-bold text-amber-800 uppercase tracking-wider mb-0.5">Available Points</div>
+                                            <div className="font-black text-amber-600 text-xl">{customerLoyalty.activePoints} Pts</div>
+                                        </div>
+                                        <div className="text-right">
+                                            <div className="text-[10px] font-bold text-rose-800 uppercase tracking-wider mb-0.5">Free Claims</div>
+                                            <div className="font-black text-rose-600 text-xl"><i className="fa-solid fa-gift mr-1"></i>{customerLoyalty.freeClaims}</div>
+                                        </div>
                                     </div>
-                                    <ul className="space-y-1.5 pl-1 max-h-32 overflow-y-auto no-scrollbar">
-                                        {(() => {
-                                            const groupedBatches = {};
-                                            customerLoyalty.activeBatches.filter(b => b.expiresAt).forEach(batch => {
-                                                const d = new Date(batch.expiresAt);
-                                                const day = String(d.getDate()).padStart(2, '0');
-                                                const month = String(d.getMonth() + 1).padStart(2, '0');
-                                                const year = d.getFullYear();
-                                                const formattedDate = `${day}-${month}-${year}`;
-                                                
-                                                if (!groupedBatches[formattedDate]) {
-                                                    groupedBatches[formattedDate] = { dateStr: formattedDate, timestamp: batch.expiresAt, points: 0 };
-                                                }
-                                                groupedBatches[formattedDate].points += batch.points;
-                                            });
-                                            
-                                            return Object.values(groupedBatches)
-                                                .sort((a, b) => a.timestamp - b.timestamp)
-                                                .map((group, idx) => (
-                                                    <li key={idx} className="flex items-center font-bold text-[11px] bg-white/60 p-1.5 rounded border border-rose-100">
-                                                        <i className="fa-solid fa-gift text-rose-500 mr-2"></i>
-                                                        <span>{group.points} Will Expire on: {group.dateStr}, Claim now !</span>
-                                                    </li>
-                                                ));
-                                        })()}
-                                    </ul>
+                                    
+                                    {globalPoints?.pointsEnabled && customerLoyalty.freeClaims === 0 && customerLoyalty.activePoints > 0 && (
+                                        <div className="text-center text-xs font-bold text-stone-500">
+                                            Earn <span className="text-amber-600">{Math.max(0, (globalPoints.redeemPoints || 10) - customerLoyalty.activePoints)} more points</span> to unlock a free reward!
+                                        </div>
+                                    )}
+
+                                    {customerLoyalty.activeBatches && customerLoyalty.activeBatches.length > 0 && (
+                                        <div className="bg-rose-50 text-rose-700 text-xs p-3 rounded-xl border border-rose-200 shadow-sm w-full">
+                                            <div className="font-black flex items-center mb-2">
+                                                <i className="fa-solid fa-clock mr-2 text-rose-500 animate-pulse text-sm"></i> 
+                                                Points Expiring Soon:
+                                            </div>
+                                            <ul className="space-y-1.5 pl-1 max-h-32 overflow-y-auto no-scrollbar">
+                                                {(() => {
+                                                    const groupedBatches = {};
+                                                    customerLoyalty.activeBatches.filter(b => b.expiresAt).forEach(batch => {
+                                                        const d = new Date(batch.expiresAt);
+                                                        const day = String(d.getDate()).padStart(2, '0');
+                                                        const month = String(d.getMonth() + 1).padStart(2, '0');
+                                                        const year = d.getFullYear();
+                                                        const formattedDate = `${day}-${month}-${year}`;
+                                                        
+                                                        if (!groupedBatches[formattedDate]) {
+                                                            groupedBatches[formattedDate] = { dateStr: formattedDate, timestamp: batch.expiresAt, points: 0 };
+                                                        }
+                                                        groupedBatches[formattedDate].points += batch.points;
+                                                    });
+                                                    
+                                                    return Object.values(groupedBatches)
+                                                        .sort((a, b) => a.timestamp - b.timestamp)
+                                                        .map((group, idx) => (
+                                                            <li key={idx} className="flex items-center font-bold text-[11px] bg-white/60 p-1.5 rounded border border-rose-100">
+                                                                <i className="fa-solid fa-coins text-amber-500 mr-2"></i>
+                                                                <span>{group.points} Pts will expire on: {group.dateStr}</span>
+                                                            </li>
+                                                        ));
+                                                })()}
+                                            </ul>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -3628,6 +3693,7 @@
                             onClose={() => setIsTrackerOpen(false)}
                             shops={shops}
                             customerLoyalty={sessionInfo.isSetup ? customerLoyalty : null}
+                            globalPoints={globalPoints}
                         />
                     )}
                 </div>
@@ -7340,7 +7406,10 @@
                                                 {customerLoyalty?.expiringSoon && (
                                                     <div className="mt-2 bg-rose-100 text-rose-700 text-[10px] p-1.5 rounded font-bold flex items-center shadow-sm w-fit border border-rose-200">
                                                         <i className="fa-solid fa-clock mr-1.5 animate-pulse text-rose-600"></i> 
-                                                        Points expire: {new Date(customerLoyalty.expiringSoon).toLocaleDateString()}
+                                                        Points expire: {(() => {
+                                                            const d = new Date(customerLoyalty.expiringSoon);
+                                                            return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+                                                        })()}
                                                     </div>
                                                 )}
                                             </div>
