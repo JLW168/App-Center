@@ -2197,7 +2197,8 @@
             // Effect to query past orders based on phone search OR active session independently of global orders sync
             useEffect(() => {
                 if (!currentUser) return; // SECURITY FIX
-                let unsub = null; // Store unsubscribe function for the live listener
+                let unsubPhone = null; 
+                let unsubUser = null;
                 let timeoutId = null;
 
                 const fetchHistory = () => {
@@ -2205,19 +2206,64 @@
                     const targetPhone = phoneSearchQuery || sessionInfo.customerPhone;
                     const cleanedQuery = String(targetPhone).replace(/\D/g, '');
                     
-                    if (!cleanedQuery || cleanedQuery.length < 8) {
-                        setCustomerHistory([]);
-                        return;
-                    }
                     try {
-                        const { query, where, onSnapshot } = window.FirebaseApp; 
-                        const q = query(getColRef('orders'), where('customerPhone', '==', targetPhone));
+                        // PHASE 3 FIX: Extract orderBy and limit for database-level optimization
+                        const { query, where, onSnapshot, orderBy, limit } = window.FirebaseApp; 
                         
-                        // Live Sync: Automatically streams KDS item ticks, payments, and status changes instantly
-                        unsub = onSnapshot(q, snap => {
-                            const history = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.createdAt-a.createdAt);
-                            setCustomerHistory(history);
-                        });
+                        // PHASE 1 FIX: Merge results from Phone listener AND User ID listener.
+                        // This guarantees Walk-in / Anonymous users instantly see their orders in the Live Tracker via local cache.
+                        const historyMap = new Map();
+                        
+                        const updateState = () => {
+                             const merged = Array.from(historyMap.values()).sort((a,b)=>b.createdAt-a.createdAt);
+                             setCustomerHistory(merged);
+                        };
+
+                        // PHASE 3 FIX: Reusable Listener Generator with Auto-Fallback Engine
+                        // Limits payload to 15 documents to prevent WebSocket choking and massive billing spikes
+                        const setupOptimizedListener = (field, value, setUnsub) => {
+                            const optimizedQ = query(
+                                getColRef('orders'), 
+                                where(field, '==', value),
+                                orderBy('createdAt', 'desc'),
+                                limit(15)
+                            );
+                            
+                            const fallbackQ = query(getColRef('orders'), where(field, '==', value));
+
+                            const handleSnap = (snap) => {
+                                snap.docs.forEach(d => historyMap.set(d.id, { id: d.id, ...d.data() }));
+                                updateState();
+                            };
+
+                            const unsub = onSnapshot(optimizedQ, handleSnap, (error) => {
+                                if (error.message && error.message.includes('index')) {
+                                    console.warn(`[Phase 3 Opt] Missing Firebase Index for ${field}. Falling back to un-ordered query to prevent crash.`);
+                                    setUnsub(onSnapshot(fallbackQ, handleSnap));
+                                } else {
+                                    console.error("Live Tracker sync failed:", error);
+                                }
+                            });
+                            
+                            setUnsub(unsub);
+                        };
+
+                        // 1. Listen by Phone Number (if available)
+                        if (cleanedQuery && cleanedQuery.length >= 8) {
+                            setupOptimizedListener('customerPhone', targetPhone, (u) => unsubPhone = u);
+                        }
+                        
+                        // 2. ALWAYS listen by current device UID to instantly catch walk-in orders.
+                        // We skip this ONLY if they are explicitly using the search box to find someone else's order.
+                        if (!phoneSearchQuery) { 
+                            setupOptimizedListener('userId', currentUser.uid, (u) => unsubUser = u);
+                        }
+                        
+                        // Clear state if completely anonymous with no queries
+                        if ((!cleanedQuery || cleanedQuery.length < 8) && !currentUser) {
+                             setCustomerHistory([]);
+                        }
+
                     } catch (err) {
                         console.warn("History fetch failed:", err);
                     }
@@ -2234,7 +2280,8 @@
                 
                 return () => {
                     if (timeoutId) clearTimeout(timeoutId);
-                    if (unsub) unsub(); // Detach live listener to prevent memory leaks
+                    if (unsubPhone) unsubPhone(); 
+                    if (unsubUser) unsubUser();
                 };
             }, [phoneSearchQuery, sessionInfo.customerPhone, currentUser]);
 
@@ -2846,7 +2893,7 @@
                 return { isForbidden: false, distance: orderDistance, limit: maxDist, phone: '' };
             }, [shops, sessionInfo.shopId, userLocation]);
 
-            const handleCheckout = (e) => {
+            const handleCheckout = async (e) => { // PHASE 2 FIX: Convert to strict async function
                 e.preventDefault();
                 if (cart.length === 0 || !sessionInfo.isSetup) return;
                 
@@ -2892,13 +2939,8 @@
                 const redeemedItemNames = currentCart.filter(i => i.redeemedQty > 0).map(i => `${i.redeemedQty}x ${i.name}`).join(', ');
                 const currentCartTotal = cartTotal;
 
-                // 1-CLICK FIX: Generate a highly-probable Fallback Queue Number instantly for the UI
-                const fallbackSeq = Math.floor(Date.now() / 1000).toString().slice(-5) + Math.floor(Math.random() * 10);
-                const tempQueueString = `${shopPrefix}-FB${fallbackSeq}`;
-
                 const orderData = {
                     userId: currentUser ? currentUser.uid : null,
-                    queueNo: tempQueueString,
                     orderType: actualOrderType,
                     tableId: sessionInfo.tableId || 'TAKEAWAY',
                     tableName: sessionInfo.tableName || 'Take Away',
@@ -2920,75 +2962,73 @@
                     createdAt: Date.now()
                 };
 
-                // OPTIMISTIC UI UPDATE: Instant Customer Gratification
-                // Trigger subtle haptic vibration on mobile devices
-                if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
-                
-                setSubmittedOrder(orderData);
-                setCart([]);
-                setIsCartOpen(false);
-                setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
-                setIsSubmitting(false); // Unlocks the UI instantly!
-
-                // BACKGROUND SYNC: Fire and Forget Database operations
-                Promise.resolve().then(async () => {
-                    try {
-                        const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
-                        
-                        // --- SECURITY FIX: Anti-Spoofing Check ---
-                        if (sessionInfo.customerPhone) {
-                            try {
-                                const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
-                                const checkSnap = await getDocs(qCheck);
-                                if (!checkSnap.empty) {
-                                    const realProfile = checkSnap.docs[0].data();
-                                    // Stop saving to DB if suspended, even though UI already showed success
-                                    if (realProfile.status === 'Inactive') return; 
-                                }
-                            } catch (err) {
-                                console.warn("Security verification failed.", err);
-                            }
+                try {
+                    const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
+                    
+                    // --- SECURITY FIX: Anti-Spoofing Check ---
+                    if (sessionInfo.customerPhone) {
+                        const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
+                        const checkSnap = await getDocs(qCheck);
+                        if (!checkSnap.empty) {
+                            const realProfile = checkSnap.docs[0].data();
+                            if (realProfile.status === 'Inactive') {
+                                setIsSubmitting(false);
+                                return; // Stop saving to DB if suspended
+                            } 
                         }
-                        
-                        // SECURE FIREBASE TRANSACTION IN BACKGROUND
-                        let finalQueueString = tempQueueString;
-                        try {
-                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                            const nextSeq = await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                return nextVal;
-                            });
-                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                        } catch (err) {
-                            console.warn("Transaction failed, using robust time-based fallback:", err);
-                        }
-
-                        orderData.queueNo = finalQueueString;
-
-                        // Update the success view secretly with the real Queue No
-                        setSubmittedOrder(prev => (prev && prev.createdAt === orderData.createdAt) ? {...prev, queueNo: finalQueueString} : prev);
-
-                        const newOrderRef = doc(getColRef('orders'));
-                        await setDoc(newOrderRef, orderData);
-
-                        // Run all heavy network tasks in parallel
-                        await Promise.all([
-                            deductInventory(currentCart, products, sessionInfo.shopId, finalQueueString),
-                            (actualOrderType === 'DINE_IN' && sessionInfo.tableId) 
-                                ? updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Occupied' }).catch(err => console.warn(err))
-                                : Promise.resolve()
-                        ]);
-                    } catch (err) {
-                        console.error("Background order sync failed:", err);
                     }
-                });
+                    
+                    // PHASE 2 FIX: AWAIT the Transaction securely before assuming success
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const newOrderRef = doc(getColRef('orders'));
+                    
+                    const finalQueueString = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
+                        
+                        const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+                        
+                        // GHOST INVOICE CHALLENGE FIX:
+                        // Move order creation INSIDE the transaction to guarantee atomicity.
+                        // If order creation fails, the counter rolls back automatically.
+                        transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
+                        
+                        return queueStr;
+                    });
+                    
+                    orderData.queueNo = finalQueueString;
+                    orderData.id = newOrderRef.id;
+
+                    // OPTIMISTIC UI UPDATE: Display success ONLY after database confirms the order
+                    if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
+                    
+                    setSubmittedOrder(orderData);
+                    setCart([]);
+                    setIsCartOpen(false);
+                    setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
+
+                    // Run non-critical background updates (Inventory & Table locking)
+                    Promise.all([
+                        deductInventory(currentCart, products, sessionInfo.shopId, finalQueueString),
+                        (actualOrderType === 'DINE_IN' && sessionInfo.tableId) 
+                            ? updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Occupied' })
+                            : Promise.resolve()
+                    ]).catch(err => console.warn("Background tasks failed:", err));
+
+                } catch (err) {
+                    console.error("Checkout sync failed:", err);
+                    setCustomMessage("Connection failed. Order not placed. Please check your internet and try again.");
+                    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+                    toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
+                } finally {
+                    setIsSubmitting(false); // Unlock UI regardless of success or failure
+                }
             };
 
             // NEW: Google Maps Routing Logic
@@ -6718,6 +6758,9 @@
 
             const [showSetupModal, setShowSetupModal] = useState(false);
             
+            // NEW: Search Query State for POS Menu
+            const [posSearchQuery, setPosSearchQuery] = useState('');
+            
             // NEW: Fetch Global Points & Special Events for Loyalty/Promo Calculation
             const [globalPoints, setGlobalPoints] = useState(null);
             const [specialEvents, setSpecialEvents] = useState([]); // ADDED: Special Events State
@@ -6803,9 +6846,25 @@
 
             const filteredProducts = useMemo(() => {
                 if (!products) return [];
+                const searchLower = (posSearchQuery || '').toLowerCase();
+                
                 return products.filter(p => {
                     const matchesCategory = activeCategory === 'All' || p.category === activeCategory;
-                    if (!matchesCategory) return false;
+                    
+                    // CRASH FIX: Added safe fallbacks to prevent undefined.toLowerCase() errors
+                    const safeName = p.name || '';
+                    const safeShortName = p.shortName || '';
+                    const safeCode = p.productCode || '';
+                    const safeBarcodeS = p.barcodeSmall || '';
+                    const safeBarcodeL = p.barcodeLarge || '';
+                    
+                    const matchesSearch = safeName.toLowerCase().includes(searchLower) || 
+                                          safeShortName.toLowerCase().includes(searchLower) ||
+                                          safeCode.toLowerCase().includes(searchLower) ||
+                                          safeBarcodeS.toLowerCase().includes(searchLower) ||
+                                          safeBarcodeL.toLowerCase().includes(searchLower);
+
+                    if (!matchesCategory || !matchesSearch) return false;
                     
                     // Phase 3: Smart Storefront Logic (POS View)
                     if (p.isAvailable === false || p.visibilityMode === 'Hidden') return false;
@@ -7008,7 +7067,7 @@
                 return { processedCart: processed, cartTotal: total };
             }, [cart, allPromotions, specialEvents, cartShopId, customerData, products]);
 
-            const handleCheckout = (targetStatus, payStatus, payMethod) => {
+            const handleCheckout = async (targetStatus, payStatus, payMethod) => { // PHASE 2 FIX: Convert POS to strict async
                 if (cart.length === 0) return;
                 
                 // --- NEW SHIFT GUARD: Block POS Checkout if no shift is open ---
@@ -7028,16 +7087,6 @@
                 const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                // 1-CLICK FIX: Fallback to local calculation instantly for the UI
-                const shopOrders = orders.filter(o => o.shopId === cartShopId);
-                const highestQueue = shopOrders.length > 0 ? 
-                    Math.max(0, ...shopOrders.map(o => {
-                        const parts = String(o.queueNo).split('-');
-                        const num = parseInt(parts.length > 1 ? parts[1] : parts[0], 10);
-                        return isNaN(num) ? 0 : num;
-                    })) : 0;
-                const tempQueueString = `${shopPrefix}-${(highestQueue + 1).toString().padStart(9, '0')}`;
-
                 // Snapshot the processed cart state
                 const currentCart = [...processedCart];
                 const currentTotal = cartTotal;
@@ -7046,7 +7095,6 @@
                     shiftId: cartTargetShift ? cartTargetShift.id : null,
                     staffId: currentAdminRecord?.id,
                     userId: customerData ? customerData.id : (currentAdminRecord?.id || null),
-                    queueNo: tempQueueString,
                     orderType: cartMode, 
                     tableId: cartMode === 'DINE_IN' ? cartTableId : 'Walk-in',
                     tableName: cartMode === 'DINE_IN' ? cartTableName : 'Take Away',
@@ -7068,76 +7116,75 @@
                     orderData.completedAt = Date.now();
                 }
 
-                // OPTIMISTIC UI UPDATE: Clear POS Register Instantly
-                if (navigator.vibrate) navigator.vibrate([30, 30]);
-                setCart([]);
-                setCustomerName('');
-                setCustomerPhone('');
-                setCustomerSex('M');
-                setCustomerData(null);
-                setCartMode('TAKEAWAY');
-                setCartTableId('');
-                setCartTableName('');
-                setMode('manage');
-                setIsSubmitting(false);
+                try {
+                    const { doc, runTransaction, collection, addDoc } = window.FirebaseApp;
+                    
+                    // SECURE FIREBASE TRANSACTION (AWAITED)
+                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                    const newOrderRef = doc(getColRef('orders'));
 
-                // BACKGROUND SYNC: Fire and Forget Database operations
-                Promise.resolve().then(async () => {
-                    try {
-                        const { setDoc, updateDoc, doc, runTransaction, collection, addDoc } = window.FirebaseApp;
+                    const finalQueueString = await runTransaction(db, async (transaction) => {
+                        const counterDoc = await transaction.get(counterRef);
+                        let nextVal = 1;
+                        if (counterDoc.exists()) {
+                            nextVal = (counterDoc.data().currentValue || 0) + 1;
+                            transaction.update(counterRef, { currentValue: nextVal });
+                        } else {
+                            transaction.set(counterRef, { currentValue: nextVal });
+                        }
                         
-                        let finalQueueString = tempQueueString;
-                        try {
-                            const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                            const nextSeq = await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                return nextVal;
-                            });
-                            finalQueueString = `${shopPrefix}-${nextSeq.toString().padStart(9, '0')}`;
-                        } catch (err) {
-                            console.warn("Transaction failed, falling back to local calculation:", err);
+                        const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+                        
+                        // GHOST INVOICE CHALLENGE FIX:
+                        // Bind the counter increment and order creation into a single atomic operation
+                        transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
+                        
+                        return queueStr;
+                    });
+
+                    orderData.queueNo = finalQueueString;
+                    orderData.id = newOrderRef.id;
+
+                    // OPTIMISTIC UI UPDATE: Clear POS Register Instantly (Only after success)
+                    if (navigator.vibrate) navigator.vibrate([30, 30]);
+                    setCart([]);
+                    setCustomerName('');
+                    setCustomerPhone('');
+                    setCustomerSex('M');
+                    setCustomerData(null);
+                    setCartMode('TAKEAWAY');
+                    setCartTableId('');
+                    setCartTableName('');
+                    setMode('manage');
+
+                    // Auto-create new customer if phone provided but not found
+                    if (customerPhone && !customerData) {
+                        const cleanPhone = String(customerPhone).replace(/\D/g, '');
+                        if (cleanPhone.length >= 8) {
+                            addDoc(collection(db, 'customers'), {
+                                phone: customerPhone,
+                                name: customerName || 'Walk-in',
+                                createdAt: Date.now(),
+                                lastVisit: Date.now()
+                            }).catch(err => console.warn("Failed to auto-create customer:", err));
                         }
-
-                        orderData.queueNo = finalQueueString;
-
-                        const newOrderRef = doc(getColRef('orders'));
-                        await setDoc(newOrderRef, orderData);
-
-                        // Auto-create new customer if phone provided but not found
-                        if (customerPhone && !customerData) {
-                            const cleanPhone = String(customerPhone).replace(/\D/g, '');
-                            if (cleanPhone.length >= 8) {
-                                try {
-                                    await addDoc(collection(db, 'customers'), {
-                                        phone: customerPhone,
-                                        name: customerName || 'Walk-in',
-                                        createdAt: Date.now(),
-                                        lastVisit: Date.now()
-                                    });
-                                } catch (err) {
-                                    console.warn("Failed to auto-create customer:", err);
-                                }
-                            }
-                        }
-
-                        // Run parallel operations
-                        await Promise.all([
-                            deductInventory(currentCart, products, cartShopId, finalQueueString),
-                            (cartMode === 'DINE_IN' && cartTableId) 
-                                ? updateDoc(doc(getColRef('tables'), cartTableId), { status: 'Occupied' }).catch(err => console.warn(err))
-                                : Promise.resolve()
-                        ]);
-                    } catch (err) {
-                        console.error("POS Checkout failed in background:", err);
                     }
-                });
+
+                    // Run non-critical background updates (Inventory & Table locking)
+                    Promise.all([
+                        deductInventory(currentCart, products, cartShopId, finalQueueString),
+                        (cartMode === 'DINE_IN' && cartTableId) 
+                            ? updateDoc(doc(getColRef('tables'), cartTableId), { status: 'Occupied' })
+                            : Promise.resolve()
+                    ]).catch(err => console.warn("Background tasks failed:", err));
+
+                } catch (err) {
+                    console.error("POS Checkout failed:", err);
+                    setPosError("Network Error: Failed to place order. Please try again.");
+                    setTimeout(() => setPosError(''), 4000);
+                } finally {
+                    setIsSubmitting(false); // Unlock UI regardless of success or failure
+                }
             };
 
             return (
@@ -7174,6 +7221,21 @@
                                     <h3 className="font-bold text-stone-800 text-sm sm:text-base"><i className="fa-solid fa-mug-hot mr-2 text-amber-600"></i> Menu Items</h3>
                                     <button onClick={() => setMode('manage')} className="text-xs sm:text-sm font-bold text-stone-500 hover:text-stone-800 px-2.5 py-1 sm:px-3 sm:py-1.5 bg-white border border-stone-200 rounded-lg transition"><i className="fa-solid fa-arrow-left mr-1"></i> Back</button>
                                 </div>
+                                
+                                {/* NEW: Search Bar for POS Menu */}
+                                <div className="p-2 sm:p-3 border-b border-stone-100 shrink-0 bg-white">
+                                    <div className="relative">
+                                        <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-sm"></i>
+                                        <input 
+                                            type="text" 
+                                            placeholder="Search product name, code, barcode..." 
+                                            className="w-full border border-stone-300 rounded-xl pl-9 pr-3 py-2 outline-none focus:border-amber-500 bg-stone-50 focus:bg-white transition-colors text-sm font-medium shadow-inner" 
+                                            value={posSearchQuery} 
+                                            onChange={e => setPosSearchQuery(e.target.value)} 
+                                        />
+                                    </div>
+                                </div>
+
                                 <div className="p-2 sm:p-3 flex gap-1.5 sm:gap-2 overflow-x-auto no-scrollbar border-b border-stone-100 shrink-0">
                                     <button onClick={() => setActiveCategory('All')} className={`px-3 py-1 sm:px-4 sm:py-1.5 rounded-full text-xs sm:text-sm font-semibold whitespace-nowrap transition ${activeCategory === 'All' ? 'bg-stone-900 text-white shadow-md' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'}`}>All</button>
                                     {categories?.map(c => (
@@ -11978,11 +12040,11 @@
                 if (newStatus === 'Served' && order.totalAmount === 0 && order.paymentStatus !== 'Paid') {
                     const targetShift = shifts?.find(s => s.shopId === order.shopId && s.status === 'Open');
                     
-                    // --- NEW AUTO-PAY SHIFT GUARD ---
-                    // Don't auto-pay if there is no open shift, force the staff to open one.
+                    // --- PHASE 1 FIX: REVISED AUTO-PAY SHIFT GUARD ---
+                    // Do NOT block the kitchen staff from serving the order. 
+                    // If no shift is open, leave a warning note on the order but proceed with marking it Served/Paid.
                     if (!targetShift && !order.shiftId) {
-                        alert("Warning: Cannot automatically settle this free order because no shift is open. Please open a shift first to record this transaction.");
-                        return; // Abort status update until shift is opened
+                        updateData.notes = (order.notes ? order.notes + ' | ' : '') + 'SYSTEM WARNING: Auto-paid but no shift was open.';
                     }
 
                     updateData.paymentStatus = 'Paid';
