@@ -485,245 +485,6 @@
             );
         };
 
-        // --- NEW: WebRTC Voice Call Context ---
-        const VoiceCallContext = createContext(null);
-        const VoiceCallProvider = ({ children }) => {
-            const { db, user } = useContext(FirebaseContext);
-            const { addToast } = useContext(ToastContext);
-            const [callState, setCallState] = useState({ type: null, data: null }); // type: 'incoming', 'active', 'calling'
-            const pcRef = useRef(null);
-            const localStreamRef = useRef(null);
-            const audioRef = useRef(null);
-            const callDocRef = useRef(null);
-            const unsubs = useRef([]);
-
-            const cleanup = async () => {
-                localStreamRef.current?.getTracks().forEach(t => t.stop());
-                if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
-                unsubs.current.forEach(u => u());
-                unsubs.current = [];
-                if (callDocRef.current) {
-                    try { await window.firebaseSDK.updateDoc(callDocRef.current, { status: 'ended' }); } catch(e){}
-                    callDocRef.current = null;
-                }
-                setCallState({ type: null, data: null });
-            };
-
-            // Listen for incoming calls globally
-            useEffect(() => {
-                if (!db || !user) return;
-                const { collection, query, where, onSnapshot } = window.firebaseSDK;
-                const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'calls'), where('receiverId', '==', user.uid), where('status', '==', 'ringing'));
-                const unsub = onSnapshot(q, (snap) => {
-                    if (!snap.empty && callState.type === null) {
-                        const doc = snap.docs[0];
-                        setCallState({ type: 'incoming', data: { id: doc.id, ...doc.data() } });
-                        callDocRef.current = doc.ref;
-                    }
-                });
-                return () => unsub();
-            }, [db, user, callState.type]);
-
-            const startCall = async (receiver) => {
-                const { collection, doc, setDoc, addDoc, onSnapshot } = window.firebaseSDK;
-                try {
-                    if (!navigator.mediaDevices) throw new Error("MediaDevices not supported");
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                    localStreamRef.current = stream;
-                    
-                    const pc = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] });
-                    pcRef.current = pc;
-                    
-                    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-                    
-                    pc.ontrack = (event) => {
-                        if (audioRef.current && !audioRef.current.srcObject) {
-                            audioRef.current.srcObject = event.streams[0];
-                        }
-                    };
-
-                    const callDoc = doc(collection(db, 'artifacts', appId, 'public', 'data', 'calls'));
-                    callDocRef.current = callDoc;
-                    
-                    const callerCandidates = collection(db, 'artifacts', appId, 'public', 'data', 'calls', callDoc.id, 'callerCandidates');
-                    const calleeCandidates = collection(db, 'artifacts', appId, 'public', 'data', 'calls', callDoc.id, 'calleeCandidates');
-
-                    pc.onicecandidate = (event) => {
-                        event.candidate && addDoc(callerCandidates, event.candidate.toJSON());
-                    };
-
-                    const offerDescription = await pc.createOffer();
-                    await pc.setLocalDescription(offerDescription);
-
-                    const callData = {
-                        callerId: user.uid,
-                        callerName: user.email?.split('@')[0] || 'Unknown',
-                        receiverId: receiver.id,
-                        receiverName: receiver.name,
-                        offer: { type: offerDescription.type, sdp: offerDescription.sdp },
-                        status: 'ringing'
-                    };
-                    
-                    await setDoc(callDoc, callData);
-                    setCallState({ type: 'calling', data: { receiverName: receiver.name } });
-
-                    unsubs.current.push(onSnapshot(callDoc, (snapshot) => {
-                        const data = snapshot.data();
-                        if (!pc.currentRemoteDescription && data?.answer) {
-                            const answerDescription = new RTCSessionDescription(data.answer);
-                            pc.setRemoteDescription(answerDescription);
-                            setCallState({ type: 'active', data: { peerName: receiver.name } });
-                        }
-                        if (data?.status === 'rejected' || data?.status === 'ended') {
-                            if(data.status === 'rejected') addToast("Call declined", "info");
-                            else addToast("Call ended", "info");
-                            cleanup();
-                        }
-                    }));
-
-                    unsubs.current.push(onSnapshot(calleeCandidates, (snapshot) => {
-                        snapshot.docChanges().forEach((change) => {
-                            if (change.type === 'added') {
-                                const candidate = new RTCIceCandidate(change.doc.data());
-                                pc.addIceCandidate(candidate);
-                            }
-                        });
-                    }));
-
-                } catch (err) {
-                    addToast("Could not start call: " + err.message, "error");
-                    cleanup();
-                }
-            };
-
-            const answerCall = async () => {
-                if (!callDocRef.current || !callState.data) return;
-                const { collection, addDoc, updateDoc, onSnapshot } = window.firebaseSDK;
-                const callData = callState.data;
-                const callDocId = callDocRef.current.id;
-
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                    localStreamRef.current = stream;
-                    
-                    const pc = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] });
-                    pcRef.current = pc;
-                    
-                    stream.getTracks().forEach(track => pc.addTrack(track, stream));
-                    
-                    pc.ontrack = (event) => {
-                        if (audioRef.current && !audioRef.current.srcObject) {
-                            audioRef.current.srcObject = event.streams[0];
-                        }
-                    };
-
-                    const calleeCandidates = collection(db, 'artifacts', appId, 'public', 'data', 'calls', callDocId, 'calleeCandidates');
-                    const callerCandidates = collection(db, 'artifacts', appId, 'public', 'data', 'calls', callDocId, 'callerCandidates');
-
-                    pc.onicecandidate = (event) => {
-                        event.candidate && addDoc(calleeCandidates, event.candidate.toJSON());
-                    };
-
-                    const offerDescription = callData.offer;
-                    await pc.setRemoteDescription(new RTCSessionDescription(offerDescription));
-
-                    const answerDescription = await pc.createAnswer();
-                    await pc.setLocalDescription(answerDescription);
-
-                    await updateDoc(callDocRef.current, {
-                        answer: { type: answerDescription.type, sdp: answerDescription.sdp },
-                        status: 'answered'
-                    });
-
-                    setCallState({ type: 'active', data: { peerName: callData.callerName } });
-
-                    unsubs.current.push(onSnapshot(callerCandidates, (snapshot) => {
-                        snapshot.docChanges().forEach((change) => {
-                            if (change.type === 'added') {
-                                const candidate = new RTCIceCandidate(change.doc.data());
-                                pc.addIceCandidate(candidate);
-                            }
-                        });
-                    }));
-
-                    unsubs.current.push(onSnapshot(callDocRef.current, (snapshot) => {
-                        if (snapshot.data()?.status === 'ended') {
-                            addToast("Call ended", "info");
-                            cleanup();
-                        }
-                    }));
-
-                } catch (err) {
-                    addToast("Could not answer call: " + err.message, "error");
-                    await updateDoc(callDocRef.current, { status: 'rejected' });
-                    cleanup();
-                }
-            };
-
-            const rejectCall = async () => {
-                if (callDocRef.current) {
-                    await window.firebaseSDK.updateDoc(callDocRef.current, { status: 'rejected' });
-                }
-                cleanup();
-            };
-
-            return (
-                <VoiceCallContext.Provider value={{ callState, startCall, answerCall, rejectCall, endCall: cleanup }}>
-                    {children}
-                    <audio ref={audioRef} autoPlay style={{ display: 'none' }} />
-                    
-                    {/* Call UI Overlays */}
-                    {callState.type && (
-                        <div className="fixed inset-0 z-[9999] bg-slate-900/90 backdrop-blur-md flex items-center justify-center p-6 animate-in fade-in zoom-in-95 duration-200">
-                            <div className="bg-white dark:bg-slate-800 rounded-3xl p-8 max-w-sm w-full text-center shadow-2xl flex flex-col items-center border border-slate-200 dark:border-slate-700">
-                                
-                                {callState.type === 'incoming' && (
-                                    <>
-                                        <div className="w-24 h-24 bg-brand-500/20 rounded-full flex items-center justify-center mb-4 animate-pulse">
-                                            <div className="w-16 h-16 bg-brand-500 rounded-full flex items-center justify-center text-white text-2xl animate-shake">
-                                                <i className="fas fa-phone-alt"></i>
-                                            </div>
-                                        </div>
-                                        <h3 className="text-2xl font-black text-slate-900 dark:text-white mb-2">{callState.data.callerName}</h3>
-                                        <p className="text-slate-500 font-bold uppercase tracking-widest text-xs mb-8">Incoming Audio Call...</p>
-                                        <div className="flex gap-4 w-full">
-                                            <button onClick={rejectCall} className="flex-1 bg-red-500 hover:bg-red-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-red-500/30 transition-all active:scale-95">Decline</button>
-                                            <button onClick={answerCall} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-emerald-500/30 transition-all active:scale-95"><i className="fas fa-phone-alt mr-2"></i>Answer</button>
-                                        </div>
-                                    </>
-                                )}
-
-                                {callState.type === 'calling' && (
-                                    <>
-                                        <div className="w-24 h-24 bg-brand-500 rounded-full flex items-center justify-center text-white text-3xl mb-4 shadow-lg shadow-brand-500/30">
-                                            <i className="fas fa-phone-alt"></i>
-                                        </div>
-                                        <h3 className="text-2xl font-black text-slate-900 dark:text-white mb-2">{callState.data.receiverName}</h3>
-                                        <p className="text-slate-500 font-bold uppercase tracking-widest text-xs mb-8 animate-pulse">Ringing...</p>
-                                        <button onClick={cleanup} className="w-full bg-red-500 hover:bg-red-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-red-500/30 transition-all active:scale-95"><i className="fas fa-phone-slash mr-2"></i>Cancel Call</button>
-                                    </>
-                                )}
-
-                                {callState.type === 'active' && (
-                                    <>
-                                        <div className="relative mb-6">
-                                            <div className="absolute inset-0 bg-emerald-500 rounded-full animate-ping opacity-20"></div>
-                                            <div className="w-24 h-24 bg-emerald-500 rounded-full flex items-center justify-center text-white text-3xl shadow-lg shadow-emerald-500/30 relative z-10">
-                                                <i className="fas fa-microphone"></i>
-                                            </div>
-                                        </div>
-                                        <h3 className="text-2xl font-black text-slate-900 dark:text-white mb-2">{callState.data.peerName}</h3>
-                                        <p className="text-emerald-500 font-bold uppercase tracking-widest text-xs mb-8">Call in Progress</p>
-                                        <button onClick={cleanup} className="w-full bg-red-500 hover:bg-red-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-red-500/30 transition-all active:scale-95"><i className="fas fa-phone-slash mr-2"></i>End Call</button>
-                                    </>
-                                )}
-                            </div>
-                        </div>
-                    )}
-                </VoiceCallContext.Provider>
-            );
-        };
-
         // --- UPDATED: Cache-First Data Fetching Strategy ---
         const useCollection = (name) => {
             const { db, user } = useContext(FirebaseContext);
@@ -919,7 +680,6 @@
             const messages = useCollection('messages'); 
             const { auth, db } = useContext(FirebaseContext);
             const { addToast } = useContext(ToastContext);
-            const { startCall } = useContext(VoiceCallContext); // NEW: Inject Call Context
             
             const [settingsTab, setSettingsTab] = useState('users'); 
             const [formError, setFormError] = useState('');
@@ -1632,15 +1392,6 @@
                                                 </div>
                                             );
                                         })()}
-                                        
-                                        <button 
-                                            onClick={() => startCall(activeChatUser)} 
-                                            className="w-9 h-9 rounded-full bg-brand-50 dark:bg-brand-500/10 text-brand-600 dark:text-brand-400 flex items-center justify-center hover:bg-brand-100 dark:hover:bg-brand-500/20 transition-all shadow-sm active:scale-95 ml-auto lg:mr-2"
-                                            title="Start WebRTC Voice Call"
-                                        >
-                                            <i className="fas fa-phone-alt text-xs"></i>
-                                        </button>
-
                                         {chatThread.length > 0 && (
                                             <button 
                                                 onClick={handleClearChat}
@@ -4538,9 +4289,7 @@
         const App = () => (
             <FirebaseProvider>
                 <ToastProvider>
-                    <VoiceCallProvider>
-                        <AppInitializer />
-                    </VoiceCallProvider>
+                    <AppInitializer />
                 </ToastProvider>
             </FirebaseProvider>
         );
