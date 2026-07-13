@@ -243,6 +243,62 @@
                 window.XLSX.writeFile(wb, filename);
                 return true;
             };
+
+            // --- NEW: Dynamic Virtual Injection Engine ---
+            const generateVirtualFixed = (fixedExpenses, startDate, endDate, exchangeRate, closedMonths) => {
+                if (!fixedExpenses || !fixedExpenses.length || !startDate || !endDate) return [];
+                const virtualRecords = [];
+                
+                const start = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+                const end = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
+
+                let currentMonth = new Date(start);
+
+                while (currentMonth <= end) {
+                    const monthStr = `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, '0')}`;
+                    
+                    // Skip if the month is already locked (physical records handle it)
+                    const isLocked = closedMonths && closedMonths.some(cm => cm.month === monthStr);
+                    
+                    if (!isLocked) {
+                        const injectionDate = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1); 
+                        const tsInjectionDate = window.Firebase?.Timestamp ? window.Firebase.Timestamp.fromDate(injectionDate) : injectionDate;
+
+                        fixedExpenses.forEach(fe => {
+                            // --- NEW: Schedule Validation ---
+                            const validFromMonth = fe.validFrom ? String(fe.validFrom).slice(0, 7) : null;
+                            const validToMonth = fe.validTo ? String(fe.validTo).slice(0, 7) : null;
+
+                            if (validFromMonth && monthStr < validFromMonth) return; // Not started yet
+                            if (validToMonth && monthStr > validToMonth) return; // Expired
+                            // --------------------------------
+
+                            const totalAmountKhr = (fe.amountKhr || 0) + ((fe.amountUsd || 0) * (exchangeRate || 4100));
+                            virtualRecords.push({
+                                id: `virtual-${monthStr}-${fe.id}`,
+                                isVirtualFixed: true, 
+                                fixedExpenseId: fe.id,
+                                date: tsInjectionDate,
+                                type: fe.type,
+                                shop: fe.type === 'Business' ? (fe.shop || fe.deductionSource) : undefined,
+                                paidBy: fe.type === 'Family' ? (fe.paidBy || fe.deductionSource || 'Shared Fixed Expense') : undefined,
+                                deductionSource: fe.deductionSource || (fe.type === 'Business' ? fe.shop : fe.paidBy),
+                                category: fe.category,
+                                itemName: `[FIXED] ${fe.description}`,
+                                description: `[FIXED] ${fe.description}`,
+                                note: 'Auto-applied by System via Fixed Expenses Config',
+                                amountKhr: fe.amountKhr || 0,
+                                amountUsd: fe.amountUsd || 0,
+                                totalAmountKhr: totalAmountKhr,
+                                recordedBy: 'System Auto',
+                            });
+                        });
+                    }
+                    currentMonth.setMonth(currentMonth.getMonth() + 1);
+                }
+                return virtualRecords;
+            };
+            // ---------------------------------------------
             // #endregion
     
             // =================================================================================
@@ -480,9 +536,9 @@
                     { type: 'orderBy', field: 'timestamp', dir: 'desc' },
                     { type: 'limit', val: 100 }
                 ];
-                const auditLogs = useCollection('auditLogs', auditLogQuery);
-                const capitalInvestments = useCollection('capitalInvestments');
-    
+                const closedMonths = useCollection('closedMonths'); // <-- NEW: Month-End Close Snapshot
+                const lossAndRecovery = useCollection('lossAndRecovery'); // <-- ADDED Phase 1
+
                 const collections = {
                     shops: useCollection('shops'),
                     employees: useCollection('employees'),
@@ -509,8 +565,9 @@
                     capitalInvestments: useCollection('capitalInvestments'), // <-- ADDED CAPEX
                     closedMonths: useCollection('closedMonths'), // <-- NEW: Month-End Close Snapshot
                     lossAndRecovery: useCollection('lossAndRecovery'), // <-- ADDED Phase 1
+                    fixedExpenses: useCollection('fixedExpenses'), // <-- NEW: Fixed Expenses
                 };
-    
+
                 // --- NICK NAME & SHOP ALIAS INTERCEPTOR: Efficiently map historical names ---
                 const mappedData = useMemo(() => {
                     const empMap = {};
@@ -3309,6 +3366,9 @@
                         .filter(e => {
                             // 1. Must be Business type
                             if (e.type !== 'Business') return false;
+
+                            // Hide system-generated fixed expenses from daily view
+                            if (e.isVirtualFixed || e.isLockedFixed) return false;
     
                             // 2. Month Filter
                             if (filterMonth) {
@@ -7243,7 +7303,7 @@
     
             // --- START: Purchase Order Page ---
             const useMonthlyData = (filters) => {
-                const { reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory } = useData(); 
+                const { reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory, fixedExpenses, closedMonths } = useData(); 
                 
                 return useMemo(() => {
                     const now = new Date();
@@ -7277,9 +7337,13 @@
                         return itemDate && itemDate >= startDate && itemDate <= endDate;
                     };
                     
+                    const virtualFixed = generateVirtualFixed(fixedExpenses, startDate, endDate, exchangeRate, closedMonths);
+                    const virtualBiz = virtualFixed.filter(v => v.type === 'Business');
+                    const virtualFam = virtualFixed.filter(v => v.type === 'Family');
+
                     const filteredReports = reports.filter(filterByDate);
-                    const filteredBusinessExpenses = businessExpenses.filter(filterByDate);
-                    const filteredFamilyExpenses = familyExpenses.filter(filterByDate);
+                    const filteredBusinessExpenses = [...businessExpenses.filter(filterByDate), ...virtualBiz];
+                    const filteredFamilyExpenses = [...familyExpenses.filter(filterByDate), ...virtualFam];
                     const filteredInternalTransfers = internalTransfers.filter(filterByDate);
                     const filteredPurchaseOrders = purchaseOrders.filter(filterByDate);
     
@@ -7289,7 +7353,7 @@
                         allPOs: purchaseOrders, allReports: reports, allTransfers: internalTransfers,
                         saleMarginHistory 
                     };
-                }, [filters, reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory]); 
+                }, [filters, reports, businessExpenses, familyExpenses, shops, purchaseOrders, internalTransfers, appSettings, saleMarginHistory, fixedExpenses, closedMonths]); 
             };
             
             const IitPaymentTab = ({ filters, onFilterChange, isCapturing }) => {
@@ -9830,7 +9894,7 @@
             };
     
             const OperatingExpenseTab = () => {
-                const { userData, businessExpenses, familyExpenses, shops, businessCategories, familyCategories, checkMonthLock } = useData();
+                const { userData, businessExpenses, familyExpenses, shops, businessCategories, familyCategories, checkMonthLock, fixedExpenses, appSettings, closedMonths } = useData();
                 // ... (keep existing state and logic)
                 const { showNotification } = useNotification();
                 const { doc, deleteDoc } = window.Firebase;
@@ -9916,11 +9980,6 @@
                         return userShopNames.includes(e.shop);
                     });
     
-                    let combinedList = [
-                        ...accessibleBusinessExpenses.map(e => ({ ...e, type: 'Business' })),
-                        ...((userData?.role === 'Admin' || userData?.role === 'Management') ? familyExpenses.map(e => ({ ...e, type: 'Family' })) : [])
-                    ];
-    
                     let startDate = null;
                     let endDate = null;
                     const { dateRangeType, startDate: customStart, endDate: customEnd } = filters;
@@ -9939,6 +9998,20 @@
                         if (customStart) { startDate = new Date(customStart); startDate.setHours(0, 0, 0, 0); }
                         if (customEnd) { endDate = new Date(customEnd); endDate.setHours(23, 59, 59, 999); }
                     }
+    
+                    const safeStart = startDate || new Date(new Date().getFullYear() - 1, 0, 1);
+                    const safeEnd = endDate || new Date();
+                    const virtualFixed = generateVirtualFixed(fixedExpenses, safeStart, safeEnd, appSettings.exchangeRate || 4100, closedMonths);
+
+                    const combinedList = [
+                        ...accessibleBusinessExpenses.map(e => ({ ...e, type: 'Business' })),
+                        ...((userData?.role === 'Admin' || userData?.role === 'Management') ? familyExpenses.map(e => ({ ...e, type: 'Family' })) : []),
+                        ...virtualFixed.filter(v => {
+                            if (v.type === 'Business') return userShopNames ? userShopNames.includes(v.shop) : true;
+                            if (v.type === 'Family') return (userData?.role === 'Admin' || userData?.role === 'Management');
+                            return false;
+                        })
+                    ];
     
                     return combinedList.filter(exp => {
                         const shopMatch = filters.shop === 'all' || exp.type !== 'Business' || exp.shop === filters.shop;
@@ -9962,7 +10035,7 @@
     
                         return shopMatch && categoryMatch && typeMatch && dateMatch && searchMatch;
                     }).sort((a, b) => (b.date?.toDate()?.getTime() || 0) - (a.date?.toDate()?.getTime() || 0));
-                }, [businessExpenses, familyExpenses, userData, filters, shops, searchTerm]);
+                }, [businessExpenses, familyExpenses, userData, filters, shops, searchTerm, fixedExpenses, appSettings.exchangeRate, closedMonths]);
     
                 const displayedExpenses = useMemo(() => {
                     if (!isAggregated) return filteredExpenses;
@@ -10205,7 +10278,11 @@
                                                     {!isAggregated ? (
                                                         <React.Fragment>
                                                             <td className="p-3 whitespace-nowrap">{formatInCambodiaDateOnly(exp.date)}</td>
-                                                            <td className="p-3"><span className={`px-2 py-1 text-xs rounded-full ${exp.type === 'Business' ? 'bg-sky-500/20 text-sky-300' : 'bg-purple-500/20 text-purple-300'}`}>{exp.type}</span></td>
+                                                            <td className="p-3">
+                                                                <span className={`px-2 py-1 text-xs rounded-full ${exp.type === 'Business' ? 'bg-sky-500/20 text-sky-300' : 'bg-purple-500/20 text-purple-300'}`}>{exp.type}</span>
+                                                                {exp.isVirtualFixed && <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-500/20 text-blue-300 border border-blue-500/30">VIRTUAL FIXED</span>}
+                                                                {exp.isLockedFixed && <span className="ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30" title="Frozen from Month Close">LOCKED FIXED</span>}
+                                                            </td>
                                                             <td className="p-3">{exp.shop || exp.paidBy || 'N/A'}</td>
                                                             <td className="p-3">{exp.category}</td>
                                                             <td className="p-3">{exp.recordedBy || 'N/A'}</td>
@@ -10213,7 +10290,7 @@
                                                             <td className="p-3 truncate max-w-xs">{exp.note}</td>
                                                             <td className="p-3 flex gap-1 justify-center">
                                                                 <Button variant="ghost" onClick={() => setViewingExpense(exp)}><Icon name="Eye"/></Button>
-                                                                {(userData?.role === 'Admin' || userData?.role === 'Management') && ( 
+                                                                {(userData?.role === 'Admin' || userData?.role === 'Management') && !exp.isVirtualFixed && !exp.isLockedFixed && ( 
                                                                     <React.Fragment> 
                                                                         <Button variant="ghost" onClick={() => handleOpenForm(exp)}><Icon name="PenSquare"/></Button> 
                                                                         <Button variant="ghost" onClick={() => setDeletingExpense(exp)} className="text-red-400 hover:bg-red-900/50"><Icon name="Trash2"/></Button> 
@@ -10713,70 +10790,345 @@
             );
     
             // --- NEW COMPONENT: ManageAuditLogSection ---
-            const ManageAuditLogSection = () => {
-                const { auditLogs } = useData();
-    
-                return (
-                    <SettingsSection>
-                        <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
-                            <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
-                                <Icon name="List" className="text-blue-400" />
-                                System Activity & Audit Log
-                            </h2>
-                        </div>
-                        <div className="overflow-x-auto max-h-[600px] custom-scrollbar">
-                            <table className="w-full text-left text-sm">
-                                <thead className="text-xs text-slate-400 uppercase bg-slate-900/50 sticky top-0 z-10 shadow-sm">
-                                    <tr>
-                                        <th className="p-3">Time</th>
-                                        <th className="p-3">User</th>
-                                        <th className="p-3">Action</th>
-                                        <th className="p-3">Module</th>
-                                        <th className="p-3">Target Name</th>
-                                        <th className="p-3">Details</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="text-sm text-slate-300 divide-y divide-slate-700">
-                                    {(!auditLogs || auditLogs.length === 0) ? (
-                                        <tr><td colSpan="6" className="p-8 text-center text-slate-500 italic">No system activity logged yet.</td></tr>
-                                    ) : (
-                                        auditLogs.map(log => (
-                                            <tr key={log.id} className="hover:bg-slate-800 transition-colors">
-                                                <td className="p-3 font-mono text-[11px] whitespace-nowrap text-slate-400">
-                                                    {formatInCambodiaTime(log.timestamp)}
-                                                </td>
-                                                <td className="p-3 font-semibold text-blue-300">
-                                                    <div className="flex items-center gap-1.5"><Icon name="Users" size={12}/>{log.performedBy}</div>
-                                                </td>
-                                                <td className="p-3">
-                                                    <span className={`px-2 py-1 text-[10px] uppercase font-bold rounded border ${
-                                                        log.action === 'CREATE' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
-                                                        log.action === 'UPDATE' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' :
-                                                        log.action === 'DELETE' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
-                                                        'bg-slate-500/10 text-slate-400 border-slate-500/20'
-                                                    }`}>
-                                                        {log.action}
-                                                    </span>
-                                                </td>
-                                                <td className="p-3 text-slate-400 text-xs font-bold uppercase tracking-wider">{log.module}</td>
-                                                <td className="p-3 font-medium text-slate-200">{log.targetName}</td>
-                                                <td className="p-3 text-xs text-slate-400">
-                                                    <div className="max-w-sm truncate" title={log.details}>{log.details || '-'}</div>
-                                                </td>
-                                            </tr>
-                                        ))
-                                    )}
-                                </tbody>
-                            </table>
-                        </div>
-                    </SettingsSection>
-                );
+        const ManageAuditLogSection = () => {
+            const { auditLogs } = useData();
+
+            return (
+                <SettingsSection>
+                    <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
+                        <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                            <Icon name="List" className="text-blue-400" />
+                            System Activity & Audit Log
+                        </h2>
+                    </div>
+                    <div className="overflow-x-auto max-h-[600px] custom-scrollbar">
+                        <table className="w-full text-left text-sm">
+                            <thead className="text-xs text-slate-400 uppercase bg-slate-900/50 sticky top-0 z-10 shadow-sm">
+                                <tr>
+                                    <th className="p-3">Time</th>
+                                    <th className="p-3">User</th>
+                                    <th className="p-3">Action</th>
+                                    <th className="p-3">Module</th>
+                                    <th className="p-3">Target Name</th>
+                                    <th className="p-3">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody className="text-sm text-slate-300 divide-y divide-slate-700">
+                                {(!auditLogs || auditLogs.length === 0) ? (
+                                    <tr><td colSpan="6" className="p-8 text-center text-slate-500 italic">No system activity logged yet.</td></tr>
+                                ) : (
+                                    auditLogs.map(log => (
+                                        <tr key={log.id} className="hover:bg-slate-800 transition-colors">
+                                            <td className="p-3 font-mono text-[11px] whitespace-nowrap text-slate-400">
+                                                {formatInCambodiaTime(log.timestamp)}
+                                            </td>
+                                            <td className="p-3 font-semibold text-blue-300">
+                                                <div className="flex items-center gap-1.5"><Icon name="Users" size={12}/>{log.performedBy}</div>
+                                            </td>
+                                            <td className="p-3">
+                                                <span className={`px-2 py-1 text-[10px] uppercase font-bold rounded border ${
+                                                    log.action === 'CREATE' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                                                    log.action === 'UPDATE' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' :
+                                                    log.action === 'DELETE' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                                                    'bg-slate-500/10 text-slate-400 border-slate-500/20'
+                                                }`}>
+                                                    {log.action}
+                                                </span>
+                                            </td>
+                                            <td className="p-3 text-slate-400 text-xs font-bold uppercase tracking-wider">{log.module}</td>
+                                            <td className="p-3 font-medium text-slate-200">{log.targetName}</td>
+                                            <td className="p-3 text-xs text-slate-400">
+                                                <div className="max-w-sm truncate" title={log.details}>{log.details || '-'}</div>
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </SettingsSection>
+            );
+        };
+        // --------------------------------------------
+
+        // --- NEW COMPONENT: FixedExpenseModal & ManageFixedExpensesSection ---
+        const FixedExpenseModal = ({ item, onClose }) => {
+            const { shops, businessCategories, familyCategories } = useData();
+            const { showNotification } = useNotification();
+            const { addDoc, doc, updateDoc, collection, Timestamp } = window.Firebase;
+            const [isSubmitting, setIsSubmitting] = useState(false);
+            const isMounted = useRef(true);
+
+            const shareholders = useMemo(() => [...new Set(shops.flatMap(s => (s.shareholders || []).map(sh => sh.name)))], [shops]);
+
+            const [formData, setFormData] = useState({
+                type: 'Business',
+                shop: shops[0]?.name || '',
+                paidBy: shareholders[0] || '',
+                category: '',
+                description: '',
+                amountKhr: '',
+                amountUsd: '',
+                validFrom: getCambodiaISODate(), // Default to today
+                validTo: ''
+            });
+
+            useEffect(() => {
+                isMounted.current = true;
+                if (item) {
+                    setFormData({
+                        ...item,
+                        paidBy: item.paidBy || shareholders[0] || '',
+                        amountKhr: String(item.amountKhr || ''),
+                        amountUsd: String(item.amountUsd || ''),
+                        validFrom: item.validFrom || '',
+                        validTo: item.validTo || ''
+                    });
+                }
+                return () => { isMounted.current = false; };
+            }, [item, shareholders]);
+
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => {
+                    const next = { ...prev, [name]: value };
+                    if (name === 'type') {
+                        next.category = ''; // Reset category when switching Expense Type
+                    }
+                    return next;
+                });
             };
-            // --------------------------------------------
-    
-            const ManageShopsSection = () => {
-                const { shops, appSettings, gcaHistory, logActivity, capitalInvestments } = useData(); // <-- ADDED capitalInvestments
-                const { showNotification } = useNotification();
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsSubmitting(true);
+
+                const dataToSave = {
+                    type: formData.type,
+                    shop: formData.type === 'Business' ? formData.shop : '',
+                    paidBy: formData.type === 'Family' ? formData.paidBy : '',
+                    deductionSource: formData.type === 'Business' ? formData.shop : formData.paidBy,
+                    category: formData.category,
+                    description: formData.description,
+                    amountKhr: parseFormattedNumber(formData.amountKhr),
+                    amountUsd: parseFormattedNumber(formData.amountUsd),
+                    validFrom: formData.validFrom,
+                    validTo: formData.validTo,
+                    updatedAt: Timestamp.now()
+                };
+
+                try {
+                    if (item?.id) {
+                        await updateDoc(doc(window.db, "fixedExpenses", item.id), dataToSave);
+                        showNotification("Fixed expense updated.", "success");
+                    } else {
+                        await addDoc(collection(window.db, "fixedExpenses"), {
+                            ...dataToSave,
+                            createdAt: Timestamp.now()
+                        });
+                        showNotification("Fixed expense added.", "success");
+                    }
+                    if (isMounted.current) onClose();
+                } catch (err) {
+                    showNotification("Failed to save fixed expense.", "error");
+                } finally {
+                    if (isMounted.current) setIsSubmitting(false);
+                }
+            };
+
+            const activeCategories = formData.type === 'Business' ? businessCategories : familyCategories;
+
+            return (
+                <Modal title={item ? 'Edit Fixed Expense' : 'Add Fixed Expense'} onClose={onClose} size="md">
+                    <form onSubmit={handleSubmit} className="space-y-4">
+                        <FormSelect 
+                            label="Expense Type" 
+                            name="type" 
+                            value={formData.type} 
+                            onChange={handleChange} 
+                            options={[{value: 'Business', label: 'Business Expense'}, {value: 'Family', label: 'Family Expense'}]} 
+                            required 
+                        />
+                        
+                        {formData.type === 'Business' && (
+                            <FormSelect 
+                                label="Deduction Source (Shop)" 
+                                name="shop" 
+                                value={formData.shop} 
+                                onChange={handleChange} 
+                                options={shops.map(s => ({value: s.name, label: s.name}))} 
+                                required 
+                            />
+                        )}
+
+                        {formData.type === 'Family' && (
+                            <FormSelect 
+                                label="Deduction Source (Shareholder)" 
+                                name="paidBy" 
+                                value={formData.paidBy} 
+                                onChange={handleChange} 
+                                options={shareholders.map(s => ({value: s, label: s}))} 
+                                required 
+                            />
+                        )}
+
+                        <FormSelect 
+                            label="Smart Category" 
+                            name="category" 
+                            value={formData.category} 
+                            onChange={handleChange} 
+                            options={[{value: '', label: 'Select Category'}, ...activeCategories.map(c => ({value: c.name, label: c.name}))]} 
+                            required 
+                        />
+
+                        <FormInput 
+                            label="Description" 
+                            name="description" 
+                            value={formData.description} 
+                            onChange={handleChange} 
+                            placeholder="e.g. Monthly Rent, Internet Bill" 
+                            required 
+                        />
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <FormInput label="Valid From" type="date" name="validFrom" value={formData.validFrom} onChange={handleChange} required />
+                            <FormInput label="Expired Date (Optional)" type="date" name="validTo" value={formData.validTo} onChange={handleChange} />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <LiveFormatInput label="Amount (KHR)" name="amountKhr" value={formData.amountKhr} onChange={handleChange} />
+                            <LiveFormatInput label="Amount (USD)" name="amountUsd" value={formData.amountUsd} onChange={handleChange} />
+                        </div>
+
+                        <div className="flex justify-end gap-3 pt-4 border-t border-slate-700">
+                            <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : "CheckCircle"}>
+                                {isSubmitting ? 'Saving...' : 'Save Fixed Expense'}
+                            </Button>
+                        </div>
+                    </form>
+                </Modal>
+            );
+        };
+
+        const ManageFixedExpensesSection = () => {
+            const { fixedExpenses } = useData();
+            const { showNotification } = useNotification();
+            const { doc, deleteDoc } = window.Firebase;
+
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingItem, setEditingItem] = useState(null);
+            const [deletingItem, setDeletingItem] = useState(null);
+            const [isDeleting, setIsDeleting] = useState(false);
+            const [filterType, setFilterType] = useState('all');
+
+            const filteredList = useMemo(() => {
+                if (!fixedExpenses) return [];
+                return fixedExpenses.filter(item => filterType === 'all' || item.type === filterType);
+            }, [fixedExpenses, filterType]);
+
+            const handleDelete = async () => {
+                if (!deletingItem) return;
+                setIsDeleting(true);
+                try {
+                    await deleteDoc(doc(window.db, "fixedExpenses", deletingItem.id));
+                    showNotification("Fixed expense deleted.", "success");
+                } catch(e) {
+                    showNotification("Failed to delete.", "error");
+                } finally {
+                    setIsDeleting(false);
+                    setDeletingItem(null);
+                }
+            };
+
+            return (
+                <SettingsSection>
+                    <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
+                        <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                            <Icon name="CreditCard" className="text-emerald-400" />
+                            Fixed Expenses Configuration
+                        </h2>
+                        <Button onClick={() => { setEditingItem(null); setIsModalOpen(true); }} icon="Plus">Add Fixed Expense</Button>
+                    </div>
+                    
+                    <div className="mb-4">
+                        <div className="flex bg-slate-900/80 p-1.5 rounded-xl border border-slate-700/50 w-fit">
+                            {[{value: 'all', label: 'All'}, {value: 'Business', label: 'Business'}, {value: 'Family', label: 'Family'}].map(s => (
+                                <button
+                                    key={s.label}
+                                    onClick={() => setFilterType(s.value)}
+                                    className={`px-4 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all ${
+                                        filterType === s.value 
+                                            ? (s.value === 'Business' ? 'bg-sky-500 text-white shadow-md' : s.value === 'Family' ? 'bg-purple-500 text-white shadow-md' : 'bg-blue-600 text-white shadow-md') 
+                                            : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                                    }`}
+                                >
+                                    {s.label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    <div className="overflow-x-auto max-h-[600px] custom-scrollbar border border-slate-700/50 rounded-lg">
+                        <table className="w-full text-left text-sm">
+                            <thead className="text-xs text-slate-400 uppercase bg-slate-900/80 sticky top-0 z-10 shadow-sm">
+                                <tr>
+                                    <th className="p-3">Type</th>
+                                    <th className="p-3">Deduction Source</th>
+                                    <th className="p-3">Category</th>
+                                    <th className="p-3">Description</th>
+                                    <th className="p-3">Schedule</th>
+                                    <th className="p-3 text-right">Amount KHR</th>
+                                    <th className="p-3 text-right">Amount USD</th>
+                                    <th className="p-3 text-center">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="text-sm text-slate-300 divide-y divide-slate-700/50 bg-slate-800/30">
+                                {(!filteredList || filteredList.length === 0) ? (
+                                    <tr><td colSpan="8" className="p-8 text-center text-slate-500 italic">No fixed expenses configured.</td></tr>
+                                ) : (
+                                    filteredList.map(item => (
+                                        <tr key={item.id} className="hover:bg-slate-700/60 transition-colors">
+                                            <td className="p-3">
+                                                <span className={`px-2 py-1 text-[10px] uppercase font-bold rounded border ${
+                                                    item.type === 'Business' ? 'bg-sky-500/10 text-sky-400 border-sky-500/20' : 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                                                }`}>
+                                                    {item.type}
+                                                </span>
+                                            </td>
+                                            <td className="p-3 font-semibold text-slate-200">
+                                                {item.deductionSource || (item.type === 'Business' ? item.shop : (item.paidBy || 'Family Expense'))}
+                                            </td>
+                                            <td className="p-3">{item.category}</td>
+                                            <td className="p-3 text-slate-200">{item.description}</td>
+                                            <td className="p-3 text-[10px] text-slate-400 uppercase tracking-wider">
+                                                <div className="flex flex-col">
+                                                    <span>From: <strong className="text-slate-300">{item.validFrom ? formatInCambodiaDateOnly(item.validFrom) : '-'}</strong></span>
+                                                    <span>To: <strong className="text-slate-300">{item.validTo ? formatInCambodiaDateOnly(item.validTo) : 'Ongoing'}</strong></span>
+                                                </div>
+                                            </td>
+                                            <td className="p-3 text-right font-mono text-emerald-400">{item.amountKhr ? formatCurrency(item.amountKhr, 'KHR').replace('៛','') : '-'}</td>
+                                            <td className="p-3 text-right font-mono text-white">{item.amountUsd ? formatCurrency(item.amountUsd, 'USD').replace('$','') : '-'}</td>
+                                            <td className="p-3 text-center flex justify-center gap-1">
+                                                <Button variant="ghost" size="sm" onClick={() => { setEditingItem(item); setIsModalOpen(true); }} className="text-blue-400 hover:bg-blue-900/50" title="Edit"><Icon name="PenSquare"/></Button>
+                                                <Button variant="ghost" size="sm" onClick={() => setDeletingItem(item)} className="text-red-400 hover:bg-red-900/50" title="Delete"><Icon name="Trash2"/></Button>
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                    {isModalOpen && <FixedExpenseModal item={editingItem} onClose={() => setIsModalOpen(false)} />}
+                    {deletingItem && <ConfirmationModal title="Delete Fixed Expense" message={`Are you sure you want to delete ${deletingItem.description}?`} onConfirm={handleDelete} onClose={() => setDeletingItem(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete" />}
+                </SettingsSection>
+            );
+        };
+        // --------------------------------------------------------------------
+
+        const ManageShopsSection = () => {
+            const { shops, appSettings, gcaHistory, logActivity, capitalInvestments } = useData(); // <-- ADDED capitalInvestments
+            const { showNotification } = useNotification();
                 const { doc, updateDoc, deleteDoc } = window.Firebase;
                 
                 const [activeSubTab, setActiveSubTab] = useState('list'); // 'list', 'history', 'margins', 'targets', 'ca_expense'
@@ -10909,24 +11261,25 @@
                 return (
                     <div>
                         {/* --- Sub-Tabs Navigation (Dropdown) --- */}
-                        <div className="mb-6 max-w-md">
-                            <FormSelect 
-                                label="Shop Configuration Menu" 
-                                labelIcon="Settings"
-                                name="activeSubTab" 
-                                value={activeSubTab} 
-                                onChange={(e) => setActiveSubTab(e.target.value)} 
-                                options={[
-                                    { value: 'list', label: 'Shops List' },
-                                    { value: 'history', label: 'GCA Adjustment History' },
-                                    { value: 'margins', label: 'Sale Margin History' },
-                                    { value: 'targets', label: 'Target History' },
-                                    { value: 'ca_expense', label: 'CA Expense (Shop Monthly)' }
-                                ]} 
-                            />
-                        </div>
-    
-                        {activeSubTab === 'list' && (
+                    <div className="mb-6 max-w-md">
+                        <FormSelect 
+                            label="Shop Configuration Menu" 
+                            labelIcon="Settings"
+                            name="activeSubTab" 
+                            value={activeSubTab} 
+                            onChange={(e) => setActiveSubTab(e.target.value)} 
+                            options={[
+                                { value: 'list', label: 'Shops List' },
+                                { value: 'history', label: 'GCA Adjustment History' },
+                                { value: 'margins', label: 'Sale Margin History' },
+                                { value: 'targets', label: 'Target History' },
+                                { value: 'ca_expense', label: 'CA Expense (Shop Monthly)' },
+                                { value: 'fixed_expenses', label: 'Fixed Expenses' }
+                            ]} 
+                        />
+                    </div>
+
+                    {activeSubTab === 'list' && (
                             <>
                                 <SettingsSection>
                                     <h2 className="text-xl font-bold text-slate-100 mb-4 border-b border-slate-700 pb-3">Exchange Rate</h2>
@@ -11070,32 +11423,37 @@
                         {/* --------------------------------------- */}
     
                         {/* --- NEW: CA Expense Tab Content --- */}
-                        {activeSubTab === 'ca_expense' && (
-                            <SettingsSection>
-                                <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
-                                    <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
-                                        <Icon name="CreditCard" className="text-emerald-400" />
-                                        Shop Monthly (CA Expense)
-                                    </h2>
-                                </div>
-                                <div className="mb-4 p-3 bg-blue-900/20 border border-blue-500/30 rounded-lg text-sm text-blue-200">
-                                    <p className="flex items-center gap-2"><Icon name="Info" size={16}/> Set the recurring monthly allowance for emergency operations for the <strong>"Shop Monthly"</strong> category.</p>
-                                </div>
-                                <div className="overflow-x-auto">
-                                    <table className="w-full text-left text-sm">
-                                        <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
-                                            <tr><th className="p-3">Shop Name</th><th className="p-3 text-right">CA Budget (Allowance)</th><th className="p-3 text-center">Action</th></tr>
-                                        </thead>
-                                        <tbody className="text-sm text-slate-300 divide-y divide-slate-700">
-                                            {shops.map(shop => ( <tr key={shop.id} className="hover:bg-slate-700/50"><td className="p-3 font-bold text-slate-200">{shop.name}</td><td className="p-3 text-right font-mono text-emerald-400">{shop.caBudget ? formatCurrency(shop.caBudget, 'KHR') : <span className="text-slate-500 italic">Not Set</span>}</td><td className="p-3 text-center"><Button variant="ghost" onClick={() => setEditingCABudget(shop)} className="text-blue-400 hover:bg-blue-900/50"><Icon name="PenSquare" /> Set Limit</Button></td></tr> ))}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </SettingsSection>
-                        )}
-    
-                        {isModalOpen && <ShopEditModal shop={editingShop} onClose={() => setIsModalOpen(false)} />}
-                        {deletingShop && <ConfirmationModal title="Delete Shop" message={`Delete ${deletingShop.name}?`} onConfirm={handleDeleteShop} onClose={() => setDeletingShop(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete" />}
+                    {activeSubTab === 'ca_expense' && (
+                        <SettingsSection>
+                            <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
+                                <h2 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                                    <Icon name="CreditCard" className="text-emerald-400" />
+                                    Shop Monthly (CA Expense)
+                                </h2>
+                            </div>
+                            <div className="mb-4 p-3 bg-blue-900/20 border border-blue-500/30 rounded-lg text-sm text-blue-200">
+                                <p className="flex items-center gap-2"><Icon name="Info" size={16}/> Set the recurring monthly allowance for emergency operations for the <strong>"Shop Monthly"</strong> category.</p>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-sm">
+                                    <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
+                                        <tr><th className="p-3">Shop Name</th><th className="p-3 text-right">CA Budget (Allowance)</th><th className="p-3 text-center">Action</th></tr>
+                                    </thead>
+                                    <tbody className="text-sm text-slate-300 divide-y divide-slate-700">
+                                        {shops.map(shop => ( <tr key={shop.id} className="hover:bg-slate-700/50"><td className="p-3 font-bold text-slate-200">{shop.name}</td><td className="p-3 text-right font-mono text-emerald-400">{shop.caBudget ? formatCurrency(shop.caBudget, 'KHR') : <span className="text-slate-500 italic">Not Set</span>}</td><td className="p-3 text-center"><Button variant="ghost" onClick={() => setEditingCABudget(shop)} className="text-blue-400 hover:bg-blue-900/50"><Icon name="PenSquare" /> Set Limit</Button></td></tr> ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </SettingsSection>
+                    )}
+
+                    {/* --- NEW: Fixed Expenses Tab Content --- */}
+                    {activeSubTab === 'fixed_expenses' && (
+                        <ManageFixedExpensesSection />
+                    )}
+
+                    {isModalOpen && <ShopEditModal shop={editingShop} onClose={() => setIsModalOpen(false)} />}
+                    {deletingShop && <ConfirmationModal title="Delete Shop" message={`Delete ${deletingShop.name}?`} onConfirm={handleDeleteShop} onClose={() => setDeletingShop(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete" />}
                         {editingGcaLog && ( <GcaLogEditModal log={editingGcaLog} onClose={() => setEditingGcaLog(null)} onSave={handleUpdateGcaLog} /> )}
                         {deletingGcaLog && ( <ConfirmationModal title="Delete Log" message="Are you sure? This will remove the record from history but will NOT automatically revert the GCA on the shop." onConfirm={handleDeleteGcaLog} onClose={() => setDeletingGcaLog(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete Log" /> )}
                         {editingCABudget && ( <CAExpenseLimitModal shop={editingCABudget} onClose={() => setEditingCABudget(null)} onSave={handleUpdateCABudget} /> )}
@@ -13569,9 +13927,9 @@
                 const data = useMonthlyData({ ...filters, dateRangeType: 'by_month' });
                 
                 // --- NEW: Hooks for Month-End Close ---
-                const { closedMonths, userData, logActivity, lossAndRecovery, gcaHistory } = useData();
+                const { closedMonths, userData, logActivity, lossAndRecovery, gcaHistory, fixedExpenses, appSettings } = useData();
                 const { showNotification } = useNotification();
-                const { addDoc, deleteDoc, doc, collection, Timestamp } = window.Firebase;
+                const { addDoc, deleteDoc, doc, collection, Timestamp, query, where, getDocs } = window.Firebase;
                 
                 const [isClosingMonth, setIsClosingMonth] = useState(false);
                 const [isUnlockingMonth, setIsUnlockingMonth] = useState(false);
@@ -13857,8 +14215,23 @@
                             closedBy: userData.uid,
                             closedByName: userData.name
                         });
-                        logActivity('CREATE', 'CashFlow Report', filters.month, `Locked financial data for the month of ${filters.month}`);
-                        showNotification("Month closed and locked successfully!", "success");
+
+                        // 2. Freeze the virtual fixed expenses
+                        const [y, m] = filters.month.split('-');
+                        const monthStart = new Date(y, m - 1, 1);
+                        const monthEnd = new Date(y, m, 0, 23, 59, 59, 999);
+                        const virtualToSave = generateVirtualFixed(fixedExpenses, monthStart, monthEnd, appSettings.exchangeRate || 4100, []); 
+                        
+                        for (const v of virtualToSave) {
+                            const collectionName = v.type === 'Business' ? 'businessExpenses' : 'familyExpenses';
+                            const { id, isVirtualFixed, fixedExpenseId, ...dataToSave } = v; 
+                            dataToSave.isLockedFixed = true; 
+                            dataToSave.lockedMonth = filters.month;
+                            await addDoc(collection(window.db, collectionName), dataToSave);
+                        }
+
+                        logActivity('CREATE', 'CashFlow Report', filters.month, `Locked financial data and froze fixed expenses for ${filters.month}`);
+                        showNotification("Month closed and fixed expenses frozen!", "success");
                         setIsClosingMonth(false);
                     } catch (e) {
                         console.error("Lock error:", e);
@@ -13872,7 +14245,17 @@
                     setIsMutatingMonth(true);
                     try {
                         await deleteDoc(doc(window.db, "closedMonths", closedSnapshot.id));
-                        logActivity('DELETE', 'CashFlow Report', filters.month, `Unlocked financial data for the month of ${filters.month}`);
+
+                        // Remove frozen fixed expenses for this month
+                        const qBiz = query(collection(window.db, "businessExpenses"), where("lockedMonth", "==", filters.month));
+                        const snapBiz = await getDocs(qBiz);
+                        snapBiz.forEach(async (d) => { await deleteDoc(doc(window.db, "businessExpenses", d.id)); });
+                        
+                        const qFam = query(collection(window.db, "familyExpenses"), where("lockedMonth", "==", filters.month));
+                        const snapFam = await getDocs(qFam);
+                        snapFam.forEach(async (d) => { await deleteDoc(doc(window.db, "familyExpenses", d.id)); });
+
+                        logActivity('DELETE', 'CashFlow Report', filters.month, `Unlocked financial data and reverted fixed expenses for ${filters.month}`);
                         showNotification("Month unlocked successfully!", "success");
                         setIsUnlockingMonth(false);
                     } catch (e) {
