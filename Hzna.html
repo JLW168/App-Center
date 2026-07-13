@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -745,6 +746,7 @@
             const [newMessage, setNewMessage] = useState('');
             const [showEmojis, setShowEmojis] = useState(false);
             const [showStickers, setShowStickers] = useState(false);
+            const [showLocationMenu, setShowLocationMenu] = useState(false);
             const [confirmClearChat, setConfirmClearChat] = useState(false);
             const messagesEndRef = useRef(null);
             const [replyingTo, setReplyingTo] = useState(null);
@@ -753,6 +755,7 @@
             // --- NEW: Typing Indicator Refs ---
             const typingTimeoutRef = useRef(null);
             const isTypingRef = useRef(false);
+            const liveLocationWatchId = useRef(null);
 
             // Cropper state
             const [cropConfig, setCropConfig] = useState({ src: null, target: null });
@@ -823,6 +826,15 @@
                     ).catch(()=>{});
                 }
             }, [activeChatUser, auth.currentUser?.uid, db]);
+
+            // --- NEW: Cleanup Live Location Watcher ---
+            useEffect(() => {
+                return () => {
+                    if (liveLocationWatchId.current && navigator.geolocation) {
+                        navigator.geolocation.clearWatch(liveLocationWatchId.current);
+                    }
+                };
+            }, []);
 
             const currentUserProfile = users.find(u => u.email?.toLowerCase() === auth.currentUser?.email?.toLowerCase());
             const currentProfileRole = currentUserProfile?.role || 'Staff';
@@ -1037,6 +1049,92 @@
                 }
             };
             
+            const handleShareStaticLocation = () => {
+                setShowLocationMenu(false);
+                if (!activeChatUser || !myId) return;
+                if (navigator.geolocation) {
+                    addToast("Fetching location...", "info");
+                    navigator.geolocation.getCurrentPosition(
+                        async (pos) => {
+                            const lat = pos.coords.latitude.toFixed(6);
+                            const lng = pos.coords.longitude.toFixed(6);
+                            try {
+                                await window.firebaseSDK.addDoc(
+                                    window.firebaseSDK.collection(db, 'artifacts', appId, 'public', 'data', 'messages'),
+                                    {
+                                        senderId: myId,
+                                        receiverId: activeChatUser.id,
+                                        text: `[[LOCATION_STATIC:${lat}:${lng}]]`,
+                                        createdAt: window.firebaseSDK.serverTimestamp(),
+                                        read: false,
+                                        replyTo: replyingTo ? { id: replyingTo.id || null, text: replyingTo.text, senderId: replyingTo.senderId } : null
+                                    }
+                                );
+                                setReplyingTo(null);
+                            } catch (err) { addToast("Failed to send location", "error"); }
+                        },
+                        (err) => addToast("GPS Access Denied", "error")
+                    );
+                } else {
+                    addToast("Geolocation not supported by this browser.", "error");
+                }
+            };
+
+            const handleToggleLiveLocation = () => {
+                setShowLocationMenu(false);
+                if (!activeChatUser || !myId) return;
+                const myUser = users.find(u => u.id === myId);
+                const currentlySharing = !!myUser?.isSharingLive;
+
+                if (currentlySharing) {
+                    // Stop sharing
+                    if (liveLocationWatchId.current) navigator.geolocation.clearWatch(liveLocationWatchId.current);
+                    window.firebaseSDK.updateDoc(window.firebaseSDK.doc(db, 'artifacts', appId, 'users', myId), {
+                        isSharingLive: false,
+                        liveLocation: null
+                    }).catch(()=>{});
+                    addToast("Stopped sharing live location", "info");
+                } else {
+                    // Start sharing
+                    if (navigator.geolocation) {
+                        addToast("Starting live location...", "info");
+                        let messageSent = false;
+
+                        liveLocationWatchId.current = navigator.geolocation.watchPosition(
+                            (pos) => {
+                                window.firebaseSDK.updateDoc(window.firebaseSDK.doc(db, 'artifacts', appId, 'users', myId), {
+                                    isSharingLive: true,
+                                    liveLocation: { lat: pos.coords.latitude, lng: pos.coords.longitude, updatedAt: Date.now() }
+                                }).catch(()=>{});
+
+                                // Only send the message to the chat once we have a confirmed lock
+                                if (!messageSent) {
+                                    window.firebaseSDK.addDoc(window.firebaseSDK.collection(db, 'artifacts', appId, 'public', 'data', 'messages'), {
+                                        senderId: myId, receiverId: activeChatUser.id, text: `[[LOCATION_LIVE]]`, createdAt: window.firebaseSDK.serverTimestamp(), read: false
+                                    }).catch(()=>{});
+                                    messageSent = true;
+                                }
+                            },
+                            (err) => {
+                                let errorMsg = "Failed to get location.";
+                                if (err.code === 1) errorMsg = "Location permission denied.";
+                                else if (err.code === 2) errorMsg = "Position unavailable.";
+                                else if (err.code === 3) errorMsg = "Location request timed out.";
+                                
+                                console.error("Geolocation Error:", err.message || err);
+                                addToast(errorMsg, "error");
+                                
+                                // Cleanup if it failed
+                                if (liveLocationWatchId.current) navigator.geolocation.clearWatch(liveLocationWatchId.current);
+                            },
+                            { enableHighAccuracy: true, timeout: 10000 }
+                        );
+                    } else {
+                        addToast("Geolocation not supported by your browser.", "error");
+                    }
+                }
+            };
+
             const handleInitiateReply = (msg) => {
                 setReplyingTo(msg);
                 setTimeout(() => chatInputRef.current?.focus(), 50);
@@ -1471,6 +1569,7 @@
                                                                             <i className="fas fa-trash-alt text-[10px]"></i>
                                                                         </button>
                                                                     )}
+                                                                    {}
                                                                     <div 
                                                                         onClick={() => handleInitiateReply(msg)}
                                                                         className={stickerMatch ? "cursor-pointer hover:opacity-90 active:scale-95 transition-all mt-1" : `px-4 py-2.5 rounded-2xl text-base shadow-sm cursor-pointer hover:opacity-90 active:scale-95 transition-all ${
@@ -1478,19 +1577,72 @@
                                                                         ? 'bg-brand-500 text-white rounded-br-sm shadow-brand-500/20' 
                                                                         : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 rounded-bl-sm'
                                                                     }`}>
-                                                                        {msg.replyTo && (
-                                                                            <div className={`text-[10px] p-1.5 mb-1.5 rounded-lg border-l-2 opacity-80 ${isMine ? (stickerMatch ? 'bg-brand-500 text-white border-brand-300 shadow-md' : 'bg-white/20 border-white text-white') : 'bg-slate-100 dark:bg-slate-700 border-brand-500 text-slate-500 dark:text-slate-300'}`}>
-                                                                                <p className="font-bold truncate max-w-[150px] mb-0.5"><i className="fas fa-reply mr-1"></i> {msg.replyTo.senderId === myId ? 'You' : activeChatUser.name}</p>
-                                                                                <p className="truncate max-w-[150px]">{msg.replyTo.text.startsWith('[[STICKER') ? 'Sticker' : msg.replyTo.text}</p>
-                                                                            </div>
-                                                                        )}
-                                                                        {stickerMatch ? (
-                                                                            <div className={`text-6xl lg:text-7xl filter drop-shadow-lg my-1 ${stickerMatch[2]}`}>
-                                                                                {stickerMatch[1]}
-                                                                            </div>
-                                                                        ) : (
-                                                                            msg.text
-                                                                        )}
+                                                                        {(() => {
+                                                                            // Define location matchers locally within the message block
+                                                                            const staticLocMatch = msg.text.match(/^\[\[LOCATION_STATIC:(.+):(.+)\]\]$/);
+                                                                            const isLiveLoc = msg.text === '[[LOCATION_LIVE]]';
+                                                                            
+                                                                            return (
+                                                                                <>
+                                                                                    {msg.replyTo && (
+                                                                                        <div className={`text-[10px] p-1.5 mb-1.5 rounded-lg border-l-2 opacity-80 ${isMine ? (stickerMatch ? 'bg-brand-500 text-white border-brand-300 shadow-md' : 'bg-white/20 border-white text-white') : 'bg-slate-100 dark:bg-slate-700 border-brand-500 text-slate-500 dark:text-slate-300'}`}>
+                                                                                            <p className="font-bold truncate max-w-[150px] mb-0.5"><i className="fas fa-reply mr-1"></i> {msg.replyTo.senderId === myId ? 'You' : activeChatUser.name}</p>
+                                                                                            <p className="truncate max-w-[150px]">{msg.replyTo.text.startsWith('[[STICKER') ? 'Sticker' : msg.replyTo.text}</p>
+                                                                                        </div>
+                                                                                    )}
+                                                                                    {staticLocMatch ? (
+                                                                                        <div className={`flex flex-col gap-3 p-1 min-w-[200px]`}>
+                                                                                            <div className="flex items-center gap-3">
+                                                                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${isMine ? 'bg-white/20 text-white' : 'bg-brand-50 text-brand-500'}`}>
+                                                                                                    <i className="fas fa-map-marker-alt text-lg"></i>
+                                                                                                </div>
+                                                                                                <div className="min-w-0">
+                                                                                                    <p className="font-bold text-sm truncate">Dropped Pin</p>
+                                                                                                    <p className="text-[10px] opacity-70 truncate">{staticLocMatch[1]}, {staticLocMatch[2]}</p>
+                                                                                                </div>
+                                                                                            </div>
+                                                                                            <a href={`https://www.google.com/maps?q=${staticLocMatch[1]},${staticLocMatch[2]}`} target="_blank" rel="noopener noreferrer" className={`text-center py-2.5 rounded-xl text-xs font-bold transition-all shadow-sm ${isMine ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-brand-500 text-white hover:bg-brand-400'}`}>
+                                                                                                <i className="fas fa-location-arrow mr-1.5"></i>Open in Maps
+                                                                                            </a>
+                                                                                        </div>
+                                                                                    ) : isLiveLoc ? (
+                                                                                        (() => {
+                                                                                            const sender = users.find(u => u.id === msg.senderId);
+                                                                                            const isSharing = !!sender?.isSharingLive;
+                                                                                            const loc = sender?.liveLocation;
+                                                                                            return (
+                                                                                                <div className={`flex flex-col gap-3 p-1 min-w-[200px]`}>
+                                                                                                    <div className="flex items-center gap-3">
+                                                                                                        <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${isSharing ? 'bg-red-500/20 text-red-500 animate-pulse' : (isMine ? 'bg-white/20 text-white/50' : 'bg-slate-200 text-slate-400')}`}>
+                                                                                                            <i className="fas fa-satellite-dish text-lg"></i>
+                                                                                                        </div>
+                                                                                                        <div className="min-w-0">
+                                                                                                            <p className="font-bold text-sm truncate">Live Location</p>
+                                                                                                            <p className="text-[10px] opacity-70 truncate">{isSharing ? 'Sharing now...' : 'Ended'}</p>
+                                                                                                        </div>
+                                                                                                    </div>
+                                                                                                    {isSharing && loc ? (
+                                                                                                        <a href={`https://www.google.com/maps?q=${loc.lat},${loc.lng}`} target="_blank" rel="noopener noreferrer" className={`text-center py-2.5 rounded-xl text-xs font-bold transition-all shadow-sm ${isMine ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-brand-500 text-white hover:bg-brand-400'}`}>
+                                                                                                            <i className="fas fa-map mr-1.5"></i>View Current Location
+                                                                                                        </a>
+                                                                                                    ) : (
+                                                                                                        <div className={`text-center py-2.5 rounded-xl text-xs font-bold ${isMine ? 'bg-white/10 text-white/50' : 'bg-slate-100 text-slate-400'}`}>
+                                                                                                            <i className="fas fa-times-circle mr-1.5"></i>Sharing Stopped
+                                                                                                        </div>
+                                                                                                    )}
+                                                                                                </div>
+                                                                                            );
+                                                                                        })()
+                                                                                    ) : stickerMatch ? (
+                                                                                        <div className={`text-6xl lg:text-7xl filter drop-shadow-lg my-1 ${stickerMatch[2]}`}>
+                                                                                            {stickerMatch[1]}
+                                                                                        </div>
+                                                                                    ) : (
+                                                                                        msg.text
+                                                                                    )}
+                                                                                </>
+                                                                            );
+                                                                        })()}
                                                                     </div>
                                                                 </div>
                                                                 <div className="flex items-center gap-1.5 mt-1 px-1">
@@ -1554,64 +1706,71 @@
                                             </div>
                                         )}
                                         {showStickers && (
-                                            <div className="flex gap-5 p-3 px-4 overflow-x-auto hide-scrollbar bg-slate-50/90 dark:bg-slate-900/80 border-b border-slate-100 dark:border-slate-700/50 animate-in slide-in-from-bottom-2 duration-200 items-center">
-                                                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mr-1 flex-shrink-0">Stickers</span>
+                                            <div className="flex gap-2 p-3 px-4 overflow-x-auto custom-scroll bg-slate-50/90 dark:bg-slate-900/80 border-b border-slate-100 dark:border-slate-700/50 animate-in slide-in-from-bottom-2 duration-200 items-center">
+                                                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest mr-2 flex-shrink-0">Cat Stickers</span>
                                                 {[
-                                                    { e: '🐱', a: 'animate-sticker-wiggle' },
-                                                    { e: '🐶', a: 'animate-sticker-bounce' },
-                                                    { e: '🥰', a: 'animate-sticker-heartbeat' },
-                                                    { e: '😭', a: 'animate-pulse' },
-                                                    { e: '🚀', a: 'animate-sticker-bounce' },
-                                                    { e: '🐷', a: 'animate-sticker-wiggle' },
-                                                    { e: '🥺', a: 'animate-sticker-heartbeat' }
+                                                    { e: '👋🐱', a: 'animate-cat-wave', l: 'Wave' },
+                                                    { e: '🙀', a: 'animate-cat-shock', l: 'Shock' },
+                                                    { e: '😽', a: 'animate-cat-kiss', l: 'Kiss' },
+                                                    { e: '😾', a: 'animate-cat-angry', l: 'Angry' },
+                                                    { e: '😴🐱', a: 'animate-cat-sleep', l: 'Sleep' },
+                                                    { e: '🐈', a: 'animate-cat-stretch', l: 'Stretch' },
+                                                    { e: '😻', a: 'animate-sticker-heartbeat', l: 'Love' },
+                                                    { e: '😹', a: 'animate-sticker-bounce', l: 'Laugh' }
                                                 ].map((sticker, idx) => (
                                                     <button 
                                                         key={idx}
                                                         type="button"
                                                         onClick={() => handleSendSticker(sticker.e, sticker.a)}
-                                                        className={`text-4xl hover:scale-125 transition-transform active:scale-90 focus:outline-none flex-shrink-0 filter drop-shadow-md ${sticker.a}`}
+                                                        className="flex flex-col items-center gap-1 hover:bg-slate-200/50 dark:hover:bg-slate-700/50 p-2 rounded-xl transition-colors flex-shrink-0 group focus:outline-none"
+                                                        title={sticker.l}
                                                     >
-                                                        {sticker.e}
+                                                        <div className={`text-4xl group-hover:scale-110 transition-transform filter drop-shadow-md ${sticker.a}`}>
+                                                            {sticker.e}
+                                                        </div>
+                                                        <span className="text-[8px] font-bold text-slate-400 uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-opacity">
+                                                            {sticker.l}
+                                                        </span>
                                                     </button>
                                                 ))}
                                             </div>
                                         )}
-                                        {showEmojis && (
-                                            <div className="flex gap-4 p-2 px-4 overflow-x-auto hide-scrollbar bg-slate-50/90 dark:bg-slate-900/80 border-b border-slate-100 dark:border-slate-700/50 animate-in slide-in-from-bottom-2 duration-200">
-                                                {[
-                                                    { e: '❤️', l: 'Love' },
-                                                    { e: '😂', l: 'Laughing' },
-                                                    { e: '😊', l: 'Happy' },
-                                                    { e: '😭', l: 'Cry' },
-                                                    { e: '😔', l: 'Sad' },
-                                                    { e: '😡', l: 'Angry' }
-                                                ].map(emoji => (
-                                                    <button 
-                                                        key={emoji.l}
-                                                        type="button"
-                                                        onClick={() => {
-                                                            setNewMessage(prev => prev + emoji.e);
-                                                            triggerTyping();
-                                                        }}
-                                                        className="text-2xl hover:scale-125 transition-transform active:scale-95 focus:outline-none"
-                                                        title={emoji.l}
-                                                    >
-                                                        {emoji.e}
-                                                    </button>
-                                                ))}
+                                        {showLocationMenu && (
+                                            <div className="flex gap-4 p-4 overflow-x-auto hide-scrollbar bg-slate-50/90 dark:bg-slate-900/80 border-b border-slate-100 dark:border-slate-700/50 animate-in slide-in-from-bottom-2 duration-200">
+                                                <button type="button" onClick={handleShareStaticLocation} className="flex flex-col items-center gap-2 p-3 rounded-2xl bg-white dark:bg-slate-800 shadow-sm hover:shadow-md transition-all min-w-[120px]">
+                                                    <div className="w-10 h-10 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-500 flex items-center justify-center text-lg"><i className="fas fa-map-pin"></i></div>
+                                                    <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600 dark:text-slate-300">Static Location</span>
+                                                </button>
+                                                {(() => {
+                                                    const myUser = users.find(u => u.id === myId);
+                                                    const isSharing = !!myUser?.isSharingLive;
+                                                    return (
+                                                        <button type="button" onClick={handleToggleLiveLocation} className={`flex flex-col items-center gap-2 p-3 rounded-2xl shadow-sm hover:shadow-md transition-all min-w-[120px] ${isSharing ? 'bg-red-50 dark:bg-red-500/10 border border-red-200 dark:border-red-500/30' : 'bg-white dark:bg-slate-800'}`}>
+                                                            <div className={`w-10 h-10 rounded-full flex items-center justify-center text-lg ${isSharing ? 'bg-red-500 text-white animate-pulse' : 'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-500'}`}><i className="fas fa-satellite-dish"></i></div>
+                                                            <span className={`text-[10px] font-bold uppercase tracking-widest ${isSharing ? 'text-red-600 dark:text-red-400' : 'text-slate-600 dark:text-slate-300'}`}>{isSharing ? 'Stop Sharing' : 'Live Location'}</span>
+                                                        </button>
+                                                    )
+                                                })()}
                                             </div>
                                         )}
                                         <form onSubmit={handleSendMessage} className="p-3 lg:p-4 flex gap-2">
                                             <button 
                                                 type="button"
-                                                onClick={() => { setShowEmojis(!showEmojis); setShowStickers(false); }}
+                                                onClick={() => { setShowLocationMenu(!showLocationMenu); setShowEmojis(false); setShowStickers(false); }}
+                                                className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showLocationMenu ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-blue-500'}`}
+                                            >
+                                                <i className="fas fa-map-marker-alt text-lg"></i>
+                                            </button>
+                                            <button 
+                                                type="button"
+                                                onClick={() => { setShowEmojis(!showEmojis); setShowStickers(false); setShowLocationMenu(false); }}
                                                 className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showEmojis ? 'bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-brand-500'}`}
                                             >
                                                 <i className="far fa-smile text-lg"></i>
                                             </button>
                                             <button 
                                                 type="button"
-                                                onClick={() => { setShowStickers(!showStickers); setShowEmojis(false); }}
+                                                onClick={() => { setShowStickers(!showStickers); setShowEmojis(false); setShowLocationMenu(false); }}
                                                 className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showStickers ? 'bg-purple-100 text-purple-600 dark:bg-purple-500/20 dark:text-purple-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-purple-500'}`}
                                             >
                                                 <i className="fas fa-cat text-lg"></i>
@@ -1626,6 +1785,7 @@
                                                 onFocus={() => {
                                                     setShowStickers(false);
                                                     setShowEmojis(false);
+                                                    setShowLocationMenu(false);
                                                     // Only scroll the messages container, don't move the input
                                                     setTimeout(() => {
                                                         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
