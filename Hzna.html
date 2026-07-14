@@ -317,9 +317,9 @@
     <script type="module">
         import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, initializeFirestore, memoryLocalCache, collection, onSnapshot, doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, initializeFirestore, memoryLocalCache, collection, onSnapshot, doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        window.firebaseSDK = { initializeApp, deleteApp, getAuth, getFirestore, initializeFirestore, memoryLocalCache, collection, onSnapshot, doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, signInWithEmailAndPassword, onAuthStateChanged, signOut, setDoc, createUserWithEmailAndPassword };
+        window.firebaseSDK = { initializeApp, deleteApp, getAuth, getFirestore, initializeFirestore, memoryLocalCache, collection, onSnapshot, doc, getDoc, addDoc, updateDoc, deleteDoc, query, where, serverTimestamp, signInWithEmailAndPassword, onAuthStateChanged, signOut, setDoc, createUserWithEmailAndPassword, writeBatch };
     </script>
 
     <script type="text/babel">
@@ -963,7 +963,7 @@
             const REQUIRED_PIN = '143412';
 
             const [activeChatUser, setActiveChatUser] = useState(null);
-            const [newMessage, setNewMessage] = useState('');
+            const [hasText, setHasText] = useState(false);
             const [showStickers, setShowStickers] = useState(false);
             const [activeStickerPack, setActiveStickerPack] = useState('cat'); 
             const [showLocationMenu, setShowLocationMenu] = useState(false);
@@ -1234,30 +1234,47 @@
             const profilePhoto = currentUserProfile?.photo || '';
             const myId = auth.currentUser?.uid;
 
-            const myMessages = messages.filter(m => m.senderId === myId || m.receiverId === myId);
+            const myMessages = useMemo(() => {
+                return messages.filter(m => m.senderId === myId || m.receiverId === myId);
+            }, [messages, myId]);
             
             useEffect(() => {
                 if (activeChatUser && myId) {
                     const unread = myMessages.filter(m => m.receiverId === myId && m.senderId === activeChatUser.id && !m.read);
-                    unread.forEach(m => {
-                        if(m.id) {
-                            window.firebaseSDK.updateDoc(
-                                window.firebaseSDK.doc(db, 'artifacts', appId, 'public', 'data', 'messages', m.id), 
-                                { 
-                                    read: true,
-                                    readAt: window.firebaseSDK.serverTimestamp() 
+                    if (unread.length > 0) {
+                        const markRead = async () => {
+                            try {
+                                const { writeBatch } = window.firebaseSDK;
+                                const batch = writeBatch(db);
+                                let batchCount = 0;
+                                
+                                unread.forEach(m => {
+                                    if (m.id) {
+                                        const ref = window.firebaseSDK.doc(db, 'artifacts', appId, 'public', 'data', 'messages', m.id);
+                                        batch.update(ref, { read: true, readAt: window.firebaseSDK.serverTimestamp() });
+                                        batchCount++;
+                                    }
+                                });
+                                
+                                // Batching prevents write-storms and massive UI re-render chains
+                                if (batchCount > 0) {
+                                    await batch.commit();
                                 }
-                            ).catch(e => console.error("Mark read error:", e));
-                        }
-                    });
+                            } catch(e) { console.error("Mark read error:", e); }
+                        };
+                        markRead();
+                    }
                 }
-            }, [activeChatUser, messages, myId, db]);
+            }, [activeChatUser, myMessages, myId, db]);
 
             const handleSendMessage = async (e) => {
                 e.preventDefault();
-                if (!newMessage.trim() || !activeChatUser || !myId) return;
-                const text = newMessage.trim();
-                setNewMessage('');
+                const rawText = chatInputRef.current?.value || '';
+                if (!rawText.trim() || !activeChatUser || !myId) return;
+                const text = rawText.trim();
+                
+                if (chatInputRef.current) chatInputRef.current.value = '';
+                setHasText(false);
                 
                 // --- NEW: Clear typing indicator immediately ---
                 if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
@@ -1275,6 +1292,7 @@
                             receiverId: activeChatUser.id,
                             text: text,
                             createdAt: window.firebaseSDK.serverTimestamp(),
+                            localTimestamp: Date.now(), // Prevents UI jumping before server acknowledges
                             read: false,
                             replyTo: replyingTo ? { id: replyingTo.id || null, text: replyingTo.text, senderId: replyingTo.senderId } : null
                         }
@@ -1307,6 +1325,7 @@
                             receiverId: activeChatUser.id,
                             text: textPayload,
                             createdAt: window.firebaseSDK.serverTimestamp(),
+                            localTimestamp: Date.now(), // Prevents UI jumping
                             read: false,
                             replyTo: replyingTo ? { id: replyingTo.id || null, text: replyingTo.text, senderId: replyingTo.senderId } : null
                         }
@@ -1334,6 +1353,7 @@
                                         receiverId: activeChatUser.id,
                                         text: `[[LOCATION_STATIC:${lat}:${lng}]]`,
                                         createdAt: window.firebaseSDK.serverTimestamp(),
+                                        localTimestamp: Date.now(), // Prevents UI jumping
                                         read: false,
                                         replyTo: replyingTo ? { id: replyingTo.id || null, text: replyingTo.text, senderId: replyingTo.senderId } : null
                                     }
@@ -1431,21 +1451,24 @@
             };
 
             const handleTyping = (e) => {
-                setNewMessage(e.target.value);
+                const val = e.target.value;
+                const currentlyHasText = val.trim().length > 0;
+                if (currentlyHasText !== hasText) setHasText(currentlyHasText);
                 triggerTyping();
             };
             
-            let chatThread = [];
-            if (activeChatUser) {
-                chatThread = myMessages.filter(m => 
+            const chatThread = useMemo(() => {
+                if (!activeChatUser) return [];
+                return myMessages.filter(m => 
                     (m.senderId === myId && m.receiverId === activeChatUser.id) ||
                     (m.senderId === activeChatUser.id && m.receiverId === myId)
                 ).sort((a, b) => {
-                    const timeA = a.createdAt?.seconds || Date.now() / 1000;
-                    const timeB = b.createdAt?.seconds || Date.now() / 1000;
+                    // Sort strictly by stable timestamps to prevent re-render jumps
+                    const timeA = a.createdAt?.seconds ? a.createdAt.seconds * 1000 : (a.localTimestamp || 0);
+                    const timeB = b.createdAt?.seconds ? b.createdAt.seconds * 1000 : (b.localTimestamp || 0);
                     return timeA - timeB;
                 });
-            }
+            }, [myMessages, activeChatUser, myId]);
 
             const handleDeleteMessage = async (msgId) => {
                 if(!msgId) return;
@@ -1519,7 +1542,9 @@
                 }
             }, [chatThread.length, activeChatUser, settingsTab]);
 
-            const totalUnreadCount = myMessages.filter(m => m.receiverId === myId && !m.read).length;
+            const totalUnreadCount = useMemo(() => {
+                return myMessages.filter(m => m.receiverId === myId && !m.read).length;
+            }, [myMessages, myId]);
 
             // --- NEW: Sticker Packs Configuration (Dynamic Merge) ---
             const combinedStickerPacks = useMemo(() => {
@@ -1579,13 +1604,22 @@
             // --- NEW: Sort Chat List by Latest Message ---
             const sortedChatUsers = useMemo(() => {
                 if (!myId) return [];
+                
+                // OPTIMIZATION: Pre-calculate the latest message time for each user using a Hash Map
+                // This drops the time complexity from O(N*M) to O(N+M), fixing typing/sending lag completely
+                const lastMsgTimes = {};
+                myMessages.forEach(m => {
+                    const otherUserId = m.senderId === myId ? m.receiverId : m.senderId;
+                    const msgTime = m.createdAt?.seconds ? m.createdAt.seconds * 1000 : (m.localTimestamp || 0);
+                    
+                    if (!lastMsgTimes[otherUserId] || msgTime > lastMsgTimes[otherUserId]) {
+                        lastMsgTimes[otherUserId] = msgTime;
+                    }
+                });
+
                 return users.filter(u => u.id !== myId).sort((a, b) => {
-                    const aLastTime = myMessages
-                        .filter(m => (m.senderId === myId && m.receiverId === a.id) || (m.senderId === a.id && m.receiverId === myId))
-                        .reduce((max, m) => Math.max(max, m.createdAt?.seconds || 0), 0);
-                    const bLastTime = myMessages
-                        .filter(m => (m.senderId === myId && m.receiverId === b.id) || (m.senderId === b.id && m.receiverId === myId))
-                        .reduce((max, m) => Math.max(max, m.createdAt?.seconds || 0), 0);
+                    const aLastTime = lastMsgTimes[a.id] || 0;
+                    const bLastTime = lastMsgTimes[b.id] || 0;
                     return bLastTime - aLastTime; // Newest at the top
                 });
             }, [users, myMessages, myId]);
@@ -1623,11 +1657,14 @@
                         <button onClick={() => { setSettingsTab('drivers'); if(isChatVisible) setIsChatVisible(false); }} className={`flex-1 min-w-[80px] py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 ${settingsTab === 'drivers' ? 'bg-brand-600 text-white shadow-lg' : 'text-slate-400'}`}>
                             <i className="fas fa-truck"></i> <span className="hidden sm:inline">Drivers</span>
                         </button>
+                        
+                        {/* Sticker Management Tab: Restricted to Admin only */}
                         {currentProfileRole === 'Admin' && (
                             <button onClick={() => { setSettingsTab('stickers'); if(isChatVisible) setIsChatVisible(false); }} className={`flex-1 min-w-[80px] py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 ${settingsTab === 'stickers' ? 'bg-brand-600 text-white shadow-lg' : 'text-slate-400'}`}>
                                 <i className="fas fa-sticky-note"></i> <span className="hidden sm:inline">Stickers</span>
                             </button>
                         )}
+
                         {isChatVisible && (
                             <button onClick={() => { setSettingsTab('chat'); setActiveChatUser(null); }} className={`flex-1 min-w-[80px] py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 relative ${settingsTab === 'chat' ? 'bg-brand-600 text-white shadow-lg' : 'text-slate-400'}`}>
                                 <i className="fas fa-comments"></i> <span className="hidden sm:inline">Chat</span>
@@ -2298,29 +2335,23 @@
                                                 })()}
                                             </div>
                                         )}
+                                        
                                         <form onSubmit={handleSendMessage} className="p-3 lg:p-4 flex gap-2">
+                                            {/* Sticker Button: Available to ALL users inside the chat modal */}
                                             <button 
                                                 type="button"
-                                                onClick={() => { setShowLocationMenu(!showLocationMenu); setShowStickers(false); }}
-                                                className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showLocationMenu ? 'bg-blue-100 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-blue-500'}`}
+                                                onClick={() => { setShowStickers(!showStickers); setShowLocationMenu(false); if(!combinedStickerPacks[activeStickerPack]) setActiveStickerPack('cat'); }}
+                                                className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showStickers ? 'bg-purple-100 text-purple-600 dark:bg-purple-500/20 dark:text-purple-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-purple-500'}`}
                                             >
-                                                <i className="fas fa-map-marker-alt text-lg"></i>
+                                                <i className="fas fa-sticky-note text-lg"></i>
                                             </button>
-                                            {currentProfileRole === 'Admin' && (
-                                                <button 
-                                                    type="button"
-                                                    onClick={() => { setShowStickers(!showStickers); setShowLocationMenu(false); if(!combinedStickerPacks[activeStickerPack]) setActiveStickerPack('cat'); }}
-                                                    className={`w-12 h-12 flex-shrink-0 rounded-xl flex items-center justify-center transition-all active:scale-95 ${showStickers ? 'bg-purple-100 text-purple-600 dark:bg-purple-500/20 dark:text-purple-400 shadow-inner' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 hover:text-purple-500'}`}
-                                                >
-                                                    <i className="fas fa-sticky-note text-lg"></i>
-                                                </button>
-                                            )}
+                                            
                                             <input 
                                                 ref={chatInputRef}
                                                 type="text"
                                                 className="flex-1 bg-slate-100 dark:bg-slate-900 border-none rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-brand-500 outline-none text-slate-900 dark:text-white transition-shadow"
                                                 placeholder="Type a message..."
-                                                value={newMessage}
+                                                defaultValue=""
                                                 onChange={handleTyping}
                                                 onFocus={() => {
                                                     setShowStickers(false);
@@ -2333,7 +2364,7 @@
                                             />
                                             <button 
                                                 type="submit" 
-                                                disabled={!newMessage.trim()}
+                                                disabled={!hasText}
                                                 className="w-12 h-12 flex-shrink-0 rounded-xl bg-brand-500 text-white flex items-center justify-center shadow-lg shadow-brand-500/30 transition-all hover:bg-brand-400 active:scale-95 disabled:opacity-50 disabled:active:scale-100"
                                             >
                                                 <i className="fas fa-paper-plane text-sm ml-[-2px]"></i>
