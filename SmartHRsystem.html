@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -727,6 +728,7 @@
                 bg: 'bg-purple-500/10',
                 tabs: [
                     { key: 'active', label: 'Active Employees' },
+                    { key: 'allowance', label: 'Allowances' }, // NEW: Allowance Tab
                     { key: 'salaryReport', label: 'Salary Revise Report' },
                     { key: 'former', label: 'Resigned/Terminated' }
                 ] 
@@ -848,7 +850,8 @@
             console.log(`[Payroll Calc] Received ${savingsWithdrawals.length} savings withdrawals for ${employee?.name} in ${selectedMonth}`, savingsWithdrawals);
 
             // --- PHASE 2: Destructured systemSettings to access the Policy Multiplier ---
-            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, shops, shifts, publicHolidays, systemSettings } = allData;
+            // --- NEW: Added 'allowances' to the destructuring ---
+            const { attendance, leaveRequests, otRequests, staffLoans, employeeStates, salaryRevisions, allowances, shops, shifts, publicHolidays, systemSettings } = allData;
 
             // --- FIX: MOVED TIMEZONE LOGIC UP ---
             // We must get the employee's timezone *first* to correctly filter attendance by the local month.
@@ -959,9 +962,9 @@
             
             const totalLateDays = monthStates.filter(es => {
                 if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return false;
-                // FIX: Read-Model Reconciliation - Void penalty if approved leave exists
-                const hasLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate);
-                return !hasLeave;
+                // FIX: Read-Model Reconciliation - Void penalty ONLY if Full Day leave exists
+                const hasFullDayLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate && lr.leaveSession === 'Full Day');
+                return !hasFullDayLeave;
             }).length;
 
             const dailyRecords = {};
@@ -1130,11 +1133,21 @@
             
             const lateDeductionsAmount = monthStates.filter(es => {
                 if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return false;
-                const hasLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && es.date < lr.returnDate);
-                return !hasLeave;
+                const hasFullDayLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && es.date < lr.returnDate && lr.leaveSession === 'Full Day');
+                return !hasFullDayLeave;
             }).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
             
             const otherDeductions = monthStates.filter(es => es.statusState === 'Deduction' && !es.note?.includes('CheckIn Late')).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
+
+            // --- NEW: Calculate Active Allowances for this specific month ---
+            const activeAllowances = (allowances || []).filter(a => 
+                a.staffId === employee.id &&
+                a.status === 'Approved' &&
+                a.effectiveDate <= selectedMonth &&
+                (!a.expiredDate || a.expiredDate >= selectedMonth)
+            );
+            const totalAllowance = activeAllowances.reduce((sum, a) => sum + (parseFloat(a.amount) || 0), 0);
+            // --- END NEW ---
 
             // "No-CheckOut" is informational. Any associated monetary deduction is handled via the "Other Deductions" from Employee States.
             // PHASE 2.1 LOGIC: Add Paid Holidays to the total days they earn a salary for
@@ -1149,7 +1162,8 @@
             );
             
             // MODIFIED (Plan Step 2, Part B): Add the savings withdrawal to the gross salary.
-            const grossSalary = baseSalaryEarned + otSalary + engagements + totalSavingsWithdrawal;
+            // NEW: Add totalAllowance to the Gross Salary equation!
+            const grossSalary = baseSalaryEarned + otSalary + engagements + totalSavingsWithdrawal + totalAllowance;
 
             // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
             let savingsDeduction = 0;
@@ -1179,7 +1193,8 @@
 
             // CORRECTED & UPDATED: Added new penalty and savings amounts to the returned calculations object.
             // MODIFIED (Plan Step 2): Add 'totalSavingsWithdrawal' to the calculations object.
-            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, totalSavingsWithdrawal, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
+            // NEW: Added 'totalAllowance' to calculations for Phase 3 payslip UI
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, totalAllowance, totalSavingsWithdrawal, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
 
             return { inputs: autoInputs, calculations };
         };
@@ -2187,6 +2202,363 @@
         // --- END AUTHENTICATION PAGE ---
 
         // --- START EMPLOYEES PAGE COMPONENTS ---
+
+        // NEW: Allowance Modal Component (Add/Edit)
+        const AllowanceModal = ({ isOpen, onClose, onSave, allowance, userProfile }) => {
+            const { shops, employees } = useAppData();
+            const [formData, setFormData] = useState({});
+
+            const availableShops = useMemo(() => {
+                if (!shops || !userProfile) return [];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') return shops;
+                if (userProfile.role === 'Shop Manager') {
+                    const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    return shops.filter(s => myShops.includes(s.name));
+                }
+                return [];
+            }, [shops, userProfile]);
+
+            const availableEmployees = useMemo(() => {
+                if (!employees || !formData.shop) return [];
+                return employees.filter(e => {
+                    const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                    return empShops.includes(formData.shop) && e.status === 'Active';
+                });
+            }, [employees, formData.shop]);
+
+            useEffect(() => {
+                if (isOpen) {
+                    const initialShop = (userProfile?.role === 'Shop Manager' && availableShops.length === 1) ? availableShops[0].name : '';
+                    setFormData(allowance ? { ...allowance } : {
+                        shop: initialShop,
+                        staffId: '',
+                        staffName: '',
+                        purpose: 'Transportation',
+                        amount: '',
+                        effectiveDate: new Date().toISOString().slice(0, 7), // YYYY-MM
+                        expiredDate: '', // Optional
+                        note: ''
+                    });
+                }
+            }, [isOpen, allowance, userProfile, availableShops]);
+
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => {
+                    const newData = { ...prev, [name]: value };
+                    if (name === 'shop') {
+                        newData.staffId = '';
+                        newData.staffName = '';
+                    }
+                    if (name === 'staffId') {
+                        const emp = employees.find(e => e.id === value);
+                        if (emp) newData.staffName = emp.name;
+                    }
+                    return newData;
+                });
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (!formData.staffId || !formData.amount || !formData.effectiveDate) {
+                    alert("Please fill all required fields.");
+                    return;
+                }
+                
+                if (formData.expiredDate && formData.effectiveDate > formData.expiredDate) {
+                    alert("Expired Month cannot be earlier than Effective Month.");
+                    return;
+                }
+
+                onSave({
+                    ...formData,
+                    amount: parseFloat(formData.amount) || 0
+                });
+            };
+
+            if (!isOpen) return null;
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-md">
+                    <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
+                        <ModalHeader title={allowance ? "Edit Allowance" : "Add New Allowance"} onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Shop <span className="text-red-400">*</span></label>
+                                        <select name="shop" value={formData.shop || ''} onChange={handleChange} className="select" required disabled={!!allowance}>
+                                            <option value="">Select Shop</option>
+                                            {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Employee <span className="text-red-400">*</span></label>
+                                        <select name="staffId" value={formData.staffId || ''} onChange={handleChange} className="select" required disabled={!formData.shop || !!allowance}>
+                                            <option value="">Select Staff</option>
+                                            {availableEmployees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                                        </select>
+                                    </div>
+                                </div>
+                                
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Purpose <span className="text-red-400">*</span></label>
+                                    <select name="purpose" value={formData.purpose || 'Transportation'} onChange={handleChange} className="select" required>
+                                        <option value="Transportation">Transportation</option>
+                                        <option value="Internet">Internet</option>
+                                        <option value="Phone">Phone / Top-up</option>
+                                        <option value="Meal">Meal</option>
+                                        <option value="Gasoline">Gasoline</option>
+                                        <option value="Parking">Parking</option>
+                                        <option value="Other">Other</option>
+                                    </select>
+                                </div>
+
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Monthly Amount (KHR) <span className="text-red-400">*</span></label>
+                                    <input 
+                                        type="number" 
+                                        name="amount" 
+                                        value={formData.amount || ''} 
+                                        onChange={handleChange} 
+                                        className="input font-bold text-green-400" 
+                                        placeholder="e.g. 50000" 
+                                        required 
+                                        min="0"
+                                    />
+                                    <p className="text-[10px] text-slate-500 mt-1">This amount will be added to the employee's payroll every month.</p>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Effective Month <span className="text-red-400">*</span></label>
+                                        <input type="month" name="effectiveDate" value={formData.effectiveDate || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Expired Month</label>
+                                        <input type="month" name="expiredDate" value={formData.expiredDate || ''} onChange={handleChange} className="input" />
+                                        <p className="text-[9px] text-slate-500 mt-1">Leave empty for permanent allowance</p>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label className="text-sm font-medium text-slate-400">Note (Optional)</label>
+                                    <textarea name="note" value={formData.note || ''} onChange={handleChange} className="input" rows="2" placeholder="e.g. Approved by CEO for remote work."></textarea>
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Submit Request</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+
+        // NEW: Allowance Management Tab Component
+        const AllowanceTab = ({ userProfile }) => {
+            const { db, auth } = useFirebase();
+            const { where, collection, addDoc, updateDoc, doc, serverTimestamp, deleteDoc } = window.firebaseSDK;
+            const { shops } = useAppData();
+            
+            const [selectedShop, setSelectedShop] = useState('');
+            const [searchTerm, setSearchTerm] = useState('');
+            const [statusFilter, setStatusFilter] = useState('Active');
+            
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingAllowance, setEditingAllowance] = useState(null);
+            const [allowanceToDelete, setAllowanceToDelete] = useState(null);
+
+            // Set initial shop
+            useEffect(() => {
+                if (userProfile && userProfile.role !== 'Admin' && userProfile.role !== 'CEO') {
+                    setSelectedShop(Array.isArray(userProfile.shop) ? '' : userProfile.shop || '');
+                }
+            }, [userProfile]);
+
+            // Query Constraints
+            const queryConstraints = useMemo(() => {
+                if (!userProfile) return [where("shop", "==", "null")];
+                if (userProfile.role === 'Admin' || userProfile.role === 'CEO') {
+                    return selectedShop ? [where("shop", "==", selectedShop)] : [];
+                }
+                if (userProfile.role === 'Shop Manager') {
+                    const managedShops = Array.isArray(userProfile.shop) ? userProfile.shop : (userProfile.shop ? [userProfile.shop] : []);
+                    if (managedShops.length === 0) return [where("shop", "==", "null")];
+                    if (selectedShop) return [where("shop", "==", selectedShop)];
+                    return [where("shop", "in", managedShops)];
+                }
+                return [where("staffId", "==", userProfile.id || null)];
+            }, [userProfile, selectedShop]);
+
+            const { data: allowances, loading } = useCollection('allowances', queryConstraints);
+
+            const filteredAllowances = useMemo(() => {
+                return allowances.filter(allowance => {
+                    const searchMatch = !searchTerm || (allowance.staffName && allowance.staffName.toLowerCase().includes(searchTerm.toLowerCase()));
+                    
+                    let statusMatch = true;
+                    if (statusFilter !== 'All') {
+                        statusMatch = allowance.status === statusFilter;
+                    }
+
+                    return searchMatch && statusMatch;
+                }).sort((a,b) => b.effectiveDate.localeCompare(a.effectiveDate));
+            }, [allowances, searchTerm, statusFilter]);
+
+            const handleSave = async (formData) => {
+                const { id, ...dataToSave } = formData;
+                try {
+                    if (id) {
+                        await updateDoc(doc(db, 'allowances', id), { ...dataToSave, updatedAt: serverTimestamp() });
+                    } else {
+                        await addDoc(collection(db, 'allowances'), { ...dataToSave, status: 'Pending', createdAt: serverTimestamp() });
+                    }
+                    setIsModalOpen(false);
+                    setEditingAllowance(null);
+                } catch (error) {
+                    console.error("Error saving allowance:", error);
+                    alert("Failed to save allowance.");
+                }
+            };
+
+            const handleUpdateStatus = async (allowance, newStatus) => {
+                try {
+                    await updateDoc(doc(db, 'allowances', allowance.id), { status: newStatus, updatedAt: serverTimestamp() });
+                    Utils.logUserActivity(db, auth, `${newStatus} Allowance`, { id: allowance.id, name: allowance.staffName, updatedData: { status: newStatus } });
+                } catch (error) {
+                    console.error("Error updating allowance status:", error);
+                }
+            };
+
+            const confirmDelete = async () => {
+                if (!allowanceToDelete) return;
+                try {
+                    await deleteDoc(doc(db, 'allowances', allowanceToDelete.id));
+                } catch (error) {
+                    console.error("Error deleting allowance:", error);
+                } finally {
+                    setAllowanceToDelete(null);
+                }
+            };
+
+            const handleExportExcel = () => {
+                const data = filteredAllowances.map(a => ({
+                    'Staff Name': a.staffName,
+                    'Shop': a.shop,
+                    'Purpose': a.purpose,
+                    'Amount (KHR)': a.amount,
+                    'Effective Month': a.effectiveDate,
+                    'Expired Month': a.expiredDate || 'Permanent',
+                    'Status': a.status,
+                    'Note': a.note || '-'
+                }));
+                Utils.exportToExcel(data, "Allowances", "Allowance_Report.xlsx");
+            };
+
+            const canManage = userProfile?.role === 'Admin' || userProfile?.role === 'CEO' || userProfile?.role === 'Shop Manager';
+            const canApprove = userProfile?.role === 'Admin' || userProfile?.role === 'CEO';
+
+            return (
+                <Card>
+                    <PageHeader title={`Allowances Management (${filteredAllowances.length})`}>
+                        <SearchInput value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Search staff..." />
+                        
+                        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="select w-full sm:w-auto font-bold text-blue-400">
+                            <option value="Active">Active / Approved</option>
+                            <option value="Pending">Pending</option>
+                            <option value="Rejected">Rejected</option>
+                            <option value="All">All Status</option>
+                        </select>
+
+                        <ShopFilterSelect userProfile={userProfile} shops={shops} selectedShop={selectedShop} onChange={e => setSelectedShop(e.target.value)} />
+                        
+                        <Button variant="success" icon="fa-file-excel" onClick={handleExportExcel}>Excel</Button>
+                        
+                        {canManage && (
+                            <Button variant="primary" icon="fa-plus" onClick={() => { setEditingAllowance(null); setIsModalOpen(true); }}>Add Allowance</Button>
+                        )}
+                    </PageHeader>
+
+                    {loading ? <div className="text-center py-10"><i className="fas fa-spinner fa-spin text-3xl text-blue-500"></i></div> : (
+                        <div className="overflow-x-auto">
+                            <table className="min-w-full divide-y divide-slate-700">
+                                <thead className="bg-slate-900/50">
+                                    <tr>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Staff Name</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Shop</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Purpose</th>
+                                        <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Amount</th>
+                                        <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Period</th>
+                                        <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Note</th>
+                                        <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Status</th>
+                                        <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-700">
+                                    {filteredAllowances.map(allowance => {
+                                        // Dynamic check if expired
+                                        const currentMonth = new Date().toISOString().slice(0, 7);
+                                        const isActuallyExpired = allowance.status === 'Approved' && allowance.expiredDate && currentMonth > allowance.expiredDate;
+                                        
+                                        return (
+                                            <tr key={allowance.id} className={`hover:bg-slate-700/50 transition-colors ${isActuallyExpired ? 'opacity-50' : ''}`}>
+                                                <td className="px-4 py-4 text-sm text-slate-200 font-medium">{allowance.staffName}</td>
+                                                <td className="px-4 py-4 text-sm text-slate-300">{allowance.shop}</td>
+                                                <td className="px-4 py-4 text-sm text-blue-300 font-bold">{allowance.purpose}</td>
+                                                <td className="px-4 py-4 text-sm text-green-400 font-bold text-right">{Utils.formatCurrency(allowance.amount)}</td>
+                                                <td className="px-4 py-4 text-xs text-slate-400 text-center whitespace-nowrap">
+                                                    <span className="text-slate-300">{allowance.effectiveDate}</span> 
+                                                    <i className="fas fa-arrow-right mx-1 text-slate-600"></i> 
+                                                    <span className={isActuallyExpired ? 'text-red-400 font-bold' : 'text-slate-300'}>{allowance.expiredDate || 'Permanent'}</span>
+                                                </td>
+                                                <td className="px-4 py-4 text-sm text-slate-400 max-w-[150px] truncate" title={allowance.note}>{allowance.note || '-'}</td>
+                                                <td className="px-4 py-4 text-center">
+                                                    {isActuallyExpired ? (
+                                                        <span className="px-2 py-1 text-[10px] font-bold rounded-full bg-slate-900/50 text-slate-500 border border-slate-700">EXPIRED</span>
+                                                    ) : (
+                                                        <span className={`px-2 py-1 text-[10px] uppercase font-bold rounded-full ${
+                                                            allowance.status === 'Approved' ? 'bg-green-900/50 text-green-400 border border-green-700/50' : 
+                                                            allowance.status === 'Rejected' ? 'bg-red-900/50 text-red-400 border border-red-700/50' : 
+                                                            'bg-yellow-900/50 text-yellow-400 border border-yellow-700/50 animate-pulse'
+                                                        }`}>
+                                                            {allowance.status}
+                                                        </span>
+                                                    )}
+                                                </td>
+                                                <td className="px-4 py-4 text-center whitespace-nowrap">
+                                                    <div className="flex items-center justify-center gap-2">
+                                                        {canApprove && allowance.status === 'Pending' && (
+                                                            <>
+                                                                <Button variant="icon-approve" icon="fa-check" onClick={() => handleUpdateStatus(allowance, 'Approved')} title="Approve" />
+                                                                <Button variant="icon-reject" icon="fa-times" onClick={() => handleUpdateStatus(allowance, 'Rejected')} title="Reject" />
+                                                            </>
+                                                        )}
+                                                        {canManage && (
+                                                            <>
+                                                                <Button variant="icon-edit" icon="fa-edit" onClick={() => handleOpenModal(allowance)} />
+                                                                <Button variant="icon-delete" icon="fa-trash" onClick={() => setAllowanceToDelete(allowance)} />
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                    {filteredAllowances.length === 0 && (
+                                        <tr><td colSpan="8" className="px-4 py-8 text-center text-slate-500">No allowance records found.</td></tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+
+                    <AllowanceModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onSave={handleSave} allowance={editingAllowance} userProfile={userProfile} />
+                    <ConfirmationModal isOpen={!!allowanceToDelete} onClose={() => setAllowanceToDelete(null)} onConfirm={confirmDelete} title="Delete Allowance" message="Are you sure you want to delete this allowance record?" />
+                </Card>
+            );
+        };
 
         // NEW: Phase 2 Refactoring - Custom Hook for Employee Fetching Logic
         const useFilteredEmployees = (userProfile, selectedShop) => {
@@ -5085,6 +5457,9 @@
                                         {currentRenderData.calculations?.engagements > 0 && (
                                             <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.engagements)}</p></div>
                                         )}
+                                        {currentRenderData.calculations?.totalAllowance > 0 && (
+                                            <div className="flex justify-between text-sm text-blue-600"><p>Allowances / ប្រាក់ឧបត្ថម្ភ</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.totalAllowance)}</p></div>
+                                        )}
                                         {currentRenderData.calculations?.totalSavingsWithdrawal > 0 && (
                                             <div className="flex justify-between text-sm text-indigo-600"><p>Savings Payback</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.totalSavingsWithdrawal)}</p></div>
                                         )}
@@ -6001,10 +6376,12 @@
             const tabs = useMemo(() => {
                 const available = {};
                 if (moduleConfig['employees:active'] !== false) available.active = <span><i className="fas fa-users mr-2 text-blue-400"></i>Active Employees</span>;
+                // NEW: Allowance Tab Logic
+                if (moduleConfig['employees:allowance'] !== false) available.allowance = <span><i className="fas fa-hand-holding-usd mr-2 text-yellow-400"></i>Allowances</span>;
                 if (moduleConfig['employees:salaryReport'] !== false) {
                     available.salaryReport = (
                         <span className="flex items-center gap-2">
-                            <span><i className="fas fa-chart-line mr-1 text-green-400"></i>Salary Report</span>
+                            <span><i className="fas fa-chart-line mr-1 text-green-400"></i>Salary Revise</span>
                             {pendingSalaryRevisions.length > 0 && (
                                 <span className="bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full animate-pulse shadow-sm">
                                     {pendingSalaryRevisions.length}
@@ -6031,7 +6408,8 @@
             return (
                 <TabbedPage tabs={tabs} activeTab={activeTab} setActiveTab={setActiveTab}>
                     {tabs.active && <div id="active"><ActiveEmployeesTab userProfile={userProfile} pageParams={pageParams} /></div>}
-                    {/* MODIFIED: Pass pendingSalaryRevisions down to the tab */}
+                    {/* NEW: Mount Allowance Tab */}
+                    {tabs.allowance && <div id="allowance"><AllowanceTab userProfile={userProfile} /></div>}
                     {tabs.salaryReport && <div id="salaryReport"><SalaryReviseReportTab userProfile={userProfile} pendingGlobalRevisions={pendingSalaryRevisions} /></div>}
                     {tabs.former && <div id="former"><FormerEmployeesTab userProfile={userProfile} /></div>}
                 </TabbedPage>
@@ -8902,7 +9280,8 @@
                         ot: [where("staffId", "==", userProfile.id), where("reqDate", ">=", recentStr)],
                         loan: blocker, 
                         state: blocker, 
-                        salary: blocker
+                        salary: blocker,
+                        allowance: blocker // NEW: Block allowance fetch until payroll preview is opened
                     };
                 }
 
@@ -8917,7 +9296,8 @@
                     ot: [where("staffId", "==", userProfile.id), where("reqDate", ">=", startStr)],
                     loan: [where("staffId", "==", userProfile.id), where("status", "==", "Active")],
                     state: [where("staffId", "==", userProfile.id), where("date", ">=", startStr)],
-                    salary: [where("staffId", "==", userProfile.id)]
+                    salary: [where("staffId", "==", userProfile.id)],
+                    allowance: [where("staffId", "==", userProfile.id), where("status", "==", "Approved")] // NEW
                 };
             }, [userProfile?.id, selectedMonth, showPayroll]);
 
@@ -8927,10 +9307,12 @@
             const { data: staffLoansData } = useCollection('staffLoans', dataConstraints.loan);
             const { data: employeeStatesData } = useCollection('employeeStates', dataConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', dataConstraints.salary);
+            const { data: allowancesData } = useCollection('allowances', dataConstraints.allowance); // NEW
 
             const allData = {
                 shops: shops, attendance: attendanceData, leaveRequests: leaveRequestsData, otRequests: otRequestsData,
                 staffLoans: staffLoansData, employeeStates: employeeStatesData, salaryRevisions: salaryRevisionsData,
+                allowances: allowancesData, // NEW
                 shifts: shifts, publicHolidays: publicHolidays,
             };
             
@@ -9480,19 +9862,34 @@
                             let lateLimitMins = lateHour * 60 + lateMinute;
                             let checkInMins = checkInHour * 60 + checkInMinute;
 
-                            // Handle overnight shifts wrapping past midnight
-                            if (lateLimitMins < startMins) lateLimitMins += 1440;
-                            const allowedLateDelta = lateLimitMins - startMins;
-
                             let isExcused = isHoliday;
 
-                            // Apply Half-Day Leave Offset
+                            // Apply Half-Day Leave Offset Logic
                             if (!isExcused && todayLeave) {
-                                // FIX: If the staff has any approved leave (Full Day, AM, or PM) for today,
-                                // entirely ignore the automatic late deduction rules. This prevents false
-                                // positives when staff check in early or at irregular times for partial shifts.
-                                isExcused = true;
+                                if (todayLeave.leaveSession === 'Full Day') {
+                                    isExcused = true;
+                                } else if (todayLeave.leaveSession === 'AM') {
+                                    // Staff took morning off, shift starts in the afternoon
+                                    if (shiftDetails.amLeaveThreshold) {
+                                        const [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = amLimitH * 60 + amLimitM;
+                                        startMins = lateLimitMins; // Expected start time shifts to the AM Leave limit
+                                    } else {
+                                        isExcused = true; // Fallback if limits aren't configured
+                                    }
+                                } else if (todayLeave.leaveSession === 'PM') {
+                                    // Staff works morning, takes afternoon off
+                                    if (shiftDetails.pmLeaveThreshold) {
+                                        const [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                    }
+                                    // startMins remains the morning shift start
+                                }
                             }
+
+                            // Handle overnight shifts wrapping past midnight (Re-evaluated after thresholds shift)
+                            if (lateLimitMins < startMins) lateLimitMins += 1440;
+                            const allowedLateDelta = lateLimitMins - startMins;
 
                             if (!isExcused) {
                                 // Handle overnight shifts wrapping past midnight
@@ -9646,19 +10043,34 @@
                             let lateLimitMins = lateHour * 60 + lateMinute;
                             let checkInMins = checkInHour * 60 + checkInMinute;
 
-                            // Handle overnight shifts wrapping past midnight
-                            if (lateLimitMins < startMins) lateLimitMins += 1440;
-                            const allowedLateDelta = lateLimitMins - startMins;
-
                             let isExcused = isHoliday;
 
-                            // Apply Half-Day Leave Offset
+                            // Apply Half-Day Leave Offset Logic
                             if (!isExcused && todayLeave) {
-                                // FIX: If the staff has any approved leave (Full Day, AM, or PM) for today,
-                                // entirely ignore the automatic late deduction rules. This prevents false
-                                // positives when staff check in early or at irregular times for partial shifts.
-                                isExcused = true;
+                                if (todayLeave.leaveSession === 'Full Day') {
+                                    isExcused = true;
+                                } else if (todayLeave.leaveSession === 'AM') {
+                                    // Staff took morning off, shift starts in the afternoon
+                                    if (shiftDetails.amLeaveThreshold) {
+                                        const [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = amLimitH * 60 + amLimitM;
+                                        startMins = lateLimitMins; // Expected start time shifts to the AM Leave limit
+                                    } else {
+                                        isExcused = true; // Fallback if limits aren't configured
+                                    }
+                                } else if (todayLeave.leaveSession === 'PM') {
+                                    // Staff works morning, takes afternoon off
+                                    if (shiftDetails.pmLeaveThreshold) {
+                                        const [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                    }
+                                    // startMins remains the morning shift start
+                                }
                             }
+
+                            // Handle overnight shifts wrapping past midnight (Re-evaluated after thresholds shift)
+                            if (lateLimitMins < startMins) lateLimitMins += 1440;
+                            const allowedLateDelta = lateLimitMins - startMins;
 
                             if (!isExcused) {
                                 if (checkInMins < startMins - 720) checkInMins += 1440;
@@ -9888,6 +10300,7 @@
                                         
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ថែមម៉ោង :</span><span className="font-semibold text-slate-200">{inputs.otDays || 0}</span></div>
                                         <div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់បន្ថែម :</span><span className="font-semibold text-slate-200">{Utils.formatCurrency(calculations.engagements)}</span></div>
+                                        {calculations.totalAllowance > 0 && (<div className="flex justify-between items-center text-sm"><span className="text-slate-400">ប្រាក់ឧបត្ថម្ភ :</span><span className="font-semibold text-blue-400">{Utils.formatCurrency(calculations.totalAllowance)}</span></div>)}
                                         {calculations.totalSavingsWithdrawal > 0 && (<div className="flex justify-between items-center text-sm" title="Savings Program Payback"><span className="text-slate-400">ការទូទាត់សងប្រាក់សន្សំ :</span><span className="font-semibold text-indigo-400">{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</span></div>)}
                                         <div className="pt-2 border-t border-slate-600 flex justify-between items-center text-sm"><span className="font-bold text-green-400">ប្រាក់ចំណូលសរុប :</span><span className="font-bold text-green-400">{Utils.formatCurrency(calculations.grossSalary)}</span></div>
                                     </div>
@@ -10622,7 +11035,8 @@
                     // 2. Queue the Penalty Deletions (if applicable)
                     if (collectionName === 'leaveRequests' && status === 'Approved') {
                         const leaveReq = requests.find(r => r.id === id);
-                        if (leaveReq) {
+                        // FIX: Only retroactive void penalties if the leave is a Full Day. Half-day leaves should retain legitimate afternoon/morning late penalties.
+                        if (leaveReq && leaveReq.leaveSession === 'Full Day') {
                             const { staffId, leaveDate, returnDate } = leaveReq;
                             
                             const statesQ = query(
@@ -12203,19 +12617,6 @@
                     const shopDetails = shopsMap.get(shopNameForLookup);
                     const shopTimezone = shopDetails?.timezone;
 
-                    let isLate = false;
-                    if (checkIn && employee) {
-                        const shiftDetails = (shifts || []).find(s => s.name === employee.shift && s.shopName === firstCheckInRecord.shop);
-                        if (shiftDetails?.lateThreshold) {
-                            const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
-                            const timeInZoneString = checkIn.toLocaleTimeString('en-GB', { timeZone: shopTimezone, hour: '2-digit', minute: '2-digit' });
-                            const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
-                            if (checkInHour > lateHour || (checkInHour === lateHour && checkInMinute > lateMinute)) {
-                                isLate = true;
-                            }
-                        }
-                    }
-
                     // --- PHASE 2.2 LOGIC: Check if current date is a Public Holiday ---
                     // MODIFIED: Enforce Shop-Specific Holiday Support
                     const isHoliday = (publicHolidays || []).some(h => {
@@ -12234,9 +12635,57 @@
                     const approvedLeave = employeeLeaves.find(lr => entry.date >= lr.leaveDate && entry.date < lr.returnDate);
                     // --- END OPTIMIZATION ---
 
-                    // FIX: Read-Model Reconciliation - Void Late flag if excused by Leave or Holiday
-                    if (approvedLeave || isHoliday) {
-                        isLate = false;
+                    let isLate = false;
+                    if (checkIn && employee) {
+                        const shiftDetails = (shifts || []).find(s => s.name === employee.shift && s.shopName === firstCheckInRecord.shop);
+                        if (shiftDetails?.lateThreshold) {
+                            const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
+                            const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
+                            
+                            let startMins = startHour * 60 + (startMinute || 0);
+                            let lateLimitMins = lateHour * 60 + lateMinute;
+                            
+                            const timeInZoneString = checkIn.toLocaleTimeString('en-GB', { timeZone: shopTimezone, hour: '2-digit', minute: '2-digit' });
+                            const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
+                            let checkInMins = checkInHour * 60 + checkInMinute;
+
+                            let isExcused = isHoliday;
+
+                            // Apply Half-Day Leave Offset Logic exactly like the scanner engine
+                            if (!isExcused && approvedLeave) {
+                                if (approvedLeave.leaveSession === 'Full Day') {
+                                    isExcused = true;
+                                } else if (approvedLeave.leaveSession === 'AM') {
+                                    // Staff took morning off, shift starts in the afternoon
+                                    if (shiftDetails.amLeaveThreshold) {
+                                        const [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = amLimitH * 60 + amLimitM;
+                                        startMins = lateLimitMins; // Expected start time shifts to the AM Leave limit
+                                    } else {
+                                        isExcused = true; // Fallback if limits aren't configured
+                                    }
+                                } else if (approvedLeave.leaveSession === 'PM') {
+                                    // Staff works morning, takes afternoon off
+                                    if (shiftDetails.pmLeaveThreshold) {
+                                        const [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
+                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                    }
+                                }
+                            }
+
+                            if (!isExcused) {
+                                // Handle overnight shifts wrapping past midnight
+                                if (lateLimitMins < startMins) lateLimitMins += 1440;
+                                if (checkInMins < startMins - 720) checkInMins += 1440;
+
+                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
+                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
+                                    if (checkInMins > lateLimitMins) {
+                                        isLate = true;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     let isOnLeave;
@@ -12767,11 +13216,11 @@
 
                     const totalLeave = monthLeave.reduce((sum, r) => sum + (parseFloat(r.numberOfDays) || 0), 0);
                     
-                    // FIX: Read-Model Reconciliation - Exclude late days covered by approved leave
+                    // FIX: Read-Model Reconciliation - Exclude late days covered by FULL DAY approved leave
                     const totalLate = monthStates.filter(es => {
                         if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late @'))) return false;
-                        const hasLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate);
-                        return !hasLeave;
+                        const hasFullDayLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate && lr.leaveSession === 'Full Day');
+                        return !hasFullDayLeave;
                     }).length;
                     
                     const dailyRecords = {};
@@ -13033,6 +13482,7 @@
                                 <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
                                 <div className="flex justify-between text-sm"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
                                 {calculations.engagements > 0 && <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className={getChangeIndicatorClass(calculations.engagements, oldCalcs.engagements)}>{Utils.formatCurrency(calculations.engagements)}</p></div>}
+                                {calculations.totalAllowance > 0 && <div className="flex justify-between text-sm text-blue-600"><p>Allowances</p><p className={getChangeIndicatorClass(calculations.totalAllowance, oldCalcs.totalAllowance)}>{Utils.formatCurrency(calculations.totalAllowance)}</p></div>}
                                 {calculations.totalSavingsWithdrawal > 0 && <div className="flex justify-between text-sm text-indigo-600"><p>Savings Payback</p><p className={getChangeIndicatorClass(calculations.totalSavingsWithdrawal, oldCalcs.totalSavingsWithdrawal)}>{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</p></div>}
                                 <div className="flex justify-between text-sm font-bold pt-2 border-t border-green-300 text-green-700"><p>Gross Earnings</p><p className={getChangeIndicatorClass(calculations.grossSalary, oldCalcs.grossSalary)}>{Utils.formatCurrency(calculations.grossSalary)}</p></div>
                             </div>
@@ -13115,7 +13565,9 @@
                         // States: Within month
                         state: [...baseFilters.shop, where("date", ">=", startStr), where("date", "<=", endStr)],
                         // Salary: All revisions (usually small collection)
-                        salary: [...baseFilters.salary]
+                        salary: [...baseFilters.salary],
+                        // Allowance: All approved allowances
+                        allowance: [...baseFilters.shop, where("status", "==", "Approved")] // NEW
                     };
                 };
                 
@@ -13170,23 +13622,25 @@
             const { data: staffLoansData } = useCollection('staffLoans', payrollQueryConstraints.loan);
             const { data: employeeStatesData } = useCollection('employeeStates', payrollQueryConstraints.state);
             const { data: salaryRevisionsData } = useCollection('salaryRevisions', payrollQueryConstraints.salary);
+            const { data: allowancesData } = useCollection('allowances', payrollQueryConstraints.allowance); // NEW
 
             // REMOVED duplicate useAppData() call here to prevent SyntaxError
 
             // PHASE 2: Added systemSettings to the allData payload
+            // NEW: Added allowances to the payload
             const allData = useMemo(() => ({
                 shops, employees, shifts, publicHolidays, systemSettings,
                 attendance: attendanceData, leaveRequests: leaveRequestsData, otRequests: otRequestsData,
                 staffLoans: staffLoansData, employeeStates: employeeStatesData, salaryRevisions: salaryRevisionsData,
-            }), [shops, employees, shifts, publicHolidays, systemSettings, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData]);
-            
-            const [manualLoanDeduction, setManualLoanDeduction] = useState(undefined);
-            const [isProcessing, setIsProcessing] = useState(false);
+                allowances: allowancesData, // NEW
+            }), [shops, employees, shifts, publicHolidays, systemSettings, attendanceData, leaveRequestsData, otRequestsData, staffLoansData, employeeStatesData, salaryRevisionsData, allowancesData]);
             const [isRecalculated, setIsRecalculated] = useState(false);
             const [displayInputs, setDisplayInputs] = useState({});
             const [displayCalculations, setDisplayCalculations] = useState({});
             const [savingsData, setSavingsData] = useState(null);
             const [savingsWithdrawals, setSavingsWithdrawals] = useState([]);
+            const [manualLoanDeduction, setManualLoanDeduction] = useState(undefined);
+            const [isProcessing, setIsProcessing] = useState(false);
 
             useEffect(() => {
                 if (!db || !selectedEmployeeId) { setSavingsData(null); return; }
@@ -16862,8 +17316,9 @@ service cloud.firestore {
                     const otRef = collection(db, 'otRequests');
                     const stateRef = collection(db, 'employeeStates');
                     const loanRef = collection(db, 'staffLoans');
+                    const allowanceRef = collection(db, 'allowances'); // NEW
 
-                    let attQ, leaveQ, otQ, stateQ, loanQ;
+                    let attQ, leaveQ, otQ, stateQ, loanQ, allowanceQ; // NEW
 
                     if (useTargetedFetch) {
                         // OPTION A: Targeted Fetch
@@ -16873,6 +17328,7 @@ service cloud.firestore {
                         otQ = query(otRef, where('staffId', 'in', targetIds), where('reqDate', '>=', startStr), where('reqDate', '<=', endStr));
                         stateQ = query(stateRef, where('staffId', 'in', targetIds), where('date', '>=', startStr), where('date', '<=', endStr));
                         loanQ = query(loanRef, where('staffId', 'in', targetIds), where('status', '==', 'Active'));
+                        allowanceQ = query(allowanceRef, where('staffId', 'in', targetIds), where('status', '==', 'Approved')); // NEW
                     } else {
                         // OPTION B: Bulk Fetch (Simplified for brevity, same logic as before)
                         setProcessLog(prev => [...prev, `> High Volume: Using Bulk Fetch...`]);
@@ -16884,11 +17340,12 @@ service cloud.firestore {
                         otQ = query(otRef, where('reqDate', '>=', startStr), where('reqDate', '<=', endStr));
                         stateQ = query(stateRef, where('date', '>=', startStr), where('date', '<=', endStr));
                         loanQ = query(loanRef, where('status', '==', 'Active'));
+                        allowanceQ = query(allowanceRef, where('status', '==', 'Approved')); // NEW
                     }
 
-                    const [attSnap, leaveSnap, otSnap, loanSnap, stateSnap] = await Promise.all([
-                        getDocs(attQ), getDocs(leaveQ), getDocs(otQ), getDocs(loanQ), getDocs(stateQ)
-                    ]);
+                    const [attSnap, leaveSnap, otSnap, loanSnap, stateSnap, allowanceSnap] = await Promise.all([
+                        getDocs(attQ), getDocs(leaveQ), getDocs(otQ), getDocs(loanQ), getDocs(stateQ), getDocs(allowanceQ)
+                    ]); // MODIFIED: Added allowanceSnap
 
                     setProcessLog(prev => [...prev, `Data loaded. (${attSnap.docs.length} attendance records)`]);
 
@@ -16903,6 +17360,7 @@ service cloud.firestore {
                         staffLoans: loanSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         employeeStates: stateSnap.docs.map(d => ({ id: d.id, ...d.data() })),
                         salaryRevisions: revSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+                        allowances: allowanceSnap.docs.map(d => ({ id: d.id, ...d.data() })), // NEW
                         publicHolidays: publicHolidays,
                         systemSettings: systemSettings
                     };
