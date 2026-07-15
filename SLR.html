@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -296,6 +297,120 @@
             const a = Math.sin(dp/2) * Math.sin(dp/2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl/2) * Math.sin(dl/2);
             const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
             return R * c; // Distance in meters
+        };
+
+        // OPTIMIZATION: Moved from client-side render loop to transaction calculation
+        const calculateLoyaltyForOrder = (orderAmount, redeemedPoints, currentLoyaltyData, globalPointsConfig) => {
+            if (!globalPointsConfig?.pointsEnabled) return currentLoyaltyData;
+
+            let { activePoints = 0, freeClaims = 0, pointBatches = [], totalSpent = 0, totalRedeemed = 0 } = currentLoyaltyData;
+            
+            const spendReq = Number(globalPointsConfig.spendAmount) || 4000;
+            const ptsEarned = Number(globalPointsConfig.pointsEarned) || 1;
+            const expDays = Number(globalPointsConfig.expirationDays) || 0;
+            const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
+            const orderTime = Date.now();
+
+            // 1. Process Redemptions
+            let redeemedHere = Number(redeemedPoints) || 0;
+            if (redeemedHere > 0) {
+                 totalRedeemed += redeemedHere;
+                 for (let i = 0; i < pointBatches.length; i++) {
+                     if (redeemedHere <= 0) break;
+                     if (pointBatches[i].points > 0) {
+                         if (pointBatches[i].points <= redeemedHere) {
+                             redeemedHere -= pointBatches[i].points;
+                             pointBatches[i].points = 0;
+                         } else {
+                             pointBatches[i].points -= redeemedHere;
+                             redeemedHere = 0;
+                         }
+                     }
+                 }
+            }
+
+            // 2. Earn Points
+            const amountSpent = Number(orderAmount) || 0;
+            totalSpent += amountSpent;
+            
+            // Calculate running remainder (Amount spent so far that hasn't converted to a point batch yet)
+            let runningSpend = (totalSpent % spendReq); 
+            // We can't perfectly calculate running spend without iterating history if they spent exactly 4000, 
+            // so we calculate batches earned on the *total* spent minus what has already been converted.
+            // A simpler approach for the transaction is just to calculate based on this specific order's total.
+            
+            // Simplified earning for transaction:
+            if (spendReq > 0) {
+                 const batchesEarned = Math.floor(amountSpent / spendReq);
+                 if (batchesEarned > 0) {
+                     const earned = batchesEarned * ptsEarned;
+                     pointBatches.push({
+                         points: earned,
+                         earnedAt: orderTime,
+                         expiresAt: expDays > 0 ? orderTime + (expDays * 24 * 60 * 60 * 1000) : null
+                     });
+                 }
+            }
+
+            // 3. Clean up expired batches and calculate active total
+            let newActivePts = 0;
+            const activeBatches = [];
+            const expiringClaims = [];
+
+            pointBatches.forEach(batch => {
+                 if (batch.points > 0) {
+                     if (batch.expiresAt && batch.expiresAt < orderTime) {
+                         batch.points = 0; 
+                     } else {
+                         newActivePts += batch.points;
+                         activeBatches.push(batch);
+                     }
+                 }
+            });
+
+            let newFreeClaims = 0;
+            if (redemptionCost > 0 && newActivePts > 0) {
+                 newFreeClaims = Math.floor(newActivePts / redemptionCost);
+            }
+
+            // Project Expirations
+            if (newFreeClaims > 0 && redemptionCost > 0 && activeBatches.length > 0) {
+                 const expBatches = [...activeBatches].filter(b => b.expiresAt).sort((a, b) => a.expiresAt - b.expiresAt);
+                 let currentPtsForProjection = newActivePts;
+                 let currentClaimsForProjection = newFreeClaims;
+                 const groupedExpirations = {};
+
+                 expBatches.forEach(b => {
+                     if (!groupedExpirations[b.expiresAt]) groupedExpirations[b.expiresAt] = 0;
+                     groupedExpirations[b.expiresAt] += b.points;
+                 });
+
+                 const sortedExpDates = Object.keys(groupedExpirations).map(Number).sort((a, b) => a - b);
+
+                 sortedExpDates.forEach(expTime => {
+                     const ptsExpiring = groupedExpirations[expTime];
+                     currentPtsForProjection -= ptsExpiring;
+                     const newClaimsCount = Math.max(0, Math.floor(currentPtsForProjection / redemptionCost));
+
+                     if (newClaimsCount < currentClaimsForProjection) {
+                         const claimsLost = currentClaimsForProjection - newClaimsCount;
+                         for (let i = 0; i < claimsLost; i++) {
+                             expiringClaims.push({ expiresAt: expTime });
+                         }
+                         currentClaimsForProjection = newClaimsCount;
+                     }
+                 });
+             }
+
+            return {
+                 activePoints: newActivePts,
+                 freeClaims: newFreeClaims,
+                 pointBatches: activeBatches,
+                 expiringClaims: expiringClaims,
+                 expiringSoon: expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null,
+                 totalSpent,
+                 totalRedeemed
+            };
         };
 
         const deductInventory = async (cart, products, orderShopId, orderQueueNo) => {
@@ -691,12 +806,12 @@
                 return () => unsub();
             }, []);
 
-            // OPTIMIZATION 1: Decouple Public Data Fetching from Auth
-            // Fetch products, categories, and shops immediately, regardless of user login status.
+            // OPTIMIZATION 1: WebSocket Consolidation & Decoupled Fetching
+            // Customer devices only open 1 WebSocket (Products). Static config is fetched once via getDocs.
             useEffect(() => {
                 if (!user) return; // SECURITY FIX: Must wait for Auth token before querying Firestore
                 
-                const { onSnapshot } = window.FirebaseApp;
+                const { onSnapshot, getDocs } = window.FirebaseApp;
 
                 const syncToState = (cacheKey, freshData, setState, setLoader) => {
                     const freshStr = JSON.stringify(freshData);
@@ -707,55 +822,65 @@
                     if (setLoader) setLoader(false);
                 };
 
-                // PRIORITY 1: Customer Catalog (Fast Paint)
-                const unsubP = onSnapshot(getColRef('products'), snap => {
+                const unsubscribers = [];
+
+                // PRIORITY 1: Live Listener ONLY for Products (To catch "Sold Out" status instantly)
+                unsubscribers.push(onSnapshot(getColRef('products'), snap => {
                     const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
                     syncToState('solaris_products', freshProducts, setProducts, setLoadingProducts);
-                });
-                
-                const unsubC = onSnapshot(getColRef('categories'), snap => {
-                    const freshCats = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
-                    syncToState('solaris_categories', freshCats, setCategories, setLoadingCategories);
-                });
-                
-                const unsubShops = onSnapshot(getColRef('shops'), snap => {
-                    const freshShops = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    syncToState('solaris_shops', freshShops, setShops, setLoadingShops);
-                });
+                }));
 
-                let unsubT, unsubInv, unsubShifts, unsubSugar, unsubIce;
-                
-                const deferTimer = setTimeout(() => {
-                    unsubSugar = onSnapshot(getColRef('sugar_options'), snap => {
-                        const freshSugar = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
-                        syncToState('solaris_sugar', freshSugar, setSugarOptions, null);
-                    });
+                // PRIORITY 2: Smart Fetching for Static Configuration Data
+                if (view === 'admin_dashboard') {
+                    // Admins get live WebSockets to see their own edits instantly
+                    unsubscribers.push(onSnapshot(getColRef('categories'), snap => {
+                        syncToState('solaris_categories', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
+                    }));
+                    unsubscribers.push(onSnapshot(getColRef('shops'), snap => {
+                        syncToState('solaris_shops', snap.docs.map(d => ({ id: d.id, ...d.data() })), setShops, setLoadingShops);
+                    }));
                     
-                    unsubIce = onSnapshot(getColRef('ice_options'), snap => {
-                        const freshIce = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order);
-                        syncToState('solaris_ice', freshIce, setIceOptions, null);
-                    });
+                    const deferTimer = setTimeout(() => {
+                        unsubscribers.push(onSnapshot(getColRef('sugar_options'), snap => {
+                            syncToState('solaris_sugar', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('ice_options'), snap => {
+                            syncToState('solaris_ice', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('tables'), snap => {
+                            syncToState('solaris_tables', snap.docs.map(d => ({ id: d.id, ...d.data() })), setTables, setLoadingTables);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
+                        unsubscribers.push(onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
+                    }, 800);
                     
-                    unsubT = onSnapshot(getColRef('tables'), snap => {
-                        const freshTables = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                        syncToState('solaris_tables', freshTables, setTables, setLoadingTables);
-                    });
-                    
-                    if (view === 'admin_dashboard') {
-                        unsubInv = onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                        unsubShifts = onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                    }
-                }, 800);
+                    // Attach the timer clear to the cleanup loop
+                    unsubscribers.push(() => clearTimeout(deferTimer));
+                } else {
+                    // Customers get a one-time parallel fetch (getDocs) to kill 5 WebSocket connections
+                    const fetchStaticConfig = async () => {
+                        try {
+                            const [catsSnap, shopsSnap, sugarSnap, iceSnap, tablesSnap] = await Promise.all([
+                                getDocs(getColRef('categories')),
+                                getDocs(getColRef('shops')),
+                                getDocs(getColRef('sugar_options')),
+                                getDocs(getColRef('ice_options')),
+                                getDocs(getColRef('tables'))
+                            ]);
+                            
+                            syncToState('solaris_categories', catsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
+                            syncToState('solaris_shops', shopsSnap.docs.map(d => ({ id: d.id, ...d.data() })), setShops, setLoadingShops);
+                            syncToState('solaris_sugar', sugarSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
+                            syncToState('solaris_ice', iceSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
+                            syncToState('solaris_tables', tablesSnap.docs.map(d => ({ id: d.id, ...d.data() })), setTables, setLoadingTables);
+                        } catch (err) {
+                            console.warn("Failed to fetch static config", err);
+                        }
+                    };
+                    fetchStaticConfig();
+                }
 
-                return () => { 
-                    clearTimeout(deferTimer);
-                    unsubP(); unsubShops(); unsubC();
-                    if(unsubT) unsubT(); 
-                    if(unsubInv) unsubInv(); 
-                    if(unsubShifts) unsubShifts();
-                    if(unsubSugar) unsubSugar();
-                    if(unsubIce) unsubIce();
-                };
+                return () => unsubscribers.forEach(unsub => { if(typeof unsub === 'function') unsub(); });
             }, [view, user]); // Added user to dependency array
 
             // OPTIMIZATION 1.5: Private Data Fetching (Orders)
@@ -1035,12 +1160,12 @@
         }
 
         function CustomizeModal({ selectedItem, sugarOptions, iceOptions, onClose, onAddToCart }) {
-            // UPSELL STRATEGY: Automatically look for Large (L) and set as default for new items
+            // DEFAULT S: Automatically set Small (S) as default for new items
             const isEditing = selectedItem.editCartIndex !== undefined;
             const hasLarge = selectedItem.product.priceLarge > 0 && selectedItem.product.sizingMode !== 'Standard';
             
-            const initialSize = (!isEditing && hasLarge) ? 'L' : selectedItem.size;
-            const initialPrice = (!isEditing && hasLarge) ? selectedItem.product.priceLarge : selectedItem.price;
+            const initialSize = (!isEditing && hasLarge) ? 'S' : selectedItem.size;
+            const initialPrice = (!isEditing && hasLarge) ? selectedItem.product.priceSmall : selectedItem.price;
 
             const [sugar, setSugar] = useState(selectedItem.sugar);
             const [ice, setIce] = useState(selectedItem.ice);
@@ -1939,23 +2064,69 @@
 
             // NEW: Fetch Secure Customer Profile for VIP Tiering in Customer Portal
             const [customerProfile, setCustomerProfile] = useState(null);
+            const [liveRefilledPoints, setLiveRefilledPoints] = useState(0);
+
             useEffect(() => {
-                if (!currentUser || !sessionInfo.isSetup || !sessionInfo.customerPhone) {
+                // Target phone prioritizes Live Tracker search over active session to ensure cross-view accuracy
+                const targetPhone = phoneSearchQuery || sessionInfo.customerPhone;
+                
+                if (!currentUser || !targetPhone) {
                     setCustomerProfile(null);
+                    setLiveRefilledPoints(0);
                     return;
                 }
+                
                 const { query, where, onSnapshot, collection } = window.FirebaseApp;
-                const q = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
-                const unsub = onSnapshot(q, snap => {
-                    if (!snap.empty) setCustomerProfile({ id: snap.docs[0].id, ...snap.docs[0].data() });
-                    else setCustomerProfile(null);
+                
+                // 1. Fetch exact customer DB profile for VIP tiering and manually refilled points
+                const qCust = query(collection(db, 'customers'), where('phone', '==', targetPhone));
+                
+                const unsubCust = onSnapshot(qCust, snap => {
+                    if (!snap.empty) {
+                        const data = snap.docs[0].data();
+                        setLiveRefilledPoints(data.refilledPoints || 0);
+                        
+                        // Only lock the profile state if the target matches the actively logged-in session
+                        if (targetPhone === sessionInfo.customerPhone && sessionInfo.isSetup) {
+                            setCustomerProfile({ id: snap.docs[0].id, ...data });
+                        }
+                    } else {
+                        setLiveRefilledPoints(0);
+                        if (targetPhone === sessionInfo.customerPhone) {
+                            setCustomerProfile(null);
+                        }
+                    }
                 });
-                return () => unsub();
-            }, [sessionInfo.customerPhone, sessionInfo.isSetup]);
+
+                return () => unsubCust();
+            }, [sessionInfo.customerPhone, sessionInfo.isSetup, phoneSearchQuery, currentUser]);
+
+            useEffect(() => {
+                const targetPhone = phoneSearchQuery || sessionInfo.customerPhone;
+                
+                if (!currentUser || !targetPhone || !globalPoints?.pointsEnabled) {
+                    setCustomerLoyalty({ activePoints: 0, freeClaims: 0, totalSpent: 0, totalRedeemed: 0 });
+                    return;
+                }
+
+                const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                
+                // 2. LIVE CRM FETCH: Pull exact math from the Earn Point Report logic by querying ALL raw paid orders
+                // This guarantees the Customer Info Cart and Live Tracker perfectly match the Admin CRM point calculations.
+                const qOrders = query(collection(db, 'orders'), where('customerPhone', '==', targetPhone));
+                const unsubOrders = onSnapshot(qOrders, snapOrders => {
+                    const rawOrders = snapOrders.docs.map(d => d.data());
+                    const exactLoyalty = calculateCustomerLoyalty(rawOrders, targetPhone, globalPoints, liveRefilledPoints);
+                    setCustomerLoyalty(exactLoyalty);
+                }, (error) => {
+                    console.warn("Live CRM Loyalty sync failed:", error);
+                });
+
+                return () => unsubOrders();
+            }, [sessionInfo.customerPhone, phoneSearchQuery, globalPoints, liveRefilledPoints, currentUser]);
 
             // DYNAMIC BADGES STATE
             const [branchLoyalty, setBranchLoyalty] = useState(null);
-            const [topSellers, setTopSellers] = useState([]);
 
             useEffect(() => {
                 const handleOffline = () => setIsOffline(true);
@@ -2037,56 +2208,24 @@
             useEffect(() => {
                 if (!currentUser) return; // SECURITY FIX
                 
-                const { doc, onSnapshot } = window.FirebaseApp;
+                const { doc, getDoc } = window.FirebaseApp;
                 
-                const unsubPoints = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
-                    if (snap.exists()) setGlobalPoints(snap.data());
-                }, e => console.warn("Failed to load global points", e));
-                
-                const unsubEvents = onSnapshot(doc(db, 'loyalty_settings', 'special_events'), snap => {
-                    if (snap.exists()) setSpecialEvents(snap.data().events || []);
-                }, e => console.warn("Failed to load special events", e));
-                
-                return () => {
-                    unsubPoints();
-                    unsubEvents();
-                };
-            }, [currentUser]); // Added currentUser to dependency array
-
-            // SPARK PLAN OPTIMIZATION: Calculate Specific Customer Loyalty
-            useEffect(() => {
-                if (!currentUser || !sessionInfo.isSetup || !sessionInfo.customerPhone || !globalPoints?.pointsEnabled) return;
-
-                const { query, where, onSnapshot, collection, orderBy } = window.FirebaseApp;
-                
-                // BUG FIX: Removed limit(50) so the running spend can calculate accurately from the customer's first order
-                const q = query(
-                    collection(db, 'orders'), 
-                    where('customerPhone', '==', sessionInfo.customerPhone),
-                    orderBy('createdAt', 'desc')
-                );
-
-                const unsub = onSnapshot(q, snap => {
-                    const customerOrders = [];
-                    snap.forEach(d => customerOrders.push({ id: d.id, ...d.data() }));
-                    
-                    // BUG FIX: Added customerProfile?.refilledPoints to ensure cart reflects admin injections
-                    const loyaltyData = calculateCustomerLoyalty(customerOrders, sessionInfo.customerPhone, globalPoints, customerProfile?.refilledPoints || 0);
-                    setCustomerLoyalty(loyaltyData);
-                }, (error) => {
-                    // Fallback if the composite index is missing
-                    if (error.message && error.message.includes('index')) {
-                        console.warn("Missing Index for Loyalty. Falling back to un-ordered query.");
-                        const fallbackQ = query(collection(db, 'orders'), where('customerPhone', '==', sessionInfo.customerPhone));
-                        onSnapshot(fallbackQ, fallbackSnap => {
-                            const fallbackOrders = [];
-                            fallbackSnap.forEach(d => fallbackOrders.push({ id: d.id, ...d.data() }));
-                            setCustomerLoyalty(calculateCustomerLoyalty(fallbackOrders, sessionInfo.customerPhone, globalPoints, customerProfile?.refilledPoints || 0));
-                        });
+                const fetchLoyaltyConfig = async () => {
+                    try {
+                        const [pointsSnap, eventsSnap] = await Promise.all([
+                            getDoc(doc(db, 'loyalty_settings', 'global_points')),
+                            getDoc(doc(db, 'loyalty_settings', 'special_events'))
+                        ]);
+                        
+                        if (pointsSnap.exists()) setGlobalPoints(pointsSnap.data());
+                        if (eventsSnap.exists()) setSpecialEvents(eventsSnap.data().events || []);
+                    } catch (e) {
+                        console.warn("Failed to load loyalty config", e);
                     }
-                });
-                return () => unsub();
-            }, [sessionInfo.customerPhone, sessionInfo.isSetup, globalPoints, customerProfile]); // Added customerProfile dependency
+                };
+                
+                fetchLoyaltyConfig();
+            }, [currentUser]); // Added currentUser to dependency array
 
             // SMART GPS DETECTION ON MOUNT (Continuous Live Tracking)
             useEffect(() => {
@@ -2426,7 +2565,7 @@
                 }
             }, [qrDetectedTable, sessionInfo.isSetup, qrError]);
 
-            // FETCH DYNAMIC BADGES: Top Sellers & Active Promos
+            // FETCH DYNAMIC BADGES: Active Promos
             useEffect(() => {
                 if (!currentUser) return; // SECURITY FIX
                 
@@ -2434,52 +2573,22 @@
                 const targetShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
                 if (!targetShopId) return;
 
-                const { doc, onSnapshot, collection, query, where, orderBy, limit } = window.FirebaseApp;
-                let unsubOrders;
+                const { doc, getDoc } = window.FirebaseApp;
 
-                const unsubLoyalty = onSnapshot(doc(db, 'loyalty_settings', targetShopId), snapLoyalty => {
-                    let currentLoyalty = null;
-                    if (snapLoyalty.exists()) {
-                        currentLoyalty = snapLoyalty.data();
-                        setBranchLoyalty(currentLoyalty);
-                    } else {
-                        setBranchLoyalty(null);
+                const fetchDynamicBadges = async () => {
+                    try {
+                        const snapLoyalty = await getDoc(doc(db, 'loyalty_settings', targetShopId));
+                        if (snapLoyalty.exists()) {
+                            setBranchLoyalty(snapLoyalty.data());
+                        } else {
+                            setBranchLoyalty(null);
+                        }
+                    } catch (e) {
+                        console.warn("Failed fetching dynamic badge data", e);
                     }
-
-                    // Configuration Check for Hot Sale Algorithm
-                    const isHotSaleEnabled = currentLoyalty?.hotSaleEnabled === true;
-                    
-                    if (!isHotSaleEnabled) {
-                        setTopSellers([]);
-                        if (unsubOrders) { unsubOrders(); unsubOrders = null; }
-                        return;
-                    }
-
-                    const lookbackCount = currentLoyalty?.hotSaleLookback ? Number(currentLoyalty.hotSaleLookback) : 150;
-                    const maxItems = currentLoyalty?.hotSaleMaxItems ? Number(currentLoyalty.hotSaleMaxItems) : 3;
-
-                    // Re-attach orders live listener with updated config
-                    if (unsubOrders) unsubOrders();
-                    
-                    const qOrders = query(collection(db, 'orders'), where('shopId', '==', targetShopId), orderBy('createdAt', 'desc'), limit(lookbackCount));
-                    
-                    unsubOrders = onSnapshot(qOrders, snapOrders => {
-                        const itemCounts = {};
-                        snapOrders.docs.forEach(d => {
-                            const items = d.data().items || [];
-                            items.forEach(item => {
-                                itemCounts[item.productId] = (itemCounts[item.productId] || 0) + item.quantity;
-                            });
-                        });
-                        const sorted = Object.entries(itemCounts).sort((a,b) => b[1] - a[1]).slice(0, maxItems).map(entry => entry[0]);
-                        setTopSellers(sorted);
-                    }, e => console.warn("Failed fetching top sellers", e));
-                }, e => console.warn("Failed fetching dynamic badge data", e));
-
-                return () => {
-                    unsubLoyalty();
-                    if (unsubOrders) unsubOrders();
                 };
+
+                fetchDynamicBadges();
             }, [sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, currentUser]); // Added currentUser dependency
 
             if (qrError) {
@@ -2594,31 +2703,26 @@
                     }
                     return true;
                 }).sort((a, b) => {
-                    // 1. Priority: Hot Sale
-                    const aHot = topSellers.includes(a.id) ? 1 : 0;
-                    const bHot = topSellers.includes(b.id) ? 1 : 0;
-                    if (aHot !== bHot) return bHot - aHot;
-
-                    // 2. Priority: Promotion Active
+                    // 1. Priority: Promotion Active
                     const checkPromo = (p) => activePromos.some(promo => !promo.applicableProductIds || promo.applicableProductIds.length === 0 || promo.applicableProductIds.includes(p.id));
                     const aPromo = checkPromo(a) ? 1 : 0;
                     const bPromo = checkPromo(b) ? 1 : 0;
                     if (aPromo !== bPromo) return bPromo - aPromo;
 
-                    // 3. Priority: New Product
+                    // 2. Priority: New Product
                     const aNew = newProductIds.has(a.id) ? 1 : 0;
                     const bNew = newProductIds.has(b.id) ? 1 : 0;
                     if (aNew !== bNew) return bNew - aNew;
 
-                    // 4. Priority: Category Order Number
+                    // 3. Priority: Category Order Number
                     const aCatOrder = categories.find(c => c.name === a.category)?.order ?? 999;
                     const bCatOrder = categories.find(c => c.name === b.category)?.order ?? 999;
                     if (aCatOrder !== bCatOrder) return aCatOrder - bCatOrder;
 
-                    // 5. Fallback: Alphabetical
+                    // 4. Fallback: Alphabetical
                     return (a.name || '').localeCompare(b.name || '');
                 });
-            }, [products, searchQuery, activeCategory, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, topSellers, branchLoyalty, categories]);
+            }, [products, searchQuery, activeCategory, sessionInfo.shopId, detectedShop, nearestShopInfo?.shop?.id, shops, branchLoyalty, categories]);
 
             const handleSizeClick = (product, size, price) => {
                 if (!sessionInfo.isSetup) {
@@ -2630,8 +2734,8 @@
                     return;
                 }
                 if (product.hasSugarOption || product.hasIceOption) {
-                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 1)?.name || sugarOptions[0].name) : '100%';
-                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 1)?.name || iceOptions[0].name) : 'Normal Ice';
+                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 3)?.name || sugarOptions[0].name) : '100%';
+                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 2)?.name || iceOptions[0].name) : 'Normal Ice';
                     setSelectedItemForOptions({ 
                         product, size, price, 
                         sugar: product.hasSugarOption ? defaultSugar : null,
@@ -2693,8 +2797,8 @@
                 
                 if (product && (product.hasSugarOption || product.hasIceOption || hasMultipleSizes)) {
                     setIsCartOpen(false); // Temporarily close cart to show modal
-                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 1)?.name || sugarOptions[0].name) : '100%';
-                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 1)?.name || iceOptions[0].name) : 'Normal Ice';
+                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 3)?.name || sugarOptions[0].name) : '100%';
+                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 2)?.name || iceOptions[0].name) : 'Normal Ice';
                     setSelectedItemForOptions({ 
                         product, 
                         size: item.size, 
@@ -3092,11 +3196,14 @@
                     const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
                     
                     // --- SECURITY FIX: Anti-Spoofing Check ---
+                    let realProfile = null;
+                    let customerDocId = null;
                     if (sessionInfo.customerPhone) {
                         const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
                         const checkSnap = await getDocs(qCheck);
                         if (!checkSnap.empty) {
-                            const realProfile = checkSnap.docs[0].data();
+                            realProfile = checkSnap.docs[0].data();
+                            customerDocId = checkSnap.docs[0].id;
                             if (realProfile.status === 'Inactive') {
                                 setIsSubmitting(false);
                                 return; // Stop saving to DB if suspended
@@ -3107,6 +3214,7 @@
                     // PHASE 2 FIX: AWAIT the Transaction securely before assuming success
                     const counterRef = doc(db, 'invoice_counters', targetShop.id);
                     const newOrderRef = doc(getColRef('orders'));
+                    const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
                     
                     const finalQueueString = await runTransaction(db, async (transaction) => {
                         const counterDoc = await transaction.get(counterRef);
@@ -3124,6 +3232,16 @@
                         // Move order creation INSIDE the transaction to guarantee atomicity.
                         // If order creation fails, the counter rolls back automatically.
                         transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
+
+                        // OPTIMIZATION: Calculate and save loyalty points during checkout transaction
+                        if (customerRef && realProfile && globalPoints?.pointsEnabled) {
+                             const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
+                             const newLoyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                             transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
+                        } else if (customerRef) {
+                             // Just update last visit
+                             transaction.update(customerRef, { lastVisit: Date.now() });
+                        }
                         
                         return queueStr;
                     });
@@ -3420,10 +3538,6 @@
                                         if (todayDate >= effectiveDate && todayDate <= expiryDate) {
                                             badges.push(<div key="new" className="bg-indigo-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-indigo-400 animate-pulse flex items-center gap-1"><i className="fa-solid fa-sparkles"></i> New</div>);
                                         }
-                                    }
-                                    
-                                    if (topSellers.includes(product.id)) {
-                                        badges.push(<div key="hot" className="bg-amber-500 text-white text-[10px] font-black px-2 py-1 rounded-lg shadow-sm border border-amber-400 animate-pulse flex items-center gap-1"><i className="fa-solid fa-fire"></i> Hot Sale</div>);
                                     }
 
                                     return (
@@ -3753,7 +3867,7 @@
                             onCancelOrder={handleCancelOrder}
                             onClose={() => setIsTrackerOpen(false)}
                             shops={shops}
-                            customerLoyalty={sessionInfo.isSetup ? customerLoyalty : null}
+                            customerLoyalty={(sessionInfo.isSetup || phoneSearchQuery) ? customerLoyalty : null}
                             globalPoints={globalPoints}
                             sessionInfo={sessionInfo}
                             onLogout={handleCustomerLogout}
@@ -4095,6 +4209,7 @@
 
             // Start directly on the mobile OS Launchpad
             const [activeTab, setActiveTab] = useState('launchpad');
+            const [posAutoOpenShopId, setPosAutoOpenShopId] = useState(null);
             
             useEffect(() => {
                 // Return to launchpad if they somehow select an app they don't have permission for
@@ -4199,8 +4314,8 @@
                     {/* App Content Window */}
                     <main className="p-4 md:p-8 flex-1 overflow-y-auto relative h-full">
                         {activeTab === 'dashboard' && <DashboardView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} />}
-                        {activeTab === 'pos' && <POSView orders={orders} products={products} categories={categories} tables={tables} shops={shops} shifts={shifts} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} admins={admins} />}
-                        {activeTab === 'kds' && <KDSView orders={orders} tables={tables} shops={shops} shifts={shifts} products={products} ingredients={ingredients} onBack={() => setActiveTab('pos')} currentAdminRecord={currentAdminRecord} />}
+                        {activeTab === 'pos' && <POSView orders={orders} products={products} categories={categories} tables={tables} shops={shops} shifts={shifts} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} admins={admins} autoOpenShopId={posAutoOpenShopId} clearAutoOpen={() => setPosAutoOpenShopId(null)} />}
+                        {activeTab === 'kds' && <KDSView orders={orders} tables={tables} shops={shops} shifts={shifts} products={products} ingredients={ingredients} onBack={(shopId) => { setPosAutoOpenShopId(shopId); setActiveTab('pos'); }} currentAdminRecord={currentAdminRecord} />}
                         {activeTab === 'products' && <ProductsView products={products} categories={categories} ingredients={ingredients} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} shops={shops} />}
                         {activeTab === 'inventory' && <InventoryView ingredients={ingredients} shops={shops} currentAdminRecord={currentAdminRecord} />}
                         {activeTab === 'sales' && <SalesView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} admins={admins} shifts={shifts} />}
@@ -6449,11 +6564,11 @@
                                                 <div className={`block w-10 h-6 rounded-full transition ${eventFormData.isActive ? 'bg-green-500' : 'bg-stone-300'}`}></div>
                                                 <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${eventFormData.isActive ? 'translate-x-4' : ''}`}></div>
                                             </div>
-                                            <div className="ml-3 text-sm font-bold text-stone-700">{eventFormData.isActive ? 'Event is Active' : 'Event is Disabled'}</div>
+                                            <div className="ml-3 text-sm font-bold text-stone-700">{eventFormData.isActive ? 'Active' : 'Inactive'}</div>
                                         </label>
                                     </div>
                                 </div>
-
+                                
                                 <div className="flex justify-end gap-2 pt-4 border-t border-stone-100">
                                     <button type="button" onClick={() => setEventModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
                                     <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-indigo-600 text-white hover:bg-indigo-700 shadow-md transition flex items-center">
@@ -6467,7 +6582,7 @@
             );
         }
 
-        function POSView({ orders, products, categories, tables, shops, shifts, sugarOptions, iceOptions, currentAdminRecord, admins }) {
+        function POSView({ orders, products, categories, tables, shops, shifts, sugarOptions, iceOptions, currentAdminRecord, admins, autoOpenShopId, clearAutoOpen }) {
             const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
             const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
             const canSelectMultiple = isSuper || allowedShopIds.includes('All') || allowedShopIds.length > 1;
@@ -6486,6 +6601,26 @@
             // FIX: Custom Alert and Confirm Modals to prevent silent Iframe execution blocks
             const [posError, setPosError] = useState('');
             const [confirmAction, setConfirmAction] = useState(null);
+
+            useEffect(() => {
+                if (autoOpenShopId) {
+                    if (autoOpenShopId === 'All') {
+                        setPosError("Please select a specific branch in KDS first to directly open the POS register.");
+                        setTimeout(() => setPosError(''), 4000);
+                        clearAutoOpen();
+                        return;
+                    }
+                    const targetShift = shifts?.find(s => s.shopId === autoOpenShopId && s.status === 'Open');
+                    setPosShopId(autoOpenShopId);
+                    setCartShopId(autoOpenShopId);
+                    if (!targetShift) {
+                        setOpenShiftModal(true);
+                    } else {
+                        setMode('pos');
+                    }
+                    clearAutoOpen();
+                }
+            }, [autoOpenShopId, shifts, clearAutoOpen]);
 
             useEffect(() => {
                 const { onSnapshot, collection } = window.FirebaseApp;
@@ -6936,6 +7071,9 @@
             
             // NEW: Search Query State for POS Menu
             const [posSearchQuery, setPosSearchQuery] = useState('');
+
+            // NEW: State to hold raw orders for POS Loyalty calculation
+            const [posCustomerRawOrders, setPosCustomerRawOrders] = useState([]);
             
             // NEW: Fetch Global Points & Special Events for Loyalty/Promo Calculation
             const [globalPoints, setGlobalPoints] = useState(null);
@@ -6975,10 +7113,32 @@
                 };
             }, [cartShopId, posShopId]);
 
+            // FETCH RAW ORDERS FOR POS LOYALTY CALCULATION
+            useEffect(() => {
+                const cleanedPhone = String(customerPhone).replace(/\D/g, '');
+                if (!cleanedPhone || cleanedPhone.length < 8 || !globalPoints?.pointsEnabled) {
+                    setPosCustomerRawOrders([]);
+                    return;
+                }
+
+                const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                const qOrders = query(collection(db, 'orders'), where('customerPhone', '==', customerPhone));
+                
+                const unsub = onSnapshot(qOrders, snap => {
+                    setPosCustomerRawOrders(snap.docs.map(d => d.data()));
+                }, (err) => console.warn("Failed to fetch orders for POS Loyalty:", err));
+
+                return () => unsub();
+            }, [customerPhone, globalPoints]);
+
             const customerLoyalty = useMemo(() => {
                 if (!customerPhone || !globalPoints?.pointsEnabled) return null;
-                return calculateCustomerLoyalty(orders, customerPhone, globalPoints, customerData?.refilledPoints || 0);
-            }, [orders, customerPhone, globalPoints, customerData]);
+                
+                // Use the exact same calculation logic as the Earn Point Report and Customer Portal
+                const refilledPts = customerData?.refilledPoints || 0;
+                return calculateCustomerLoyalty(posCustomerRawOrders, customerPhone, globalPoints, refilledPts);
+                
+            }, [customerPhone, globalPoints, customerData, posCustomerRawOrders]);
 
             useEffect(() => {
                 const checkPhone = async () => {
@@ -7058,8 +7218,8 @@
 
             const handleSizeClick = (product, size, price) => {
                 if (product.hasSugarOption || product.hasIceOption) {
-                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 1)?.name || sugarOptions[0].name) : '100%';
-                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 1)?.name || iceOptions[0].name) : 'Normal Ice';
+                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 3)?.name || sugarOptions[0].name) : '100%';
+                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 2)?.name || iceOptions[0].name) : 'Normal Ice';
                     setSelectedItemForOptions({ 
                         product, 
                         size, 
@@ -7106,8 +7266,8 @@
                 const hasMultipleSizes = product && product.priceSmall > 0 && product.priceLarge > 0 && product.sizingMode !== 'Standard';
                 
                 if (product && (product.hasSugarOption || product.hasIceOption || hasMultipleSizes)) {
-                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 1)?.name || sugarOptions[0].name) : '100%';
-                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 1)?.name || iceOptions[0].name) : 'Normal Ice';
+                    const defaultSugar = sugarOptions?.length > 0 ? (sugarOptions.find(o => Number(o.order) === 3)?.name || sugarOptions[0].name) : '100%';
+                    const defaultIce = iceOptions?.length > 0 ? (iceOptions.find(o => Number(o.order) === 2)?.name || iceOptions[0].name) : 'Normal Ice';
                     setSelectedItemForOptions({ 
                         product, 
                         size: item.size, 
@@ -7293,11 +7453,26 @@
                 }
 
                 try {
-                    const { doc, runTransaction, collection, addDoc } = window.FirebaseApp;
+                    const { doc, runTransaction, collection, addDoc, getDocs, query, where } = window.FirebaseApp;
                     
+                    // Retrieve fresh customer profile if needed for loyalty transaction
+                    let realProfile = null;
+                    let customerDocId = customerData ? customerData.id : null;
+                    if (customerPhone && !customerDocId) {
+                        const qCheck = query(collection(db, 'customers'), where('phone', '==', customerPhone));
+                        const checkSnap = await getDocs(qCheck);
+                        if (!checkSnap.empty) {
+                            realProfile = checkSnap.docs[0].data();
+                            customerDocId = checkSnap.docs[0].id;
+                        }
+                    } else if (customerData) {
+                        realProfile = customerData;
+                    }
+
                     // SECURE FIREBASE TRANSACTION (AWAITED)
                     const counterRef = doc(db, 'invoice_counters', targetShop.id);
                     const newOrderRef = doc(getColRef('orders'));
+                    const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
 
                     const finalQueueString = await runTransaction(db, async (transaction) => {
                         const counterDoc = await transaction.get(counterRef);
@@ -7314,6 +7489,20 @@
                         // GHOST INVOICE CHALLENGE FIX:
                         // Bind the counter increment and order creation into a single atomic operation
                         transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
+
+                        // OPTIMIZATION: Calculate and save loyalty points during checkout transaction if Paid
+                        if (customerRef && realProfile && payStatus === 'Paid' && globalPoints?.pointsEnabled) {
+                             const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
+                             // In POS, if they claim an item, we don't currently have `redeemedPoints` tracked in orderData easily here, 
+                             // so we need to calculate it.
+                             const totalRedeemedInCart = currentCart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+                             const pointsToRedeem = totalRedeemedInCart * (globalPoints?.redeemPoints || 10);
+
+                             const newLoyaltyData = calculateLoyaltyForOrder(currentTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                             transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
+                        } else if (customerRef) {
+                             transaction.update(customerRef, { lastVisit: Date.now() });
+                        }
                         
                         return queueStr;
                     });
@@ -12320,10 +12509,13 @@
                         </div>
                     )}
                     
-                    <div className="flex justify-between items-center mb-4">
-                        <h2 className="text-2xl font-bold flex items-center">
+                    <div className="flex justify-between items-center mb-4 flex-wrap gap-y-3">
+                        <h2 className="text-xl sm:text-2xl font-bold flex items-center flex-wrap">
                            Welcome KDS!
-                            {isAwake && <i className="fa-solid fa-eye text-amber-500 ml-3 text-sm animate-pulse" title="Screen Wake Lock Active (Screen will not sleep)"></i>}
+                            {isAwake && <i className="fa-solid fa-eye text-amber-500 ml-2 sm:ml-3 text-sm animate-pulse" title="Screen Wake Lock Active (Screen will not sleep)"></i>}
+                            <button onClick={() => onBack(filterShop)} className="ml-3 sm:ml-4 bg-amber-600 text-white px-3 py-1.5 rounded-lg text-xs sm:text-sm font-bold shadow-md hover:bg-amber-700 transition flex items-center gap-1.5 active:scale-95">
+                                <i className="fa-solid fa-cash-register"></i> Main POS
+                            </button>
                         </h2>
                         
                         <div className="flex gap-2 items-center">
