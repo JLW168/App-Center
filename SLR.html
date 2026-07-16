@@ -7213,7 +7213,7 @@
                     
                     return true;
                 });
-            }, [products, activeCategory, cartShopId]);
+            }, [products, activeCategory, cartShopId, posSearchQuery]);
 
             const handleSizeClick = (product, size, price) => {
                 if (product.hasSugarOption || product.hasIceOption) {
@@ -7402,8 +7402,8 @@
                 return { processedCart: processed, cartTotal: total };
             }, [cart, allPromotions, specialEvents, cartShopId, customerData, products]);
 
-            const handleCheckout = async (targetStatus, payStatus, payMethod) => { // PHASE 2 FIX: Convert POS to strict async
-                if (cart.length === 0) return;
+            const handleCheckout = async (targetStatus, payStatus, payMethod) => { 
+                if (cart.length === 0 || isSubmitting) return;
                 
                 // --- NEW SHIFT GUARD: Block POS Checkout if no shift is open ---
                 const cartTargetShift = shifts?.find(s => s.shopId === cartShopId && s.status === 'Open');
@@ -7417,138 +7417,144 @@
                 
                 const today = getTodayString();
                 
-                // TAX DEPT FORMAT: Extract last 3 alphanumeric characters of the shop name
-                const targetShop = shops.find(s => s.id === cartShopId) || { name: 'UNK', id: 'UNKNOWN' };
-                const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
-
                 // Snapshot the processed cart state
                 const currentCart = [...processedCart];
                 const currentTotal = cartTotal;
+                const snapShopId = cartShopId;
+                const snapMode = cartMode;
+                const snapTableId = cartTableId;
+                const snapTableName = cartTableName;
+                const snapCustomerPhone = customerPhone;
+                const snapCustomerName = customerName;
+                const snapCustomerSex = customerSex;
+                const snapCustomerData = customerData;
+                
+                // OPTIMISTIC UI UPDATE: Clear POS Register Instantly to allow next order
+                if (navigator.vibrate) navigator.vibrate([30, 30]);
+                setCart([]);
+                setCustomerName('');
+                setCustomerPhone('');
+                setCustomerSex('M');
+                setCustomerData(null);
+                setCartMode('TAKEAWAY');
+                setCartTableId('');
+                setCartTableName('');
+                
+                setIsSubmitting(false); // Unlock UI instantly
+                
+                // BACKGROUND SYNCHRONIZATION
+                (async () => {
+                    const targetShop = shops.find(s => s.id === snapShopId) || { name: 'UNK', id: 'UNKNOWN' };
+                    const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                    const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                const orderData = {
-                    shiftId: cartTargetShift ? cartTargetShift.id : null,
-                    staffId: currentAdminRecord?.id,
-                    userId: customerData ? customerData.id : (currentAdminRecord?.id || null),
-                    orderType: cartMode, 
-                    tableId: cartMode === 'DINE_IN' ? cartTableId : 'Walk-in',
-                    tableName: cartMode === 'DINE_IN' ? cartTableName : 'Take Away',
-                    shopId: cartShopId,
-                    customerName: customerName || 'Walk-in',
-                    customerPhone: customerPhone || '',
-                    customerSex: customerData ? customerSex : 'M',
-                    chargeStatus: customerData?.chargeStatus || 'Normal',
-                    items: currentCart,
-                    totalAmount: currentTotal,
-                    status: targetStatus, 
-                    paymentStatus: payStatus,
-                    paymentMethod: payMethod,
-                    dateString: today,
-                    createdAt: Date.now()
-                };
+                    const orderData = {
+                        shiftId: cartTargetShift ? cartTargetShift.id : null,
+                        staffId: currentAdminRecord?.id,
+                        userId: snapCustomerData ? snapCustomerData.id : (currentAdminRecord?.id || null),
+                        orderType: snapMode, 
+                        tableId: snapMode === 'DINE_IN' ? snapTableId : 'Walk-in',
+                        tableName: snapMode === 'DINE_IN' ? snapTableName : 'Take Away',
+                        shopId: snapShopId,
+                        customerName: snapCustomerName || 'Walk-in',
+                        customerPhone: snapCustomerPhone || '',
+                        customerSex: snapCustomerData ? snapCustomerSex : 'M',
+                        chargeStatus: snapCustomerData?.chargeStatus || 'Normal',
+                        items: currentCart,
+                        totalAmount: currentTotal,
+                        status: targetStatus, 
+                        paymentStatus: payStatus,
+                        paymentMethod: payMethod,
+                        dateString: today,
+                        createdAt: Date.now()
+                    };
 
-                if (targetStatus === 'Served' || targetStatus === 'Cancelled') {
-                    orderData.completedAt = Date.now();
-                }
-
-                try {
-                    const { doc, runTransaction, collection, addDoc, getDocs, query, where } = window.FirebaseApp;
-                    
-                    // Retrieve fresh customer profile if needed for loyalty transaction
-                    let realProfile = null;
-                    let customerDocId = customerData ? customerData.id : null;
-                    if (customerPhone && !customerDocId) {
-                        const qCheck = query(collection(db, 'customers'), where('phone', '==', customerPhone));
-                        const checkSnap = await getDocs(qCheck);
-                        if (!checkSnap.empty) {
-                            realProfile = checkSnap.docs[0].data();
-                            customerDocId = checkSnap.docs[0].id;
-                        }
-                    } else if (customerData) {
-                        realProfile = customerData;
+                    if (targetStatus === 'Served' || targetStatus === 'Cancelled') {
+                        orderData.completedAt = Date.now();
                     }
 
-                    // SECURE FIREBASE TRANSACTION (AWAITED)
-                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                    const newOrderRef = doc(getColRef('orders'));
-                    const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
-
-                    const finalQueueString = await runTransaction(db, async (transaction) => {
-                        const counterDoc = await transaction.get(counterRef);
-                        let nextVal = 1;
-                        if (counterDoc.exists()) {
-                            nextVal = (counterDoc.data().currentValue || 0) + 1;
-                            transaction.update(counterRef, { currentValue: nextVal });
-                        } else {
-                            transaction.set(counterRef, { currentValue: nextVal });
-                        }
+                    try {
+                        const { doc, runTransaction, collection, addDoc, getDocs, query, where } = window.FirebaseApp;
                         
-                        const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
-                        
-                        // GHOST INVOICE CHALLENGE FIX:
-                        // Bind the counter increment and order creation into a single atomic operation
-                        transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
-
-                        // OPTIMIZATION: Calculate and save loyalty points during checkout transaction if Paid
-                        if (customerRef && realProfile && payStatus === 'Paid' && globalPoints?.pointsEnabled) {
-                             const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
-                             // In POS, if they claim an item, we don't currently have `redeemedPoints` tracked in orderData easily here, 
-                             // so we need to calculate it.
-                             const totalRedeemedInCart = currentCart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
-                             const pointsToRedeem = totalRedeemedInCart * (globalPoints?.redeemPoints || 10);
-
-                             const newLoyaltyData = calculateLoyaltyForOrder(currentTotal, pointsToRedeem, currentLoyalty, globalPoints);
-                             transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
-                        } else if (customerRef) {
-                             transaction.update(customerRef, { lastVisit: Date.now() });
+                        // Retrieve fresh customer profile if needed for loyalty transaction
+                        let realProfile = null;
+                        let customerDocId = snapCustomerData ? snapCustomerData.id : null;
+                        if (snapCustomerPhone && !customerDocId) {
+                            const qCheck = query(collection(db, 'customers'), where('phone', '==', snapCustomerPhone));
+                            const checkSnap = await getDocs(qCheck);
+                            if (!checkSnap.empty) {
+                                realProfile = checkSnap.docs[0].data();
+                                customerDocId = checkSnap.docs[0].id;
+                            }
+                        } else if (snapCustomerData) {
+                            realProfile = snapCustomerData;
                         }
-                        
-                        return queueStr;
-                    });
 
-                    orderData.queueNo = finalQueueString;
-                    orderData.id = newOrderRef.id;
+                        // SECURE FIREBASE TRANSACTION
+                        const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                        const newOrderRef = doc(getColRef('orders'));
+                        const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
 
-                    // OPTIMISTIC UI UPDATE: Clear POS Register Instantly (Only after success)
-                    if (navigator.vibrate) navigator.vibrate([30, 30]);
-                    setCart([]);
-                    setCustomerName('');
-                    setCustomerPhone('');
-                    setCustomerSex('M');
-                    setCustomerData(null);
-                    setCartMode('TAKEAWAY');
-                    setCartTableId('');
-                    setCartTableName('');
-                    setMode('manage');
+                        const finalQueueString = await runTransaction(db, async (transaction) => {
+                            const counterDoc = await transaction.get(counterRef);
+                            let nextVal = 1;
+                            if (counterDoc.exists()) {
+                                nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                transaction.update(counterRef, { currentValue: nextVal });
+                            } else {
+                                transaction.set(counterRef, { currentValue: nextVal });
+                            }
+                            
+                            const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+                            
+                            // Bind the counter increment and order creation into a single atomic operation
+                            transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
 
-                    // Auto-create new customer if phone provided but not found
-                    if (customerPhone && !customerData) {
-                        const cleanPhone = String(customerPhone).replace(/\D/g, '');
-                        if (cleanPhone.length >= 8) {
-                            addDoc(collection(db, 'customers'), {
-                                phone: customerPhone,
-                                name: customerName || 'Walk-in',
-                                createdAt: Date.now(),
-                                lastVisit: Date.now()
-                            }).catch(err => console.warn("Failed to auto-create customer:", err));
+                            // Calculate and save loyalty points during checkout transaction if Paid
+                            if (customerRef && realProfile && payStatus === 'Paid' && globalPoints?.pointsEnabled) {
+                                 const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
+                                 const totalRedeemedInCart = currentCart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
+                                 const pointsToRedeem = totalRedeemedInCart * (globalPoints?.redeemPoints || 10);
+
+                                 const newLoyaltyData = calculateLoyaltyForOrder(currentTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                                 transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
+                            } else if (customerRef) {
+                                 transaction.update(customerRef, { lastVisit: Date.now() });
+                            }
+                            
+                            return queueStr;
+                        });
+
+                        orderData.queueNo = finalQueueString;
+                        orderData.id = newOrderRef.id;
+
+                        // Auto-create new customer if phone provided but not found
+                        if (snapCustomerPhone && !snapCustomerData) {
+                            const cleanPhone = String(snapCustomerPhone).replace(/\D/g, '');
+                            if (cleanPhone.length >= 8) {
+                                addDoc(collection(db, 'customers'), {
+                                    phone: snapCustomerPhone,
+                                    name: snapCustomerName || 'Walk-in',
+                                    createdAt: Date.now(),
+                                    lastVisit: Date.now()
+                                }).catch(err => console.warn("Failed to auto-create customer:", err));
+                            }
                         }
+
+                        // Run non-critical background updates (Inventory & Table locking)
+                        Promise.all([
+                            deductInventory(currentCart, products, snapShopId, finalQueueString),
+                            (snapMode === 'DINE_IN' && snapTableId) 
+                                ? updateDoc(doc(getColRef('tables'), snapTableId), { status: 'Occupied' })
+                                : Promise.resolve()
+                        ]).catch(err => console.warn("Background tasks failed:", err));
+
+                    } catch (err) {
+                        console.error("POS Checkout failed:", err);
+                        setPosError("Network Error: Failed to sync an order in the background.");
+                        setTimeout(() => setPosError(''), 4000);
                     }
-
-                    // Run non-critical background updates (Inventory & Table locking)
-                    Promise.all([
-                        deductInventory(currentCart, products, cartShopId, finalQueueString),
-                        (cartMode === 'DINE_IN' && cartTableId) 
-                            ? updateDoc(doc(getColRef('tables'), cartTableId), { status: 'Occupied' })
-                            : Promise.resolve()
-                    ]).catch(err => console.warn("Background tasks failed:", err));
-
-                } catch (err) {
-                    console.error("POS Checkout failed:", err);
-                    setPosError("Network Error: Failed to place order. Please try again.");
-                    setTimeout(() => setPosError(''), 4000);
-                } finally {
-                    setIsSubmitting(false); // Unlock UI regardless of success or failure
-                }
+                })();
             };
 
             return (
