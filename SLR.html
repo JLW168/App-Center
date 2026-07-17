@@ -1293,7 +1293,7 @@
             );
         }
 
-        function SetupModal({ sessionInfo, onSubmit, onClose, bypassPin = false }) {
+        function SetupModal({ sessionInfo, onSubmit, onClose, bypassPin = false, shops = [] }) {
             const [phone, setPhone] = useState(sessionInfo.customerPhone || '');
             const [name, setName] = useState(sessionInfo.customerName || '');
             const [sex, setSex] = useState(sessionInfo.customerSex || 'M');
@@ -1424,17 +1424,40 @@
 
                 // SAVE / UPDATE CUSTOMER SECURITY RECORD
                 try {
-                    const { addDoc, doc, updateDoc, collection } = window.FirebaseApp;
+                    const { addDoc, doc, updateDoc, collection, runTransaction } = window.FirebaseApp;
                     
                     if (!isExisting || (isExisting && !customerId)) {
-                        // Create brand new customer document with PIN
-                        await addDoc(collection(db, 'customers'), {
-                            phone: phone,
-                            name: finalName,
-                            sex: sex,
-                            pin: bypassPin ? null : cleanPin, // Don't save a pin if bypassing
-                            createdAt: Date.now(),
-                            lastVisit: Date.now()
+                        // Dynamically pull target shop name for sequence prefixing
+                        const regShopId = sessionInfo.shopId || (shops.length > 0 ? shops[0].id : 'UNKNOWN');
+                        const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
+                        const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                        const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+
+                        const counterRef = doc(db, 'customer_counters', regShopId);
+                        const newCustRef = doc(collection(db, 'customers'));
+
+                        // Secure atomic transaction to guarantee sequential ID even under concurrent load
+                        await runTransaction(db, async (transaction) => {
+                            const counterDoc = await transaction.get(counterRef);
+                            let nextVal = 1;
+                            if (counterDoc.exists()) {
+                                nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                transaction.update(counterRef, { currentValue: nextVal });
+                            } else {
+                                transaction.set(counterRef, { currentValue: nextVal });
+                            }
+                            const customerIdStr = `${shopPrefix}-${nextVal.toString().padStart(6, '0')}`;
+
+                            transaction.set(newCustRef, {
+                                customerId: customerIdStr,
+                                phone: phone,
+                                name: finalName,
+                                sex: sex,
+                                pin: bypassPin ? null : cleanPin,
+                                createdAt: Date.now(),
+                                lastVisit: Date.now(),
+                                registeredAtShop: regShopId
+                            });
                         });
                     } else if (isExisting && !dbPin && customerId && !bypassPin) {
                         // Legacy Migration: Update old customer doc with the newly created PIN
@@ -3827,6 +3850,7 @@
                             sessionInfo={sessionInfo} 
                             onSubmit={handleSetupSubmit} 
                             onClose={() => { setShowSetupModal(false); if(!sessionInfo.isSetup) setSessionInfo({...sessionInfo, mode: null}); }} 
+                            shops={shops}
                         />
                     )}
 
@@ -5027,7 +5051,7 @@
                         <div className="relative" ref={dropdownRef}>
                             <button 
                                 onClick={() => setIsShopPropertyOpen(!isShopPropertyOpen)} 
-                                className={`px-5 py-2 font-bold whitespace-nowrap transition-colors flex items-center gap-2 ${['security', 'branches', 'tables', 'biz_data'].includes(activeTab) ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}
+                                className={`px-5 py-2 font-bold whitespace-nowrap transition-colors flex items-center gap-2 ${['security', 'branches', 'tables', 'biz_data', 'receipts'].includes(activeTab) ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}
                             >
                                 Shop Property <i className={`fa-solid fa-chevron-down text-xs transition-transform ${isShopPropertyOpen ? 'rotate-180' : ''}`}></i>
                             </button>
@@ -5056,9 +5080,15 @@
                                     </button>
                                     <button 
                                         onClick={() => handleDropdownSelect('biz_data')} 
-                                        className={`text-left px-4 py-3 text-sm font-bold transition-colors border-b-0 ${activeTab === 'biz_data' ? 'bg-amber-50 text-amber-700' : 'text-stone-700 hover:bg-stone-50'}`}
+                                        className={`text-left px-4 py-3 text-sm font-bold transition-colors border-b border-stone-100 ${activeTab === 'biz_data' ? 'bg-amber-50 text-amber-700' : 'text-stone-700 hover:bg-stone-50'}`}
                                     >
                                         <i className="fa-solid fa-chart-pie w-5 text-center mr-1 text-stone-400"></i> Biz Data
+                                    </button>
+                                    <button 
+                                        onClick={() => handleDropdownSelect('receipts')} 
+                                        className={`text-left px-4 py-3 text-sm font-bold transition-colors border-b-0 ${activeTab === 'receipts' ? 'bg-amber-50 text-amber-700' : 'text-stone-700 hover:bg-stone-50'}`}
+                                    >
+                                        <i className="fa-solid fa-receipt w-5 text-center mr-1 text-stone-400"></i> Receipts
                                     </button>
                                 </div>
                             )}
@@ -5142,6 +5172,260 @@
                     {activeTab === 'biz_data' && (
                         <BizDataView shops={shops} currentAdminRecord={currentAdminRecord} />
                     )}
+
+                    {activeTab === 'receipts' && (
+                        <ReceiptsView shops={shops} currentAdminRecord={currentAdminRecord} />
+                    )}
+                </div>
+            );
+        }
+
+        function ReceiptsView({ shops, currentAdminRecord }) {
+            const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
+            const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
+            const [filterShop, setFilterShop] = useState(isSuper || allowedShopIds.includes('All') ? 'All' : allowedShopIds[0] || 'All');
+            
+            const [receiptForm, setReceiptForm] = useState(null);
+            const [receiptSaving, setReceiptSaving] = useState(false);
+            
+            const [previewPayment, setPreviewPayment] = useState('Cash'); // NEW: State for Previewing Payment Method
+
+            useEffect(() => {
+                if (filterShop && filterShop !== 'All') {
+                    const shop = shops.find(s => s.id === filterShop);
+                    setReceiptForm({
+                        paperSize: '80mm',
+                        headerText: shop?.brandingName || shop?.name || '',
+                        addressText: shop?.location || '',
+                        footerText: 'Thank you for your visit!',
+                        hostingWebAddress: '',
+                        showCustomer: true,
+                        showDate: true,
+                        showInvoice: true,
+                        showStaff: true,
+                        ...(shop?.receiptConfig || {})
+                    });
+                } else {
+                    setReceiptForm(null);
+                }
+            }, [filterShop, shops]);
+
+            const saveReceiptConfig = async (e) => {
+                e.preventDefault();
+                if (!filterShop || filterShop === 'All') return;
+                setReceiptSaving(true);
+                try {
+                    const { doc, updateDoc } = window.FirebaseApp;
+                    await updateDoc(doc(db, 'shops', filterShop), {
+                        receiptConfig: receiptForm
+                    });
+                    alert("Receipt template saved successfully!");
+                } catch (err) {
+                    alert("Error saving receipt: " + err.message);
+                } finally {
+                    setReceiptSaving(false);
+                }
+            };
+
+            const getTodayString = () => {
+                const d = new Date();
+                return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+            };
+
+            return (
+                <div className="animate-fade-in max-w-6xl">
+                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
+                        <div>
+                            <h2 className="text-2xl font-bold">Receipt Templates</h2>
+                            <p className="text-sm text-stone-500 mt-1">Configure thermal printer settings and receipt details for each branch.</p>
+                        </div>
+                        <div className="flex gap-2 w-full sm:w-auto">
+                            <select className="border border-stone-300 rounded-xl px-4 py-2 font-bold outline-none flex-1 sm:flex-none" value={filterShop} onChange={e=>setFilterShop(e.target.value)}>
+                                {isSuper && <option value="All">Select Branch...</option>}
+                                {shops.filter(s => isSuper || allowedShopIds.includes('All') || allowedShopIds.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                            </select>
+                        </div>
+                    </div>
+
+                    {filterShop === 'All' ? (
+                        <div className="bg-white p-12 rounded-2xl shadow-sm border border-stone-200 text-center flex flex-col items-center">
+                            <div className="w-20 h-20 bg-stone-100 text-stone-300 rounded-full flex items-center justify-center mb-4">
+                                <i className="fa-solid fa-receipt text-4xl"></i>
+                            </div>
+                            <p className="text-stone-500 font-bold text-lg">Select a Branch</p>
+                            <p className="text-stone-400 text-sm mt-1">Please select a specific branch from the dropdown above to view and edit its receipt template.</p>
+                        </div>
+                    ) : receiptForm ? (
+                        <div className="flex flex-col lg:flex-row gap-6">
+                            <div className="flex-1 bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
+                                <h3 className="text-lg font-bold text-stone-800 mb-5 flex items-center">
+                                    <i className="fa-solid fa-pen-to-square mr-2 text-amber-500"></i> Edit Template Settings
+                                </h3>
+                                <form onSubmit={saveReceiptConfig} className="space-y-5">
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-2">Thermal Paper Size</label>
+                                        <div className="flex gap-3">
+                                            <button type="button" onClick={()=>setReceiptForm({...receiptForm, paperSize: '80mm'})} className={`flex-1 py-3 rounded-xl border font-bold text-sm transition-colors ${receiptForm.paperSize === '80mm' ? 'bg-amber-50 border-amber-500 text-amber-800 shadow-sm' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'}`}>80mm Width</button>
+                                            <button type="button" onClick={()=>setReceiptForm({...receiptForm, paperSize: '58mm'})} className={`flex-1 py-3 rounded-xl border font-bold text-sm transition-colors ${receiptForm.paperSize === '58mm' ? 'bg-amber-50 border-amber-500 text-amber-800 shadow-sm' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'}`}>57mm / 58mm Width</button>
+                                        </div>
+                                    </div>
+
+                                    <div className="pt-3 border-t border-stone-100">
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Branding / Header Name</label>
+                                        <input type="text" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-bold" value={receiptForm.headerText} onChange={e=>setReceiptForm({...receiptForm, headerText: e.target.value})} placeholder="e.g. SOLARIS CAFE" />
+                                    </div>
+                                    
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Shop Location / Address</label>
+                                        <textarea className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium resize-none h-20" value={receiptForm.addressText} onChange={e=>setReceiptForm({...receiptForm, addressText: e.target.value})} placeholder="e.g. 123 Street Name, City"></textarea>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-2">Dynamic Receipt Fields</label>
+                                        <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 space-y-4">
+                                            <label className="flex items-center justify-between cursor-pointer">
+                                                <span className="text-sm font-bold text-stone-700">Show Date & Time</span>
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={receiptForm.showDate} onChange={e => setReceiptForm({...receiptForm, showDate: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${receiptForm.showDate ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${receiptForm.showDate ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                            </label>
+                                            <div className="w-full h-px bg-stone-200"></div>
+                                            <label className="flex items-center justify-between cursor-pointer">
+                                                <span className="text-sm font-bold text-stone-700">Show Staff ID</span>
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={receiptForm.showStaff ?? true} onChange={e => setReceiptForm({...receiptForm, showStaff: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${receiptForm.showStaff ?? true ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${receiptForm.showStaff ?? true ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                            </label>
+                                            <div className="w-full h-px bg-stone-200"></div>
+                                            <label className="flex items-center justify-between cursor-pointer">
+                                                <span className="text-sm font-bold text-stone-700">Show Invoice Number</span>
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={receiptForm.showInvoice ?? true} onChange={e => setReceiptForm({...receiptForm, showInvoice: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${receiptForm.showInvoice ?? true ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${receiptForm.showInvoice ?? true ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                            </label>
+                                            <div className="w-full h-px bg-stone-200"></div>
+                                            <label className="flex items-center justify-between cursor-pointer">
+                                                <span className="text-sm font-bold text-stone-700">Show Customer Details</span>
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={receiptForm.showCustomer ?? true} onChange={e => setReceiptForm({...receiptForm, showCustomer: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${receiptForm.showCustomer ?? true ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${receiptForm.showCustomer ?? true ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                            </label>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Footer Text</label>
+                                        <textarea className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium resize-none h-20" value={receiptForm.footerText} onChange={e=>setReceiptForm({...receiptForm, footerText: e.target.value})} placeholder="e.g. Thank you for your visit!"></textarea>
+                                    </div>
+                                    
+                                    <div>
+                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Hosting Web Address (QR Code)</label>
+                                        <input type="url" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium" value={receiptForm.hostingWebAddress || ''} onChange={e=>setReceiptForm({...receiptForm, hostingWebAddress: e.target.value})} placeholder="e.g. https://solaris.cafe" />
+                                        <p className="text-xs text-stone-400 mt-1 font-medium"><i className="fa-solid fa-qrcode mr-1"></i>A QR code will be generated at the bottom of the receipt.</p>
+                                    </div>
+
+                                    <div className="pt-3 border-t border-stone-100">
+                                        <button type="submit" disabled={receiptSaving} className="w-full bg-stone-900 text-white font-bold py-3.5 rounded-xl hover:bg-stone-800 shadow-md transition disabled:opacity-50 flex items-center justify-center gap-2">
+                                            {receiptSaving ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-save text-amber-500"></i>}
+                                            Save Template
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+
+                            <div className="w-full lg:w-80 xl:w-96 shrink-0 flex flex-col items-center">
+                                <div className="flex justify-between items-center w-full max-w-[300px] mb-3">
+                                    <h3 className="text-sm font-bold text-stone-500 uppercase tracking-wider">Live Preview</h3>
+                                    <div className="flex bg-stone-200/50 rounded-lg p-0.5 border border-stone-200 shadow-sm">
+                                        <button type="button" onClick={() => setPreviewPayment('Cash')} className={`px-2.5 py-1 text-[10px] font-bold rounded-md transition ${previewPayment === 'Cash' ? 'bg-white shadow-sm text-stone-800' : 'text-stone-500 hover:text-stone-700'}`}>Cash</button>
+                                        <button type="button" onClick={() => setPreviewPayment('Bank')} className={`px-2.5 py-1 text-[10px] font-bold rounded-md transition ${previewPayment === 'Bank' ? 'bg-white shadow-sm text-stone-800' : 'text-stone-500 hover:text-stone-700'}`}>Bank</button>
+                                    </div>
+                                </div>
+                                <div className="bg-white p-6 shadow-xl border border-stone-200 relative transition-all duration-300" style={{ width: receiptForm.paperSize === '80mm' ? '300px' : '220px', fontFamily: "'Courier New', Courier, monospace" }}>
+                                    <div className="absolute -top-1 left-0 right-0 h-2 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHBvbHlnb24gcG9pbnRzPSIwLDEwIDUsMCAxMCwxMCIgZmlsbD0iI2Y1ZjVmNCIvPjwvc3ZnPg==')] bg-repeat-x"></div>
+                                    
+                                    <div className="text-center mb-4">
+                                        <h2 className="text-xl font-black uppercase mb-1 leading-none">{receiptForm.headerText || 'SHOP NAME'}</h2>
+                                        {receiptForm.addressText && <p className="text-[11px] whitespace-pre-wrap leading-tight mt-2">{receiptForm.addressText}</p>}
+                                    </div>
+
+                                    {(receiptForm.showDate || receiptForm.showStaff !== false) && (
+                                        <div className="border-t border-dashed border-stone-400 py-3 text-[11px] space-y-1">
+                                            {receiptForm.paperSize === '80mm' ? (
+                                                <div className="flex justify-between">
+                                                    {receiptForm.showStaff !== false && <span>Staff: J-001</span>}
+                                                    {receiptForm.showDate && <span>Date: {getTodayString()} 12:34</span>}
+                                                </div>
+                                            ) : (
+                                                <>
+                                                    {receiptForm.showDate && <div className="flex justify-between"><span>Date:</span><span>{getTodayString()} 12:34</span></div>}
+                                                    {receiptForm.showStaff !== false && <div className="flex justify-between"><span>Staff ID:</span><span>J-001</span></div>}
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    <div className="border-t border-dashed border-stone-400 py-3 text-[11px] space-y-1">
+                                        <div className="flex justify-between font-bold"><span>1x Sample Coffee S</span><span>5,000 ៛</span></div>
+                                        <div className="flex justify-between font-bold"><span>2x Sample Pastry</span><span>6,000 ៛</span></div>
+                                        <div className="flex justify-between font-bold text-rose-600">
+                                            <span>1x Loyalty Reward <span className="text-[9px] uppercase tracking-wider">(Free Claim)</span></span>
+                                            <span>0 ៛</span>
+                                        </div>
+                                    </div>
+
+                                    <div className="border-t border-dashed border-stone-400 py-3 text-xs font-bold space-y-1">
+                                        <div className="flex justify-between text-rose-600 font-normal text-[11px] mb-1"><span>Discount (10%)</span><span>-1,100 ៛</span></div>
+                                        <div className="flex justify-between text-sm mb-1"><span>TOTAL</span><span>9,900 ៛</span></div>
+                                        <div className="pt-2 mt-1.5 border-t border-dashed border-stone-300 text-center">
+                                            <span className="uppercase tracking-widest font-black text-[12px] text-stone-900">Paid By: {previewPayment}</span>
+                                        </div>
+                                    </div>
+
+                                    {(receiptForm.showInvoice || receiptForm.showCustomer) && (
+                                        <div className="border-t border-dashed border-stone-400 py-3 text-[11px] space-y-1">
+                                            {receiptForm.showInvoice && <div className="flex justify-between"><span>Inv:</span><span>BKK-000000123</span></div>}
+                                            {receiptForm.showCustomer && (
+                                                <>
+                                                    <div className="flex justify-between"><span>Cust:</span><span>012 345 678</span></div>
+                                                    <div className="flex justify-between text-amber-600 font-bold mt-1"><span>Active Points:</span><span>120 Pts</span></div>
+                                                    <div className="flex justify-between text-rose-600 font-bold"><span>Free Claims:</span><span>1</span></div>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {receiptForm.footerText && (
+                                        <div className="border-t border-dashed border-stone-400 pt-4 text-center text-[11px] whitespace-pre-wrap leading-tight font-medium">
+                                            {receiptForm.footerText}
+                                        </div>
+                                    )}
+
+                                    {receiptForm.hostingWebAddress && (
+                                        <div className="pt-3 mt-3 flex flex-col items-center justify-center">
+                                            <img 
+                                                src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(receiptForm.hostingWebAddress)}`} 
+                                                alt="Website QR" 
+                                                className="w-20 h-20 mb-1.5 mix-blend-multiply"
+                                                crossOrigin="anonymous"
+                                            />
+                                            <span className="text-[9px] text-stone-500 font-bold uppercase tracking-widest">Scan to Visit</span>
+                                        </div>
+                                    )}
+
+                                    <div className="absolute -bottom-1 left-0 right-0 h-2 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHBvbHlnb24gcG9pbnRzPSIwLDAgNSwxMCAxMCwwIiBmaWxsPSIjZjVmNWY0Ii8+PC9zdmc+')] bg-repeat-x"></div>
+                                </div>
+                            </div>
+                        </div>
+                    ) : null}
                 </div>
             );
         }
@@ -7581,12 +7865,33 @@
                         if (snapCustomerPhone && !snapCustomerData) {
                             const cleanPhone = String(snapCustomerPhone).replace(/\D/g, '');
                             if (cleanPhone.length >= 8) {
-                                addDoc(collection(db, 'customers'), {
-                                    phone: snapCustomerPhone,
-                                    name: snapCustomerName || 'Walk-in',
-                                    createdAt: Date.now(),
-                                    lastVisit: Date.now()
-                                }).catch(err => console.warn("Failed to auto-create customer:", err));
+                                try {
+                                    const counterRefCust = doc(db, 'customer_counters', snapShopId);
+                                    const newCustRef = doc(collection(db, 'customers'));
+                                    
+                                    await runTransaction(db, async (t2) => {
+                                        const cDoc = await t2.get(counterRefCust);
+                                        let nVal = 1;
+                                        if (cDoc.exists()) {
+                                            nVal = (cDoc.data().currentValue || 0) + 1;
+                                            t2.update(counterRefCust, { currentValue: nVal });
+                                        } else {
+                                            t2.set(counterRefCust, { currentValue: nVal });
+                                        }
+                                        const cIdStr = `${shopPrefix}-${nVal.toString().padStart(6, '0')}`;
+                                        
+                                        t2.set(newCustRef, {
+                                            customerId: cIdStr,
+                                            phone: snapCustomerPhone,
+                                            name: snapCustomerName || 'Walk-in',
+                                            createdAt: Date.now(),
+                                            lastVisit: Date.now(),
+                                            registeredAtShop: snapShopId
+                                        });
+                                    });
+                                } catch(err) {
+                                    console.warn("Failed to auto-create customer:", err);
+                                }
                             }
                         }
 
@@ -8354,7 +8659,7 @@
 
                     {showSetupModal && (
                         <SetupModal 
-                            sessionInfo={{ customerPhone, customerName, customerSex }}
+                            sessionInfo={{ customerPhone, customerName, customerSex, shopId: cartShopId || posShopId }}
                             bypassPin={true}
                             onSubmit={(e, data) => {
                                 if (e) e.preventDefault();
@@ -8372,6 +8677,7 @@
                                 if (document.activeElement && typeof document.activeElement.blur === 'function') document.activeElement.blur();
                                 setShowSetupModal(false);
                             }}
+                            shops={shops}
                         />
                     )}
 
@@ -11049,7 +11355,7 @@
                     } else {
                         // CREATE NEW CUSTOMER
                         // Check if phone already exists first
-                        const { query, where, getDocs } = window.FirebaseApp;
+                        const { query, where, getDocs, runTransaction } = window.FirebaseApp;
                         const qCheck = query(collection(db, 'customers'), where('phone', '==', editCustomerData.phone));
                         const checkSnap = await getDocs(qCheck);
                         
@@ -11059,11 +11365,34 @@
                             return;
                         }
 
+                        // Determine Shop ID mapping context for ID generation
+                        const regShopId = filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN');
+                        const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
+                        const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                        const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+
+                        const counterRef = doc(db, 'customer_counters', regShopId);
                         const newRef = doc(collection(db, 'customers'));
-                        await setDoc(newRef, {
-                            ...payload,
-                            createdAt: Date.now(),
-                            lastVisit: Date.now()
+
+                        // Secure atomic transaction to guarantee sequential ID 
+                        await runTransaction(db, async (transaction) => {
+                            const counterDoc = await transaction.get(counterRef);
+                            let nextVal = 1;
+                            if (counterDoc.exists()) {
+                                nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                transaction.update(counterRef, { currentValue: nextVal });
+                            } else {
+                                transaction.set(counterRef, { currentValue: nextVal });
+                            }
+                            const customerIdStr = `${shopPrefix}-${nextVal.toString().padStart(6, '0')}`;
+
+                            transaction.set(newRef, {
+                                ...payload,
+                                customerId: customerIdStr,
+                                createdAt: Date.now(),
+                                lastVisit: Date.now(),
+                                registeredAtShop: regShopId
+                            });
                         });
                     }
 
@@ -11546,8 +11875,9 @@
                                             {filteredCustomers.map(customer => (
                                                 <tr key={customer.phone} className="hover:bg-amber-50 transition-colors bg-white">
                                                     <td className="p-3 border border-stone-300">
-                                                        <div className="font-bold text-stone-900 text-base flex items-center gap-2">
+                                                        <div className="font-bold text-stone-900 text-base flex items-center gap-2 flex-wrap">
                                                             {customer.name}
+                                                            {customer.customerId && <span className="text-[10px] font-bold text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded border border-stone-200">ID: {customer.customerId}</span>}
                                                             {customer.customerType && customer.customerType !== 'Normal' && (
                                                                 <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider shadow-sm ${
                                                                     customer.customerType === 'VVIP' ? 'bg-purple-100 text-purple-700 border border-purple-200' :
@@ -13134,9 +13464,27 @@
                 { id: 'settings', label: 'System Settings' }
             ], []);
 
-            const [formData, setFormData] = useState({ name: '', email: '', password: '', role: 'Cashier', shopId: '', shopIds: [], permissions: rolePerms['Cashier'], status: 'Active' });
+            const [formData, setFormData] = useState({ staffId: '', name: '', email: '', password: '', role: 'Cashier', shopId: '', shopIds: [], permissions: rolePerms['Cashier'], status: 'Active' });
             const [isProcessing, setIsProcessing] = useState(false);
             
+            // Auto-generate Staff ID when adding a new user
+            useEffect(() => {
+                if (isModalOpen && !editingId && !formData.staffId) {
+                    let maxSeq = 0;
+                    admins.forEach(a => {
+                        if (a.staffId && a.staffId.startsWith('J-')) {
+                            const seq = parseInt(a.staffId.split('-')[1], 10);
+                            if (!isNaN(seq) && seq > maxSeq) {
+                                maxSeq = seq;
+                            }
+                        }
+                    });
+                    const nextSeq = maxSeq + 1;
+                    const newCode = `J-${String(nextSeq).padStart(3, '0')}`;
+                    setFormData(prev => ({ ...prev, staffId: newCode }));
+                }
+            }, [isModalOpen, editingId, admins, formData.staffId]);
+
             const filteredAdmins = useMemo(() => {
                 return admins.filter(a => {
                     const searchLower = searchQuery.toLowerCase();
@@ -13188,6 +13536,7 @@
                     const targetShopId = targetShopIds[0] || '';
                     
                     const dataToSave = {
+                        staffId: formData.staffId || '',
                         name: formData.name,
                         role: formData.role,
                         shopId: targetShopId, // Legacy fallback
@@ -13243,7 +13592,7 @@
                                 <input type="text" placeholder="Search staff..." className="w-full border border-stone-300 rounded-xl pl-9 pr-4 py-2 outline-none focus:border-amber-600 bg-white shadow-sm text-sm" value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} />
                             </div>
                             {isSuper && (
-                                <button onClick={() => { setFormData({ name: '', email: '', password: '', role: 'Cashier', shopId: '', shopIds: [], permissions: rolePerms['Cashier'], status: 'Active' }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap">
+                                <button onClick={() => { setFormData({ staffId: '', name: '', email: '', password: '', role: 'Cashier', shopId: '', shopIds: [], permissions: rolePerms['Cashier'], status: 'Active' }); setEditingId(null); setIsModalOpen(true); }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap">
                                     <i className="fa-solid fa-plus mr-2"></i> Add Staff
                                 </button>
                             )}
@@ -13276,7 +13625,10 @@
                                                     <div className="font-bold text-stone-900 text-base flex items-center gap-2">
                                                         {admin.name} {admin.id === currentUser?.uid && <span className="text-[10px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-bold uppercase">You</span>}
                                                     </div>
-                                                    <div className="text-stone-500 font-medium text-xs mt-0.5">{admin.email}</div>
+                                                    <div className="text-stone-500 font-medium text-xs mt-0.5">
+                                                        {admin.staffId && <span className="text-amber-600 font-bold mr-1.5">[{admin.staffId}]</span>}
+                                                        {admin.email}
+                                                    </div>
                                                 </td>
                                                 <td className="p-3 border border-stone-300">
                                                     <div className="font-bold text-stone-700">{admin.role}</div>
@@ -13293,7 +13645,7 @@
                                                 {isSuper && (
                                                     <td className="p-3 border border-stone-300 text-right">
                                                         <div className="flex justify-end gap-2">
-                                                            <button onClick={() => { setFormData({ name: admin.name||'', email: admin.email||'', role: admin.role||'Cashier', shopId: admin.shopId||'', shopIds: admin.shopIds || (admin.shopId ? [admin.shopId] : []), password: '', permissions: admin.permissions || rolePerms[admin.role] || [], status: admin.status || 'Active' }); setEditingId(admin.id); setIsModalOpen(true); }} className="px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded text-xs font-bold transition" title="Edit Staff">
+                                                            <button onClick={() => { setFormData({ staffId: admin.staffId||'', name: admin.name||'', email: admin.email||'', role: admin.role||'Cashier', shopId: admin.shopId||'', shopIds: admin.shopIds || (admin.shopId ? [admin.shopId] : []), password: '', permissions: admin.permissions || rolePerms[admin.role] || [], status: admin.status || 'Active' }); setEditingId(admin.id); setIsModalOpen(true); }} className="px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded text-xs font-bold transition" title="Edit Staff">
                                                                 <i className="fa-solid fa-pen"></i>
                                                             </button>
                                                             <button onClick={() => toggleStatus(admin.id, admin.status || 'Active')} className={`px-3 py-1.5 rounded text-xs font-bold transition ${admin.status === 'Inactive' ? 'bg-green-50 text-green-600 hover:bg-green-100' : 'bg-amber-50 text-amber-600 hover:bg-amber-100'}`} title={admin.status === 'Inactive' ? 'Reactivate' : 'Deactivate'}>
@@ -13324,9 +13676,15 @@
                                 <h3 className="text-xl font-bold mb-4">{editingId ? 'Edit Staff Member' : 'Add New Staff Member'}</h3>
                                 
                                 <div className="space-y-4 mb-6">
-                                    <div>
-                                        <label className="block text-sm font-semibold text-stone-700 mb-1">Full Name</label>
-                                        <input type="text" required placeholder="e.g. Jane Doe" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} autoFocus />
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Staff ID *</label>
+                                            <input type="text" required placeholder="e.g. J-001" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-mono font-bold text-amber-700" value={formData.staffId || ''} onChange={e => setFormData({...formData, staffId: e.target.value})} />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Full Name *</label>
+                                            <input type="text" required placeholder="e.g. Jane Doe" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} autoFocus={!editingId} />
+                                        </div>
                                     </div>
                                     <div>
                                         <label className="block text-sm font-semibold text-stone-700 mb-1">Email Address</label>
