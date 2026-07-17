@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1265,7 +1266,13 @@
                         
                         <div className="bg-stone-50 rounded-2xl p-6 border border-stone-100 mb-8">
                             <div className="mb-4 text-sm font-bold text-stone-500 bg-white py-3 px-4 rounded-xl border border-stone-200 shadow-sm flex items-center justify-center gap-2">
-                                <i className="fa-solid fa-satellite-dish text-amber-500"></i> Track order for Queue No.
+                                <i className="fa-solid fa-satellite-dish text-amber-500"></i> 
+                                Order No:
+                                {order.queueNo === 'Syncing...' ? (
+                                    <span className="text-amber-500 animate-pulse flex items-center gap-1.5"><i className="fa-solid fa-spinner fa-spin"></i> Syncing</span>
+                                ) : (
+                                    <span className="font-black text-stone-800">{order.queueNo}</span>
+                                )}
                             </div>
                             
                             <div className="grid grid-cols-2 gap-2 text-sm text-left">
@@ -3194,7 +3201,7 @@
                 return { isForbidden: false, distance: orderDistance, limit: maxDist, phone: '' };
             }, [shops, sessionInfo.shopId, userLocation]);
 
-            const handleCheckout = async (e) => { // PHASE 2 FIX: Convert to strict async function
+            const handleCheckout = async (e) => { 
                 e.preventDefault();
                 if (cart.length === 0 || !sessionInfo.isSetup) return;
                 
@@ -3240,19 +3247,28 @@
                 const redeemedItemNames = currentCart.filter(i => i.redeemedQty > 0).map(i => `${i.redeemedQty}x ${i.name}`).join(', ');
                 const currentCartTotal = cartTotal;
 
+                // Snapshot local variables before clearing state for background sync
+                const snapShopId = sessionInfo.shopId;
+                const snapTableId = sessionInfo.tableId;
+                const snapTableName = sessionInfo.tableName;
+                const snapCustomerName = sessionInfo.customerName;
+                const snapCustomerPhone = sessionInfo.customerPhone;
+                const snapCustomerSex = sessionInfo.customerSex || 'M';
+                const snapNotes = cartNotes;
+
                 const orderData = {
                     userId: currentUser ? currentUser.uid : null,
                     orderType: actualOrderType,
-                    tableId: sessionInfo.tableId || 'TAKEAWAY',
-                    tableName: sessionInfo.tableName || 'Take Away',
-                    shopId: sessionInfo.shopId || 'UNKNOWN',
-                    customerName: sessionInfo.customerName,
-                    customerPhone: sessionInfo.customerPhone,
-                    customerSex: sessionInfo.customerSex || 'M',
+                    tableId: snapTableId || 'TAKEAWAY',
+                    tableName: snapTableName || 'Take Away',
+                    shopId: snapShopId || 'UNKNOWN',
+                    customerName: snapCustomerName,
+                    customerPhone: snapCustomerPhone,
+                    customerSex: snapCustomerSex,
                     customerDistance: orderDistance,
                     customerLat: userLocation ? userLocation.lat : null,
                     customerLng: userLocation ? userLocation.lng : null,
-                    notes: cartNotes,
+                    notes: snapNotes,
                     chargeStatus: customerProfile?.chargeStatus || 'Normal',
                     items: currentCart,
                     totalAmount: currentCartTotal,
@@ -3262,90 +3278,93 @@
                     paymentStatus: 'Unpaid',
                     paymentMethod: 'N/A',
                     dateString: today,
-                    createdAt: Date.now()
+                    createdAt: Date.now(),
+                    queueNo: 'Syncing...' // Temporary placeholder for UI
                 };
 
-                try {
-                    const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
-                    
-                    // --- SECURITY FIX: Anti-Spoofing Check ---
-                    let realProfile = null;
-                    let customerDocId = null;
-                    if (sessionInfo.customerPhone) {
-                        const qCheck = query(collection(db, 'customers'), where('phone', '==', sessionInfo.customerPhone));
-                        const checkSnap = await getDocs(qCheck);
-                        if (!checkSnap.empty) {
-                            realProfile = checkSnap.docs[0].data();
-                            customerDocId = checkSnap.docs[0].id;
-                            if (realProfile.status === 'Inactive') {
-                                setIsSubmitting(false);
-                                return; // Stop saving to DB if suspended
-                            } 
+                // --- OPTIMISTIC UI UPDATE: Display success immediately, bypass loading screen ---
+                if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
+                
+                setSubmittedOrder(orderData);
+                setCart([]);
+                setCartNotes('');
+                setIsCartOpen(false);
+                setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
+                setIsSubmitting(false); // Unlock UI instantly
+
+                // --- BACKGROUND FIREBASE SYNCHRONIZATION ---
+                (async () => {
+                    try {
+                        const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
+                        
+                        // Retrieve fresh customer profile if needed for loyalty transaction
+                        let realProfile = null;
+                        let customerDocId = null;
+                        if (snapCustomerPhone) {
+                            const qCheck = query(collection(db, 'customers'), where('phone', '==', snapCustomerPhone));
+                            const checkSnap = await getDocs(qCheck);
+                            if (!checkSnap.empty) {
+                                realProfile = checkSnap.docs[0].data();
+                                customerDocId = checkSnap.docs[0].id;
+                                if (realProfile.status === 'Inactive') return; // Abort sync if suspended
+                            }
                         }
+
+                        // SECURE FIREBASE TRANSACTION
+                        const counterRef = doc(db, 'invoice_counters', targetShop.id);
+                        const newOrderRef = doc(getColRef('orders'));
+                        const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
+
+                        const finalQueueString = await runTransaction(db, async (transaction) => {
+                            const counterDoc = await transaction.get(counterRef);
+                            let nextVal = 1;
+                            if (counterDoc.exists()) {
+                                nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                transaction.update(counterRef, { currentValue: nextVal });
+                            } else {
+                                transaction.set(counterRef, { currentValue: nextVal });
+                            }
+                            
+                            const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+                            
+                            // Bind the counter increment and order creation into a single atomic operation
+                            transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
+
+                            // Calculate and save loyalty points during checkout transaction if enabled
+                            if (customerRef && realProfile && globalPoints?.pointsEnabled) {
+                                 const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
+                                 const newLoyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                                 transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
+                            } else if (customerRef) {
+                                 transaction.update(customerRef, { lastVisit: Date.now() });
+                            }
+                            
+                            return queueStr;
+                        });
+
+                        // Update the success view UI with the finalized Queue Number so they can track it!
+                        setSubmittedOrder(prev => {
+                            if (prev && prev.createdAt === orderData.createdAt) {
+                                return { ...prev, queueNo: finalQueueString, id: newOrderRef.id };
+                            }
+                            return prev;
+                        });
+
+                        // Run non-critical background updates (Inventory & Table locking)
+                        Promise.all([
+                            deductInventory(currentCart, products, snapShopId, finalQueueString),
+                            (actualOrderType === 'DINE_IN' && snapTableId) 
+                                ? updateDoc(doc(getColRef('tables'), snapTableId), { status: 'Occupied' })
+                                : Promise.resolve()
+                        ]).catch(err => console.warn("Background tasks failed:", err));
+
+                    } catch (err) {
+                        console.error("Checkout sync failed:", err);
+                        setCustomMessage("Connection drop. The order may have failed. Please check the Live Tracker.");
+                        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+                        toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
                     }
-                    
-                    // PHASE 2 FIX: AWAIT the Transaction securely before assuming success
-                    const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                    const newOrderRef = doc(getColRef('orders'));
-                    const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
-                    
-                    const finalQueueString = await runTransaction(db, async (transaction) => {
-                        const counterDoc = await transaction.get(counterRef);
-                        let nextVal = 1;
-                        if (counterDoc.exists()) {
-                            nextVal = (counterDoc.data().currentValue || 0) + 1;
-                            transaction.update(counterRef, { currentValue: nextVal });
-                        } else {
-                            transaction.set(counterRef, { currentValue: nextVal });
-                        }
-                        
-                        const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
-                        
-                        // GHOST INVOICE CHALLENGE FIX:
-                        // Move order creation INSIDE the transaction to guarantee atomicity.
-                        // If order creation fails, the counter rolls back automatically.
-                        transaction.set(newOrderRef, { ...orderData, queueNo: queueStr });
-
-                        // OPTIMIZATION: Calculate and save loyalty points during checkout transaction
-                        if (customerRef && realProfile && globalPoints?.pointsEnabled) {
-                             const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
-                             const newLoyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
-                             transaction.update(customerRef, { loyaltyData: newLoyaltyData, lastVisit: Date.now() });
-                        } else if (customerRef) {
-                             // Just update last visit
-                             transaction.update(customerRef, { lastVisit: Date.now() });
-                        }
-                        
-                        return queueStr;
-                    });
-                    
-                    orderData.queueNo = finalQueueString;
-                    orderData.id = newOrderRef.id;
-
-                    // OPTIMISTIC UI UPDATE: Display success ONLY after database confirms the order
-                    if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
-                    
-                    setSubmittedOrder(orderData);
-                    setCart([]);
-                    setIsCartOpen(false);
-                    setSessionInfo(prev => ({...prev, sessionTimestamp: Date.now()}));
-
-                    // Run non-critical background updates (Inventory & Table locking)
-                    Promise.all([
-                        deductInventory(currentCart, products, sessionInfo.shopId, finalQueueString),
-                        (actualOrderType === 'DINE_IN' && sessionInfo.tableId) 
-                            ? updateDoc(doc(getColRef('tables'), sessionInfo.tableId), { status: 'Occupied' })
-                            : Promise.resolve()
-                    ]).catch(err => console.warn("Background tasks failed:", err));
-
-                } catch (err) {
-                    console.error("Checkout sync failed:", err);
-                    setCustomMessage("Connection failed. Order not placed. Please check your internet and try again.");
-                    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-                    toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
-                } finally {
-                    setIsSubmitting(false); // Unlock UI regardless of success or failure
-                }
+                })();
             };
 
             // NEW: Google Maps Routing Logic
