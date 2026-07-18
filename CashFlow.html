@@ -4686,7 +4686,7 @@
                                                                     <Icon name="CheckCircle" size={16}/>
                                                                 </Button>
                                                             )}
-                                                            {canVerifyRequests && (
+                                                            {(userRole === 'Admin' || (canVerifyRequests && record.status === 'Pending Verification')) && (
                                                                 <>
                                                                     <Button 
                                                                         size="sm" 
@@ -4697,7 +4697,6 @@
                                                                     >
                                                                         <Icon name="PenSquare" size={16}/>
                                                                     </Button>
-                                                                    {/* --- NEW: Delete Button --- */}
                                                                     <Button 
                                                                         size="sm" 
                                                                         variant="ghost" 
@@ -4707,7 +4706,6 @@
                                                                     >
                                                                         <Icon name="Trash2" size={16}/>
                                                                     </Button>
-                                                                    {/* ------------------------- */}
                                                                 </>
                                                             )}
                                                         </td>
@@ -7819,7 +7817,12 @@
                     if (userData.role === 'Admin' || userData.role === 'Management') return shops;
                     return shops.filter(s => userData.shopIds?.includes(s.id));
                 }, [shops, userData]);
-    
+
+                // --- NEW: Role checks ---
+                const userRole = userData?.role ? String(userData.role).trim() : '';
+                const isStaff = userRole === 'Staff';
+                const canDirectlySubmit = ['Admin', 'Management', 'Shop Manager'].includes(userRole);
+                
                 const [formData, setFormData] = useState({
                     poDate: getCambodiaISODate(),
                     poNumber: '',
@@ -7829,9 +7832,28 @@
                     amountUsd: '',
                     status: 'Unpaid',
                     note: '',
-                    orderBy: userData?.nickName || userData?.name || ''
+                    orderBy: userData?.nickName || userData?.name || '',
+                    requestedReviewerUid: '',
+                    requestedReviewerName: ''
                 });
-    
+
+                const eligibleReviewers = useMemo(() => {
+                    if (!staffList || !formData.shop) return [];
+                    const currentShop = shops.find(s => s.name === formData.shop);
+                    if (!currentShop) return [];
+
+                    return staffList.filter(s => {
+                        if (s.status === 'Inactive') return false;
+                        if (s.uid === userData?.uid) return false; 
+
+                        const isAssigned = s.shopIds?.includes(currentShop.id);
+                        const isGlobalAdmin = ['Admin', 'Management'].includes(s.role);
+                        if (!isAssigned && !isGlobalAdmin) return false;
+
+                        return ['Shop Manager', 'Admin', 'Management'].includes(s.role);
+                    });
+                }, [staffList, formData.shop, shops, userData]);
+                
                 const [isWeeklyCash, setIsWeeklyCash] = useState(false);
     
                 useEffect(() => {
@@ -7847,7 +7869,9 @@
                             status: po.status || 'Unpaid',
                             orderBy: po.orderBy || (userData?.nickName || userData?.name || ''),
                             poNumber: po.poNumber || '',
-                            note: po.note || ''
+                            note: po.note || '',
+                            requestedReviewerUid: po.requestedReviewerUid || '',
+                            requestedReviewerName: po.requestedReviewerName || ''
                         });
                     } else {
                         setFormData(prev => ({
@@ -7870,9 +7894,11 @@
                     const checked = e.target.checked;
                     setIsWeeklyCash(checked);
                     if (checked) {
-                        setFormData(prev => ({ ...prev, status: 'Paid' }));
+                        // If Staff uses weekly cash, it's still pending verification, but we need to track intent
+                        // Let's keep status 'Pending Verification' if Staff, but update note
+                        setFormData(prev => ({ ...prev, status: canDirectlySubmit ? 'Paid' : 'Pending Verification' }));
                     } else {
-                        setFormData(prev => ({ ...prev, status: 'Unpaid' }));
+                        setFormData(prev => ({ ...prev, status: canDirectlySubmit ? 'Unpaid' : 'Pending Verification' }));
                     }
                 };
     
@@ -7968,6 +7994,13 @@
                         showNotification("Please select or enter a vendor.", "error");
                         return;
                     }
+                    
+                    // --- NEW: Staff Validation ---
+                    if (isStaff && !po && !formData.requestedReviewerUid) {
+                        showNotification("Please select a Manager to verify this order.", "error");
+                        return;
+                    }
+                    // -----------------------------
     
                     setIsSubmitting(true);
     
@@ -7979,6 +8012,12 @@
                     } else {
                         updatedNote = updatedNote.replace('[Week Cash Withdraw]', '').replace('Week Cash Withdraw', '').trim();
                     }
+                    
+                    // Determine final status
+                    let finalStatus = formData.status;
+                    if (isStaff && !po) {
+                        finalStatus = 'Pending Verification';
+                    }
     
                     const poData = {
                         date: createTimestampFromDateAndCurrentTime(formData.poDate),
@@ -7987,9 +8026,11 @@
                         vendor: vendorName,
                         amountKhr: parseFormattedNumber(formData.amountKhr),
                         amountUsd: parseFormattedNumber(formData.amountUsd),
-                        status: formData.status,
+                        status: finalStatus,
                         note: updatedNote,
                         orderBy: formData.orderBy,
+                        requestedReviewerUid: isStaff && !po ? formData.requestedReviewerUid : (formData.requestedReviewerUid || ''),
+                        requestedReviewerName: isStaff && !po ? formData.requestedReviewerName : (formData.requestedReviewerName || ''),
                         updatedAt: Timestamp.now()
                     };
     
@@ -8014,9 +8055,10 @@
                         } else {
                             await addDoc(collection(window.db, "purchaseOrders"), {
                                 ...poData,
-                                createdAt: Timestamp.now()
+                                createdAt: Timestamp.now(),
+                                submittedByUid: userData.uid // Track who originally requested
                             });
-                            showNotification("Purchase order created!", "success");
+                            showNotification(isStaff ? "Verification requested!" : "Purchase order created!", "success");
                         }
                         if (isMounted.current) onClose();
                     } catch (error) {
@@ -8065,25 +8107,49 @@
                                         </label>
                                     </div>
     
-                                    <FormSelect 
-                                        label="Status" 
-                                        name="status" 
-                                        value={formData.status} 
-                                        onChange={handleFormChange} 
-                                        options={[{value:'Unpaid', label:'Unpaid'}, {value:'Paid', label:'Paid'}]} 
-                                        disabled={isWeeklyCash} 
-                                    />
+                                    {canDirectlySubmit ? (
+                                        <FormSelect 
+                                            label="Status" 
+                                            name="status" 
+                                            value={formData.status} 
+                                            onChange={handleFormChange} 
+                                            options={[{value:'Unpaid', label:'Unpaid'}, {value:'Paid', label:'Paid'}, {value:'Pending Verification', label:'Pending Verify'}]} 
+                                            disabled={isWeeklyCash} 
+                                        />
+                                    ) : (
+                                        <FormInput label="Status" value={po ? formData.status : "Pending Verification"} disabled />
+                                    )}
                                 </div>
                             </div>
     
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <FormTextarea label="Note" name="note" value={formData.note} onChange={handleFormChange} />
-                                <FormInput label="Sub-Total POs (៛)" value={subTotalPOs.toLocaleString()} disabled readOnly />
+                                <div className="flex flex-col gap-4">
+                                    <FormInput label="Sub-Total POs (៛)" value={subTotalPOs.toLocaleString()} disabled readOnly />
+                                    
+                                    {/* --- NEW: Reviewer Selection for Staff --- */}
+                                    {isStaff && !po && (
+                                        <div className="bg-blue-900/20 p-3 rounded-lg border border-blue-500/30">
+                                            <FormSelect
+                                                label="Request Verification From"
+                                                name="requestedReviewerUid"
+                                                value={formData.requestedReviewerUid}
+                                                onChange={(e) => {
+                                                    const selected = eligibleReviewers.find(r => r.id === e.target.value);
+                                                    setFormData(prev => ({...prev, requestedReviewerUid: e.target.value, requestedReviewerName: selected ? selected.name : ''}));
+                                                }}
+                                                options={[{value: '', label: 'Select Manager...'}, ...eligibleReviewers.map(r => ({value: r.id, label: r.name}))]}
+                                                required
+                                            />
+                                        </div>
+                                    )}
+                                    {/* --------------------------------------- */}
+                                </div>
                             </div>
                             <div className="flex justify-end gap-2 pt-4 border-t border-slate-700">
                                 <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
-                                <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : null}>
-                                    {isSubmitting ? 'Saving...' : (po ? 'Update PO' : 'Create PO')}
+                                <Button type="submit" disabled={isSubmitting} icon={isSubmitting ? "LoaderCircle" : (isStaff && !po ? "CheckCircle" : null)}>
+                                    {isSubmitting ? 'Saving...' : (po ? 'Update PO' : (isStaff ? 'Request Verify' : 'Create PO'))}
                                 </Button>
                             </div>
                         </form>
@@ -8123,9 +8189,9 @@
                 const { doc, deleteDoc, updateDoc, Timestamp } = window.Firebase;
                 const isMounted = useRef(true);
     
-                const [isCalendarOpen, setIsCalendarOpen] = useState(false); // <-- NEW: Calendar State
-    
-                // --- PHASE 2: Calculate Chronological GCA Balance for each PO ---
+                const [isCalendarOpen, setIsCalendarOpen] = useState(false); 
+                const [confirmingPO, setConfirmingPO] = useState(null); // NEW: State for confirming pending POs
+                const [isConfirming, setIsConfirming] = useState(false); // NEW
                 const { poGCA, currentGCAByShop } = useMemo(() => {
                     if (!shops || !cashDrops || !purchaseOrders) return { poGCA: {}, currentGCAByShop: {} };
                     const exchangeRate = appSettings.exchangeRate || 4100;
@@ -8231,6 +8297,7 @@
                 const normalizedRole = useMemo(() => userData?.role ? userData.role.trim() : '', [userData]);
                 const isAdmin = normalizedRole === 'Admin';
                 const isShopManager = normalizedRole === 'Shop Manager';
+                const canVerifyRequests = ['Admin', 'Management', 'Shop Manager'].includes(normalizedRole);
                 // ----------------------------------
     
                 const [filters, setFilters] = useState({ 
@@ -8357,8 +8424,12 @@
                     return baseFilteredPOs
                         .filter(po => filters.status ? po.status === filters.status : true)
                         .sort((a,b) => {
-                            if (a.status === 'Unpaid' && b.status !== 'Unpaid') return -1;
-                            if (a.status !== 'Unpaid' && b.status === 'Unpaid') return 1;
+                            // Sort Pending first, then Unpaid, then Date
+                            const statusOrder = { 'Pending Verification': 0, 'Unpaid': 1, 'Paid': 2 };
+                            const orderA = statusOrder[a.status] ?? 3;
+                            const orderB = statusOrder[b.status] ?? 3;
+                            
+                            if (orderA !== orderB) return orderA - orderB;
                             return (b.date?.toDate()?.getTime() || 0) - (a.date?.toDate()?.getTime() || 0);
                         });
                 }, [baseFilteredPOs, filters.status]);
@@ -8411,13 +8482,39 @@
                     try {
                         await updateDoc(doc(window.db, "purchaseOrders", poId), {
                             status: 'Paid',
-                            paidAt: Timestamp.now()
+                            paidAt: Timestamp.now(),
+                            paidBy: userData.name // Track who paid it
                         });
                         showNotification("PO marked as Paid.", "success");
                     } catch (error) {
                         showNotification("Failed to update PO status.", "error");
                     }
                 };
+
+                // --- NEW: Handle Confirm Order ---
+                const handleConfirmOrder = async () => {
+                    if (!confirmingPO) return;
+                    if (checkMonthLock(confirmingPO.date)) {
+                        showNotification("This month is closed and locked. Please contact Admin to make changes.", "error");
+                        setConfirmingPO(null);
+                        return;
+                    }
+                    setIsConfirming(true);
+                    try {
+                        await updateDoc(doc(window.db, "purchaseOrders", confirmingPO.id), {
+                            status: 'Unpaid', // Moves from Pending to Unpaid
+                            verifiedAt: Timestamp.now(),
+                            verifiedBy: userData.name
+                        });
+                        showNotification("Order confirmed and ready for payment.", "success");
+                    } catch (error) {
+                        showNotification("Failed to confirm order.", "error");
+                    } finally {
+                        setIsConfirming(false);
+                        setConfirmingPO(null);
+                    }
+                };
+                // ---------------------------------
     
                 const handleExport = useCallback(() => {
                    // ... existing export logic ...
@@ -8520,13 +8617,13 @@
                             <div className="flex flex-col sm:flex-row gap-2">
                                 {/* Quick Status Pills */}
                                 <div className="flex bg-slate-900/80 p-1.5 rounded-xl border border-slate-700/50 shrink-0">
-                                    {[{value: '', label: 'All'}, {value: 'Unpaid', label: 'Unpaid'}, {value: 'Paid', label: 'Paid'}].map(s => (
+                                    {[{value: '', label: 'All'}, {value: 'Pending Verification', label: 'Pending'}, {value: 'Unpaid', label: 'Unpaid'}, {value: 'Paid', label: 'Paid'}].map(s => (
                                         <button
                                             key={s.label}
                                             onClick={() => setFilters(prev => ({...prev, status: s.value}))}
                                             className={`px-4 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all ${
                                                 filters.status === s.value 
-                                                    ? (s.value === 'Unpaid' ? 'bg-red-500 text-white shadow-md' : s.value === 'Paid' ? 'bg-emerald-500 text-white shadow-md' : 'bg-blue-600 text-white shadow-md') 
+                                                    ? (s.value === 'Unpaid' ? 'bg-orange-500 text-white shadow-md' : s.value === 'Paid' ? 'bg-emerald-500 text-white shadow-md' : s.value === 'Pending Verification' ? 'bg-yellow-500 text-slate-900 shadow-md' : 'bg-blue-600 text-white shadow-md') 
                                                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
                                             }`}
                                         >
@@ -8665,23 +8762,33 @@
                                             </td>
     
                                             <td className="p-3">
-                                                <span className={`px-2 py-1 text-xs rounded-full ${po.status === 'Paid' ? 'bg-green-500/20 text-green-300' : 'bg-yellow-500/20 text-yellow-300'}`}>
-                                                    {po.status}
-                                                </span>
-                                                {po.status === 'Paid' && po.paidAt ? ` (${formatInCambodiaTime(po.paidAt)})` : ''}
+                                                <div className="flex flex-col">
+                                                    <span className={`px-2 py-1 text-xs rounded-full w-fit ${po.status === 'Paid' ? 'bg-green-500/20 text-green-300' : po.status === 'Pending Verification' ? 'bg-yellow-500/20 text-yellow-300' : 'bg-orange-500/20 text-orange-300'}`}>
+                                                        {po.status === 'Pending Verification' ? 'Pending' : po.status}
+                                                    </span>
+                                                    {po.status === 'Paid' && po.paidAt ? <span className="text-[10px] text-slate-500 mt-1">{formatInCambodiaTime(po.paidAt)}</span> : null}
+                                                    {po.status === 'Pending Verification' && <span className="text-[10px] text-slate-500 mt-1">Req: {po.requestedReviewerName || 'Mgr'}</span>}
+                                                </div>
                                             </td>
                                             
                                             {/* --- UPDATED: Desktop Action Column --- */}
                                             <td className="p-3">
                                                 <div className="flex items-center justify-center gap-2">
-                                                    {/* 1. Paid Button Group */}
+                                                    {/* 1. Confirm / Paid Button Group */}
+                                                    {canVerifyRequests && po.status === 'Pending Verification' && (
+                                                        <>
+                                                            <Button variant="ghost" size="sm" onClick={() => setConfirmingPO(po)} className="text-blue-400 bg-blue-400/10 hover:bg-blue-400/20 border border-blue-500/20 px-3" title="Confirm Order">
+                                                                <Icon name="CheckCircle" size={14}/> <span className="ml-1">Confirm</span>
+                                                            </Button>
+                                                            <div className="w-px h-5 bg-slate-600 mx-1"></div>
+                                                        </>
+                                                    )}
                                                     {(isAdmin || isShopManager) && po.status === 'Unpaid' && (
                                                         <>
                                                             <Button variant="ghost" size="sm" onClick={() => handleMarkPaid(po.id)} className="text-emerald-400 bg-emerald-400/10 hover:bg-emerald-400/20 border border-emerald-500/20 px-3" title="Mark as Paid">
-                                                                <Icon name="CheckCircle" size={14}/> <span className="ml-1">Paid</span>
+                                                                <Icon name="CheckCircle" size={14}/> <span className="ml-1">Pay</span>
                                                             </Button>
-                                                            {/* Separator Line */}
-                                                            <div className="w-px h-5 bg-slate-600 mx-2"></div>
+                                                            <div className="w-px h-5 bg-slate-600 mx-1"></div>
                                                         </>
                                                     )}
     
@@ -8747,14 +8854,17 @@
                             {paginatedPOs.map(po => {
                                 const subTotal = (po.amountKhr || 0) + ((po.amountUsd || 0) * (appSettings.exchangeRate || 4100));
                                 const isUnpaid = po.status === 'Unpaid';
+                                const isPending = po.status === 'Pending Verification';
                                 
                                 return (
                                     <div 
                                         key={po.id} 
                                         className={`relative p-4 rounded-r-xl rounded-l-md border-y border-r border-slate-700 shadow-lg ${
-                                            isUnpaid 
-                                                ? 'bg-gradient-to-r from-red-900/10 to-slate-800 border-l-4 border-l-red-500' 
-                                                : 'bg-slate-800 border-l-4 border-l-emerald-500'
+                                            isPending
+                                                ? 'bg-gradient-to-r from-yellow-900/10 to-slate-800 border-l-4 border-l-yellow-500'
+                                                : isUnpaid 
+                                                    ? 'bg-gradient-to-r from-orange-900/10 to-slate-800 border-l-4 border-l-orange-500' 
+                                                    : 'bg-slate-800 border-l-4 border-l-emerald-500'
                                         }`}
                                     >
                                         {/* Top Row: Date & Status */}
@@ -8767,9 +8877,9 @@
                                                 </div>
                                             </div>
                                             <span className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md ${
-                                                isUnpaid ? 'bg-red-500/20 text-red-400 ring-1 ring-inset ring-red-500/50' : 'bg-emerald-500/20 text-emerald-400 ring-1 ring-inset ring-emerald-500/50'
+                                                isPending ? 'bg-yellow-500/20 text-yellow-400 ring-1 ring-inset ring-yellow-500/50' : isUnpaid ? 'bg-orange-500/20 text-orange-400 ring-1 ring-inset ring-orange-500/50' : 'bg-emerald-500/20 text-emerald-400 ring-1 ring-inset ring-emerald-500/50'
                                             }`}>
-                                                {po.status}
+                                                {isPending ? 'Pending' : po.status}
                                             </span>
                                         </div>
     
@@ -8835,16 +8945,26 @@
     
                                         {/* --- UPDATED: Mobile Action Buttons (Split Layout) --- */}
                                         <div className="flex justify-between items-center mt-4 pt-3 border-t border-slate-700/30 border-dashed">
-                                            {/* Left Side: Critical Action (Paid) */}
+                                            {/* Left Side: Critical Action (Paid/Confirm) */}
                                             <div>
-                                                {(isAdmin || isShopManager) && po.status === 'Unpaid' && (
+                                                {canVerifyRequests && isPending && (
+                                                    <Button 
+                                                        size="sm" 
+                                                        onClick={() => setConfirmingPO(po)} 
+                                                        className="bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/20 border border-blue-500 px-4" 
+                                                        title="Confirm Order"
+                                                    >
+                                                        <Icon name="CheckCircle" size={16}/> Confirm
+                                                    </Button>
+                                                )}
+                                                {(isAdmin || isShopManager) && isUnpaid && (
                                                     <Button 
                                                         size="sm" 
                                                         onClick={() => handleMarkPaid(po.id)} 
                                                         className="bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/20 border border-emerald-500 px-4" 
                                                         title="Mark as Paid"
                                                     >
-                                                        <Icon name="CheckCircle" size={16}/> Paid
+                                                        <Icon name="CheckCircle" size={16}/> Pay
                                                     </Button>
                                                 )}
                                             </div>
@@ -8882,6 +9002,7 @@
                         </div>
     
                         {deletingPO && <ConfirmationModal title="Delete Purchase Order" message="Are you sure?" onConfirm={handleDelete} onClose={() => setDeletingPO(null)} isSubmitting={isDeleting} confirmVariant="danger" confirmText="Delete" />}
+                        {confirmingPO && <ConfirmationModal title="Confirm Purchase Order" message={`Are you sure you want to verify and confirm this order from ${confirmingPO.vendor}? It will be marked as Unpaid and ready for Admin payment.`} onConfirm={handleConfirmOrder} onClose={() => setConfirmingPO(null)} isSubmitting={isConfirming} confirmVariant="primary" confirmText="Confirm Order" />}
                         {viewingNote && <NoteViewModal title="Purchase Order Note" onClose={() => setViewingNote(null)} note={viewingNote} />}
                         {/* --- NEW: Render Calendar Modal --- */}
                         {isCalendarOpen && <OpsCalendarModal onClose={() => setIsCalendarOpen(false)} />}
