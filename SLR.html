@@ -7550,7 +7550,27 @@
                 if (!currentShift) return;
                 setIsFetchingShiftData(true);
                 try {
-                    const { getDocs, query, where, collection } = window.FirebaseApp;
+                    const { getDocs, query, where, collection, doc, writeBatch } = window.FirebaseApp;
+                    
+                    // --- THE CATCH-UP FIX (RESCUE) ---
+                    // Scan for any "Paid" orders created during your shift that missed getting a shift ID
+                    const orphanedOrders = orders.filter(o => 
+                        o.shopId === currentShift.shopId && 
+                        o.createdAt >= currentShift.openedAt && 
+                        o.paymentStatus === 'Paid' && 
+                        !o.shiftId
+                    );
+
+                    if (orphanedOrders.length > 0) {
+                        const batch = writeBatch(db);
+                        orphanedOrders.forEach(o => {
+                            batch.update(doc(db, 'orders', o.id), { shiftId: currentShift.id });
+                        });
+                        await batch.commit();
+                        console.log(`Rescued ${orphanedOrders.length} orphaned orders into shift ${currentShift.id}`);
+                    }
+                    // ----------------------------------
+
                     const q = query(collection(db, 'orders'), where('shiftId', '==', currentShift.id));
                     const snap = await getDocs(q);
                     
@@ -7562,6 +7582,7 @@
 
                     snap.forEach(docSnap => {
                         const o = docSnap.data();
+                        if (o.status === 'Cancelled') return; // BUG FIX: Explicitly exclude Cancelled orders from shift revenue
                         if (o.paymentStatus !== 'Paid') return;
 
                         sNet += o.totalAmount;
@@ -7569,8 +7590,11 @@
                         if (o.paymentMethod === 'Bank') bSales += o.totalAmount;
                         
                         (o.items || []).forEach(i => {
+                            // BUG FIX: Use paidQuantity for Gross Sales to prevent Free/BOGO items from inflating revenue metrics
+                            const paidQty = i.paidQuantity !== undefined ? i.paidQuantity : (i.quantity || 1);
                             const totalQty = i.quantity || 1;
-                            sGross += (i.originalPrice || i.price || 0) * totalQty;
+                            
+                            sGross += (i.originalPrice || i.price || 0) * paidQty;
                             
                             const product = products.find(p => p.id === i.productId);
                             if (product) {
@@ -7578,7 +7602,7 @@
                                 if (i.size === 'S' || i.size === 'Standard') cost = product.costSmall || 0;
                                 else if (i.size === 'L') cost = product.costLarge || 0;
                                 else cost = product.costSmall || product.costLarge || 0;
-                                sCost += cost * totalQty;
+                                sCost += cost * totalQty; // Cost still applies to all items, including free ones!
                             }
                         });
                     });
@@ -8354,6 +8378,7 @@
 
                     const orderData = {
                         userId: currentAdminRecord ? currentAdminRecord.id : null,
+                        staffId: currentAdminRecord ? currentAdminRecord.id : null,
                         orderType: actualOrderType,
                         tableId: snapTableId || 'TAKEAWAY',
                         tableName: snapTableName || 'Take Away',
@@ -8371,6 +8396,7 @@
                         status: targetStatus, 
                         paymentStatus: payStatus,
                         paymentMethod: payMethod,
+                        shiftId: (payStatus === 'Paid' && cartTargetShift) ? cartTargetShift.id : null, // THE ROOT FIX
                         dateString: today,
                         createdAt: Date.now()
                     };
@@ -8926,7 +8952,7 @@
                                         </thead>
                                         <tbody>
                                             {displayedOrders.map(order => {
-                                                const staffName = admins?.find(a => a.id === order.staffId)?.name || 'System / Pending';
+                                                const staffName = admins?.find(a => a.id === (order.staffId || order.userId))?.name || 'Self-Order';
                                                 const shopName = shops.find(s => s.id === order.shopId)?.name || 'Unknown';
                                                 return (
                                                 <tr key={order.id} className="hover:bg-stone-50 bg-white">
@@ -11220,64 +11246,90 @@
 
                     {activeTab === 'invoices' && (
                     <>
-                    {/* Unified Smart Filters Card */}
-                    <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 mb-4 sm:mb-6 no-print space-y-3">
-                        <div className="flex justify-between items-center mb-1">
-                            <span className="text-xs font-bold text-stone-500 uppercase tracking-wider"><i className="fa-solid fa-filter mr-1.5"></i> Report Filters</span>
-                            <button onClick={exportCSV} className="text-xs bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-3 py-1.5 rounded-lg font-bold transition flex items-center shadow-sm">
-                                <i className="fa-solid fa-file-csv mr-1.5"></i> Export CSV
+                    {/* REDESIGNED SMART FILTERS */}
+                    <div className="bg-white rounded-2xl shadow-sm border border-stone-200 mb-4 sm:mb-6 no-print overflow-hidden flex flex-col">
+                        {/* Top Bar: Smart Search & Actions */}
+                        <div className="p-4 border-b border-stone-100 bg-stone-50 flex flex-col sm:flex-row justify-between items-center gap-4 shrink-0">
+                            <div className="relative w-full sm:max-w-md lg:max-w-lg">
+                                <i className="fa-solid fa-magnifying-glass absolute left-4 top-1/2 -translate-y-1/2 text-amber-600"></i>
+                                <input 
+                                    type="text" 
+                                    placeholder="Smart Search: Invoice, Customer, Phone, Table..." 
+                                    className="w-full pl-11 pr-10 py-2.5 rounded-xl border border-stone-300 text-sm outline-none focus:border-amber-500 bg-white font-medium text-stone-800 shadow-sm transition-all focus:ring-4 focus:ring-amber-500/10" 
+                                    value={searchQuery} 
+                                    onChange={e => setSearchQuery(e.target.value)} 
+                                />
+                                {searchQuery && (
+                                    <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 w-6 h-6 bg-stone-100 hover:bg-stone-200 text-stone-500 rounded-full flex items-center justify-center transition" title="Clear Search">
+                                        <i className="fa-solid fa-xmark text-xs"></i>
+                                    </button>
+                                )}
+                            </div>
+                            <button onClick={exportCSV} className="w-full sm:w-auto bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 px-5 py-2.5 rounded-xl font-bold transition flex items-center justify-center shadow-sm">
+                                <i className="fa-solid fa-file-csv mr-2"></i> Export Report
                             </button>
                         </div>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-                            {/* Shop Filter */}
-                            {canSelectMultiple ? (
-                                <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 w-full" value={filterShopId} onChange={e=>setFilterShopId(e.target.value)}>
-                                    {isSuper && <option value="All">All Branches</option>}
-                                    {shops.filter(s => isSuper || currentAdminRecord?.shopIds?.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                                </select>
-                            ) : (
-                                <div className="bg-amber-50 text-amber-900 px-3 py-2 rounded-lg font-bold border border-amber-200 shadow-sm flex items-center text-sm w-full truncate">
-                                    <i className="fa-solid fa-location-dot mr-2 opacity-70"></i> {shops.find(s => s.id === filterShopId)?.name}
-                                </div>
-                            )}
 
-                            {/* Date Filter */}
-                            <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 w-full" value={filter} onChange={e=>setFilter(e.target.value)}>
-                                <option value="today">Today</option>
-                                <option value="yesterday">Yesterday</option>
-                                <option value="week">Last 7 Days</option>
-                                <option value="last_week">Previous 7 Days</option>
-                                <option value="this_month">This Month</option>
-                                <option value="last_month">Last Month</option>
-                                <option value="custom_month">Custom Month</option>
-                            </select>
-
-                            {/* Staff Filter */}
-                            <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 w-full" value={filterStaff} onChange={e => setFilterStaff(e.target.value)}>
-                                <option value="All">All Staff / Handlers</option>
-                                <option value="Self-Order">Self-Order (Customer Portal)</option>
-                                {admins?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-                            </select>
-
-                            {/* Payment Filter */}
-                            <select className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 w-full" value={filterPayment} onChange={e => setFilterPayment(e.target.value)}>
-                                <option value="All">All Payment Types</option>
-                                <option value="Paid">Paid (Any Method)</option>
-                                <option value="Cash">Paid - Cash</option>
-                                <option value="Bank">Paid - Bank</option>
-                                <option value="Unpaid">Unpaid</option>
-                            </select>
-
-                            {/* Search Filter */}
-                            <div className="relative w-full sm:col-span-2 lg:col-span-1">
-                                <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-stone-400"></i>
-                                <input type="text" placeholder="Search Invoice..." className="w-full pl-9 pr-3 py-2 rounded-lg border border-stone-300 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-800" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+                        {/* Bottom Bar: Categorized Filters */}
+                        <div className="p-4 bg-white">
+                            <div className="flex items-center mb-3">
+                                <span className="text-xs font-bold text-stone-500 uppercase tracking-wider"><i className="fa-solid fa-sliders mr-1.5"></i> Categorized Filters</span>
                             </div>
-                            
-                            {/* Custom Month Dynamic Render */}
-                            {filter === 'custom_month' && (
-                                <input type="month" className="border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-medium text-stone-700 w-full sm:col-span-2 lg:col-span-1" value={customMonth} onChange={e => setCustomMonth(e.target.value)} />
-                            )}
+                            <div className="flex flex-wrap gap-4">
+                                <div className="flex-1 min-w-[150px]">
+                                    <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1.5 ml-1">Branch</label>
+                                    {canSelectMultiple ? (
+                                        <select className="w-full border border-stone-300 rounded-xl px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filterShopId} onChange={e=>setFilterShopId(e.target.value)}>
+                                            {isSuper && <option value="All">All Branches</option>}
+                                            {shops.filter(s => isSuper || currentAdminRecord?.shopIds?.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                        </select>
+                                    ) : (
+                                        <div className="w-full bg-amber-50 text-amber-900 px-3 py-2 rounded-xl font-bold border border-amber-200 shadow-sm flex items-center text-sm truncate">
+                                            <i className="fa-solid fa-location-dot mr-2 opacity-70"></i> {shops.find(s => s.id === filterShopId)?.name}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="flex-1 min-w-[150px]">
+                                    <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1.5 ml-1">Date Range</label>
+                                    <select className="w-full border border-stone-300 rounded-xl px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filter} onChange={e=>setFilter(e.target.value)}>
+                                        <option value="today">Today</option>
+                                        <option value="yesterday">Yesterday</option>
+                                        <option value="week">Last 7 Days</option>
+                                        <option value="last_week">Previous 7 Days</option>
+                                        <option value="this_month">This Month</option>
+                                        <option value="last_month">Last Month</option>
+                                        <option value="custom_month">Custom Month</option>
+                                    </select>
+                                </div>
+
+                                {filter === 'custom_month' && (
+                                    <div className="flex-1 min-w-[150px] animate-fade-in">
+                                        <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1.5 ml-1">Select Month</label>
+                                        <input type="month" className="w-full border border-stone-300 rounded-xl px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={customMonth} onChange={e => setCustomMonth(e.target.value)} />
+                                    </div>
+                                )}
+
+                                <div className="flex-1 min-w-[150px]">
+                                    <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1.5 ml-1">Staff / Source</label>
+                                    <select className="w-full border border-stone-300 rounded-xl px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filterStaff} onChange={e => setFilterStaff(e.target.value)}>
+                                        <option value="All">All Staff / Handlers</option>
+                                        <option value="Self-Order">Self-Order (Customer Portal)</option>
+                                        {admins?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                                    </select>
+                                </div>
+
+                                <div className="flex-1 min-w-[150px]">
+                                    <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1.5 ml-1">Payment Status</label>
+                                    <select className="w-full border border-stone-300 rounded-xl px-3 py-2 text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filterPayment} onChange={e => setFilterPayment(e.target.value)}>
+                                        <option value="All">All Payment Types</option>
+                                        <option value="Paid">Paid (Any Method)</option>
+                                        <option value="Cash">Paid - Cash</option>
+                                        <option value="Bank">Paid - Bank</option>
+                                        <option value="Unpaid">Unpaid</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
