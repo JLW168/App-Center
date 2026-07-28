@@ -169,12 +169,12 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache, collection, doc, setDoc, getDoc, getDocs, onSnapshot, addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit, writeBatch, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
         window.FirebaseApp = {
             initializeApp, getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, 
             onAuthStateChanged, signOut, signInAnonymously,
-            getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, 
+            getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
             collection, doc, setDoc, getDoc, getDocs, onSnapshot, 
             addDoc, updateDoc, deleteDoc, increment, query, where, orderBy, limit, writeBatch, runTransaction
         };
@@ -197,20 +197,35 @@
 
         let app, auth, db, getColRef;
 
-        function initializeFirebase() {
-            if (app) return;
-            const { initializeApp, getAuth, getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection } = window.FirebaseApp;
-            app = initializeApp(firebaseConfig);
-            auth = getAuth(app);
+        function initializeFirebase(isAdmin = false) {
+            if (app && db) return; // Prevent re-initialization
             
-            try {
-                db = initializeFirestore(app, {
-                    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
-                });
-                console.log("Firestore initialized (Persistent Cache Mode).");
-            } catch (err) {
-                console.warn("Failed to initialize persistent cache, falling back to standard: ", err);
-                db = getFirestore(app); 
+            const { initializeApp, getAuth, getFirestore, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache, collection } = window.FirebaseApp;
+            
+            if (!app) {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+            }
+            
+            if (!db) {
+                try {
+                    if (isAdmin) {
+                        // BACK OFFICE: Enable full IndexedDB offline persistence with multi-tab support
+                        db = initializeFirestore(app, {
+                            localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+                        });
+                        console.log("Firestore initialized for Admin: Persistent Offline Cache Enabled.");
+                    } else {
+                        // FRONT END: Use standard memory cache to keep customer browser light and fast
+                        db = initializeFirestore(app, {
+                            localCache: memoryLocalCache()
+                        });
+                        console.log("Firestore initialized for Customer: Memory Cache Only.");
+                    }
+                } catch (err) {
+                    console.warn("Failed to initialize requested cache strategy, falling back to standard getFirestore(): ", err);
+                    db = getFirestore(app); 
+                }
             }
             
             getColRef = (colName) => collection(db, colName);
@@ -1068,7 +1083,7 @@
 
             if (!isReady) return <div className="flex h-screen items-center justify-center text-stone-500 font-medium"><i className="fa-solid fa-spinner fa-spin mr-2"></i> Connecting...</div>;
 
-            initializeFirebase();
+            // Notice we don't initialize here globally anymore; we wait to see the view.
             return <MainApp />;
         }
 
@@ -1201,9 +1216,15 @@
             const [loadingTables, setLoadingTables] = useState(() => !localStorage.getItem('solaris_tables'));
             
             const isMenuLoading = loadingProducts || loadingCategories;
-            // OPTIMIZATION: Removed loadingTables from blocking the main setup phase.
-            // Customers don't need to wait for tables to download just to view the menu.
             const isSetupLoading = loadingShops; 
+
+            // Initialize Firebase with the correct profile strategy based on the current view
+            useEffect(() => {
+                if (window.FirebaseApp) {
+                    const isAdminView = view === 'admin_dashboard' || view === 'admin_login';
+                    initializeFirebase(isAdminView);
+                }
+            }, [view]);
 
             useEffect(() => {
                 const hideAddressBar = () => {
@@ -2263,9 +2284,7 @@
                                             </div>
                                         </div>
                                         {(() => {
-                                            const product = products.find(p => p.id === item.productId);
-                                            const targetShop = shops.find(s => s.id === sessionInfo.shopId);
-                                            let isHappyHourActive = false;
+                                            const isHappyHourActive = false;
                                             const slots = targetShop?.happyHourSlots || (targetShop?.happyHourStart ? [{start: targetShop.happyHourStart, end: targetShop.happyHourEnd}] : []);
                                             if (targetShop?.happyHourEnabled && slots.length > 0) {
                                                 const now = new Date();
@@ -2285,10 +2304,12 @@
                                                     if (isHappyHourActive) break;
                                                 }
                                             }
+                                            
+                                            const freeClaims = customerLoyalty?.freeClaims || 0;
                                             const isEligible = globalPoints?.pointsEnabled && globalPoints?.redeemableCategories?.includes(product?.category);
-                                            if (!isEligible || (customerLoyalty?.freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
+                                            if (!isEligible || (freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
                                             const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
-                                            const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
+                                            const availableClaims = Math.min(1, freeClaims) - totalRedeemedInCart;
 
                                             return (
                                                 <div className="mt-2 flex items-center justify-between bg-rose-50/50 p-1.5 rounded-lg border border-rose-100">
@@ -4418,10 +4439,12 @@
                                                                 if (currentMins >= startMins || currentMins <= endMins) isHappyHourActive = true;
                                                             }
                                                         }
+                                                        
+                                                        const freeClaims = customerLoyalty?.freeClaims || 0;
                                                         const isEligible = globalPoints?.pointsEnabled && globalPoints?.redeemableCategories?.includes(product?.category);
-                                                        if (!isEligible || (customerLoyalty?.freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
+                                                        if (!isEligible || (freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
                                                         const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
-                                                        const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
+                                                        const availableClaims = Math.min(1, freeClaims) - totalRedeemedInCart;
 
                                                         return (
                                                             <div className="mt-2 flex items-center justify-between bg-rose-50/50 p-1.5 rounded-lg border border-rose-100">
@@ -8759,6 +8782,9 @@
                 const expectedBankValue = shiftSalesData.expectedBank || 0;
                 const actualBankValue = actualBank !== '' ? Number(actualBank) : expectedBankValue;
                 
+                const estNetIncome = (shiftSalesData.shiftNetSaleNonScp || 0) - (shiftSalesData.shiftTotalCostNonScp || 0);
+                const estMargin = shiftSalesData.shiftNetSaleNonScp > 0 ? ((estNetIncome / shiftSalesData.shiftNetSaleNonScp) * 100).toFixed(1) : 0;
+                
                 const printContent = `
                     <div style="width: 80mm; margin: 0 auto; font-family: 'Courier New', Courier, monospace; text-align: left; font-size: 12px; padding: 10px; color: #000; background: #fff;">
                         <div style="text-align: center; margin-bottom: 10px;">
@@ -8777,6 +8803,9 @@
                             ${shiftSalesData.shiftScpDiscount > 0 ? `<div style="display: flex; justify-content: space-between; color: #4f46e5;"><span>Partner Promos (SCP):</span><span>-${shiftSalesData.shiftScpDiscount.toLocaleString()} ៛</span></div>` : ''}
                             <div style="display: flex; justify-content: space-between; font-weight: bold; padding-top: 4px;"><span>Total Net Sales:</span><span>${shiftSalesData.shiftNetSale.toLocaleString()} ៛</span></div>
                             <div style="display: flex; justify-content: space-between; font-weight: bold; padding-top: 4px; color: #57534e;"><span>Net Sales (Non-SCP):</span><span style="color: #dc2626; text-decoration: underline;">${(shiftSalesData.shiftNetSaleNonScp || 0).toLocaleString()} ៛</span></div>
+                            <div style="display: flex; justify-content: space-between; color: #78716c; padding-top: 2px;"><span>Est. COGS (Non-SCP):</span><span>-${(shiftSalesData.shiftTotalCostNonScp || 0).toLocaleString()} ៛</span></div>
+                            <div style="display: flex; justify-content: space-between; font-weight: bold; color: #047857; padding-top: 2px;"><span>Est. Net Income:</span><span>${estNetIncome.toLocaleString()} ៛</span></div>
+                            <div style="display: flex; justify-content: space-between; font-weight: bold; color: #d97706; padding-top: 2px; padding-bottom: 6px; margin-bottom: 4px; border-bottom: 1px dotted #ccc;"><span>Est. Sale Margin:</span><span>${estMargin}%</span></div>
                         </div>
                         <div style="border-top: 1px dashed #000; border-bottom: 1px dashed #000; padding: 5px 0; margin-bottom: 10px;">
                             <div style="display: flex; justify-content: space-between;"><span>Starting Float:</span><span>${(currentShift.startingCash || 0).toLocaleString()} ៛</span></div>
@@ -8846,6 +8875,7 @@
                     
                     let sGross = 0;
                     let sCost = 0;
+                    let sCostNonScp = 0;
                     let cSales = 0;
                     let bSales = 0;
                     let sNet = 0;
@@ -8882,6 +8912,9 @@
                                 else if (i.size === 'L') cost = product.costLarge || 0;
                                 else cost = product.costSmall || product.costLarge || 0;
                                 sCost += cost * totalQty; // Cost still applies to all items, including free ones!
+                                if (!o.appliedScpId) {
+                                    sCostNonScp += cost * totalQty;
+                                }
                             }
                         });
                     });
@@ -8892,6 +8925,7 @@
                     setShiftSalesData({
                         shiftGrossSale: sGross,
                         shiftTotalCost: sCost,
+                        shiftTotalCostNonScp: sCostNonScp,
                         cashSales: cSales,
                         bankSales: bSales,
                         expectedCash: (currentShift.startingCash || 0) + cSales,
@@ -10161,10 +10195,12 @@
                                                             if (isHappyHourActive) break;
                                                         }
                                                     }
+                                                    
+                                                    const freeClaims = customerLoyalty?.freeClaims || 0;
                                                     const isEligible = globalPoints?.pointsEnabled && globalPoints?.redeemableCategories?.includes(product?.category);
-                                                    if (!isEligible || (customerLoyalty?.freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
+                                                    if (!isEligible || (freeClaims <= 0 && !item.redeemedQty) || isHappyHourActive) return null;
                                                     const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
-                                                    const availableClaims = Math.min(1, customerLoyalty?.freeClaims || 0) - totalRedeemedInCart;
+                                                    const availableClaims = Math.min(1, freeClaims) - totalRedeemedInCart;
 
                                                     return (
                                                         <div className="mt-2 flex items-center justify-between bg-rose-50/50 p-1.5 rounded-lg border border-rose-100">
@@ -10608,8 +10644,17 @@
                                             <div className="flex justify-between items-center pt-1 font-bold text-stone-800">
                                                 <span>Total Net Sales</span> <span className="text-sm">{shiftSalesData.shiftNetSale.toLocaleString()} ៛</span>
                                             </div>
-                                            <div className="flex justify-between items-center pt-1 pb-1 font-bold text-stone-500">
+                                            <div className="flex justify-between items-center pt-1 font-bold text-stone-500">
                                                 <span className="text-[11px]">Net Sales (Non-SCP)</span> <span className="text-sm text-red-600 underline">{(shiftSalesData.shiftNetSaleNonScp || 0).toLocaleString()} ៛</span>
+                                            </div>
+                                            <div className="flex justify-between items-center pt-1 border-t border-stone-100 text-stone-500">
+                                                <span className="text-[11px]">Est. COGS (Non-SCP)</span> <span className="text-sm">-{ (shiftSalesData.shiftTotalCostNonScp || 0).toLocaleString() } ៛</span>
+                                            </div>
+                                            <div className="flex justify-between items-center pt-1 font-bold text-emerald-600">
+                                                <span className="text-[11px]">Est. Net Income</span> <span className="text-sm">{ ((shiftSalesData.shiftNetSaleNonScp || 0) - (shiftSalesData.shiftTotalCostNonScp || 0)).toLocaleString() } ៛</span>
+                                            </div>
+                                            <div className="flex justify-between items-center pt-1 pb-1 font-bold text-amber-600">
+                                                <span className="text-[11px]">Est. Sale Margin</span> <span className="text-sm">{ shiftSalesData.shiftNetSaleNonScp > 0 ? ((((shiftSalesData.shiftNetSaleNonScp || 0) - (shiftSalesData.shiftTotalCostNonScp || 0)) / shiftSalesData.shiftNetSaleNonScp) * 100).toFixed(1) : 0 }%</span>
                                             </div>
                                         </div>
                                     </div>
@@ -12082,6 +12127,30 @@
                 });
             }, [products, searchQuery, filterCategory]); // CRITICAL FIX: Added filterCategory to dependencies
 
+            const { avgMarginS, avgMarginL } = useMemo(() => {
+                let sumPriceS = 0; let sumCostS = 0;
+                let sumPriceL = 0; let sumCostL = 0;
+                
+                products.forEach(p => {
+                    if (p.priceSmall > 0) {
+                        sumPriceS += p.priceSmall;
+                        sumCostS += (p.costSmall || 0);
+                    }
+                    if (p.priceLarge > 0) {
+                        sumPriceL += p.priceLarge;
+                        sumCostL += (p.costLarge || 0);
+                    }
+                });
+                
+                const marginS = sumPriceS > 0 ? Math.round(((sumPriceS - sumCostS) / sumPriceS) * 100) : 0;
+                const marginL = sumPriceL > 0 ? Math.round(((sumPriceL - sumCostL) / sumPriceL) * 100) : 0;
+                
+                return {
+                    avgMarginS: marginS,
+                    avgMarginL: marginL
+                };
+            }, [products]);
+
             const recalcCosts = (currentFormData, newRecipe) => {
                 let cS = 0;
                 let cL = 0;
@@ -12239,7 +12308,13 @@
                         <div className="animate-fade-in">
                             <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
                                 <div>
-                                    <h2 className="text-2xl font-bold">Products</h2>
+                                    <h2 className="text-2xl font-bold flex flex-wrap items-center gap-3">
+                                        Products
+                                        <div className="grid grid-cols-2 bg-stone-100 rounded-lg p-1 border border-stone-200 shadow-inner gap-2 text-[10px] font-bold tracking-wider uppercase mt-1 sm:mt-0">
+                                            <div className="px-2 py-1 bg-white rounded shadow-sm text-stone-600 flex items-center justify-between gap-2"><span>Avg Margin S:</span> <span className={avgMarginS >= 50 ? 'text-green-600' : avgMarginS > 20 ? 'text-amber-600' : 'text-red-600'}>{avgMarginS}%</span></div>
+                                            <div className="px-2 py-1 bg-white rounded shadow-sm text-stone-600 flex items-center justify-between gap-2"><span>Avg Margin L:</span> <span className={avgMarginL >= 50 ? 'text-green-600' : avgMarginL > 20 ? 'text-amber-600' : 'text-red-600'}>{avgMarginL}%</span></div>
+                                        </div>
+                                    </h2>
                                     <p className="text-sm text-stone-500 mt-1">Manage your menu items and prices.</p>
                                 </div>
                                 <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
@@ -14225,14 +14300,21 @@
             }, [orders, realCustomers]);
 
             const filteredCustomers = useMemo(() => {
-                const searchLower = (searchQuery || '').toLowerCase(); // Optimization: Evaluate once
-                const cleanSearch = searchLower.replace(/\D/g, ''); // Extract just numbers for phone matching
+                if (!searchQuery) return customersData;
+
+                const searchLower = searchQuery.toLowerCase();
+                const cleanSearch = searchLower.replace(/\D/g, '');
                 
                 return customersData.filter(c => {
                     const safeName = c.name || '';
                     const safePhone = c.phone || '';
                     const cleanPhone = safePhone.replace(/\D/g, '');
-                    return safeName.toLowerCase().includes(searchLower) || cleanPhone.includes(cleanSearch);
+                    
+                    const matchName = safeName.toLowerCase().includes(searchLower);
+                    // BUG FIX: Only attempt to match phone numbers if the search query actually contains digits
+                    const matchPhone = cleanSearch ? cleanPhone.includes(cleanSearch) : false;
+
+                    return matchName || matchPhone;
                 });
             }, [customersData, searchQuery]);
 
@@ -14600,7 +14682,7 @@
                             </div>
 
                             <div className="bg-white rounded-2xl shadow-sm border border-stone-200 flex-1 overflow-hidden flex flex-col">
-                                <div className="flex-1 overflow-auto p-4">
+                                <div className="hidden md:block flex-1 overflow-auto p-4">
                                     <table className="w-full min-w-[800px] text-left text-sm border-collapse border border-stone-300">
                                         <thead>
                                             <tr className="bg-stone-100 text-stone-700 uppercase tracking-wider border-b border-stone-300">
@@ -14707,6 +14789,105 @@
                                             )}
                                         </tbody>
                                     </table>
+                                </div>
+
+                                {/* Mobile Card Layout */}
+                                <div className="block md:hidden flex-1 overflow-y-auto p-4 space-y-4 bg-stone-50">
+                                    {filteredCustomers.map(customer => (
+                                        <div key={customer.phone} className="bg-white rounded-2xl shadow-sm border border-stone-200 p-4 flex flex-col gap-3 relative">
+                                            <div className="flex justify-between items-start">
+                                                <div>
+                                                    <div className="font-bold text-stone-900 text-lg flex items-center gap-2 flex-wrap">
+                                                        {customer.name}
+                                                        {customer.customerId && <span className="text-[10px] font-bold text-stone-500 bg-stone-100 px-1.5 py-0.5 rounded border border-stone-200">ID: {customer.customerId}</span>}
+                                                        {customer.customerType && customer.customerType !== 'Normal' && (
+                                                            <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider shadow-sm ${
+                                                                customer.customerType === 'VVIP' ? 'bg-purple-100 text-purple-700 border border-purple-200' :
+                                                                customer.customerType === 'Gold' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
+                                                                'bg-stone-200 text-stone-700 border border-stone-300'
+                                                            }`}>
+                                                                {customer.customerType}
+                                                            </span>
+                                                        )}
+                                                        {customer.chargeStatus && customer.chargeStatus !== 'Normal' && (
+                                                            <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider shadow-sm border ${
+                                                                customer.chargeStatus === 'FOC' ? 'bg-emerald-100 text-emerald-800 border-emerald-200' :
+                                                                customer.chargeStatus === 'COG' ? 'bg-blue-100 text-blue-800 border-blue-200' :
+                                                                'bg-rose-100 text-rose-800 border-rose-200'
+                                                            }`}>
+                                                                {customer.chargeStatus}
+                                                            </span>
+                                                        )}
+                                                        {customer.status === 'Inactive' && <span className="bg-red-100 text-red-700 px-1.5 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider">Inactive</span>}
+                                                    </div>
+                                                    <div className="text-stone-500 font-medium text-sm mt-1">
+                                                        <i className="fa-solid fa-phone mr-1.5 opacity-70"></i>{customer.phone}
+                                                    </div>
+                                                </div>
+                                                <div className="shrink-0 ml-2">
+                                                    {customer.sex === 'F' ? (
+                                                        <span className="bg-pink-100 text-pink-700 w-8 h-8 rounded-full flex items-center justify-center text-sm shadow-sm border border-pink-200"><i className="fa-solid fa-venus"></i></span>
+                                                    ) : (
+                                                        <span className="bg-blue-100 text-blue-700 w-8 h-8 rounded-full flex items-center justify-center text-sm shadow-sm border border-blue-200"><i className="fa-solid fa-mars"></i></span>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            <div className="grid grid-cols-2 gap-2 bg-stone-50 p-3 rounded-xl border border-stone-100 mt-1">
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">Lifetime Value</span>
+                                                    <span className="font-black text-amber-700 text-sm">{customer.totalSpent.toLocaleString()} ៛</span>
+                                                </div>
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">Total Visits</span>
+                                                    <span className="font-bold text-stone-800 text-sm">{customer.orderCount} Orders</span>
+                                                </div>
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">Reg. Location</span>
+                                                    <span className="font-bold text-stone-700 text-xs truncate">
+                                                        {customer.registeredAtShop ? (shops.find(s=>s.id === customer.registeredAtShop)?.name || 'Unknown') : 'Unspecified'}
+                                                    </span>
+                                                </div>
+                                                <div className="flex flex-col">
+                                                    <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">Last Visit</span>
+                                                    <span className="font-bold text-stone-700 text-xs">{new Date(customer.lastVisit).toLocaleDateString()}</span>
+                                                </div>
+                                            </div>
+
+                                            <div className="flex items-center justify-between border-t border-stone-100 pt-3">
+                                                <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Security PIN</span>
+                                                {customer.pin ? (
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="font-mono bg-stone-100 px-2 py-1 rounded border border-stone-200 font-black tracking-widest text-stone-700 text-xs">{customer.pin}</span>
+                                                        <button onClick={() => setPinResetData({ id: customer.id, name: customer.name, newPin: '', error: '' })} className="w-7 h-7 flex items-center justify-center bg-stone-100 hover:bg-stone-200 rounded-md text-blue-500 hover:text-blue-700 transition shadow-sm" title="Reset PIN">
+                                                            <i className="fa-solid fa-rotate-right text-xs"></i>
+                                                        </button>
+                                                    </div>
+                                                ) : (
+                                                    <span className="text-stone-400 text-xs italic font-medium">No PIN set</span>
+                                                )}
+                                            </div>
+
+                                            <div className="flex gap-2 pt-3 border-t border-stone-100">
+                                                <button onClick={() => setSelectedCustomer(customer)} className="flex-[2] py-3 bg-stone-900 text-white rounded-xl text-xs font-bold hover:bg-stone-800 transition shadow-sm flex justify-center items-center">
+                                                    View Invoices
+                                                </button>
+                                                {isSuper && (
+                                                    <>
+                                                        <button onClick={() => { setEditCustomerData({...customer, originalPhone: customer.phone}); setEditCustomerModalOpen(true); }} className="flex-1 py-3 bg-blue-50 text-blue-600 rounded-xl text-xs font-bold hover:bg-blue-100 transition shadow-sm flex items-center justify-center" title="Edit Customer">
+                                                            <i className="fa-solid fa-pen"></i>
+                                                        </button>
+                                                        <button onClick={() => deleteCustomer(customer)} className="flex-1 py-3 bg-red-50 text-red-600 rounded-xl text-xs font-bold hover:bg-red-100 transition shadow-sm flex items-center justify-center" title="Delete Customer">
+                                                            <i className="fa-solid fa-trash"></i>
+                                                        </button>
+                                                    </>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {filteredCustomers.length === 0 && (
+                                        <div className="text-center py-10 text-stone-400 font-medium">No customers found.</div>
+                                    )}
                                 </div>
                             </div>
                         </div>
