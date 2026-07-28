@@ -2883,22 +2883,27 @@
                         // 1. Process Source Shop metrics
                         if (stats[cd.shop]) {
                             const defaultMargin = shopConfig[cd.shop]?.defaultMargin || 0;
-                            const effectiveMargin = marginHistoryMap.has(`${cd.shop}|${month}`) 
-                                ? marginHistoryMap.get(`${cd.shop}|${month}`) 
-                                : defaultMargin;
+                            const effectiveMargin = cd.customMarginEnabled 
+                                ? cd.customMargin 
+                                : (marginHistoryMap.has(`${cd.shop}|${month}`) 
+                                    ? marginHistoryMap.get(`${cd.shop}|${month}`) 
+                                    : defaultMargin);
                             
                             const amount = (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
                             stats[cd.shop].salesContributionAllTime += amount;
                             
                             // --- FIX: Track Promo Paid for Source Shop ---
-                            if (cd.promoEnabled) {
-                                stats[cd.shop].promoPaidAllTime += (cd.promoAmount || 0);
-                            }
+                            // Rule 1: We no longer track promoPaid for direct GCA deduction.
+                            // if (cd.promoEnabled) {
+                            //     stats[cd.shop].promoPaidAllTime += (cd.promoAmount || 0);
+                            // }
                         }
     
                         // 2. Process Destination Shop metrics independently (Fixes Staff Role GCA discrepancy)
                         if (cd.promoEnabled && cd.promoPayToShop && stats[cd.promoPayToShop]) {
-                            stats[cd.promoPayToShop].promoReceivedAllTime += (cd.promoAmount || 0);
+                            // Rule 2: Route only Cost to GCA. Fallback to promoAmount for legacy records.
+                            const costRecovery = cd.promoTotalCost !== undefined ? cd.promoTotalCost : (cd.promoAmount || 0);
+                            stats[cd.promoPayToShop].promoReceivedAllTime += costRecovery;
                         }
                     });
     
@@ -2926,8 +2931,8 @@
                     const processedData = availableShops.map(shop => {
                         const s = stats[shop.name];
                         const config = shopConfig[shop.name];
-                        // --- FIX: Sponsoring Shop's GCA MUST be reduced by promoPaidAllTime to balance the ledger ---
-                        const currentGCA = config.openingGCA + s.salesContributionAllTime + s.promoReceivedAllTime - s.promoPaidAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
+                        // --- FIX: Rule 1: Removed s.promoPaidAllTime deduction ---
+                        const currentGCA = config.openingGCA + s.salesContributionAllTime + s.promoReceivedAllTime - s.poAllTime - s.transInAllTime + s.transOutAllTime + s.gcaAdjustment + s.repaidLossesAllTime;
     
                         globalGCA += currentGCA;
                         globalSalesCurr += s.salesCurr;
@@ -4889,7 +4894,8 @@
                     promoDetail: promo.promoDetail || ''
                 });
                 
-                const [currentPromoItem, setCurrentPromoItem] = useState({ productId: '', name: '', unitPrice: '', qty: '1' });
+                // --- UPDATED: Added cost to state ---
+                const [currentPromoItem, setCurrentPromoItem] = useState({ productId: '', name: '', cost: '', unitPrice: '', qty: '1' });
 
                 const handleCurrentPromoItemChange = (field, value) => {
                     setCurrentPromoItem(prev => {
@@ -4898,10 +4904,12 @@
                             const product = crossPromoProducts?.find(p => p.id === value);
                             if (product) {
                                 next.name = product.name;
+                                next.cost = String(product.cost || 0); // <-- ADDED
                                 next.unitPrice = String(product.price || 0);
                                 next.qty = '1';
                             } else {
                                 next.name = '';
+                                next.cost = ''; // <-- ADDED
                                 next.unitPrice = '';
                             }
                         }
@@ -5265,9 +5273,11 @@
                             "From Shop": r.shop,
                             "To Shop": r.promoPayToShop,
                             "QTY": r.promoQty || 1,
-                            "Promo Amount": r.promoBaseAmount || 0,
+                            "Base Amount": r.promoBaseAmount || 0,
                             "Disc": r.promoDisc || '30%',
-                            "Total": r.promoAmount || 0,
+                            "Total Payout": r.promoAmount || 0,
+                            "Total Cost": r.promoTotalCost !== undefined ? r.promoTotalCost : 'N/A',
+                            "Net Profit": r.promoNetProfit !== undefined ? r.promoNetProfit : 'N/A',
                             "Detail": r.promoDetail || ''
                         };
                     });
@@ -5295,6 +5305,20 @@
                     setIsSaving(true);
                     try {
                         const { doc, updateDoc, collection, query, where, getDocs } = window.Firebase;
+
+                        // --- NEW: Calculate Total Cost and Net Profit for Promo ---
+                        let promoTotalCost = 0;
+                        if (updatedFields.promoItems) {
+                            updatedFields.promoItems.forEach(item => {
+                                const q = parseInt(item.qty) || 0;
+                                // Handle legacy items gracefully if they lack cost
+                                const c = parseFloat(String(item.cost || 0).replace(/,/g, '')) || 0; 
+                                promoTotalCost += (q * c);
+                            });
+                        }
+                        const promoNetProfit = calculatedTotal - promoTotalCost;
+                        // ----------------------------------------------------------
+
                         await updateDoc(doc(window.db, "cashDrops", editingPromo.id), {
                             promoPayToShop: updatedFields.promoPayToShop,
                             promoItems: updatedFields.promoItems || [],
@@ -5304,6 +5328,8 @@
                             promoQty: updatedFields.promoQty,
                             promoBaseAmount: parseFloat(String(updatedFields.promoBaseAmount).replace(/,/g, '')) || 0,
                             promoAmount: calculatedTotal,
+                            promoTotalCost: promoTotalCost, // <-- ADDED
+                            promoNetProfit: promoNetProfit, // <-- ADDED
                             promoDisc: updatedFields.promoDisc,
                             promoDetail: updatedFields.promoDetail
                         });
@@ -5466,16 +5492,18 @@
                                             <th className="p-3">From Shop</th>
                                             <th className="p-3">To Shop</th>
                                             <th className="p-3 text-center">QTY</th>
-                                            <th className="p-3 text-right">Promo Amount</th>
+                                            <th className="p-3 text-right">Base Amount</th>
                                             <th className="p-3 text-center">Disc</th>
-                                            <th className="p-3 text-right">Total</th>
+                                            <th className="p-3 text-right">Total Payout</th>
+                                            <th className="p-3 text-right">Total Cost</th>
+                                            <th className="p-3 text-right">Net Profit</th>
                                             <th className="p-3">Detail</th>
                                             {canManage && <th className="p-3 text-center">Action</th>}
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-700">
                                         {promoReports.length === 0 ? (
-                                            <tr><td colSpan={canManage ? "10" : "9"} className="p-8 text-center text-slate-500">No matching cross-shop promotions found.</td></tr>
+                                            <tr><td colSpan={canManage ? "12" : "11"} className="p-8 text-center text-slate-500">No matching cross-shop promotions found.</td></tr>
                                         ) : (
                                             promoReports.map(r => (
                                                 <tr key={r.id} className="hover:bg-slate-700/50">
@@ -5487,6 +5515,8 @@
                                                     <td className="p-3 text-right font-mono">{formatCurrency(r.promoBaseAmount || 0, 'KHR')}</td>
                                                     <td className="p-3 text-center font-mono">{r.promoDisc || '30%'}</td>
                                                     <td className="p-3 text-right font-mono font-bold text-emerald-400">{formatCurrency(r.promoAmount, 'KHR')}</td>
+                                                    <td className="p-3 text-right font-mono text-orange-400">{r.promoTotalCost !== undefined ? formatCurrency(r.promoTotalCost, 'KHR') : 'N/A'}</td>
+                                                    <td className="p-3 text-right font-mono font-bold text-blue-400">{r.promoNetProfit !== undefined ? formatCurrency(r.promoNetProfit, 'KHR') : 'N/A'}</td>
                                                     <td className="p-3 font-medium text-slate-300">{r.promoDetail || 'N/A'}</td>
                                                     {canManage && (
                                                         <td className="p-3 text-center">
@@ -6290,7 +6320,8 @@
                 const [lastSubmittedData, setLastSubmittedData] = useState(null);
                 
                 // --- NEW: Promo Item & Bill Counter States ---
-                const [currentPromoItem, setCurrentPromoItem] = useState({ productId: '', name: '', unitPrice: '', qty: '1' });
+                // --- UPDATED: Added cost to state ---
+                const [currentPromoItem, setCurrentPromoItem] = useState({ productId: '', name: '', cost: '', unitPrice: '', qty: '1' });
                 const [billCounterState, setBillCounterState] = useState({ isOpen: false, currency: 'KHR', targetField: '' });
                 // -------------------------------
                 
@@ -6307,10 +6338,12 @@
                             const product = crossPromoProducts?.find(p => p.id === value);
                             if (product) {
                                 next.name = product.name;
+                                next.cost = String(product.cost || 0); // <-- ADDED
                                 next.unitPrice = String(product.price || 0);
                                 next.qty = '1';
                             } else {
                                 next.name = '';
+                                next.cost = ''; // <-- ADDED
                                 next.unitPrice = '';
                             }
                         }
@@ -6459,6 +6492,18 @@
                         const promoDiscVal = parseFloat(String(formData.promoDisc || '0').replace(/%/g, '')) || 0;
                         const computedPromoTotal = promoBaseAmt * (1 - promoDiscVal / 100);
     
+                        // --- NEW: Calculate Total Cost and Net Profit for Promo ---
+                        let promoTotalCost = 0;
+                        if (formData.promoEnabled && formData.promoItems) {
+                            formData.promoItems.forEach(item => {
+                                const q = parseInt(item.qty) || 0;
+                                const c = parseFloat(String(item.cost || 0).replace(/,/g, '')) || 0;
+                                promoTotalCost += (q * c);
+                            });
+                        }
+                        const promoNetProfit = computedPromoTotal - promoTotalCost;
+                        // ----------------------------------------------------------
+
                         const submissionData = {
                             ...formData,
                             actualCashFloat: clean(formData.actualCashFloat),
@@ -6473,6 +6518,8 @@
                             promoQtyR: 0,
                             promoBaseAmount: formData.promoEnabled ? promoBaseAmt : 0,
                             promoAmount: formData.promoEnabled ? computedPromoTotal : 0,
+                            promoTotalCost: formData.promoEnabled ? promoTotalCost : 0, // <-- ADDED
+                            promoNetProfit: formData.promoEnabled ? promoNetProfit : 0, // <-- ADDED
                             promoQty: formData.promoEnabled ? (parseInt(formData.promoQty) || 1) : 0,
                             promoDetail: formData.promoEnabled ? formData.promoDetail : '',
                             promoDisc: formData.promoEnabled ? formData.promoDisc : '',
@@ -8283,7 +8330,7 @@
                         cashDrops.filter(cd => cd.shop === sObj.name).forEach(cd => {
                             const d = cd.createdAt?.toDate ? cd.createdAt.toDate() : new Date(cd.createdAt);
                             const monthKey = d.toISOString().slice(0, 7);
-                            const effectiveMargin = marginMap.has(`${sObj.name}|${monthKey}`) ? marginMap.get(`${sObj.name}|${monthKey}`) : defaultMargin;
+                            const effectiveMargin = cd.customMarginEnabled ? cd.customMargin : (marginMap.has(`${sObj.name}|${monthKey}`) ? marginMap.get(`${sObj.name}|${monthKey}`) : defaultMargin);
                             salesContribution += (cd.grandTotalKhr || 0) * (1 - (effectiveMargin / 100));
                             
                             if (cd.promoEnabled) {
@@ -8578,8 +8625,9 @@
     
                             // --- Handle destination GCA addition for Cross-Shop Promotion ---
                             if (cd.promoEnabled && cd.promoPayToShop) {
-                                events.push({ time: d.getTime(), type: 'promoReceived', shop: cd.promoPayToShop, amount: cd.promoAmount || 0 });
-                                events.push({ time: d.getTime(), type: 'promoPaid', shop: cd.shop, amount: cd.promoAmount || 0 });
+                                const costRecovery = cd.promoTotalCost !== undefined ? cd.promoTotalCost : (cd.promoAmount || 0);
+                                events.push({ time: d.getTime(), type: 'promoReceived', shop: cd.promoPayToShop, amount: costRecovery });
+                                // Removed promoPaid (Source Shop deduction) to prevent double-dip with Business Expense
                             }
                         });
                     }
@@ -8636,8 +8684,6 @@
                             runningGCA[ev.shop] += ev.amount;
                         } else if (ev.type === 'promoReceived') {
                             runningGCA[ev.shop] += ev.amount;
-                        } else if (ev.type === 'promoPaid') {
-                            runningGCA[ev.shop] -= ev.amount;
                         } else if (ev.type === 'transIn') {
                             runningGCA[ev.shop] -= ev.amount;
                         } else if (ev.type === 'transOut') {
@@ -9261,7 +9307,20 @@
     
                                         {/* Middle Row: Vendor & Details */}
                                         <div className="mb-4">
-                                            <h4 className="text-base font-bold text-white mb-1">{po.vendor}</h4>
+                                            <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                                <h4 className="text-base font-bold text-white">{po.vendor}</h4>
+                                                {(() => {
+                                                    const v = vendors.find(v => v.name === po.vendor);
+                                                    if (v?.contactPerson) {
+                                                        return (
+                                                            <span className="text-[10px] text-slate-400 bg-slate-900/80 px-2 py-0.5 rounded-full border border-slate-700 flex items-center gap-1 shadow-inner">
+                                                                <Icon name="Users" size={10} /> {v.contactPerson}
+                                                            </span>
+                                                        );
+                                                    }
+                                                    return null;
+                                                })()}
+                                            </div>
                                             {(() => {
                                                 const vendorDetails = vendors.find(v => v.name === po.vendor);
                                                 if (!vendorDetails || (!vendorDetails.bankName && !vendorDetails.accNoKhr && !vendorDetails.accNoUsd)) return null;
@@ -10354,9 +10413,9 @@
                                     {filteredVendors.map(vendor => (
                                         <tr key={vendor.id} className="hover:bg-slate-700/50">
                                             <td className="p-3 font-semibold text-slate-200">{vendor.name}</td>
-                                            <td className="p-3">{vendor.contactPerson || 'N/A'}</td>
-                                            <td className="p-3">{vendor.phone || 'N/A'}</td>
-                                            <td className="p-3">{vendor.bankName || 'N/A'}</td>
+                                            <td className="p-3">{vendor.contactPerson || ''}</td>
+                                            <td className="p-3">{vendor.phone || ''}</td>
+                                            <td className="p-3">{vendor.bankName || ''}</td>
                                             <td 
                                                 className="p-3 text-right font-mono cursor-pointer hover:text-blue-400 transition-colors group"
                                                 onClick={() => handleCopy(vendor.accNoKhr, "KHR Account")}
@@ -13607,10 +13666,7 @@
 
                 const handleSubmit = async (e) => {
                     e.preventDefault();
-                    if (!formData.shops || formData.shops.length === 0) {
-                        showNotification("Please select at least one shop.", "error");
-                        return;
-                    }
+                    // Allow empty shops for ended promotions
                     if (!formData.name.trim()) {
                         showNotification("Product name is required.", "error");
                         return;
@@ -13697,6 +13753,12 @@
                     }
                 }
 
+                // Helper to calculate Margin Percentage
+                const calculateMargin = (price, cost) => {
+                    if (!price || price <= 0) return 0;
+                    return (((price - cost) / price) * 100).toFixed(1);
+                };
+
                 return (
                     <Card className="mt-8">
                         <div className="flex justify-between items-center mb-4 border-b border-slate-700 pb-3">
@@ -13714,29 +13776,40 @@
                                         <th className="p-3">Product Name</th>
                                         <th className="p-3 text-right">Cost (៛)</th>
                                         <th className="p-3 text-right">Price (៛)</th>
+                                        <th className="p-3 text-right">Margin (%)</th>
                                         <th className="p-3">Note</th>
                                         <th className="p-3 text-center">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody className="text-sm text-slate-300 divide-y divide-slate-700/50 bg-slate-800/30">
                                     {(!crossPromoProducts || crossPromoProducts.length === 0) ? (
-                                        <tr><td colSpan="6" className="p-8 text-center text-slate-500 italic">No cross promotion products configured.</td></tr>
+                                        <tr><td colSpan="7" className="p-8 text-center text-slate-500 italic">No cross promotion products configured.</td></tr>
                                     ) : (
-                                        crossPromoProducts.map(p => (
-                                            <tr key={p.id} className="hover:bg-slate-700/60 transition-colors">
-                                                <td className="p-3 font-semibold text-blue-300 max-w-[200px] truncate" title={(p.shops && p.shops.length > 0) ? p.shops.join(', ') : (p.shop || 'N/A')}>
-                                                    {(p.shops && p.shops.length > 0) ? p.shops.join(', ') : (p.shop || 'N/A')}
-                                                </td>
-                                                <td className="p-3 font-semibold text-slate-200">{p.name}</td>
-                                                <td className="p-3 text-right font-mono text-orange-400">{formatCurrency(p.cost, 'KHR').replace('៛', '')}</td>
-                                                <td className="p-3 text-right font-mono text-emerald-400">{formatCurrency(p.price, 'KHR').replace('៛', '')}</td>
-                                                <td className="p-3 text-slate-400">{p.note || '-'}</td>
-                                                <td className="p-3 text-center flex justify-center gap-1">
-                                                    <Button variant="ghost" size="sm" onClick={() => {setEditingProduct(p); setIsModalOpen(true);}} className="text-blue-400 hover:bg-blue-900/50" title="Edit"><Icon name="PenSquare"/></Button>
-                                                    <Button variant="ghost" size="sm" onClick={() => setDeletingProduct(p)} className="text-red-400 hover:bg-red-900/50" title="Delete"><Icon name="Trash2"/></Button>
-                                                </td>
-                                            </tr>
-                                        ))
+                                        crossPromoProducts.map(p => {
+                                            const cost = parseFloat(p.cost) || 0;
+                                            const price = parseFloat(p.price) || 0;
+                                            const margin = calculateMargin(price, cost);
+                                            const marginColor = margin > 0 ? 'text-emerald-400' : margin < 0 ? 'text-red-400' : 'text-slate-400';
+
+                                            return (
+                                                <tr key={p.id} className="hover:bg-slate-700/60 transition-colors">
+                                                    <td className="p-3 font-semibold text-blue-300 max-w-[200px] truncate" title={(p.shops && p.shops.length > 0) ? p.shops.join(', ') : (p.shop || '')}>
+                                                        {(p.shops && p.shops.length > 0) ? p.shops.join(', ') : (p.shop || '')}
+                                                    </td>
+                                                    <td className="p-3 font-semibold text-slate-200">{p.name}</td>
+                                                    <td className="p-3 text-right font-mono text-orange-400">{formatCurrency(cost, 'KHR').replace('៛', '')}</td>
+                                                    <td className="p-3 text-right font-mono text-emerald-400">{formatCurrency(price, 'KHR').replace('៛', '')}</td>
+                                                    <td className={`p-3 text-right font-mono font-bold ${marginColor}`}>
+                                                        {margin}%
+                                                    </td>
+                                                    <td className="p-3 text-slate-400">{p.note || '-'}</td>
+                                                    <td className="p-3 text-center flex justify-center gap-1">
+                                                        <Button variant="ghost" size="sm" onClick={() => {setEditingProduct(p); setIsModalOpen(true);}} className="text-blue-400 hover:bg-blue-900/50" title="Edit"><Icon name="PenSquare"/></Button>
+                                                        <Button variant="ghost" size="sm" onClick={() => setDeletingProduct(p)} className="text-red-400 hover:bg-red-900/50" title="Delete"><Icon name="Trash2"/></Button>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })
                                     )}
                                 </tbody>
                             </table>
@@ -14497,21 +14570,13 @@
                         // --- NEW: Promo Received (IN) as recipient ---
                         cashDrops.filter(cd => cd.promoEnabled && cd.promoPayToShop === selectedShop).forEach(cd => {
                             const d = getTimestamp(cd.createdAt);
+                            // Phase 2: Only route the COST to GCA (Capital Recovery). Legacy records fallback to full amount.
+                            const costRecovery = cd.promoTotalCost !== undefined ? cd.promoTotalCost : (cd.promoAmount || 0);
                             events.push({
-                                id: cd.id + '-promoRecv', time: d.getTime(), dateObj: d, type: 'Promo Received', inOut: 'IN', amount: cd.promoAmount || 0,
-                                desc: `Promo Received From: ${cd.shop} (${cd.promoDetail || 'N/A'})`, ref: cd.staff || 'N/A'
+                                id: cd.id + '-promoRecv', time: d.getTime(), dateObj: d, type: 'Promo Received', inOut: 'IN', amount: costRecovery,
+                                desc: `Promo Received From: ${cd.shop} (${cd.promoDetail || 'N/A'}) - Cost Recovery`, ref: cd.staff || 'N/A'
                             });
                         });
-    
-                        // --- FIX: Add Promo Paid (OUT) as Sponsoring Shop ---
-                        cashDrops.filter(cd => cd.promoEnabled && cd.shop === selectedShop).forEach(cd => {
-                            const d = getTimestamp(cd.createdAt);
-                            events.push({
-                                id: cd.id + '-promoPaid', time: d.getTime(), dateObj: d, type: 'Promo Paid', inOut: 'OUT', amount: cd.promoAmount || 0,
-                                desc: `Promo Sponsored For: ${cd.promoPayToShop} (${cd.promoDetail || 'N/A'})`, ref: cd.staff || 'N/A'
-                            });
-                        });
-                        // ----------------------------------------------------
                     }
     
                     // 2. POs (OUT)
@@ -14877,7 +14942,7 @@
                 const data = useMonthlyData({ ...filters, dateRangeType: 'by_month' });
                 
                 // --- NEW: Hooks for Month-End Close ---
-                const { closedMonths, userData, logActivity, lossAndRecovery, gcaHistory, fixedExpenses, appSettings } = useData();
+                const { closedMonths, userData, logActivity, lossAndRecovery, gcaHistory, fixedExpenses, appSettings, shops } = useData();
                 const { showNotification } = useNotification();
                 const { addDoc, deleteDoc, doc, collection, Timestamp, query, where, getDocs } = window.Firebase;
                 
@@ -14885,6 +14950,14 @@
                 const [isUnlockingMonth, setIsUnlockingMonth] = useState(false);
                 const [isMutatingMonth, setIsMutatingMonth] = useState(false);
                 // --------------------------------------
+
+                // --- SECURITY FIX: Filter shops based on user permission ---
+                const availableShops = useMemo(() => {
+                    if (!userData) return [];
+                    if (userData.role === 'Admin' || userData.role === 'Management') return shops;
+                    return shops.filter(s => userData.shopIds?.includes(s.id));
+                }, [shops, userData]);
+                // -----------------------------------------------------------
     
                 // Create a lookup map for faster margin history access
                 const marginHistoryMap = useMemo(() => {
@@ -14932,9 +15005,28 @@
                     }
                     // ------------------------------------------------------
                     
-                    const shareholderData = {}; // Initialize shareholderData here
+                    const shareholderData = {};
     
-                    const shopCalculations = data.shops.map(shop => {
+                    // Safely initialize all known shareholders to prevent undefined errors
+                    const allShareholders = new Set();
+                    availableShops.forEach(s => {
+                        if (s.gcaHolderName) allShareholders.add(s.gcaHolderName);
+                        (s.shareholders || []).forEach(sh => allShareholders.add(sh.name));
+                    });
+                    
+                    // Add failsafe for mathematically orphaned data
+                    allShareholders.add('Unassigned Equity');
+                    
+                    allShareholders.forEach(name => {
+                        shareholderData[name] = {
+                            totalNetSale: 0, totalNetProfit: 0, totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, 
+                            familyExpense: 0, finalNetIncome: 0, totalCOH: 0,
+                            gcaHoldingShops: [], isEmployee: false
+                        };
+                    });
+    
+                    // --- FIX: Map only over availableShops (Security) ---
+                    const shopCalculations = availableShops.map(shop => {
                         const openingGCA = shop.gca || 0;
                         const saleMargin = shop.saleMargin || 0; // This is the *default* margin
                         
@@ -14942,7 +15034,6 @@
                         const salesContributionAllTime = data.allReports
                             .filter(cd => cd.shop === shop.name)
                             .reduce((sum, cd) => {
-                                // Use the new helper function to get the correct margin
                                 const effectiveMargin = getMarginForReport(cd, saleMargin);
                                 const marginToUse = (1 - (effectiveMargin / 100));
                                 return sum + (cd.grandTotalKhr * marginToUse);
@@ -14952,7 +15043,10 @@
                         // --- NEW: Add Promo Received from other shops ---
                         const promoReceivedAllTime = data.allReports
                             .filter(cd => cd.promoEnabled && cd.promoPayToShop === shop.name)
-                            .reduce((sum, cd) => sum + (cd.promoAmount || 0), 0);
+                            .reduce((sum, cd) => {
+                                const costRecovery = cd.promoTotalCost !== undefined ? cd.promoTotalCost : (cd.promoAmount || 0);
+                                return sum + costRecovery;
+                            }, 0);
                             
                         const promoPaidAllTime = data.allReports
                             .filter(cd => cd.promoEnabled && cd.shop === shop.name)
@@ -14965,155 +15059,107 @@
                         const repaidLossesAllTime = (lossAndRecovery || []).filter(loss => loss.shop === shop.name && loss.status === 'Repaid').reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
                         const gcaAdjustmentsAllTime = (gcaHistory || []).filter(adj => adj.shopName === shop.name).reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
     
-                        // --- FIX: Shareholder's GCA Liability MUST be reduced by promoPaidAllTime to balance the ledger. ---
-                        const currentGCA = openingGCA + salesContributionAllTime + promoReceivedAllTime - promoPaidAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
-    
-                        const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
-                        const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
-                        
-                        // --- Updated Net Profit Logic: Promo Payout is fully represented as Business Expense and subtracted via totalBizExpense ---
-                        const netProfitForMonth = data.filteredReports
-                            .filter(cd => cd.shop === shop.name)
-                            .reduce((sum, cd) => {
-                                // Use the new helper function to get the correct margin
-                                const effectiveMargin = getMarginForReport(cd, saleMargin);
-                                const marginToUse = (effectiveMargin / 100);
-                                return sum + (cd.grandTotalKhr * marginToUse);
-                            }, 0);
-                        
-                        const totalNetIncomeForMonth = netProfitForMonth - bizExpenseForMonth;
-                        const totalPOForMonth = data.filteredPurchaseOrders.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
-                        const totalTransInForMonth = data.filteredInternalTransfers.filter(it => it.toShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                        const totalTransOutForMonth = data.filteredInternalTransfers.filter(it => it.fromShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-    
-                        return { 
-                            name: shop.name, 
-                            // --- NEW: Pass Holder Name ---
-                            holderName: shop.gcaHolderName,
-                            // -----------------------------
-                            currentGCA, netSale: netSaleForMonth, netProfit: netProfitForMonth, totalPO: totalPOForMonth, totalTransIn: totalTransInForMonth, totalTransOut: totalTransOutForMonth, totalBizExpense: bizExpenseForMonth, totalNetIncome: totalNetIncomeForMonth 
-                        };
-                    }).sort((a, b) => {
-                        // --- UPDATED: Sort by GCA Holder Name ---
-                        const hA = a.holderName || 'Unassigned';
-                        const hB = b.holderName || 'Unassigned';
-                        if (hA < hB) return -1;
-                        if (hA > hB) return 1;
-                        return a.name.localeCompare(b.name);
-                        // ----------------------------------------
-                    });
-    
-                    // Calculate Shop Totals for Table 1 Footer
-                    const shopTotals = shopCalculations.reduce((acc, s) => {
-                        acc.currentGCA += s.currentGCA;
-                        acc.netSale += s.netSale;
-                        acc.netProfit += s.netProfit;
-                        acc.totalPO += s.totalPO;
-                        acc.totalTransIn += s.totalTransIn;
-                        acc.totalTransOut += s.totalTransOut;
-                        acc.totalBizExpense += s.totalBizExpense;
-                        acc.totalNetIncome += s.totalNetIncome;
-                        return acc;
-                    }, { currentGCA: 0, netSale: 0, netProfit: 0, totalPO: 0, totalTransIn: 0, totalTransOut: 0, totalBizExpense: 0, totalNetIncome: 0 });
-    
-                    data.shops.forEach(shop => {
-                        // --- NEW: Ensure GCA Holder exists in data (even if Employee) ---
-                        if (shop.gcaHolderName) {
-                            if (!shareholderData[shop.gcaHolderName]) {
-                                shareholderData[shop.gcaHolderName] = { 
-                                    totalNetSale: 0, totalNetProfit: 0,
-                                    totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0,
-                                    gcaHoldingShops: [], isEmployee: shop.gcaHolderType === 'Employee'
-                                };
-                            }
-                            // Add shop to their holding list
-                            if (!shareholderData[shop.gcaHolderName].gcaHoldingShops.includes(shop.name)) {
-                                shareholderData[shop.gcaHolderName].gcaHoldingShops.push(shop.name);
-                            }
-                        }
-                        // ----------------------------------------------------------------
-    
-                        // Ensure Shareholder Keys exist for anyone listed in shareholders array (Legacy support)
-                        (shop.shareholders || []).forEach(sh => {
-                            if (!shareholderData[sh.name]) {
-                                shareholderData[sh.name] = { 
-                                    totalNetSale: 0, totalNetProfit: 0,
-                                    totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, finalNetIncome: 0, totalCOH: 0,
-                                    gcaHoldingShops: [], isEmployee: false
-                                };
-                            }
-                        });
-    
-                        const openingGCA = shop.gca || 0;
-                        const saleMargin = shop.saleMargin || 0; 
-                        
-                        const salesContributionAllTime = data.allReports
-                            .filter(cd => cd.shop === shop.name)
-                            .reduce((sum, cd) => {
-                                const effectiveMargin = getMarginForReport(cd, saleMargin); 
-                                const marginToUse = (1 - (effectiveMargin / 100));
-                                return sum + (cd.grandTotalKhr * marginToUse);
-                            }, 0);
-    
-                        // --- NEW: Add Promo Received from other shops ---
-                        const promoReceivedAllTime = data.allReports
-                            .filter(cd => cd.promoEnabled && cd.promoPayToShop === shop.name)
-                            .reduce((sum, cd) => sum + (cd.promoAmount || 0), 0);
-                        
-                        const totalPOsAllTime = data.allPOs.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
-                        const transfersInAllTime = data.allTransfers.filter(it => it.toShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                        const transfersOutAllTime = data.allTransfers.filter(it => it.fromShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
-                        
-                        const repaidLossesAllTime = (lossAndRecovery || []).filter(loss => loss.shop === shop.name && loss.status === 'Repaid').reduce((sum, loss) => sum + (loss.amountKhr || 0) + ((loss.amountUsd || 0) * data.exchangeRate), 0);
-                        const gcaAdjustmentsAllTime = (gcaHistory || []).filter(adj => adj.shopName === shop.name).reduce((sum, adj) => sum + (adj.adjustmentAmount || 0), 0);
-    
-                        // --- UPDATED: Sponsoring Shop's GCA is no longer directly reduced by promoPaidAllTime (reconciled through auto Business Expenses) ---
+                        // --- FIXED: Do not deduct promoPaidAllTime from GCA to avoid double deduction. Payout is only deducted via auto-generated Business Expense. ---
                         const currentGCA = openingGCA + salesContributionAllTime + promoReceivedAllTime - totalPOsAllTime - transfersInAllTime + transfersOutAllTime + repaidLossesAllTime + gcaAdjustmentsAllTime;
     
                         const netSaleForMonth = data.filteredReports.filter(cd => cd.shop === shop.name).reduce((sum, cd) => sum + (cd.grandTotalKhr || 0), 0);
                         const bizExpenseForMonth = data.filteredBusinessExpenses.filter(e => e.shop === shop.name).reduce((sum, e) => sum + (e.totalAmountKhr || 0), 0);
                         
+                        // Extract profit from incoming promos
+                        const incomingPromoProfitForMonth = data.filteredReports
+                            .filter(cd => cd.promoEnabled && cd.promoPayToShop === shop.name)
+                            .reduce((sum, cd) => sum + (cd.promoNetProfit || 0), 0);
+
                         const netProfitForMonth = data.filteredReports
                             .filter(cd => cd.shop === shop.name)
                             .reduce((sum, cd) => {
                                 const effectiveMargin = getMarginForReport(cd, saleMargin); 
                                 const marginToUse = (effectiveMargin / 100);
                                 return sum + (cd.grandTotalKhr * marginToUse);
-                            }, 0);
+                            }, 0) + incomingPromoProfitForMonth; // Phase 2 injection
                         
                         const totalNetIncomeForMonth = netProfitForMonth - bizExpenseForMonth;
                         
-                        // --- UPDATED: Assign GCA Liability to the Holder (Shareholder OR Employee) ---
+                        // Missing monthly computations for the UI
+                        const totalPOsForMonth = data.filteredPurchaseOrders.filter(po => po.shop === shop.name).reduce((sum, po) => sum + ((po.amountKhr || 0) + (po.amountUsd || 0) * data.exchangeRate), 0);
+                        const transfersInForMonth = data.filteredInternalTransfers.filter(it => it.toShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
+                        const transfersOutForMonth = data.filteredInternalTransfers.filter(it => it.fromShop === shop.name && (it.status || 'Confirmed') === 'Confirmed').reduce((sum, it) => sum + (it.amountKhr || 0) + ((it.amountUsd || 0) * data.exchangeRate), 0);
+
+                        // --- FIX: Strict Mathematical Mapping for GCA and P&L ---
+                        let gcaDistributed = false;
                         if (shop.gcaHolderName && shareholderData[shop.gcaHolderName]) {
-                            // The holder gets 100% of the GCA liability for this shop visually
-                            // (Note: This assumes 1 shop = 1 holder. If multiple, logic splits. Currently 1:1)
                             shareholderData[shop.gcaHolderName].totalGCA += currentGCA; 
-                        } else {
-                            // Fallback: If no holder assigned, split GCA by equity (Legacy behavior)
-                            (shop.shareholders || []).forEach(sh => {
+                            gcaDistributed = true;
+                        } else if (shop.shareholders && shop.shareholders.length > 0) {
+                            shop.shareholders.forEach(sh => {
                                 if(shareholderData[sh.name]) {
                                     shareholderData[sh.name].totalGCA += currentGCA * (sh.percentage / 100);
                                 }
                             });
+                            gcaDistributed = true;
                         }
-                        // -----------------------------------------------------------------------------
-    
-                        // Distribute Net Income (Always by Equity)
-                        (shop.shareholders || []).forEach(sh => {
-                            if(shareholderData[sh.name]) {
-                                shareholderData[sh.name].totalNetSale += netSaleForMonth * (sh.percentage / 100);
-                                shareholderData[sh.name].totalNetProfit += netProfitForMonth * (sh.percentage / 100);
-                                shareholderData[sh.name].totalNetIncome += totalNetIncomeForMonth * (sh.percentage / 100);
-                                shareholderData[sh.name].totalBizExpense += bizExpenseForMonth * (sh.percentage / 100);
-                            }
-                        });
+
+                        let pnlDistributed = false;
+                        if (shop.shareholders && shop.shareholders.length > 0) {
+                            shop.shareholders.forEach(sh => {
+                                if(shareholderData[sh.name]) {
+                                    shareholderData[sh.name].totalNetSale += netSaleForMonth * (sh.percentage / 100);
+                                    shareholderData[sh.name].totalNetProfit += netProfitForMonth * (sh.percentage / 100);
+                                    shareholderData[sh.name].totalNetIncome += totalNetIncomeForMonth * (sh.percentage / 100);
+                                    shareholderData[sh.name].totalBizExpense += bizExpenseForMonth * (sh.percentage / 100);
+                                }
+                            });
+                            pnlDistributed = true;
+                        }
+                        
+                        // Failsafe to protect orphaned data missing from the Shareholder table
+                        if (!gcaDistributed) shareholderData['Unassigned Equity'].totalGCA += currentGCA;
+                        if (!pnlDistributed) {
+                            shareholderData['Unassigned Equity'].totalNetSale += netSaleForMonth;
+                            shareholderData['Unassigned Equity'].totalNetProfit += netProfitForMonth;
+                            shareholderData['Unassigned Equity'].totalNetIncome += totalNetIncomeForMonth;
+                            shareholderData['Unassigned Equity'].totalBizExpense += bizExpenseForMonth;
+                        }
+                        // -------------------------------------------------------
+                        
+                        // MUST Return the object mapping for shopCalculations array
+                        return { 
+                            name: shop.name, 
+                            currentGCA, 
+                            netSale: netSaleForMonth, 
+                            netProfit: netProfitForMonth, 
+                            totalBizExpense: bizExpenseForMonth, 
+                            totalPO: totalPOsForMonth,
+                            totalTransIn: transfersInForMonth,
+                            totalTransOut: transfersOutForMonth,
+                            totalNetIncome: totalNetIncomeForMonth,
+                            holderName: shop.gcaHolderName
+                        };
                     });
     
-                    // --- FIX: Process Family Expenses for Shareholders ---
-                    data.filteredFamilyExpenses.forEach(expense => {
+                    // --- NEW: Sort shopCalculations by GCA Holder Name to group them in the UI ---
+                    shopCalculations.sort((a, b) => {
+                        const holderA = a.holderName || 'Unassigned';
+                        const holderB = b.holderName || 'Unassigned';
+                        if (holderA === 'Unassigned' && holderB !== 'Unassigned') return 1; // Put unassigned at bottom
+                        if (holderA !== 'Unassigned' && holderB === 'Unassigned') return -1;
+                        if (holderA < holderB) return -1;
+                        if (holderA > holderB) return 1;
+                        // If same holder, sort alphabetically by shop name
+                        if (a.name < b.name) return -1;
+                        if (a.name > b.name) return 1;
+                        return 0;
+                    });
+                    // -----------------------------------------------------------------------------
+    
+                    // --- FIX: Secure Family Expenses (Admin Only) ---
+                    const allowedFamilyExpenses = (userData?.role === 'Admin' || userData?.role === 'Management') 
+                        ? data.filteredFamilyExpenses 
+                        : [];
+                        
+                    allowedFamilyExpenses.forEach(expense => {
                         const personName = expense.paidBy;
                         if (personName) {
-                            // Ensure the person exists in the tracking object in case they have expenses but no shop equity
                             if (!shareholderData[personName]) {
                                 shareholderData[personName] = { 
                                     totalNetSale: 0, totalNetProfit: 0, totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, 
@@ -15121,11 +15167,10 @@
                                     gcaHoldingShops: [], isEmployee: false
                                 };
                             }
-                            // Add the family expense total
                             shareholderData[personName].familyExpense += (expense.totalAmountKhr || 0);
                         }
                     });
-                    // -----------------------------------------------------
+                    // ------------------------------------------------
     
                     Object.keys(shareholderData).forEach(name => {
                         const d = shareholderData[name];
@@ -15134,6 +15179,13 @@
                         d.totalCOH = d.finalNetIncome + d.totalGCA;
                     });
                     
+                    // --- FIX: Remove 'Unassigned Equity' from UI if it has no orphaned financial data ---
+                    const unassigned = shareholderData['Unassigned Equity'];
+                    if (unassigned && unassigned.totalGCA === 0 && unassigned.totalNetSale === 0 && unassigned.totalBizExpense === 0) {
+                        delete shareholderData['Unassigned Equity'];
+                    }
+                    // ------------------------------------------------------------------------------------
+
                     const shareholderTotals = Object.values(shareholderData).reduce((acc, d) => {
                         acc.totalNetSale += d.totalNetSale;
                         acc.totalNetProfit += d.totalNetProfit;
@@ -15147,8 +15199,21 @@
                         return acc;
                     }, { totalNetSale: 0, totalNetProfit: 0, totalGCA: 0, totalNetIncome: 0, totalBizExpense: 0, familyExpense: 0, totalExpense: 0, finalNetIncome: 0, totalCOH: 0 });
     
+                    // Define shopTotals explicitly
+                    const shopTotals = shopCalculations.reduce((acc, shop) => {
+                        acc.currentGCA += shop.currentGCA;
+                        acc.netSale += shop.netSale;
+                        acc.netProfit += shop.netProfit;
+                        acc.totalPO += shop.totalPO;
+                        acc.totalTransIn += shop.totalTransIn;
+                        acc.totalTransOut += shop.totalTransOut;
+                        acc.totalBizExpense += shop.totalBizExpense;
+                        acc.totalNetIncome += shop.totalNetIncome;
+                        return acc;
+                    }, { currentGCA: 0, netSale: 0, netProfit: 0, totalPO: 0, totalTransIn: 0, totalTransOut: 0, totalBizExpense: 0, totalNetIncome: 0 });
+
                     return { shopCalculations, shopTotals, shareholderData, shareholderTotals };
-                }, [data, getMarginForReport, closedSnapshot, lossAndRecovery, gcaHistory]); // <-- ADDED closedSnapshot as dependency
+                }, [data, getMarginForReport, closedSnapshot, lossAndRecovery, gcaHistory, availableShops, userData]); 
     
                 // --- NEW: Handlers for Month-End Close ---
                 const executeCloseMonth = async () => {
@@ -15247,66 +15312,79 @@
                             
                             {/* 1. Mobile Card View (md:hidden) */}
                             <div className="md:hidden space-y-4">
-                                {shopCalculations.map((shop, index) => (
-                                    <div key={shop.name} className="bg-slate-800 border border-slate-700 rounded-xl p-4 shadow-lg relative overflow-hidden">
-                                        <div className="flex justify-between items-center mb-3">
-                                            <div className="flex items-center gap-2">
-                                                <span className="flex items-center justify-center w-6 h-6 rounded-full bg-slate-700 text-xs font-bold text-slate-400">{index + 1}</span>
-                                                <div>
-                                                    <h4 className="font-bold text-slate-200">{shop.name}</h4>
-                                                    {/* --- NEW: Show Holder Name on Shop Card --- */}
-                                                    {shop.holderName && (
-                                                        <div className="flex items-center gap-1 mt-0.5">
-                                                            <span className="text-[9px] text-slate-500 uppercase font-bold">Holder:</span>
-                                                            <span className="text-[9px] text-blue-300 font-bold bg-blue-900/30 px-1.5 py-0.5 rounded border border-blue-500/20">{shop.holderName}</span>
-                                                        </div>
-                                                    )}
-                                                    {/* ------------------------------------------ */}
+                                {shopCalculations.map((shop, index) => {
+                                    const prevShop = shopCalculations[index - 1];
+                                    const currentHolder = shop.holderName || 'Unassigned';
+                                    const prevHolder = prevShop ? (prevShop.holderName || 'Unassigned') : null;
+                                    const isNewGroup = currentHolder !== prevHolder;
+                                    
+                                    return (
+                                    <React.Fragment key={shop.name}>
+                                        {isNewGroup && (
+                                            <div className="pt-2 pb-1 border-b border-slate-700/50 flex items-center gap-2 text-blue-300 font-bold uppercase text-[11px] tracking-wider mt-2">
+                                                <Icon name="Users" size={14} /> {currentHolder}
+                                            </div>
+                                        )}
+                                        <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 shadow-lg relative overflow-hidden">
+                                            <div className="flex justify-between items-center mb-3">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="flex items-center justify-center w-6 h-6 rounded-full bg-slate-700 text-xs font-bold text-slate-400">{index + 1}</span>
+                                                    <div>
+                                                        <h4 className="font-bold text-slate-200">{shop.name}</h4>
+                                                        {/* --- NEW: Show Holder Name on Shop Card --- */}
+                                                        {shop.holderName && (
+                                                            <div className="flex items-center gap-1 mt-0.5">
+                                                                <span className="text-[9px] text-slate-500 uppercase font-bold">Holder:</span>
+                                                                <span className="text-[9px] text-blue-300 font-bold bg-blue-900/30 px-1.5 py-0.5 rounded border border-blue-500/20">{shop.holderName}</span>
+                                                            </div>
+                                                        )}
+                                                        {/* ------------------------------------------ */}
+                                                    </div>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-[10px] uppercase text-slate-500 font-bold">Current GCA</p>
+                                                    <p className="font-mono font-bold text-emerald-400">{formatCurrency(shop.currentGCA, 'KHR').replace('៛', '')}</p>
                                                 </div>
                                             </div>
-                                            <div className="text-right">
-                                                <p className="text-[10px] uppercase text-slate-500 font-bold">Current GCA</p>
-                                                <p className="font-mono font-bold text-emerald-400">{formatCurrency(shop.currentGCA, 'KHR').replace('៛', '')}</p>
+                                            
+                                            <div className="grid grid-cols-2 gap-3 mb-3 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
+                                                <div>
+                                                    <p className="text-[10px] text-slate-500 uppercase">Net Sale</p>
+                                                    <p className="font-mono text-xs text-slate-300">{shop.netSale.toLocaleString()}</p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-[10px] text-slate-500 uppercase">Net Profit</p>
+                                                    <p className="font-mono text-xs text-green-400">{shop.netProfit.toLocaleString()}</p>
+                                                </div>
+                                                <div>
+                                                    <p className="text-[10px] text-slate-500 uppercase">Biz Expense</p>
+                                                    <p className="font-mono text-xs text-red-400">{shop.totalBizExpense.toLocaleString()}</p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-[10px] text-slate-500 uppercase">Total PO</p>
+                                                    <p className="font-mono text-xs text-orange-400">{shop.totalPO.toLocaleString()}</p>
+                                                </div>
+                                                {/* --- NEW: Transfer Info --- */}
+                                                <div>
+                                                    <p className="text-[10px] text-slate-500 uppercase">Trans IN</p>
+                                                    <p className="font-mono text-xs text-blue-300">{shop.totalTransIn.toLocaleString()}</p>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="text-[10px] text-slate-500 uppercase">Trans OUT</p>
+                                                    <p className="font-mono text-xs text-red-300">{shop.totalTransOut.toLocaleString()}</p>
+                                                </div>
+                                                {/* -------------------------- */}
+                                            </div>
+        
+                                            <div className="flex justify-between items-center pt-2 border-t border-slate-700/50">
+                                                <span className="text-xs font-bold text-slate-400 uppercase tracking-wide">Net Income</span>
+                                                <span className={`font-mono text-lg font-bold ${shop.totalNetIncome >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
+                                                    {formatCurrency(shop.totalNetIncome, 'KHR')}
+                                                </span>
                                             </div>
                                         </div>
-                                        
-                                        <div className="grid grid-cols-2 gap-3 mb-3 bg-slate-900/50 p-3 rounded-lg border border-slate-700/50">
-                                            <div>
-                                                <p className="text-[10px] text-slate-500 uppercase">Net Sale</p>
-                                                <p className="font-mono text-xs text-slate-300">{shop.netSale.toLocaleString()}</p>
-                                            </div>
-                                            <div className="text-right">
-                                                <p className="text-[10px] text-slate-500 uppercase">Net Profit</p>
-                                                <p className="font-mono text-xs text-green-400">{shop.netProfit.toLocaleString()}</p>
-                                            </div>
-                                            <div>
-                                                <p className="text-[10px] text-slate-500 uppercase">Biz Expense</p>
-                                                <p className="font-mono text-xs text-red-400">{shop.totalBizExpense.toLocaleString()}</p>
-                                            </div>
-                                            <div className="text-right">
-                                                <p className="text-[10px] text-slate-500 uppercase">Total PO</p>
-                                                <p className="font-mono text-xs text-orange-400">{shop.totalPO.toLocaleString()}</p>
-                                            </div>
-                                            {/* --- NEW: Transfer Info --- */}
-                                            <div>
-                                                <p className="text-[10px] text-slate-500 uppercase">Trans IN</p>
-                                                <p className="font-mono text-xs text-blue-300">{shop.totalTransIn.toLocaleString()}</p>
-                                            </div>
-                                            <div className="text-right">
-                                                <p className="text-[10px] text-slate-500 uppercase">Trans OUT</p>
-                                                <p className="font-mono text-xs text-red-300">{shop.totalTransOut.toLocaleString()}</p>
-                                            </div>
-                                            {/* -------------------------- */}
-                                        </div>
-    
-                                        <div className="flex justify-between items-center pt-2 border-t border-slate-700/50">
-                                            <span className="text-xs font-bold text-slate-400 uppercase tracking-wide">Net Income</span>
-                                            <span className={`font-mono text-lg font-bold ${shop.totalNetIncome >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
-                                                {formatCurrency(shop.totalNetIncome, 'KHR')}
-                                            </span>
-                                        </div>
-                                    </div>
-                                ))}
+                                    </React.Fragment>
+                                )})}
                             </div>
     
                             {/* 2. Desktop Table View (hidden md:block) */}
