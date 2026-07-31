@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -10939,48 +10938,56 @@
 
             // Filter and sort requests for display
             const { pendingRequests, historyRequests } = useMemo(() => {
-                const filtered = requests.filter(req => {
-                    if (!req[dateField]) return false;
-                    const now = new Date();
-                    let dateMatch = false;
-                    switch (filterPeriod) {
-                        case 'thisWeek':
-                            const startOfWeek = new Date(now);
-                            startOfWeek.setDate(now.getDate() - now.getDay());
-                            startOfWeek.setHours(0, 0, 0, 0);
-                            const endOfWeek = new Date(startOfWeek);
-                            endOfWeek.setDate(startOfWeek.getDate() + 6);
-                            endOfWeek.setHours(23, 59, 59, 999);
-                            const reqDate = new Date(req[dateField]);
-                            dateMatch = reqDate >= startOfWeek && reqDate <= endOfWeek;
-                            break;
-                        // FIX: The following cases now use local date components to avoid timezone errors.
-                        case 'thisMonth':
-                            const year_tm = now.getFullYear();
-                            const month_tm = String(now.getMonth() + 1).padStart(2, '0');
-                            dateMatch = req[dateField].startsWith(`${year_tm}-${month_tm}`);
-                            break;
-                        case 'lastMonth':
-                            const lastMonthDate = new Date();
-                            lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
-                            const year_lm = lastMonthDate.getFullYear();
-                            const month_lm = String(lastMonthDate.getMonth() + 1).padStart(2, '0');
-                            dateMatch = req[dateField].startsWith(`${year_lm}-${month_lm}`);
-                            break;
-                        case 'thisYear':
-                            dateMatch = req[dateField].startsWith(now.getFullYear().toString());
-                            break;
-                        case 'custom':
-                            dateMatch = req[dateField] === customDate;
-                            break;
-                        default:
-                            dateMatch = true;
-                    }
-                    return dateMatch && (!selectedShop || req.shop === selectedShop) && (!selectedEmployeeId || req.staffId === selectedEmployeeId);
-                });
+                // --- FIX: ALWAYS SHOW PENDING REQUESTS ---
+                // Pending requests skip the date filter completely, so management always has a clear picture.
+                // They still respect the Shop and Employee filters.
+                const pending = requests
+                    .filter(req => req.status === 'Pending')
+                    .filter(req => (!selectedShop || req.shop === selectedShop) && (!selectedEmployeeId || req.staffId === selectedEmployeeId))
+                    .sort((a, b) => (b[submissionDateField]?.toDate() || 0) - (a[submissionDateField]?.toDate() || 0));
 
-                const pending = filtered.filter(req => req.status === 'Pending').sort((a, b) => (b[submissionDateField]?.toDate() || 0) - (a[submissionDateField]?.toDate() || 0));
-                const history = filtered.filter(req => req.status !== 'Pending').sort((a, b) => (b[submissionDateField]?.toDate() || 0) - (a[submissionDateField]?.toDate() || 0));
+                // History requests apply the strict date filtering logic
+                const history = requests
+                    .filter(req => req.status !== 'Pending')
+                    .filter(req => {
+                        if (!req[dateField]) return false;
+                        const now = new Date();
+                        let dateMatch = false;
+                        switch (filterPeriod) {
+                            case 'thisWeek':
+                                const startOfWeek = new Date(now);
+                                startOfWeek.setDate(now.getDate() - now.getDay());
+                                startOfWeek.setHours(0, 0, 0, 0);
+                                const endOfWeek = new Date(startOfWeek);
+                                endOfWeek.setDate(startOfWeek.getDate() + 6);
+                                endOfWeek.setHours(23, 59, 59, 999);
+                                const reqDate = new Date(req[dateField]);
+                                dateMatch = reqDate >= startOfWeek && reqDate <= endOfWeek;
+                                break;
+                            case 'thisMonth':
+                                const year_tm = now.getFullYear();
+                                const month_tm = String(now.getMonth() + 1).padStart(2, '0');
+                                dateMatch = req[dateField].startsWith(`${year_tm}-${month_tm}`);
+                                break;
+                            case 'lastMonth':
+                                const lastMonthDate = new Date();
+                                lastMonthDate.setMonth(lastMonthDate.getMonth() - 1);
+                                const year_lm = lastMonthDate.getFullYear();
+                                const month_lm = String(lastMonthDate.getMonth() + 1).padStart(2, '0');
+                                dateMatch = req[dateField].startsWith(`${year_lm}-${month_lm}`);
+                                break;
+                            case 'thisYear':
+                                dateMatch = req[dateField].startsWith(now.getFullYear().toString());
+                                break;
+                            case 'custom':
+                                dateMatch = req[dateField] === customDate;
+                                break;
+                            default:
+                                dateMatch = true;
+                        }
+                        return dateMatch && (!selectedShop || req.shop === selectedShop) && (!selectedEmployeeId || req.staffId === selectedEmployeeId);
+                    })
+                    .sort((a, b) => (b[submissionDateField]?.toDate() || 0) - (a[submissionDateField]?.toDate() || 0));
                 
                 return { pendingRequests: pending, historyRequests: history };
             }, [requests, selectedShop, selectedEmployeeId, filterPeriod, customDate, dateField, submissionDateField]);
@@ -21714,6 +21721,211 @@ service cloud.firestore {
             );
         });
 
+        // --- NEW: PHASE 1 - AI PAYROLL ESTIMATOR ENGINE (DATA LAYER ONLY) ---
+        const useLiveShopPayrollEstimate = () => {
+            const { db } = useFirebase();
+            const { shops, employees, shifts, publicHolidays, systemSettings } = useAppData();
+            
+            const [status, setStatus] = useState('idle'); // idle, fetching, calculating, complete, error
+            const [progress, setProgress] = useState({ current: 0, total: 0 });
+            const [estimateData, setEstimateData] = useState(null);
+            const [error, setError] = useState(null);
+
+            const runEstimate = useCallback(async (selectedShop, selectedMonth) => {
+                if (!selectedShop || !selectedMonth || !db) return;
+                
+                setStatus('fetching');
+                setEstimateData(null);
+                setError(null);
+                
+                try {
+                    const { collection, query, where, getDocs } = window.firebaseSDK;
+                    const [y, m] = selectedMonth.split('-').map(Number);
+                    const startOfMonth = new Date(y, m - 1, 1);
+                    // Add timezone buffer for attendance
+                    const bufferStart = new Date(startOfMonth);
+                    bufferStart.setDate(bufferStart.getDate() - 2);
+                    const endOfMonth = new Date(y, m, 0, 23, 59, 59, 999);
+                    const bufferEnd = new Date(endOfMonth);
+                    bufferEnd.setDate(bufferEnd.getDate() + 2);
+                    
+                    const startStr = `${selectedMonth}-01`;
+                    const endStr = `${selectedMonth}-31`;
+
+                    // 1. Fetch all required payroll data for this shop ONLY to save DB quotas
+                    const attQ = query(collection(db, 'attendance'), where('shop', '==', selectedShop), where('timestamp', '>=', bufferStart), where('timestamp', '<=', bufferEnd));
+                    const leaveQ = query(collection(db, 'leaveRequests'), where('shop', '==', selectedShop), where('returnDate', '>=', startStr));
+                    const otQ = query(collection(db, 'otRequests'), where('shop', '==', selectedShop), where('reqDate', '>=', startStr), where('reqDate', '<=', endStr));
+                    const stateQ = query(collection(db, 'employeeStates'), where('shop', '==', selectedShop), where('date', '>=', startStr), where('date', '<=', endStr));
+                    const loanQ = query(collection(db, 'staffLoans'), where('shop', '==', selectedShop), where('status', '==', 'Active'));
+                    const allowQ = query(collection(db, 'allowances'), where('shop', '==', selectedShop), where('status', '==', 'Approved'));
+                    const revQ = query(collection(db, 'salaryRevisions'), where('shopName', '==', selectedShop));
+
+                    const [attSnap, leaveSnap, otSnap, stateSnap, loanSnap, allowSnap, revSnap] = await Promise.all([
+                        getDocs(attQ), getDocs(leaveQ), getDocs(otQ), getDocs(stateQ), getDocs(loanQ), getDocs(allowQ), getDocs(revQ)
+                    ]);
+
+                    const shopAllData = {
+                        shops, shifts, publicHolidays, systemSettings,
+                        attendance: attSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        leaveRequests: leaveSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        otRequests: otSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        staffLoans: loanSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        employeeStates: stateSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        allowances: allowSnap.docs.map(d => ({id: d.id, ...d.data()})),
+                        salaryRevisions: revSnap.docs.map(d => ({id: d.id, ...d.data()}))
+                    };
+
+                    // 2. Identify Employees for this shop
+                    const targetEmployees = employees.filter(e => {
+                        if (e.status !== 'Active') return false;
+                        const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                        return empShops.includes(selectedShop);
+                    });
+
+                    setStatus('calculating');
+                    setProgress({ current: 0, total: targetEmployees.length });
+
+                    // 3. Yielding Calculation Loop
+                    let totalGross = 0;
+                    let totalBase = 0;
+                    let totalOT = 0;
+                    let totalAllowances = 0;
+                    let totalEngagements = 0;
+                    let totalDeductions = 0;
+                    let totalNet = 0;
+                    let activeStaffCount = 0;
+
+                    for (let i = 0; i < targetEmployees.length; i++) {
+                        const emp = targetEmployees[i];
+                        
+                        // Execute massive calculation engine IN MEMORY
+                        const { calculations } = calculatePayrollForEmployee(emp, selectedMonth, shopAllData, undefined, [], null);
+                        
+                        if (calculations && calculations.grossSalary > 0) {
+                            totalGross += calculations.grossSalary;
+                            totalBase += calculations.baseSalaryEarned;
+                            totalOT += calculations.otSalary;
+                            totalAllowances += calculations.totalAllowance;
+                            totalEngagements += calculations.engagements;
+                            totalDeductions += calculations.totalDeductions;
+                            totalNet += calculations.netSalary;
+                            activeStaffCount++;
+                        }
+
+                        setProgress({ current: i + 1, total: targetEmployees.length });
+                        
+                        // YIELD MAIN THREAD: Unblocks the UI so Dashboard remains perfectly smooth!
+                        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+                    }
+
+                    setEstimateData({
+                        totalGross, totalBase, totalOT, totalAllowances, totalEngagements, totalDeductions, totalNet,
+                        activeStaffCount
+                    });
+                    setStatus('complete');
+
+                } catch (err) {
+                    console.error("AI Estimator Engine Error:", err);
+                    setStatus('error');
+                    setError(err.message);
+                }
+            }, [db, employees, shops, shifts, publicHolidays, systemSettings]);
+
+            return { runEstimate, status, progress, estimateData, error };
+        };
+
+        // --- PHASE 1 ONLY: BAREBONES DATA LAYER TEST UI ---
+        const AIPayrollWidget = memo(({ userProfile }) => {
+            const { shops } = useAppData();
+            const [selectedShop, setSelectedShop] = useState('');
+            const [selectedMonth, setSelectedMonth] = useState(() => new Date().toISOString().slice(0, 7));
+            
+            const availableShops = useAllowedShops(userProfile, shops);
+            
+            // Phase 1: Using the separated Engine Hook
+            const { runEstimate, status, progress, estimateData, error } = useLiveShopPayrollEstimate();
+            
+            useEffect(() => {
+                if (userProfile && availableShops.length > 0 && !selectedShop) {
+                    setSelectedShop(availableShops[0].name);
+                }
+            }, [userProfile, availableShops]);
+
+            return (
+                <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-lg overflow-hidden flex flex-col relative group">
+                    <div className="p-5 border-b border-slate-800 flex flex-col sm:flex-row justify-between items-start sm:items-center bg-slate-900/80 gap-4 relative z-10">
+                        <div className="flex items-center gap-3">
+                            <div className="p-2 bg-indigo-500/10 rounded-lg text-indigo-400 border border-indigo-500/20 shadow-inner">
+                                <i className="fas fa-database text-xl"></i>
+                            </div>
+                            <div>
+                                <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                                    Payroll Aggregation Engine
+                                    <span className="text-[9px] bg-indigo-600 text-white px-2 py-0.5 rounded-full uppercase tracking-wider font-bold">Phase 1 Data Layer</span>
+                                </h3>
+                                <p className="text-xs text-slate-400">Read-Only Background Processing</p>
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 w-full sm:w-auto">
+                            <select value={selectedShop} onChange={e => setSelectedShop(e.target.value)} className="select w-full sm:w-auto text-sm border-slate-700 bg-slate-800" disabled={status === 'fetching' || status === 'calculating'}>
+                                <option value="">Select Shop</option>
+                                {availableShops.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+                            </select>
+                            <input type="month" value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)} className="input w-full sm:w-auto text-sm border-slate-700 bg-slate-800" disabled={status === 'fetching' || status === 'calculating'} />
+                            <Button 
+                                onClick={() => runEstimate(selectedShop, selectedMonth)} 
+                                disabled={status === 'fetching' || status === 'calculating' || !selectedShop}
+                                className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold whitespace-nowrap shadow-lg shadow-indigo-900/20"
+                            >
+                                {status === 'fetching' || status === 'calculating' ? <><i className="fas fa-spinner fa-spin mr-2"></i> Running...</> : <><i className="fas fa-play mr-2"></i> Test Engine</>}
+                            </Button>
+                        </div>
+                    </div>
+
+                    <div className="p-5 relative z-10 min-h-[200px]">
+                        {status === 'idle' && (
+                            <div className="text-center py-10 text-slate-500">
+                                <i className="fas fa-server text-4xl mb-3 opacity-30"></i>
+                                <p className="text-sm">Engine ready. Click <strong>Test Engine</strong> to run the Phase 1 background calculation<br/>and output the raw JSON data.</p>
+                            </div>
+                        )}
+
+                        {(status === 'fetching' || status === 'calculating') && (
+                            <div className="text-center py-10">
+                                <i className="fas fa-cog fa-spin text-4xl text-indigo-500 mb-4"></i>
+                                <p className="text-sm text-slate-300 font-bold">{status === 'fetching' ? 'Aggregating Database Records...' : 'Processing Engine In-Memory...'}</p>
+                                {status === 'calculating' && progress.total > 0 && (
+                                    <div className="w-full max-w-xs mx-auto mt-4">
+                                        <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                                            <div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${(progress.current / progress.total) * 100}%` }}></div>
+                                        </div>
+                                        <p className="text-[10px] text-slate-500 mt-2 font-mono">{progress.current} / {progress.total} Staff Analyzed</p>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {error && (
+                            <div className="p-4 bg-red-900/20 border border-red-500/50 rounded-lg text-red-400 text-center">
+                                <i className="fas fa-exclamation-triangle mr-2"></i> {error}
+                            </div>
+                        )}
+
+                        {status === 'complete' && estimateData && (
+                            <div className="animate-fade-in p-4 bg-slate-950 rounded-lg border border-slate-700">
+                                <h4 className="text-sm font-bold text-slate-200 mb-4 border-b border-slate-800 pb-2">Phase 1 Output (Raw Data):</h4>
+                                <pre className="text-xs text-green-400 font-mono overflow-x-auto">
+                                    {JSON.stringify(estimateData, null, 2)}
+                                </pre>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        });
+
         // FIX: Wrapped DashboardSummaryPage in memo to prevent it from re-rendering every second 
         // when the parent AppContent's clock updates. This stabilizes the children widgets (like TeamStatus)
         // and fixes touch interaction issues on mobile.
@@ -22685,20 +22897,25 @@ service cloud.firestore {
                             />
                         </div>
 
-                        {/* REMOVED: Memo Board Widget was here */}
+                        {/* --- NEW: AI PAYROLL ESTIMATOR (Order 6 - Spans Full Width) --- */}
+                        {(userProfile.role === 'Admin' || userProfile.role === 'CEO' || userProfile.role === 'Shop Manager') && (
+                            <div className="order-6 col-span-2 lg:order-6 lg:col-span-full h-auto">
+                                <AIPayrollWidget userProfile={userProfile} />
+                            </div>
+                        )}
 
-                        {/* NEW: TOP 5 STATS WIDGET (Order 6 - New Widget) */}
-                        <div className="order-6 col-span-2 lg:order-6 lg:col-span-2 h-[500px] lg:h-auto">
+                        {/* TOP 5 STATS WIDGET (Order 7) */}
+                        <div className="order-7 col-span-2 lg:order-7 lg:col-span-2 h-[500px] lg:h-auto">
                             <TopStatsWidget topStats={topStats} loading={isLoading} />
                         </div>
 
-                        {/* NEW POSITION: 7. BIRTHDAY CELEBRATIONS (Order 7) */}
-                        <div className="order-7 col-span-2 lg:order-7 lg:col-span-2 h-full min-h-[120px]">
+                        {/* BIRTHDAY CELEBRATIONS (Order 8) */}
+                        <div className="order-8 col-span-2 lg:order-8 lg:col-span-2 h-full min-h-[120px]">
                             <BirthdayWidget employees={activeEmployees} compact={true} />
                         </div>
 
-                        {/* NEW: MY ASSETS FOR ADMIN/MANAGER (Order 8) */}
-                        <div className="order-8 col-span-2 lg:order-8 lg:col-span-2 h-[400px] lg:h-auto">
+                        {/* MY ASSETS FOR ADMIN/MANAGER (Order 9) */}
+                        <div className="order-9 col-span-2 lg:order-9 lg:col-span-2 h-[400px] lg:h-auto">
                              <MyAssetsWidget assets={myAssets} loading={assetsLoading} />
                         </div>
 
