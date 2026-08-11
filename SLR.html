@@ -11707,8 +11707,8 @@
                 }, [isModalOpen, editingId, ingredients]);
 
                 // NEW: Calculate Total Cost Value for filtered logs (Received & Usage)
-                const { filteredLogsList, totalReceivedValue, totalUsageValue } = useMemo(() => {
-                    let result = logs;
+                const { filteredLogsList, totalReceivedValue, totalUsageValue, totalWasteValue, totalAuditValue } = useMemo(() => {
+                    let result = [...logs]; // Prevent state mutation
                     if (filterShop && filterShop !== 'All') {
                         result = result.filter(l => l.shopId === filterShop);
                     }
@@ -11736,29 +11736,26 @@
                         // Do nothing, keep all
                     }
 
-                    if (logsSearchQuery) {
-                        const lower = logsSearchQuery.toLowerCase();
-                        result = result.filter(l => {
-                            const ing = ingredients.find(i => i.id === l.ingredientId);
-                            const ingName = ing ? (ing.name || '').toLowerCase() : '';
-                            const ingCode = ing ? (ing.ingredientCode || '').toLowerCase() : '';
-                            const ref = (l.reference || '').toLowerCase();
-                            return ingName.includes(lower) || ingCode.includes(lower) || ref.includes(lower);
-                        });
-                    }
-
-                    if (logsTypeFilter !== 'All') {
-                        result = result.filter(l => l.type === logsTypeFilter);
-                    }
-                    
-                    const sortedLogs = result.sort((a, b) => b.timestamp - a.timestamp);
-                    
+                    // CALCULATE TOTALS BEFORE APPLYING SEARCH/TYPE FILTERS
+                    // This ensures the summary cards reflect the time period accurately
                     let receivedValue = 0;
                     let usageValue = 0;
+                    let wasteValue = 0;
+                    let auditValue = 0;
 
-                    sortedLogs.forEach(log => {
-                        if (log.type === 'Delivery' && log.cost) {
+                    result.forEach(log => {
+                        const ing = ingredients.find(i => i.id === log.ingredientId);
+                        const rate = ing ? (Number(ing.conversionRate) || 1) : 1;
+                        const costPerRecipeUnit = ing ? ((ing.conversionUnit && rate > 0) ? (Number(ing.costPerUnit || 0) / rate) : Number(ing.costPerUnit || 0)) : 0;
+
+                        if ((log.type === 'Delivery' || log.type === 'Restock') && log.cost) {
                             receivedValue += Number(log.cost);
+                        }
+                        if (log.type === 'Waste') {
+                            wasteValue += Math.abs(Number(log.amount || 0)) * costPerRecipeUnit;
+                        }
+                        if (log.type === 'Audit' || log.type === 'Adjustment') {
+                            auditValue += Number(log.amount || 0) * costPerRecipeUnit;
                         }
                     });
 
@@ -11784,8 +11781,61 @@
                         }
                     });
 
-                    return { filteredLogsList: sortedLogs, totalReceivedValue: receivedValue, totalUsageValue: usageValue };
-                }, [logs, filterShop, logFilter, ingredients, orders, historicalOrders, products]);
+                    // NOW APPLY SEARCH AND TYPE FILTERS FOR THE LIST DISPLAY
+                    if (logsSearchQuery) {
+                        const lower = logsSearchQuery.toLowerCase();
+                        result = result.filter(l => {
+                            const ing = ingredients.find(i => i.id === l.ingredientId);
+                            const ingName = ing ? (ing.name || '').toLowerCase() : '';
+                            const ingCode = ing ? (ing.ingredientCode || '').toLowerCase() : '';
+                            const ref = (l.reference || '').toLowerCase();
+                            return ingName.includes(lower) || ingCode.includes(lower) || ref.includes(lower);
+                        });
+                    }
+
+                    if (logsTypeFilter !== 'All') {
+                        result = result.filter(l => {
+                            // Support legacy types for backwards compatibility
+                            if (logsTypeFilter === 'Delivery') return l.type === 'Delivery' || l.type === 'Restock';
+                            if (logsTypeFilter === 'Audit') return l.type === 'Audit' || l.type === 'Adjustment';
+                            return l.type === logsTypeFilter;
+                        });
+                    }
+                    
+                    const sortedLogs = result.sort((a, b) => b.timestamp - a.timestamp);
+
+                    return { filteredLogsList: sortedLogs, totalReceivedValue: receivedValue, totalUsageValue: usageValue, totalWasteValue: wasteValue, totalAuditValue: auditValue };
+                }, [logs, filterShop, logFilter, ingredients, orders, historicalOrders, products, logsSearchQuery, logsTypeFilter]); // <-- FIX: Dependencies Added
+
+                const exportLogsCSV = () => {
+                    const headers = "Date_Time,Shop_Name,Ingredient,Type,Amount,Unit,Reference,Estimated_Cost_KHR\n";
+                    const rows = filteredLogsList.map(log => {
+                        const ing = ingredients.find(i => i.id === log.ingredientId);
+                        const unit = ing ? (ing.conversionUnit || ing.unit) : '';
+                        const ingName = ing ? ing.name : 'Deleted Item';
+                        const shopName = shops.find(s => s.id === log.shopId)?.name || 'Unknown';
+                        const dateStr = new Date(log.timestamp).toLocaleString();
+                        
+                        let estCost = 0;
+                        if (log.type === 'Delivery' && log.cost) {
+                            estCost = Number(log.cost);
+                        } else {
+                            const rate = ing ? (Number(ing.conversionRate) || 1) : 1;
+                            const costPerRecipeUnit = ing ? ((ing.conversionUnit && rate > 0) ? (Number(ing.costPerUnit || 0) / rate) : Number(ing.costPerUnit || 0)) : 0;
+                            estCost = Math.abs(Number(log.amount || 0)) * costPerRecipeUnit;
+                        }
+                        
+                        return `"${dateStr}","${shopName.replace(/"/g, '""')}","${ingName.replace(/"/g, '""')}","${log.type}",${log.amount},"${unit}","${(log.reference || '').replace(/"/g, '""')}",${Math.round(estCost)}`;
+                    }).join("\n");
+                    
+                    const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
+                    const link = document.createElement("a");
+                    link.href = URL.createObjectURL(blob);
+                    const d = new Date();
+                    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+                    link.download = `inventory_logs_export_${dateStr}.csv`;
+                    link.click();
+                };
 
                 const handleSubmit = async (e) => {
                     e.preventDefault();
@@ -11829,12 +11879,10 @@
                     for (const ing of ingredients) {
                         const inputVal = stocktakeData[ing.id];
                         if (inputVal !== undefined && inputVal !== '') {
-                            const physicalCountBase = Number(inputVal);
-                            if (!isNaN(physicalCountBase) && physicalCountBase >= 0) {
+                            const physicalCountConverted = Number(inputVal);
+                            if (!isNaN(physicalCountConverted) && physicalCountConverted >= 0) {
                                 const currentStock = ing.stockByShop?.[filterShop] || 0;
-                                const convRate = Number(ing.conversionRate) || 1;
                                 
-                                const physicalCountConverted = physicalCountBase * convRate;
                                 const varianceConverted = physicalCountConverted - currentStock;
 
                                 if (varianceConverted !== 0) {
@@ -11937,10 +11985,8 @@
 
                     const { doc, updateDoc, collection, addDoc, increment } = window.FirebaseApp;
 
-                    const wasteCountBase = Number(wasteData.qty);
-                    if (isNaN(wasteCountBase) || wasteCountBase <= 0) return alert("Please enter a valid quantity.");
-
-                    const wasteConverted = wasteCountBase * wasteData.conversionRate;
+                    const wasteConverted = Number(wasteData.qty);
+                    if (isNaN(wasteConverted) || wasteConverted <= 0) return alert("Please enter a valid quantity.");
 
                     try {
                         await updateDoc(doc(getColRef('ingredients'), wasteData.id), {
@@ -12014,6 +12060,9 @@
                                             onChange={e => setLogsSearchQuery(e.target.value)} 
                                         />
                                     </div>
+                                    <button onClick={exportLogsCSV} className="shrink-0 bg-green-600 text-white px-3 sm:px-4 py-2 rounded-xl font-bold shadow-md hover:bg-green-700 transition flex items-center justify-center text-sm">
+                                        <i className="fa-solid fa-file-csv sm:mr-1.5"></i> <span className="hidden sm:inline">Export</span>
+                                    </button>
                                 </>
                             )}
                             
@@ -12112,6 +12161,8 @@
                                                     const convRate = Number(ing.conversionRate) || 1;
                                                     const baseStock = currentStock / convRate;
                                                     const isLowStock = baseStock <= (ing.parLevel || 0);
+                                                    const recipeStock = currentStock;
+                                                    const displayUnit = ing.conversionUnit || ing.unit;
 
                                                     return (
                                                         <tr key={ing.id} className={`hover:bg-stone-50 transition-colors bg-white ${isLowStock && !isStocktakeMode ? 'bg-red-50/10' : ''}`}>
@@ -12128,7 +12179,7 @@
                                                             </td>
                                                             <td className="p-3 text-center">
                                                                 <div className={`text-lg font-black ${isLowStock ? 'text-red-600' : 'text-stone-800'}`}>
-                                                                    {baseStock.toLocaleString(undefined, {maximumFractionDigits: 2})} <span className="text-xs font-bold text-stone-500">{ing.unit}</span>
+                                                                    {recipeStock.toLocaleString(undefined, {maximumFractionDigits: 2})} <span className="text-xs font-bold text-stone-500">{displayUnit}</span>
                                                                 </div>
                                                             </td>
                                                             {isStocktakeMode && (
@@ -12140,9 +12191,9 @@
                                                                             className="w-full border-2 border-purple-200 focus:border-purple-500 outline-none rounded-lg pl-3 pr-10 py-1.5 font-black text-base bg-white shadow-inner transition-colors text-purple-900 text-center"
                                                                             value={stocktakeData[ing.id] !== undefined ? stocktakeData[ing.id] : ''}
                                                                             onChange={(e) => setStocktakeData({...stocktakeData, [ing.id]: e.target.value})}
-                                                                            placeholder={baseStock.toFixed(2)}
+                                                                            placeholder={recipeStock.toFixed(2)}
                                                                         />
-                                                                        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-stone-400 pointer-events-none">{ing.unit}</span>
+                                                                        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-stone-400 pointer-events-none">{displayUnit}</span>
                                                                     </div>
                                                                 </td>
                                                             )}
@@ -12150,14 +12201,14 @@
                                                                 <td className="p-3 text-center bg-amber-50/30">
                                                                     {stocktakeData[ing.id] !== undefined && stocktakeData[ing.id] !== '' ? (
                                                                         <div className={`text-xs font-bold inline-block px-2.5 py-1 rounded shadow-sm border ${(() => {
-                                                                            const variance = (Number(stocktakeData[ing.id]) * convRate) - currentStock;
+                                                                            const variance = Number(stocktakeData[ing.id]) - recipeStock;
                                                                             if (variance === 0) return 'text-stone-500 border-stone-200 bg-stone-100';
                                                                             return variance > 0 ? 'text-green-700 border-green-200 bg-green-50' : 'text-red-700 border-red-200 bg-red-50';
                                                                         })()}`}>
                                                                             {(() => {
-                                                                                const varianceBase = Number(stocktakeData[ing.id]) - baseStock;
-                                                                                if (varianceBase === 0) return <><i className="fa-solid fa-check mr-1"></i> Match</>;
-                                                                                return `${varianceBase > 0 ? '+' : ''}${varianceBase.toFixed(2)}`;
+                                                                                const variance = Number(stocktakeData[ing.id]) - recipeStock;
+                                                                                if (variance === 0) return <><i className="fa-solid fa-check mr-1"></i> Match</>;
+                                                                                return `${variance > 0 ? '+' : ''}${variance.toFixed(2)}`;
                                                                             })()}
                                                                         </div>
                                                                     ) : <span className="text-stone-300">-</span>}
@@ -12181,7 +12232,7 @@
                                                                                 name: ing.name,
                                                                                 qty: '',
                                                                                 reason: 'Expired',
-                                                                                unit: ing.unit,
+                                                                                unit: displayUnit,
                                                                                 conversionUnit: ing.conversionUnit,
                                                                                 conversionRate: convRate
                                                                             });
@@ -12209,6 +12260,8 @@
                                         const convRate = Number(ing.conversionRate) || 1;
                                         const baseStock = currentStock / convRate;
                                         const isLowStock = baseStock <= (ing.parLevel || 0);
+                                        const recipeStock = currentStock;
+                                        const displayUnit = ing.conversionUnit || ing.unit;
 
                                         return (
                                             <div key={ing.id} className={`bg-white rounded-xl border ${isLowStock && !isStocktakeMode ? 'border-red-300 shadow-sm' : 'border-stone-200 shadow-sm'} overflow-hidden flex flex-col relative transition-all duration-300`}>
@@ -12234,7 +12287,7 @@
                                                     {isStocktakeMode ? (
                                                         <div className="flex flex-col gap-2">
                                                             <div className="flex justify-between items-center mb-0.5">
-                                                                <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">Sys: {baseStock.toLocaleString(undefined, {maximumFractionDigits: 2})} {ing.unit}</span>
+                                                                <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider">Sys: {recipeStock.toLocaleString(undefined, {maximumFractionDigits: 2})} {displayUnit}</span>
                                                                 <span className="text-[10px] font-bold text-purple-600 uppercase tracking-wider">Physical Count</span>
                                                             </div>
                                                             <div className="relative">
@@ -12244,20 +12297,20 @@
                                                                     className="w-full border-2 border-purple-200 focus:border-purple-500 outline-none rounded-lg pl-3 pr-10 py-2 font-black text-lg bg-white shadow-inner transition-colors text-purple-900"
                                                                     value={stocktakeData[ing.id] !== undefined ? stocktakeData[ing.id] : ''}
                                                                     onChange={(e) => setStocktakeData({...stocktakeData, [ing.id]: e.target.value})}
-                                                                    placeholder={baseStock.toFixed(2)}
+                                                                    placeholder={recipeStock.toFixed(2)}
                                                                 />
-                                                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-stone-400 pointer-events-none">{ing.unit}</span>
+                                                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-stone-400 pointer-events-none">{displayUnit}</span>
                                                             </div>
                                                             {stocktakeData[ing.id] !== undefined && stocktakeData[ing.id] !== '' && (
                                                                 <div className={`text-[10px] font-bold bg-white px-2 py-1 rounded shadow-sm border text-center ${(() => {
-                                                                    const variance = (Number(stocktakeData[ing.id]) * convRate) - currentStock;
+                                                                    const variance = Number(stocktakeData[ing.id]) - recipeStock;
                                                                     if (variance === 0) return 'text-stone-400 border-stone-200';
                                                                     return variance > 0 ? 'text-green-600 border-green-200' : 'text-red-600 border-red-200';
                                                                 })()}`}>
                                                                     {(() => {
-                                                                        const varianceBase = Number(stocktakeData[ing.id]) - baseStock;
-                                                                        if (varianceBase === 0) return <><i className="fa-solid fa-check mr-1"></i> Perfect match</>;
-                                                                        return `${varianceBase > 0 ? '+' : ''}${varianceBase.toFixed(2)} variance`;
+                                                                        const variance = Number(stocktakeData[ing.id]) - recipeStock;
+                                                                        if (variance === 0) return <><i className="fa-solid fa-check mr-1"></i> Perfect match</>;
+                                                                        return `${variance > 0 ? '+' : ''}${variance.toFixed(2)} variance`;
                                                                     })()}
                                                                 </div>
                                                             )}
@@ -12267,7 +12320,7 @@
                                                             <div className="flex flex-col">
                                                                 <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider mb-0.5">On-Hand</span>
                                                                 <span className={`text-xl font-black leading-none ${isLowStock ? 'text-red-600' : 'text-stone-800'}`}>
-                                                                    {baseStock.toLocaleString(undefined, {maximumFractionDigits: 2})} <span className="text-xs font-bold text-stone-500 ml-0.5">{ing.unit}</span>
+                                                                    {recipeStock.toLocaleString(undefined, {maximumFractionDigits: 2})} <span className="text-xs font-bold text-stone-500 ml-0.5">{displayUnit}</span>
                                                                 </span>
                                                             </div>
                                                             <button 
@@ -12277,7 +12330,7 @@
                                                                         name: ing.name,
                                                                         qty: '',
                                                                         reason: 'Expired',
-                                                                        unit: ing.unit,
+                                                                        unit: displayUnit,
                                                                         conversionUnit: ing.conversionUnit,
                                                                         conversionRate: convRate
                                                                     });
@@ -12380,24 +12433,47 @@
                         {inventoryTab === 'logs' && (
                             <div className="flex flex-col flex-1 overflow-hidden animate-fade-in gap-4">
                                 {/* Summary Cards for Total Cost Value */}
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 shrink-0">
-                                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200 flex items-center justify-between">
-                                        <div>
-                                            <p className="text-[10px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">Stock Received Value</p>
-                                            <p className="text-xl sm:text-2xl font-black text-green-600">+{totalReceivedValue.toLocaleString()} ៛</p>
+                                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 shrink-0">
+                                    <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-between">
+                                        <div className="flex justify-between items-start mb-2">
+                                            <p className="text-[10px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider">Delivery (In)</p>
+                                            <div className="w-8 h-8 rounded-full bg-green-50 flex items-center justify-center border border-green-100 shrink-0">
+                                                <i className="fa-solid fa-truck-ramp-box text-green-500"></i>
+                                            </div>
                                         </div>
-                                        <div className="w-12 h-12 rounded-full bg-green-50 flex items-center justify-center border border-green-100">
-                                            <i className="fa-solid fa-truck-ramp-box text-xl text-green-500"></i>
-                                        </div>
+                                        <p className="text-base sm:text-xl font-black text-green-600 truncate">+{totalReceivedValue.toLocaleString()} ៛</p>
                                     </div>
-                                    <div className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200 flex items-center justify-between">
-                                        <div>
-                                            <p className="text-[10px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider mb-1">COGS <span className="text-stone-400 normal-case">(Paid Orders Only)</span></p>
-                                            <p className="text-xl sm:text-2xl font-black text-amber-600">-{totalUsageValue.toLocaleString()} ៛</p>
+                                    
+                                    <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-between">
+                                        <div className="flex justify-between items-start mb-2">
+                                            <p className="text-[10px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider">Usage (COGS)</p>
+                                            <div className="w-8 h-8 rounded-full bg-amber-50 flex items-center justify-center border border-amber-100 shrink-0">
+                                                <i className="fa-solid fa-fire-burner text-amber-500"></i>
+                                            </div>
                                         </div>
-                                        <div className="w-12 h-12 rounded-full bg-amber-50 flex items-center justify-center border border-amber-100">
-                                            <i className="fa-solid fa-fire-burner text-xl text-amber-500"></i>
+                                        <p className="text-base sm:text-xl font-black text-amber-600 truncate">-{totalUsageValue.toLocaleString()} ៛</p>
+                                    </div>
+
+                                    <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-between">
+                                        <div className="flex justify-between items-start mb-2">
+                                            <p className="text-[10px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider">Waste (Out)</p>
+                                            <div className="w-8 h-8 rounded-full bg-orange-50 flex items-center justify-center border border-orange-100 shrink-0">
+                                                <i className="fa-solid fa-trash-can text-orange-500"></i>
+                                            </div>
                                         </div>
+                                        <p className="text-base sm:text-xl font-black text-orange-600 truncate">-{Math.round(totalWasteValue).toLocaleString()} ៛</p>
+                                    </div>
+
+                                    <div className={`bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border flex flex-col justify-between ${totalAuditValue >= 0 ? 'border-stone-200' : 'border-red-200 bg-red-50/30'}`}>
+                                        <div className="flex justify-between items-start mb-2">
+                                            <p className={`text-[10px] sm:text-xs font-bold uppercase tracking-wider ${totalAuditValue >= 0 ? 'text-stone-500' : 'text-red-700'}`}>Audit (Adj)</p>
+                                            <div className="w-8 h-8 rounded-full bg-purple-50 flex items-center justify-center border border-purple-100 shrink-0">
+                                                <i className="fa-solid fa-clipboard-list text-purple-500"></i>
+                                            </div>
+                                        </div>
+                                        <p className={`text-base sm:text-xl font-black truncate ${totalAuditValue > 0 ? 'text-emerald-600' : totalAuditValue < 0 ? 'text-red-600' : 'text-stone-700'}`}>
+                                            {totalAuditValue > 0 ? '+' : ''}{Math.round(totalAuditValue).toLocaleString()} ៛
+                                        </p>
                                     </div>
                                 </div>
 
