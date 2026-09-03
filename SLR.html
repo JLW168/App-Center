@@ -392,8 +392,10 @@
                 });
 
                 let newFreeClaims = 0;
+                let displayActivePts = newActivePts;
                 if (redemptionCost > 0 && newActivePts > 0) {
                     newFreeClaims = Math.floor(newActivePts / redemptionCost);
+                    displayActivePts = newActivePts % redemptionCost;
                 }
 
                 // Project Expirations
@@ -426,7 +428,7 @@
                 }
 
                 return {
-                    activePoints: newActivePts,
+                    activePoints: displayActivePts,
                     freeClaims: newFreeClaims,
                     pointBatches: activeBatches,
                     expiringClaims: expiringClaims,
@@ -614,8 +616,13 @@
                 const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
                 let freeClaims = 0;
                 let expiredClaims = 0;
+                let displayActivePts = activePts;
+                
                 if (redemptionCost > 0) {
-                    if (activePts > 0) freeClaims = Math.floor(activePts / redemptionCost);
+                    if (activePts > 0) {
+                        freeClaims = Math.floor(activePts / redemptionCost);
+                        displayActivePts = activePts % redemptionCost;
+                    }
                     if (expiredPts > 0) expiredClaims = Math.floor(expiredPts / redemptionCost);
                 }
                 
@@ -655,8 +662,8 @@
                 const expiringSoon = expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null;
                 
                 return { 
-                    activePoints: activePts, 
-                    activePts, 
+                    activePoints: displayActivePts, 
+                    activePts: displayActivePts, 
                     freeClaims, 
                     expiredPoints: expiredPts,
                     expiredClaims,
@@ -16338,14 +16345,15 @@
                             chargeStatusScope: c.chargeStatusScope || 'All',
                             chargeStatusShopIds: c.chargeStatusShopIds || [],
                             registeredAtShop: c.registeredAtShop || null,
-                            totalSpent: 0,
-                            totalRedeemed: 0,
+                            totalSpent: c.loyaltyData?.totalSpent || 0,
+                            totalRedeemed: c.loyaltyData?.totalRedeemed || 0,
                             orderCount: 0,
                             lastVisit: c.createdAt || 0,
                             createdAt: c.createdAt || null,
                             lastShopId: null,
                             orders: [],
-                            shopBreakdown: {}
+                            shopBreakdown: {},
+                            dbLoyaltyData: c.loyaltyData || null
                         });
                     });
 
@@ -16374,7 +16382,8 @@
                                 createdAt: o.createdAt,
                                 lastShopId: o.shopId,
                                 orders: [],
-                                shopBreakdown: {}
+                                shopBreakdown: {},
+                                dbLoyaltyData: null
                             });
                         }
                         
@@ -16402,12 +16411,13 @@
                         
                         // BUG FIX: Only count financial totals and visits for PAID orders
                         if (o.paymentStatus === 'Paid') {
-                            c.totalSpent += o.totalAmount;
+                            if (!c.dbLoyaltyData) {
+                                c.totalSpent += o.totalAmount;
+                                if (o.redeemedPoints) c.totalRedeemed += o.redeemedPoints;
+                            }
                             c.shopBreakdown[o.shopId].spent += o.totalAmount;
                             c.orderCount += 1;
                             c.shopBreakdown[o.shopId].count += 1;
-                            
-                            if (o.redeemedPoints) c.totalRedeemed += o.redeemedPoints;
                         }
                         
                         c.orders.push(o);
@@ -16468,9 +16478,76 @@
                                 if (c.lastVisit < startTime || c.lastVisit >= endTime) return acc;
                             }
 
-                            // 2. Heavy Math Calculation (Only executed for customers that pass the filter!)
-                            const loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, globalPoints, c.refilledPoints || 0);
-                            const lifetimeEarnedPts = Math.floor(c.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                            // 2. Heavy Math Calculation (Optimized with DB Data)
+                            let loyaltyMath = null;
+                            const lifetimeSpent = c.totalSpent || 0;
+                            const lifetimeEarnedPts = Math.floor(lifetimeSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+
+                            if (c.dbLoyaltyData) {
+                                const now = Date.now();
+                                let activePts = 0;
+                                const activeBatches = [];
+                                
+                                const safeRefill = Number(c.refilledPoints) || 0;
+                                if (safeRefill > 0) activePts += safeRefill;
+
+                                (c.dbLoyaltyData.pointBatches || []).forEach(batch => {
+                                    if (batch.points > 0) {
+                                        if (!batch.expiresAt || batch.expiresAt >= now) {
+                                            activePts += batch.points;
+                                            if (batch.expiresAt) activeBatches.push(batch);
+                                        }
+                                    }
+                                });
+
+                                const redemptionCost = Number(globalPoints?.redeemPoints) || 10;
+                                let freeClaims = 0;
+                                if (redemptionCost > 0 && activePts > 0) {
+                                    freeClaims = Math.floor(activePts / redemptionCost);
+                                }
+                                
+                                const expiringClaims = [];
+                                if (freeClaims > 0 && redemptionCost > 0 && activeBatches.length > 0) {
+                                    const expBatches = [...activeBatches].filter(b => b.expiresAt).sort((a, b) => a.expiresAt - b.expiresAt);
+                                    let currentPtsForProjection = activePts;
+                                    let currentClaimsForProjection = freeClaims;
+                                    const groupedExpirations = {};
+
+                                    expBatches.forEach(b => {
+                                        if (!groupedExpirations[b.expiresAt]) groupedExpirations[b.expiresAt] = 0;
+                                        groupedExpirations[b.expiresAt] += b.points;
+                                    });
+
+                                    const sortedExpDates = Object.keys(groupedExpirations).map(Number).sort((a, b) => a - b);
+
+                                    sortedExpDates.forEach(expTime => {
+                                        const ptsExpiring = groupedExpirations[expTime];
+                                        currentPtsForProjection -= ptsExpiring;
+                                        const newClaimsCount = Math.max(0, Math.floor(currentPtsForProjection / redemptionCost));
+
+                                        if (newClaimsCount < currentClaimsForProjection) {
+                                            const claimsLost = currentClaimsForProjection - newClaimsCount;
+                                            for (let i = 0; i < claimsLost; i++) {
+                                                expiringClaims.push({ expiresAt: expTime });
+                                            }
+                                            currentClaimsForProjection = newClaimsCount;
+                                        }
+                                    });
+                                }
+
+                                loyaltyMath = {
+                                    activePoints: activePts,
+                                    activePts: activePts,
+                                    freeClaims: freeClaims,
+                                    expiringSoon: expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null,
+                                    expiringClaims: expiringClaims,
+                                    expiredPoints: 0,
+                                    expiredClaims: 0
+                                };
+                            } else {
+                                // Fallback to calculation if no DB data exists
+                                loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, globalPoints, c.refilledPoints || 0);
+                            }
 
                             acc.push({
                                 ...c,
@@ -17551,10 +17628,8 @@
                                         <select required className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium shadow-sm" value={refillData.id} onChange={e => {
                                             const cust = customersData.find(c => c.id === e.target.value);
                                             if (cust) {
-                                                const earnedPts = Math.floor(cust.totalSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
-                                                const totalEarnedAndRefilled = earnedPts + (cust.refilledPoints || 0);
-                                                const activePts = Math.max(0, totalEarnedAndRefilled - cust.totalRedeemed);
-                                                setRefillData({...refillData, id: cust.id, name: cust.name, phone: cust.phone, currentPts: activePts});
+                                                const loyalty = calculateCustomerLoyalty(cust.orders, cust.phone, globalPoints, cust.refilledPoints || 0);
+                                                setRefillData({...refillData, id: cust.id, name: cust.name, phone: cust.phone, currentPts: loyalty.activePoints});
                                             }
                                         }}>
                                             <option value="" disabled>Search / Select Customer...</option>
