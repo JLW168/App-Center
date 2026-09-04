@@ -17959,8 +17959,20 @@
 
                 const getLoyalty = (phone) => {
                     if (!phone || phone === 'N/A' || !globalPoints?.pointsEnabled) return null;
-                    // FIX: Retrieve refilledPoints from the synced kdsCustomers map to match CRM exactly
-                    const refilledPts = kdsCustomers[phone]?.refilledPoints || 0;
+                    
+                    const customer = kdsCustomers[phone];
+                    
+                    // PRIORITY FIX: Use the securely calculated database loyalty data. 
+                    // Admin 'orders' array is limited to the last 200 orders, so recalculating here would wipe out older history!
+                    if (customer && customer.loyaltyData) {
+                        return {
+                            ...customer.loyaltyData,
+                            activePts: customer.loyaltyData.activePoints // Alias for backward compatibility
+                        };
+                    }
+
+                    // Fallback for customers without saved loyalty data
+                    const refilledPts = customer?.refilledPoints || 0;
                     return calculateCustomerLoyalty(orders, phone, globalPoints, refilledPts);
                 };
 
@@ -18083,7 +18095,7 @@
                     if (isClaiming) return;
                     setIsClaiming(true);
                     try {
-                        const { doc, updateDoc } = window.FirebaseApp;
+                        const { doc, updateDoc, getDoc } = window.FirebaseApp;
                         const newItems = [...claimOrder.items, {
                             productId: product.id,
                             name: product.name,
@@ -18102,7 +18114,7 @@
                         const newNames = claimOrder.redeemedItemName ? `${claimOrder.redeemedItemName}, 1x ${product.name}` : `1x ${product.name}`;
 
                         // 1. Deduct Inventory (using the globally available deductInventory)
-                        const fakeCart = [{productId: product.id, quantity: 1, size: size}];
+                        const fakeCart = [{productId: product.id, quantity: 1, size: size, gradeName: 'Default'}];
                         await deductInventory(fakeCart, products, claimOrder.shopId, claimOrder.queueNo);
 
                         // 2. Update Order with new items and points
@@ -18111,6 +18123,76 @@
                             redeemedPoints: newPoints,
                             redeemedItemName: newNames
                         });
+
+                        // 3. Update Customer DB Loyalty to instantly reflect the deduction
+                        const customer = kdsCustomers[claimOrder.customerPhone];
+                        if (customer && customer.id) {
+                            const custRef = doc(db, 'customers', customer.id);
+                            const custSnap = await getDoc(custRef);
+                            if (custSnap.exists()) {
+                                const custData = custSnap.data();
+                                let currentLoyalty = custData.loyaltyData;
+                                
+                                if (!currentLoyalty) {
+                                    currentLoyalty = calculateCustomerLoyalty(orders.filter(o=>o.customerPhone === customer.phone), customer.phone, globalPoints, customer.refilledPoints || 0);
+                                    currentLoyalty = {
+                                        activePoints: currentLoyalty.activePoints,
+                                        freeClaims: currentLoyalty.freeClaims,
+                                        pointBatches: currentLoyalty.activeBatches || [],
+                                        totalSpent: 0,
+                                        totalRedeemed: 0
+                                    };
+                                }
+                                
+                                let { activePoints = 0, freeClaims = 0, pointBatches = [], totalSpent = 0, totalRedeemed = 0 } = currentLoyalty;
+                                
+                                totalRedeemed += ptsToDeduct;
+                                let redeemedHere = ptsToDeduct;
+                                
+                                for (let i = 0; i < pointBatches.length; i++) {
+                                    if (redeemedHere <= 0) break;
+                                    if (pointBatches[i].points > 0) {
+                                        if (pointBatches[i].points <= redeemedHere) {
+                                            redeemedHere -= pointBatches[i].points;
+                                            pointBatches[i].points = 0;
+                                        } else {
+                                            pointBatches[i].points -= redeemedHere;
+                                            redeemedHere = 0;
+                                        }
+                                    }
+                                }
+                                
+                                let newActivePts = 0;
+                                const activeBatches = [];
+                                const orderTime = Date.now();
+                                pointBatches.forEach(batch => {
+                                    if (batch.points > 0) {
+                                        if (!batch.expiresAt || batch.expiresAt >= orderTime) {
+                                            newActivePts += batch.points;
+                                            activeBatches.push(batch);
+                                        }
+                                    }
+                                });
+                                
+                                const redemptionCost = globalPoints?.redeemPoints || 10;
+                                let newFreeClaims = 0;
+                                let displayActivePts = newActivePts;
+                                if (redemptionCost > 0 && newActivePts > 0) {
+                                    newFreeClaims = Math.floor(newActivePts / redemptionCost);
+                                    displayActivePts = newActivePts % redemptionCost;
+                                }
+                                
+                                await updateDoc(custRef, {
+                                    loyaltyData: {
+                                        activePoints: displayActivePts,
+                                        freeClaims: newFreeClaims,
+                                        pointBatches: activeBatches,
+                                        totalSpent,
+                                        totalRedeemed
+                                    }
+                                });
+                            }
+                        }
 
                         setClaimOrder(null);
                     } catch (err) {
@@ -18240,14 +18322,14 @@
                                                     return (
                                                         <>
                                                             <span className="text-stone-300">|</span>
-                                                            <span className="text-amber-600 font-bold text-sm">{loyalty.activePts}P</span>
+                                                            <span className="text-amber-600 font-bold text-sm">{loyalty.activePts !== undefined ? loyalty.activePts : loyalty.activePoints}P</span>
                                                             <span className="text-stone-300">|</span>
                                                             {loyalty.freeClaims > 0 ? (
                                                                 <button onClick={() => setClaimOrder(order)} className="text-rose-600 font-bold text-sm bg-rose-50 px-2 py-0.5 rounded hover:bg-rose-100 transition shadow-sm border border-rose-200 cursor-pointer active:scale-95 flex items-center gap-1">
                                                                     <i className="fa-solid fa-gift"></i> {loyalty.freeClaims} Claim
                                                                 </button>
                                                             ) : (
-                                                                <span className="text-rose-400 font-bold text-sm"><i className="fa-solid fa-gift mr-1"></i> {loyalty.freeClaims}</span>
+                                                                <span className="text-rose-400 font-bold text-sm"><i className="fa-solid fa-gift mr-1"></i> {loyalty.freeClaims || 0}</span>
                                                             )}
                                                         </>
                                                     );
