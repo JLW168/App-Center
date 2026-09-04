@@ -352,21 +352,21 @@
                     }
                 }
 
-                // 2. Earn Points
+                // 2. Earn Points (PHASE 2 FIX: Cumulative Running Spend)
                 const amountSpent = Number(orderAmount) || 0;
+                const previousTotalSpent = totalSpent;
                 totalSpent += amountSpent;
                 
-                // Calculate running remainder (Amount spent so far that hasn't converted to a point batch yet)
-                let runningSpend = (totalSpent % spendReq); 
-                // We can't perfectly calculate running spend without iterating history if they spent exactly 4000, 
-                // so we calculate batches earned on the *total* spent minus what has already been converted.
-                // A simpler approach for the transaction is just to calculate based on this specific order's total.
-                
-                // Simplified earning for transaction:
                 if (spendReq > 0) {
-                    const batchesEarned = Math.floor(amountSpent / spendReq);
-                    if (batchesEarned > 0) {
-                        const earned = batchesEarned * ptsEarned;
+                    // How many total batches have they EVER earned before this order?
+                    const previouslyEarnedBatches = Math.floor(previousTotalSpent / spendReq);
+                    // How many total batches have they EVER earned including this order?
+                    const currentlyEarnedBatches = Math.floor(totalSpent / spendReq);
+                    // The difference is what they earned JUST NOW.
+                    const newBatchesEarned = currentlyEarnedBatches - previouslyEarnedBatches;
+                    
+                    if (newBatchesEarned > 0) {
+                        const earned = newBatchesEarned * ptsEarned;
                         pointBatches.push({
                             points: earned,
                             earnedAt: orderTime,
@@ -514,6 +514,87 @@
                         await updateDoc(doc(db, 'tables', tableId), { status: 'Available' });
                     } catch (e) {}
                 }
+            };
+
+            // NEW: Centralized Live Loyalty Engine
+            // Dynamically processes database points and applies live expirations based on the current clock
+            const computeLiveLoyalty = (dbLoyaltyData, globalPointsConfig, refilledPoints = 0) => {
+                if (!globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null, activeBatches: [], expiringClaims: [], totalSpent: 0, totalRedeemed: 0 };
+
+                const { pointBatches = [], totalSpent = 0, totalRedeemed = 0 } = dbLoyaltyData || {};
+                const now = Date.now();
+                
+                let activePts = 0;
+                const activeBatches = [];
+
+                // 1. Manually injected points never expire
+                const safeRefill = Number(refilledPoints) || 0;
+                if (safeRefill > 0) {
+                    activePts += safeRefill;
+                }
+
+                // 2. Process organic database batches & drop expired ones instantly
+                pointBatches.forEach(batch => {
+                    if (batch.points > 0) {
+                        if (!batch.expiresAt || batch.expiresAt >= now) {
+                            activePts += batch.points;
+                            if (batch.expiresAt) activeBatches.push({ points: batch.points, expiresAt: batch.expiresAt });
+                        }
+                    }
+                });
+
+                // 3. Translate raw points to Claims and Remainders
+                const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
+                let freeClaims = 0;
+                let displayActivePts = activePts;
+
+                if (redemptionCost > 0 && activePts > 0) {
+                    freeClaims = Math.floor(activePts / redemptionCost);
+                    displayActivePts = activePts % redemptionCost;
+                }
+
+                // 4. Project future claim expirations
+                const expiringClaims = [];
+                if (freeClaims > 0 && redemptionCost > 0 && activeBatches.length > 0) {
+                    const expBatches = [...activeBatches].filter(b => b.expiresAt).sort((a, b) => a.expiresAt - b.expiresAt);
+                    let currentPtsForProjection = activePts;
+                    let currentClaimsForProjection = freeClaims;
+                    const groupedExpirations = {};
+
+                    expBatches.forEach(b => {
+                        if (!groupedExpirations[b.expiresAt]) groupedExpirations[b.expiresAt] = 0;
+                        groupedExpirations[b.expiresAt] += b.points;
+                    });
+
+                    const sortedExpDates = Object.keys(groupedExpirations).map(Number).sort((a, b) => a - b);
+
+                    sortedExpDates.forEach(expTime => {
+                        const ptsExpiring = groupedExpirations[expTime];
+                        currentPtsForProjection -= ptsExpiring;
+                        const newClaimsCount = Math.max(0, Math.floor(currentPtsForProjection / redemptionCost));
+
+                        if (newClaimsCount < currentClaimsForProjection) {
+                            const claimsLost = currentClaimsForProjection - newClaimsCount;
+                            for (let i = 0; i < claimsLost; i++) {
+                                expiringClaims.push({ expiresAt: expTime });
+                            }
+                            currentClaimsForProjection = newClaimsCount;
+                        }
+                    });
+                }
+
+                const expiringSoon = expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null;
+
+                return {
+                    activePoints: displayActivePts,
+                    activePts: displayActivePts,
+                    freeClaims,
+                    expiringSoon,
+                    activeBatches,
+                    expiringClaims,
+                    totalSpent,
+                    totalRedeemed
+                };
             };
 
             const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig, refilledPoints = 0) => {
@@ -2052,7 +2133,7 @@
                                     }
                                 } else {
                                     setIsExisting(false);
-                                    setJoinTelegram(prev => hasInteractedWithTelegramRef.current ? prev : true);
+                                    setJoinTelegram(prev => hasInteractedWithTelegramRef.current ? prev : false);
                                     setPastCustomerName('');
                                     setDbPin(null);
                                     setCustomerId(null);
@@ -2113,7 +2194,7 @@
 
                     // SAVE / UPDATE CUSTOMER SECURITY RECORD
                     try {
-                        const { addDoc, doc, updateDoc, collection, runTransaction } = window.FirebaseApp;
+                        const { doc, updateDoc, collection, runTransaction, setDoc } = window.FirebaseApp;
                         
                         if (!isExisting || (isExisting && !customerId)) {
                             // Dynamically pull target shop name for sequence prefixing
@@ -2125,34 +2206,50 @@
                             const counterRef = doc(db, 'customer_counters', finalRegShopId);
                             const newCustRef = doc(collection(db, 'customers'));
                             generatedDocId = newCustRef.id;
+                            
+                            welcomeFlag = !!globalPoints?.welcomeDiscountEnabled;
+                            
+                            // Clean payload to prevent Firebase strict-schema rejection of 'null' values
+                            const basePayload = {
+                                phone: phone,
+                                name: finalName,
+                                sex: sex,
+                                customerType: 'Normal',
+                                status: 'Active',
+                                chargeStatus: 'Normal',
+                                chargeStatusScope: 'All',
+                                chargeStatusShopIds: [],
+                                createdAt: Date.now(),
+                                lastVisit: Date.now(),
+                                registeredAtShop: finalRegShopId,
+                                hasWelcomeDiscount: welcomeFlag
+                            };
+                            if (!bypassPin && cleanPin) basePayload.pin = cleanPin;
 
-                            // Secure atomic transaction to guarantee sequential ID even under concurrent load
-                            await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                const customerIdStr = `${shopPrefix}-${nextVal.toString().padStart(6, '0')}`;
-                                generatedCustomerId = customerIdStr;
-                                
-                                welcomeFlag = !!globalPoints?.welcomeDiscountEnabled;
+                            try {
+                                // Secure atomic transaction to guarantee sequential ID even under concurrent load
+                                await runTransaction(db, async (transaction) => {
+                                    const counterDoc = await transaction.get(counterRef);
+                                    let nextVal = 1;
+                                    if (counterDoc.exists()) {
+                                        nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                        transaction.update(counterRef, { currentValue: nextVal });
+                                    } else {
+                                        transaction.set(counterRef, { currentValue: nextVal });
+                                    }
+                                    const customerIdStr = `${shopPrefix}-${nextVal.toString().padStart(6, '0')}`;
+                                    generatedCustomerId = customerIdStr;
 
-                                transaction.set(newCustRef, {
-                                    customerId: customerIdStr,
-                                    phone: phone,
-                                    name: finalName,
-                                    sex: sex,
-                                    pin: bypassPin ? null : cleanPin,
-                                    createdAt: Date.now(),
-                                    lastVisit: Date.now(),
-                                    registeredAtShop: finalRegShopId,
-                                    hasWelcomeDiscount: welcomeFlag
+                                    transaction.set(newCustRef, {
+                                        ...basePayload,
+                                        customerId: customerIdStr
+                                    });
                                 });
-                            });
+                            } catch (txErr) {
+                                console.warn("Sequential ID transaction blocked (Self-Registration). Using standard document creation...", txErr);
+                                // Standard fallback: Saves customer instantly without a sequential ID to bypass transaction security blocks
+                                await setDoc(newCustRef, basePayload);
+                            }
                         } else if (isExisting && !dbPin && customerId && !bypassPin) {
                             // Legacy Migration: Update old customer doc with the newly created PIN
                             await updateDoc(doc(db, 'customers', customerId), {
@@ -3015,6 +3112,14 @@
                         return;
                     }
 
+                    // PHASE 1 FIX: Stop querying hundreds of raw orders for loyalty!
+                    // Read the database loyalty object and apply live expirations instantly.
+                    if (customerProfile && customerProfile.loyaltyData) {
+                        const exactLoyalty = computeLiveLoyalty(customerProfile.loyaltyData, globalPoints, liveRefilledPoints);
+                        setCustomerLoyalty(exactLoyalty);
+                        return;
+                    }
+
                     const { query, where, onSnapshot, collection } = window.FirebaseApp;
                     
                     // 2. LIVE CRM FETCH: Pull exact math from the Earn Point Report logic by querying ALL raw paid orders
@@ -3022,14 +3127,14 @@
                     const qOrders = query(collection(db, 'orders'), where('customerPhone', '==', targetPhone));
                     const unsubOrders = onSnapshot(qOrders, snapOrders => {
                         const rawOrders = snapOrders.docs.map(d => d.data());
-                        const exactLoyalty = calculateCustomerLoyalty(rawOrders, targetPhone, globalPoints, liveRefilledPoints);
-                        setCustomerLoyalty(exactLoyalty);
+                        const legacyLoyalty = calculateCustomerLoyalty(rawOrders, targetPhone, globalPoints, liveRefilledPoints);
+                        setCustomerLoyalty(legacyLoyalty);
                     }, (error) => {
                         console.warn("Live CRM Loyalty sync failed:", error);
                     });
 
                     return () => unsubOrders();
-                }, [sessionInfo.customerPhone, phoneSearchQuery, globalPoints, liveRefilledPoints, currentUser]);
+                }, [sessionInfo.customerPhone, phoneSearchQuery, globalPoints, liveRefilledPoints, currentUser, customerProfile]);
 
                 // DYNAMIC BADGES STATE
                 const [branchLoyalty, setBranchLoyalty] = useState(null);
@@ -3700,14 +3805,17 @@
                             newCart[existingIndex] = { ...newCart[existingIndex], quantity: newCart[existingIndex].quantity + 1 };
                             return newCart;
                         }
-                        return [...prev, { productId: product.id, name: product.name, size, price: price || 0, quantity: 1, image: product.image, sugar, ice, gradeName }];
+                        
+                        // PHASE 3 ALIAS CLEANUP: Use Short Name (Alias) in the cart if available to save space
+                        const displayName = product.shortName ? product.shortName : product.name;
+                        return [...prev, { productId: product.id, name: displayName, size, price: price || 0, quantity: 1, image: product.image, sugar, ice, gradeName }];
                     });
 
                     if (editCartIndex !== undefined) {
-                        setCustomMessage(`Updated options for ${product.name}!`);
+                        setCustomMessage(`Updated options for ${product.shortName || product.name}!`);
                         setTimeout(() => setIsCartOpen(true), 200); // Re-open mobile cart automatically
                     } else {
-                        setCustomMessage(`Added ${product.name} to cart! ☕`);
+                        setCustomMessage(`Added ${product.shortName || product.name} to cart! ☕`);
                     }
                     
                     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -4568,7 +4676,9 @@
 
                                             {/* Content Section */}
                                             <div className="p-3 sm:p-4 flex-1 flex flex-col items-center justify-center bg-white z-10">
-                                                <h3 className="font-bold text-[#4A3B32] text-[13px] sm:text-[16px] leading-snug line-clamp-2 tracking-wide transition-colors text-center">{product.name}</h3>
+                                                <h3 className="font-bold text-[#4A3B32] text-[13px] sm:text-[16px] leading-snug line-clamp-2 tracking-wide transition-colors text-center" title={product.name}>
+                                                    {product.shortName || product.name}
+                                                </h3>
                                             </div>
 
                                             {/* Pricing & Add to Cart Area */}
@@ -10511,7 +10621,8 @@
                 // FETCH RAW ORDERS FOR POS LOYALTY CALCULATION
                 useEffect(() => {
                     const cleanedPhone = String(customerPhone).replace(/\D/g, '');
-                    if (!cleanedPhone || cleanedPhone.length < 8 || !globalPoints?.pointsEnabled) {
+                    // PHASE 1 FIX: If we already have the customer data from DB, we don't need to fetch orders!
+                    if (!cleanedPhone || cleanedPhone.length < 8 || !globalPoints?.pointsEnabled || (customerData && customerData.loyaltyData)) {
                         setPosCustomerRawOrders([]);
                         return;
                     }
@@ -10524,13 +10635,19 @@
                     }, (err) => console.warn("Failed to fetch orders for POS Loyalty:", err));
 
                     return () => unsub();
-                }, [customerPhone, globalPoints]);
+                }, [customerPhone, globalPoints, customerData]);
 
                 const customerLoyalty = useMemo(() => {
                     if (!customerPhone || !globalPoints?.pointsEnabled) return null;
                     
-                    // Use the exact same calculation logic as the Earn Point Report and Customer Portal
                     const refilledPts = customerData?.refilledPoints || 0;
+
+                    // PHASE 1 FIX: Use centralized engine if DB object exists
+                    if (customerData && customerData.loyaltyData) {
+                        return computeLiveLoyalty(customerData.loyaltyData, globalPoints, refilledPts);
+                    }
+
+                    // Fallback for walk-ins / legacy
                     return calculateCustomerLoyalty(posCustomerRawOrders, customerPhone, globalPoints, refilledPts);
                     
                 }, [customerPhone, globalPoints, customerData, posCustomerRawOrders]);
@@ -10664,7 +10781,10 @@
                             newCart[existingIndex] = { ...newCart[existingIndex], quantity: newCart[existingIndex].quantity + 1 };
                             return newCart;
                         }
-                        return [...prev, { productId: product.id, name: product.name, size, price: price || 0, quantity: 1, image: product.image, sugar, ice, gradeName }];
+                        
+                        // PHASE 3 ALIAS CLEANUP: Use Short Name (Alias) in the POS cart if available to save space
+                        const displayName = product.shortName ? product.shortName : product.name;
+                        return [...prev, { productId: product.id, name: displayName, size, price: price || 0, quantity: 1, image: product.image, sugar, ice, gradeName }];
                     });
                 };
 
@@ -11277,7 +11397,9 @@
                                         {filteredProducts.map(p => (
                                             <div key={p.id} className="border border-stone-200 rounded-xl sm:rounded-2xl p-2 sm:p-3 flex flex-col hover:border-amber-400 hover:shadow-md transition bg-white h-full">
                                                 <div className="mb-1.5 sm:mb-2 min-h-[2rem] sm:min-h-[2.5rem]">
-                                                    <h3 className="font-bold text-stone-800 text-xs sm:text-sm leading-tight line-clamp-2">{p.name}</h3>
+                                                    <h3 className="font-bold text-stone-800 text-xs sm:text-sm leading-tight line-clamp-2" title={p.name}>
+                                                        {p.shortName || p.name}
+                                                    </h3>
                                                 </div>
                                                 
                                                 <div className="flex flex-row gap-2 sm:gap-2.5 mt-auto">
@@ -14025,7 +14147,7 @@
                                                             </div>
                                                             <div>
                                                                 <div className="font-bold text-stone-800 text-base leading-tight">{p.name}</div>
-                                                                {p.shortName && <div className="text-xs text-stone-500 font-medium">Short: {p.shortName}</div>}
+                                                                {p.shortName && <div className="text-xs text-stone-500 font-medium">Alias: {p.shortName}</div>}
                                                                 <div className="mt-1 flex items-center gap-2">
                                                                     {p.productCode && <span className="text-[10px] font-bold bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded uppercase tracking-wider">{p.productCode}</span>}
                                                                     <span className="text-[10px] font-bold bg-stone-200 text-stone-600 px-1.5 py-0.5 rounded uppercase tracking-wider">{p.category}</span>
@@ -14343,7 +14465,7 @@
                                     </div>
                                     <div className="flex gap-2">
                                         <div className="flex-1">
-                                            <input type="text" placeholder="Short Name (Optional)" className="w-full border rounded p-2 text-[16px]" value={formData.shortName || ''} onChange={e=>setFormData({...formData, shortName: e.target.value})}/>
+                                            <input type="text" placeholder="Alias / Short Name (Optional)" className="w-full border rounded p-2 text-[16px]" value={formData.shortName || ''} onChange={e=>setFormData({...formData, shortName: e.target.value})}/>
                                         </div>
                                         <div className="flex-1">
                                             <select className="w-full border rounded p-2 text-[16px]" value={formData.category} onChange={e=>setFormData({...formData, category: e.target.value})}>
@@ -16142,6 +16264,31 @@
                     fetchHistory();
                 }, [loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth]);
 
+                const handlePinResetSubmit = async (e) => {
+                    e.preventDefault();
+                    if (!pinResetData || !pinResetData.id) return;
+                    
+                    const cleanPin = pinResetData.newPin.replace(/\D/g, '');
+                    if (cleanPin.length !== 4) {
+                        setPinResetData(prev => ({ ...prev, error: 'PIN must be exactly 4 digits.' }));
+                        return;
+                    }
+
+                    try {
+                        const { doc, updateDoc } = window.FirebaseApp;
+                        await updateDoc(doc(db, 'customers', pinResetData.id), {
+                            pin: cleanPin,
+                            updatedAt: Date.now()
+                        });
+                        
+                        setPinResetData(null);
+                        setCustomerError('PIN successfully reset!');
+                        setTimeout(() => setCustomerError(''), 3000);
+                    } catch (err) {
+                        setPinResetData(prev => ({ ...prev, error: 'Failed to reset PIN: ' + err.message }));
+                    }
+                };
+
                 const handleEditCustomerSubmit = async (e) => {
                     e.preventDefault();
                     
@@ -16486,66 +16633,8 @@
                             const lifetimeEarnedPts = Math.floor(lifetimeSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
 
                             if (c.dbLoyaltyData) {
-                                const now = Date.now();
-                                let activePts = 0;
-                                const activeBatches = [];
-                                
-                                const safeRefill = Number(c.refilledPoints) || 0;
-                                if (safeRefill > 0) activePts += safeRefill;
-
-                                (c.dbLoyaltyData.pointBatches || []).forEach(batch => {
-                                    if (batch.points > 0) {
-                                        if (!batch.expiresAt || batch.expiresAt >= now) {
-                                            activePts += batch.points;
-                                            if (batch.expiresAt) activeBatches.push(batch);
-                                        }
-                                    }
-                                });
-
-                                const redemptionCost = Number(globalPoints?.redeemPoints) || 10;
-                                let freeClaims = 0;
-                                if (redemptionCost > 0 && activePts > 0) {
-                                    freeClaims = Math.floor(activePts / redemptionCost);
-                                }
-                                
-                                const expiringClaims = [];
-                                if (freeClaims > 0 && redemptionCost > 0 && activeBatches.length > 0) {
-                                    const expBatches = [...activeBatches].filter(b => b.expiresAt).sort((a, b) => a.expiresAt - b.expiresAt);
-                                    let currentPtsForProjection = activePts;
-                                    let currentClaimsForProjection = freeClaims;
-                                    const groupedExpirations = {};
-
-                                    expBatches.forEach(b => {
-                                        if (!groupedExpirations[b.expiresAt]) groupedExpirations[b.expiresAt] = 0;
-                                        groupedExpirations[b.expiresAt] += b.points;
-                                    });
-
-                                    const sortedExpDates = Object.keys(groupedExpirations).map(Number).sort((a, b) => a - b);
-
-                                    sortedExpDates.forEach(expTime => {
-                                        const ptsExpiring = groupedExpirations[expTime];
-                                        currentPtsForProjection -= ptsExpiring;
-                                        const newClaimsCount = Math.max(0, Math.floor(currentPtsForProjection / redemptionCost));
-
-                                        if (newClaimsCount < currentClaimsForProjection) {
-                                            const claimsLost = currentClaimsForProjection - newClaimsCount;
-                                            for (let i = 0; i < claimsLost; i++) {
-                                                expiringClaims.push({ expiresAt: expTime });
-                                            }
-                                            currentClaimsForProjection = newClaimsCount;
-                                        }
-                                    });
-                                }
-
-                                loyaltyMath = {
-                                    activePoints: activePts,
-                                    activePts: activePts,
-                                    freeClaims: freeClaims,
-                                    expiringSoon: expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null,
-                                    expiringClaims: expiringClaims,
-                                    expiredPoints: 0,
-                                    expiredClaims: 0
-                                };
+                                // PHASE 1 FIX: Replaced massive inline calculation with centralized engine!
+                                loyaltyMath = computeLiveLoyalty(c.dbLoyaltyData, globalPoints, c.refilledPoints);
                             } else {
                                 // Fallback to calculation if no DB data exists
                                 loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, globalPoints, c.refilledPoints || 0);
@@ -17630,7 +17719,11 @@
                                         <select required className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium shadow-sm" value={refillData.id} onChange={e => {
                                             const cust = customersData.find(c => c.id === e.target.value);
                                             if (cust) {
-                                                const loyalty = calculateCustomerLoyalty(cust.orders, cust.phone, globalPoints, cust.refilledPoints || 0);
+                                                // PHASE 1 FIX: Use centralized logic
+                                                const loyalty = cust.dbLoyaltyData 
+                                                    ? computeLiveLoyalty(cust.dbLoyaltyData, globalPoints, cust.refilledPoints || 0)
+                                                    : calculateCustomerLoyalty(cust.orders, cust.phone, globalPoints, cust.refilledPoints || 0);
+                                                    
                                                 setRefillData({...refillData, id: cust.id, name: cust.name, phone: cust.phone, currentPts: loyalty.activePoints});
                                             }
                                         }}>
@@ -17959,8 +18052,18 @@
 
                 const getLoyalty = (phone) => {
                     if (!phone || phone === 'N/A' || !globalPoints?.pointsEnabled) return null;
-                    // FIX: Retrieve refilledPoints from the synced kdsCustomers map to match CRM exactly
-                    const refilledPts = kdsCustomers[phone]?.refilledPoints || 0;
+                    
+                    const customer = kdsCustomers[phone];
+                    
+                    // PRIORITY FIX: Use the securely calculated database loyalty data. 
+                    // Admin 'orders' array is limited to the last 200 orders, so recalculating here would wipe out older history!
+                    if (customer && customer.loyaltyData) {
+                        // PHASE 1 FIX: Use centralized compute logic to catch live expirations
+                        return computeLiveLoyalty(customer.loyaltyData, globalPoints, customer.refilledPoints);
+                    }
+
+                    // Fallback for customers without saved loyalty data
+                    const refilledPts = customer?.refilledPoints || 0;
                     return calculateCustomerLoyalty(orders, phone, globalPoints, refilledPts);
                 };
 
@@ -18083,7 +18186,7 @@
                     if (isClaiming) return;
                     setIsClaiming(true);
                     try {
-                        const { doc, updateDoc } = window.FirebaseApp;
+                        const { doc, updateDoc, getDoc } = window.FirebaseApp;
                         const newItems = [...claimOrder.items, {
                             productId: product.id,
                             name: product.name,
@@ -18102,7 +18205,7 @@
                         const newNames = claimOrder.redeemedItemName ? `${claimOrder.redeemedItemName}, 1x ${product.name}` : `1x ${product.name}`;
 
                         // 1. Deduct Inventory (using the globally available deductInventory)
-                        const fakeCart = [{productId: product.id, quantity: 1, size: size}];
+                        const fakeCart = [{productId: product.id, quantity: 1, size: size, gradeName: 'Default'}];
                         await deductInventory(fakeCart, products, claimOrder.shopId, claimOrder.queueNo);
 
                         // 2. Update Order with new items and points
@@ -18111,6 +18214,35 @@
                             redeemedPoints: newPoints,
                             redeemedItemName: newNames
                         });
+
+                        // 3. Update Customer DB Loyalty to instantly reflect the deduction
+                        const customer = kdsCustomers[claimOrder.customerPhone];
+                        if (customer && customer.id) {
+                            const custRef = doc(db, 'customers', customer.id);
+                            const custSnap = await getDoc(custRef);
+                            if (custSnap.exists()) {
+                                const custData = custSnap.data();
+                                let currentLoyalty = custData.loyaltyData;
+                                
+                                if (!currentLoyalty) {
+                                    currentLoyalty = calculateCustomerLoyalty(orders.filter(o=>o.customerPhone === customer.phone), customer.phone, globalPoints, customer.refilledPoints || 0);
+                                    currentLoyalty = {
+                                        activePoints: currentLoyalty.activePoints,
+                                        freeClaims: currentLoyalty.freeClaims,
+                                        pointBatches: currentLoyalty.activeBatches || [],
+                                        totalSpent: 0,
+                                        totalRedeemed: 0
+                                    };
+                                }
+                                
+                                // PHASE 2 FIX: Reuse the standardized write-engine function to deduct points!
+                                const newLoyalty = calculateLoyaltyForOrder(0, ptsToDeduct, currentLoyalty, globalPoints);
+                                
+                                await updateDoc(custRef, {
+                                    loyaltyData: newLoyalty
+                                });
+                            }
+                        }
 
                         setClaimOrder(null);
                     } catch (err) {
@@ -18240,14 +18372,14 @@
                                                     return (
                                                         <>
                                                             <span className="text-stone-300">|</span>
-                                                            <span className="text-amber-600 font-bold text-sm">{loyalty.activePts}P</span>
+                                                            <span className="text-amber-600 font-bold text-sm">{loyalty.activePts !== undefined ? loyalty.activePts : loyalty.activePoints}P</span>
                                                             <span className="text-stone-300">|</span>
                                                             {loyalty.freeClaims > 0 ? (
                                                                 <button onClick={() => setClaimOrder(order)} className="text-rose-600 font-bold text-sm bg-rose-50 px-2 py-0.5 rounded hover:bg-rose-100 transition shadow-sm border border-rose-200 cursor-pointer active:scale-95 flex items-center gap-1">
                                                                     <i className="fa-solid fa-gift"></i> {loyalty.freeClaims} Claim
                                                                 </button>
                                                             ) : (
-                                                                <span className="text-rose-400 font-bold text-sm"><i className="fa-solid fa-gift mr-1"></i> {loyalty.freeClaims}</span>
+                                                                <span className="text-rose-400 font-bold text-sm"><i className="fa-solid fa-gift mr-1"></i> {loyalty.freeClaims || 0}</span>
                                                             )}
                                                         </>
                                                     );
