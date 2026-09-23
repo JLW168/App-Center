@@ -1471,6 +1471,20 @@
                 const isMenuLoading = loadingProducts || loadingCategories;
                 const isSetupLoading = loadingShops; 
 
+                // NEW: Fetch Admin Profile globally once to speed up downstream queries
+                const [adminProfile, setAdminProfile] = useState(null);
+                
+                useEffect(() => {
+                    if (user && !user.isAnonymous && window.FirebaseApp) {
+                        const { doc, getDoc } = window.FirebaseApp;
+                        getDoc(doc(db, 'admins', user.uid))
+                            .then(snap => { if (snap.exists()) setAdminProfile(snap.data()); })
+                            .catch(e => console.warn(e));
+                    } else {
+                        setAdminProfile(null);
+                    }
+                }, [user]);
+
                 // Initialize Firebase with the correct profile strategy based on the current view
                 useEffect(() => {
                     if (window.FirebaseApp) {
@@ -1527,6 +1541,8 @@
 
                     const unsubscribers = [];
 
+                    const isAdmin = user && !user.isAnonymous;
+
                     // PRIORITY 1: Live Listener ONLY for Products (To catch "Sold Out" status instantly)
                     unsubscribers.push(onSnapshot(getColRef('products'), snap => {
                         const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
@@ -1534,8 +1550,8 @@
                     }));
 
                     // PRIORITY 2: Smart Fetching for Static Configuration Data
-                    if (view === 'admin_dashboard') {
-                        // Admins get live WebSockets to see their own edits instantly
+                    if (view === 'admin_dashboard' || isAdmin) {
+                        // Admins get live WebSockets for EVERYTHING, running continuously in background
                         unsubscribers.push(onSnapshot(getColRef('categories'), snap => {
                             syncToState('solaris_categories', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
                         }));
@@ -1543,22 +1559,19 @@
                             syncToState('solaris_shops', snap.docs.map(d => ({ id: d.id, ...d.data() })), setShops, setLoadingShops);
                         }));
                         
-                        const deferTimer = setTimeout(() => {
-                            unsubscribers.push(onSnapshot(getColRef('sugar_options'), snap => {
-                                syncToState('solaris_sugar', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
-                            }));
-                            unsubscribers.push(onSnapshot(getColRef('ice_options'), snap => {
-                                syncToState('solaris_ice', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
-                            }));
-                            unsubscribers.push(onSnapshot(getColRef('tables'), snap => {
-                                syncToState('solaris_tables', snap.docs.map(d => ({ id: d.id, ...d.data() })), setTables, setLoadingTables);
-                            }));
-                            unsubscribers.push(onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
-                            unsubscribers.push(onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
-                        }, 800);
+                        // Removed 800ms debounce for instant data availability
+                        unsubscribers.push(onSnapshot(getColRef('sugar_options'), snap => {
+                            syncToState('solaris_sugar', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('ice_options'), snap => {
+                            syncToState('solaris_ice', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('tables'), snap => {
+                            syncToState('solaris_tables', snap.docs.map(d => ({ id: d.id, ...d.data() })), setTables, setLoadingTables);
+                        }));
+                        unsubscribers.push(onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
+                        unsubscribers.push(onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
                         
-                        // Attach the timer clear to the cleanup loop
-                        unsubscribers.push(() => clearTimeout(deferTimer));
                     } else {
                         // Customers get a one-time parallel fetch (getDocs) to kill 5 WebSocket connections
                         const fetchStaticConfig = async () => {
@@ -1589,76 +1602,64 @@
                 // OPTIMIZATION 1.5: Private Data Fetching (Orders)
                 useEffect(() => {
                     if (!user) return;
-                    const { onSnapshot, doc, getDoc } = window.FirebaseApp;
+                    const { onSnapshot, query, orderBy, limit, where } = window.FirebaseApp;
                     let unsubO;
 
-                    const deferTimer = setTimeout(async () => {
-                        if (view === 'customer') {
-                            // OPTIMIZATION: CustomerPortal handles its own hyper-targeted queries.
-                            // No need to download global orders here.
-                            setOrders([]);
+                    const isAdmin = user && !user.isAnonymous;
+
+                    if (!isAdmin && view === 'customer') {
+                        // Non-admins on customer portal do not need global orders
+                        setOrders([]);
+                    } else if (isAdmin && adminProfile) {
+                        // HIGHSPEED FIX: Removed 800ms setTimeout and inline getDoc(). 
+                        // Synchronizes instantly using the globally fetched adminProfile.
+                        
+                        let q;
+                        let isTargeted = false;
+                        if (adminProfile.role !== 'Admin' && adminProfile.shopId && adminProfile.shopId !== 'All') {
+                            // Targeted Query: Saves hundreds of document reads and bandwidth!
+                            q = query(getColRef('orders'), where('shopId', '==', adminProfile.shopId), orderBy('createdAt', 'desc'), limit(150));
+                            isTargeted = true;
                         } else {
-                            const { query, orderBy, limit, where } = window.FirebaseApp;
-                            
-                            // OPTIMIZATION: Check Admin Permissions before downloading orders
-                            // If they are a Branch Manager, ONLY download orders for their specific branch.
-                            let adminDoc = null;
-                            try {
-                                const snap = await getDoc(doc(db, 'admins', user.uid));
-                                if (snap.exists()) adminDoc = snap.data();
-                            } catch (e) {
-                                console.warn("Failed to fetch admin profile for optimization", e);
-                            }
-
-                            let q;
-                            let isTargeted = false;
-                            if (adminDoc && adminDoc.role !== 'Admin' && adminDoc.shopId && adminDoc.shopId !== 'All') {
-                                // Targeted Query: Saves hundreds of document reads and bandwidth!
-                                q = query(getColRef('orders'), where('shopId', '==', adminDoc.shopId), orderBy('createdAt', 'desc'), limit(150));
-                                isTargeted = true;
-                            } else {
-                                // Super Admin: Needs global view
-                                q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
-                            }
-
-                            // HIGH-SPEED UI FIX: Process only document changes to preserve object references.
-                            // This allows React to skip re-rendering unchanged KDS and POS cards, drastically cutting lag.
-                            const ordersMap = new Map();
-                            const handleSnap = (snap) => {
-                                let hasChanges = false;
-                                snap.docChanges().forEach(change => {
-                                    hasChanges = true;
-                                    if (change.type === 'removed') {
-                                        ordersMap.delete(change.doc.id);
-                                    } else {
-                                        ordersMap.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
-                                    }
-                                });
-                                if (hasChanges) {
-                                    setOrders(Array.from(ordersMap.values()).sort((a,b)=>b.createdAt-a.createdAt));
-                                }
-                            };
-
-                            try {
-                                unsubO = onSnapshot(q, handleSnap, (error) => {
-                                    // Graceful Fallback: If Firebase throws a missing index error, fallback to the global query.
-                                    if (isTargeted && error.message && error.message.includes('index')) {
-                                        console.warn("Missing Composite Index in Firebase. Falling back to global query...", error);
-                                        const fallbackQ = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
-                                        unsubO = onSnapshot(fallbackQ, handleSnap);
-                                    }
-                                });
-                            } catch (err) {
-                                console.error("Order fetch setup failed:", err);
-                            }
+                            // Super Admin: Needs global view
+                            q = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
                         }
-                    }, 800);
+
+                        // HIGH-SPEED UI FIX: Process only document changes to preserve object references.
+                        const ordersMap = new Map();
+                        const handleSnap = (snap) => {
+                            let hasChanges = false;
+                            snap.docChanges().forEach(change => {
+                                hasChanges = true;
+                                if (change.type === 'removed') {
+                                    ordersMap.delete(change.doc.id);
+                                } else {
+                                    ordersMap.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
+                                }
+                            });
+                            if (hasChanges) {
+                                setOrders(Array.from(ordersMap.values()).sort((a,b)=>b.createdAt-a.createdAt));
+                            }
+                        };
+
+                        try {
+                            unsubO = onSnapshot(q, handleSnap, (error) => {
+                                // Graceful Fallback
+                                if (isTargeted && error.message && error.message.includes('index')) {
+                                    console.warn("Missing Composite Index in Firebase. Falling back to global query...", error);
+                                    const fallbackQ = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
+                                    unsubO = onSnapshot(fallbackQ, handleSnap);
+                                }
+                            });
+                        } catch (err) {
+                            console.error("Order fetch setup failed:", err);
+                        }
+                    }
 
                     return () => { 
-                        clearTimeout(deferTimer);
                         if(unsubO) unsubO(); 
                     };
-                }, [user, view]);
+                }, [user, view, adminProfile]);
 
                 if (authError) {
                     return (
@@ -2063,6 +2064,7 @@
                 const [isSuspended, setIsSuspended] = useState(false);
                 const [pastCustomerName, setPastCustomerName] = useState('');
                 const [isCheckingPhone, setIsCheckingPhone] = useState(false);
+                const [fullCustomerData, setFullCustomerData] = useState(null);
 
                 const [joinTelegram, setJoinTelegram] = useState(false);
                 const hasInteractedWithTelegramRef = useRef(false);
@@ -2103,6 +2105,7 @@
                             
                             if (!snapCust.empty) {
                                 const data = snapCust.docs[0].data();
+                                setFullCustomerData(data);
                                 
                                 if (data.status === 'Inactive') {
                                     setIsExisting(true);
@@ -2197,6 +2200,7 @@
                     let welcomeFlag = false;
                     let generatedCustomerId = null;
                     let generatedDocId = null;
+                    let returnedFullData = fullCustomerData;
 
                     // SAVE / UPDATE CUSTOMER SECURITY RECORD
                     try {
@@ -2231,6 +2235,8 @@
                                 hasWelcomeDiscount: welcomeFlag
                             };
                             if (!bypassPin && cleanPin) basePayload.pin = cleanPin;
+                            
+                            returnedFullData = basePayload; // Pass the new payload back to POS
 
                             try {
                                 // Secure atomic transaction to guarantee sequential ID even under concurrent load
@@ -2310,7 +2316,7 @@
                         }, 100);
                     }
 
-                    onSubmit(e, { phone, name: finalName, sex, hasWelcomeDiscount: welcomeFlag, systemCustomerId: generatedCustomerId, docId: generatedDocId || customerId });
+                    onSubmit(e, { phone, name: finalName, sex, hasWelcomeDiscount: welcomeFlag, systemCustomerId: generatedCustomerId, docId: generatedDocId || customerId, fullData: returnedFullData });
                 };
 
                 const currentShop = shops.find(s => s.id === regShopId) || shops.find(s => s.id === sessionInfo.shopId) || shops[0];
@@ -2373,15 +2379,6 @@
 
                                 {(String(phone).replace(/\D/g, '').length < 9 || !isExisting) && (
                                     <div className="animate-fade-in space-y-4">
-                                        {globalPoints?.welcomeDiscountEnabled && String(phone).replace(/\D/g, '').length >= 8 && !isCheckingPhone && (
-                                            <div className="bg-gradient-to-r from-rose-500 to-pink-500 text-white p-4 rounded-xl shadow-lg border border-pink-400 flex items-start gap-3 animate-bounce shadow-pink-500/30">
-                                                <i className="fa-solid fa-gift text-3xl mt-0.5"></i>
-                                                <div>
-                                                    <p className="font-black text-sm drop-shadow-sm">Welcome Gift Unlocked!</p>
-                                                    <p className="text-[11px] font-medium text-pink-50 leading-tight mt-0.5">Complete registration to instantly get {globalPoints.welcomeDiscountPct}% off your first order today.</p>
-                                                </div>
-                                            </div>
-                                        )}
                                         <div>
                                             <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 ml-1">Your Name</label>
                                             <div className="relative">
@@ -3097,13 +3094,11 @@
                             
                             // Only lock the profile state if the target matches the actively logged-in session
                             if (targetPhone === sessionInfo.customerPhone && sessionInfo.isSetup) {
-                                setCustomerProfile({ id: snap.docs[0].id, ...data });
+                                setCustomerProfile(prev => ({ ...(prev || {}), id: snap.docs[0].id, ...data }));
                             }
                         } else {
                             setLiveRefilledPoints(0);
-                            if (targetPhone === sessionInfo.customerPhone) {
-                                setCustomerProfile(null);
-                            }
+                            // BUG FIX: Removed aggressive nullification to preserve data securely passed by SetupModal
                         }
                     });
 
@@ -4038,116 +4033,191 @@
                     })();
 
                     const customerChargeStatus = customerProfile?.chargeStatus || 'Normal';
+                    const scope = customerProfile?.chargeStatusScope || 'All';
+                    const allowedShops = customerProfile?.chargeStatusShopIds || [];
+                    const isGlobalVIP = scope === 'All' || scope === 'Global';
+                    const isShopEligible = isGlobalVIP || allowedShops.includes(sessionInfo.shopId);
 
                     const processed = cart.map(item => {
-                        let effectiveUnitPrice = item.price;
-                        let lineTotal = item.price * item.quantity;
-                        let promoNames = [];
                         let freeQty = 0;
                         let totalQtyForKDS = item.quantity;
                         const redeemedQty = item.redeemedQty || 0;
                         const paidQty = Math.max(0, item.quantity - redeemedQty);
 
-                        // 1. Process Happy Hour / Promos on the PAID portion of the quantity
-                        if (paidQty > 0) {
-                            if (activeHappyHour) {
-                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    const discountAmt = item.price * (activeHappyHour.value / 100);
-                                    effectiveUnitPrice = item.price - discountAmt;
-                                } else {
-                                    effectiveUnitPrice = Math.max(0, item.price - activeHappyHour.value);
+                        // Initialize Baseline Scenario (No Discount)
+                        let bestScenario = {
+                            name: 'None',
+                            effectiveUnitPrice: item.price,
+                            lineTotal: item.price * paidQty,
+                            savings: 0,
+                            totalQtyForKDS: item.quantity,
+                            freeQuantity: 0,
+                            promoNames: []
+                        };
+
+                        // Best Value Evaluator Function
+                        const addScenario = (scenario) => {
+                            // Tie-breaker priority: VIP/Member > Welcome > Happy Hour > General Promo
+                            const getPriority = (name) => {
+                                if (name.includes('VIP')) return 4;
+                                if (name.includes('Welcome')) return 3;
+                                if (name.includes('Happy')) return 2;
+                                return 1;
+                            };
+
+                            if (scenario.savings > bestScenario.savings) {
+                                bestScenario = scenario;
+                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
+                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
+                                    bestScenario = scenario;
                                 }
-                                lineTotal = effectiveUnitPrice * paidQty;
-                                promoNames.push(`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`);
-                            } else {
-                                const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                                if (promo) {
-                                    promoNames.push(promo.name);
-                                    if (promo.type === 'DISCOUNT_PCT') {
-                                        const discountAmt = item.price * (Number(promo.discountValue || 0) / 100);
-                                        effectiveUnitPrice = item.price - discountAmt;
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'DISCOUNT_FIXED') {
-                                        effectiveUnitPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'BOGO') {
-                                        const reqQty = Math.max(1, Number(promo.requiredQty || 1));
-                                        const rewQty = Math.max(1, Number(promo.rewardQty || 1));
-                                        const bogoFreeQty = Math.floor(paidQty / reqQty) * rewQty;
-                                        totalQtyForKDS = item.quantity + bogoFreeQty;
-                                        freeQty += bogoFreeQty;
-                                        if (bogoFreeQty > 0) {
-                                            promoNames.push(`+${bogoFreeQty} Free`);
-                                        }
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'FREE_ITEM') {
-                                        effectiveUnitPrice = 0;
-                                        lineTotal = 0;
-                                    }
+                            }
+                        };
+
+                        if (paidQty > 0) {
+                            // Scenario 1: Happy Hour
+                            if (activeHappyHour) {
+                                let effPrice = item.price;
+                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
                                 } else {
-                                    lineTotal = effectiveUnitPrice * paidQty;
+                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                }
+                                let lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Happy',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                });
+                            }
+
+                            // Scenario 2: Standard Promo (Percentage, Fixed, BOGO, Free Item)
+                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            if (promo) {
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let fQty = 0;
+                                let tQty = item.quantity;
+                                let pName = promo.name;
+                                let savings = 0;
+
+                                if (promo.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'DISCOUNT_FIXED') {
+                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'BOGO') {
+                                    const reqQty = Math.max(1, Number(promo.requiredQty || 1));
+                                    const rewQty = Math.max(1, Number(promo.rewardQty || 1));
+                                    fQty = Math.floor(paidQty / reqQty) * rewQty;
+                                    tQty = item.quantity + fQty;
+                                    lTotal = effPrice * paidQty;
+                                    savings = fQty * item.price; // Savings derived from the value of free items given
+                                    if (fQty > 0) pName += ` (+${fQty} Free)`;
+                                } else if (promo.type === 'FREE_ITEM') {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                }
+
+                                if (savings > 0) {
+                                    addScenario({
+                                        name: 'Promo',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: tQty,
+                                        freeQuantity: fQty,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
 
-                            // Welcome Discount Override
+                            // Scenario 3: Welcome Discount
                             if (sessionInfo.hasWelcomeDiscount && globalPoints?.welcomeDiscountEnabled && globalPoints?.welcomeDiscountPct > 0) {
                                 const welcomePct = Number(globalPoints.welcomeDiscountPct) / 100;
-                                const welcomeDiscountAmt = item.price * welcomePct;
-                                const potentialPrice = item.price - welcomeDiscountAmt;
-                                
-                                if (potentialPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = potentialPrice;
-                                    lineTotal = effectiveUnitPrice * paidQty;
-                                    promoNames = [promoNames.find(n => n.includes('Happy Hour')) || `🎉 New Member ${globalPoints.welcomeDiscountPct}%`];
-                                }
+                                const effPrice = item.price - (item.price * welcomePct);
+                                const lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Welcome',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`🎉 New Member ${globalPoints.welcomeDiscountPct}%`]
+                                });
                             }
-                        } else {
-                            effectiveUnitPrice = 0;
-                            lineTotal = 0;
-                        }
 
-                        // 2. VIP Charge Status Override (Applies to paid portion)
-                        if (paidQty > 0 && customerChargeStatus !== 'Normal') {
-                            const scope = customerProfile?.chargeStatusScope || customerProfile?.benefitScope || 'All';
-                            const allowedShops = customerProfile?.chargeStatusShopIds || customerProfile?.allowedBranches || [];
-                            const isGlobalVIP = !scope || scope === 'All' || scope === 'Global';
-                            const isShopEligible = isGlobalVIP || allowedShops.includes(sessionInfo.shopId);
-
-                            if (isShopEligible) {
+                            // Scenario 4: VIP / Member Discount
+                            if (customerChargeStatus !== 'Normal' && isShopEligible) {
                                 const tierLabel = customerProfile?.customerType && customerProfile.customerType !== 'Normal' ? customerProfile.customerType : 'Member';
-                                let vipPrice = effectiveUnitPrice;
-                                let vipPromoName = null;
+                                const statusStr = String(customerChargeStatus).toUpperCase();
+                                
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let savings = 0;
+                                let pName = '';
 
-                                if (customerChargeStatus.includes('FOC')) {
-                                    vipPrice = 0;
-                                    vipPromoName = `${tierLabel} (FOC)`;
-                                } else if (customerChargeStatus === 'COG') {
-                                    let itemCost = 0;
+                                if (statusStr.includes('FOC')) {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                    pName = `${tierLabel} (FOC)`;
+                                } else if (statusStr.includes('COG')) {
                                     const product = products.find(p => p.id === item.productId);
+                                    let itemCost = 0;
                                     if (product) {
                                         if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
                                         else if (item.size === 'L') itemCost = product.costLarge || 0;
                                         else itemCost = product.costSmall || 0; 
                                     }
-                                    vipPrice = itemCost;
-                                    vipPromoName = `${tierLabel} (COG)`;
-                                } else if (customerChargeStatus.includes('% Dis')) {
-                                    const pct = parseInt(customerChargeStatus);
-                                    if (!isNaN(pct)) {
-                                        vipPrice = item.price * (1 - (pct / 100));
-                                        vipPromoName = `${tierLabel} ${pct}%`;
+                                    effPrice = itemCost;
+                                    lTotal = itemCost * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                    pName = `${tierLabel} (COG)`;
+                                } else {
+                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
+                                    if (!isNaN(pct) && pct > 0) {
+                                        effPrice = item.price - (item.price * (pct / 100));
+                                        lTotal = effPrice * paidQty;
+                                        savings = (item.price * paidQty) - lTotal;
+                                        pName = `${tierLabel} ${pct}%`;
                                     }
                                 }
 
-                                if (vipPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = vipPrice;
-                                    lineTotal = effectiveUnitPrice * paidQty;
-                                    promoNames = [vipPromoName]; // Replace other promos with VIP as it's better
+                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
+                                    addScenario({
+                                        name: 'VIP',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: item.quantity,
+                                        freeQuantity: 0,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
+                        } else {
+                            bestScenario.effectiveUnitPrice = 0;
+                            bestScenario.lineTotal = 0;
                         }
 
-                        // 3. Add Loyalty tag if applicable
+                        // Apply the winning scenario
+                        let effectiveUnitPrice = bestScenario.effectiveUnitPrice;
+                        let lineTotal = bestScenario.lineTotal;
+                        totalQtyForKDS = bestScenario.totalQtyForKDS;
+                        freeQty = bestScenario.freeQuantity;
+                        let promoNames = [...bestScenario.promoNames];
+
+                        // Add Loyalty tag if applicable
                         if (redeemedQty > 0) {
                             promoNames.unshift(redeemedQty === item.quantity ? 'Loyalty Reward' : `Loyalty Reward (${redeemedQty})`);
                             if (item.quantity > 0 && paidQty === 0) {
@@ -4171,7 +4241,7 @@
                         };
                     });
 
-                    return { processedCart: processed, cartTotal: total, cartItemCount: count };
+                    return { processedCart: processed, cartTotal: Math.max(0, total), cartItemCount: count };
                 }, [cart, activeBranchPromos, sessionInfo.shopId, sessionInfo.hasWelcomeDiscount, customerProfile, products, globalPoints, shops]);
 
                 // LIVE DISTANCE & TERRITORY CHECK (Synchronized instantly with Firestore)
@@ -5142,16 +5212,7 @@
                         } else {
                             // OPTIMIZATION: Removed the sequential getDoc verification block.
                             // Firebase Auth executes immediately, and the Dashboard handles 'Inactive' security live.
-                            const userCred = await signInWithEmailAndPassword(auth, email, password);
-                            
-                            // NEW STRICT LOGIN BLOCK
-                            const userDoc = await getDoc(doc(db, 'admins', userCred.user.uid));
-                            if (userDoc.exists() && userDoc.data().status === 'Inactive') {
-                                await window.FirebaseApp.signOut(auth);
-                                setError('Your account has been deactivated. Please contact an administrator.');
-                                setIsProcessing(false);
-                                return;
-                            }
+                            await signInWithEmailAndPassword(auth, email, password);
                         }
                         onLogin();
                     } catch (err) { 
@@ -5522,8 +5583,8 @@
 
             function DashboardView({ orders, shops, currentAdminRecord, admins, shifts, products }) {
                 const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
-                // Default to 'this_month' as requested, no branch filter needed
-                const [filter, setFilter] = useState('this_month');
+                // HIGH-SPEED UI FIX: Default to 'today' so the Dashboard loads instantly using memory data.
+                const [filter, setFilter] = useState('today');
                 const [customMonth, setCustomMonth] = useState(() => {
                     const d = new Date();
                     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -10693,7 +10754,8 @@
                     const checkPhone = async () => {
                         const cleanedPhone = String(customerPhone).replace(/\D/g, '');
                         if (!cleanedPhone || cleanedPhone.length < 8) {
-                            setCustomerData(null);
+                            // If phone is explicitly cleared out or invalid, we can safely reset it
+                            if (!customerPhone) setCustomerData(null);
                             return;
                         }
                         
@@ -10713,12 +10775,11 @@
                                     return;
                                 }
 
-                                setCustomerData({ id: snapCust.docs[0].id, ...data });
+                                setCustomerData(prev => ({ ...(prev || {}), id: snapCust.docs[0].id, ...data }));
                                 if (!customerName) setCustomerName(data.name);
                                 if (data.sex) setCustomerSex(data.sex);
-                            } else {
-                                setCustomerData(null);
                             }
+                            // BUG FIX: Removed aggressive setCustomerData(null) on empty snap to preserve SetupModal data
                         } catch (err) {
                             console.warn("Phone check failed:", err);
                         } finally {
@@ -10870,10 +10931,8 @@
                     let total = 0;
                     let scpDiscountTotal = 0;
                     const todayStr = getTodayString();
-                    
                     const activePromos = allPromotions.filter(p => p.shopId === cartShopId && p.isActive && (!p.startDate || p.startDate <= todayStr) && (!p.endDate || p.endDate >= todayStr));
 
-                    // HAPPY HOUR CHECK
                     const activeHappyHour = (() => {
                         if (appliedScp) return null; // SCP OVERRIDES HAPPY HOUR
                         
@@ -10918,97 +10977,171 @@
                     const processed = cart.map(item => {
                         const product = products.find(p => p.id === item.productId);
                         
-                        let effectiveUnitPrice = item.price;
-                        let lineTotal = item.price * item.quantity;
-                        let promoNames = [];
                         let freeQty = 0;
                         let totalQtyForKDS = item.quantity;
                         const redeemedQty = item.redeemedQty || 0;
                         const paidQty = Math.max(0, item.quantity - redeemedQty);
 
-                        // 1. Process Happy Hour / Promos on the PAID portion of the quantity
-                        if (paidQty > 0) {
-                            if (activeHappyHour) {
-                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    const discountAmt = item.price * (activeHappyHour.value / 100);
-                                    effectiveUnitPrice = item.price - discountAmt;
-                                } else {
-                                    effectiveUnitPrice = Math.max(0, item.price - activeHappyHour.value);
+                        // Initialize Baseline Scenario (No Discount)
+                        let bestScenario = {
+                            name: 'None',
+                            effectiveUnitPrice: item.price,
+                            lineTotal: item.price * paidQty,
+                            savings: 0,
+                            totalQtyForKDS: item.quantity,
+                            freeQuantity: 0,
+                            promoNames: []
+                        };
+
+                        // Best Value Evaluator Function
+                        const addScenario = (scenario) => {
+                            // Priority: VIP > Happy Hour > Promo
+                            const getPriority = (name) => {
+                                if (name.includes('VIP')) return 4;
+                                if (name.includes('Happy')) return 2;
+                                return 1;
+                            };
+
+                            if (scenario.savings > bestScenario.savings) {
+                                bestScenario = scenario;
+                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
+                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
+                                    bestScenario = scenario;
                                 }
-                                lineTotal = effectiveUnitPrice * paidQty;
-                                promoNames.push(`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`);
-                            } else {
-                                const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                                if (promo) {
-                                    promoNames.push(promo.name);
-                                    if (promo.type === 'DISCOUNT_PCT') {
-                                        const discountAmt = item.price * (Number(promo.discountValue || 0) / 100);
-                                        effectiveUnitPrice = item.price - discountAmt;
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'DISCOUNT_FIXED') {
-                                        effectiveUnitPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'BOGO') {
-                                        const reqQty = Math.max(1, Number(promo.requiredQty || 1));
-                                        const rewQty = Math.max(1, Number(promo.rewardQty || 1));
-                                        const bogoFreeQty = Math.floor(paidQty / reqQty) * rewQty;
-                                        totalQtyForKDS = item.quantity + bogoFreeQty;
-                                        freeQty += bogoFreeQty;
-                                        if (bogoFreeQty > 0) {
-                                            promoNames.push(`+${bogoFreeQty} Free`);
-                                        }
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'FREE_ITEM') {
-                                        effectiveUnitPrice = 0;
-                                        lineTotal = 0;
-                                    }
+                            }
+                        };
+
+                        if (paidQty > 0) {
+                            // Scenario 1: Happy Hour
+                            if (activeHappyHour) {
+                                let effPrice = item.price;
+                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
                                 } else {
-                                    lineTotal = effectiveUnitPrice * paidQty;
+                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                }
+                                let lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Happy',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                });
+                            }
+
+                            // Scenario 2: Standard Promo
+                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            if (promo) {
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let fQty = 0;
+                                let tQty = item.quantity;
+                                let pName = promo.name;
+                                let savings = 0;
+
+                                if (promo.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'DISCOUNT_FIXED') {
+                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'BOGO') {
+                                    const reqQty = Math.max(1, Number(promo.requiredQty || 1));
+                                    const rewQty = Math.max(1, Number(promo.rewardQty || 1));
+                                    fQty = Math.floor(paidQty / reqQty) * rewQty;
+                                    tQty = item.quantity + fQty;
+                                    lTotal = effPrice * paidQty;
+                                    savings = fQty * item.price;
+                                    if (fQty > 0) pName += ` (+${fQty} Free)`;
+                                } else if (promo.type === 'FREE_ITEM') {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                }
+
+                                if (savings > 0) {
+                                    addScenario({
+                                        name: 'Promo',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: tQty,
+                                        freeQuantity: fQty,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
 
-                            // 2. VIP Charge Status Override (Applies to paid portion)
+                            // Scenario 3: VIP / Charge Status
                             if (customerChargeStatus !== 'Normal' && isShopEligible) {
                                 const tierLabel = customerData?.customerType && customerData.customerType !== 'Normal' ? customerData.customerType : 'Member';
-                                let vipPrice = effectiveUnitPrice;
-                                let vipPromoName = null;
+                                const statusStr = String(customerChargeStatus).toUpperCase();
+                                
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let savings = 0;
+                                let pName = '';
 
-                                if (customerChargeStatus.includes('FOC')) {
-                                    vipPrice = 0;
-                                    vipPromoName = `${tierLabel} (FOC)`;
-                                } else if (customerChargeStatus === 'COG') {
+                                if (statusStr.includes('FOC')) {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                    pName = `${tierLabel} (FOC)`;
+                                } else if (statusStr.includes('COG')) {
                                     let itemCost = 0;
                                     if (product) {
                                         if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
                                         else if (item.size === 'L') itemCost = product.costLarge || 0;
                                         else itemCost = product.costSmall || 0; 
                                     }
-                                    vipPrice = itemCost;
-                                    vipPromoName = `${tierLabel} (COG)`;
-                                } else if (customerChargeStatus.includes('% Dis')) {
-                                    const pct = parseInt(customerChargeStatus);
-                                    if (!isNaN(pct)) {
-                                        vipPrice = item.price * (1 - (pct / 100));
-                                        vipPromoName = `${tierLabel} ${pct}%`;
+                                    effPrice = itemCost;
+                                    lTotal = itemCost * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                    pName = `${tierLabel} (COG)`;
+                                } else {
+                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
+                                    if (!isNaN(pct) && pct > 0) {
+                                        effPrice = item.price - (item.price * (pct / 100));
+                                        lTotal = effPrice * paidQty;
+                                        savings = (item.price * paidQty) - lTotal;
+                                        pName = `${tierLabel} ${pct}%`;
                                     }
                                 }
 
-                                if (vipPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = vipPrice;
-                                    lineTotal = effectiveUnitPrice * paidQty;
-                                    promoNames = [vipPromoName]; // Replace other promos with VIP as it's better
+                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
+                                    addScenario({
+                                        name: 'VIP',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: item.quantity,
+                                        freeQuantity: 0,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
                         } else {
-                            effectiveUnitPrice = 0;
-                            lineTotal = 0;
+                            bestScenario.effectiveUnitPrice = 0;
+                            bestScenario.lineTotal = 0;
                         }
 
-                        // 3. Add Loyalty tag if applicable
+                        // Apply the winning scenario
+                        let effectiveUnitPrice = bestScenario.effectiveUnitPrice;
+                        let lineTotal = bestScenario.lineTotal;
+                        totalQtyForKDS = bestScenario.totalQtyForKDS;
+                        freeQty = bestScenario.freeQuantity;
+                        let promoNames = [...bestScenario.promoNames];
+
+                        // Add Loyalty tag if applicable
                         if (redeemedQty > 0) {
                             promoNames.unshift(redeemedQty === item.quantity ? 'Loyalty Reward' : `Loyalty Reward (${redeemedQty})`);
                             if (item.quantity > 0 && paidQty === 0) {
-                                effectiveUnitPrice = 0; // Fully free
+                                effectiveUnitPrice = 0;
                             }
                         }
 
@@ -11869,20 +12002,20 @@
                                 
                                 <div className="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6 shrink-0">
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Today's Sales</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-green-600 truncate">{todayOrders.filter(o=>o.paymentStatus==='Paid').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Total Sales</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-green-600 truncate">{displayedOrders.filter(o=>o.paymentStatus==='Paid').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Pending</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-red-500 truncate">{todayOrders.filter(o=>o.paymentStatus!=='Paid' && o.status!=='Cancelled').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Pending Sales</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-red-500 truncate">{displayedOrders.filter(o=>o.paymentStatus!=='Paid' && o.status!=='Cancelled').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Active Kitchen</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-amber-600 truncate">{activeOrders.filter(o => ['New', 'Preparing', 'Ready'].includes(o.status)).length}</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Active Tickets</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-amber-600 truncate">{displayedOrders.filter(o => ['New', 'Preparing', 'Ready'].includes(o.status)).length}</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Completed</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-stone-700 truncate">{todayOrders.filter(o=>o.status==='Served').length}</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Completed Orders</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-stone-700 truncate">{displayedOrders.filter(o=>o.status==='Served').length}</p>
                                     </div>
                                 </div>
 
@@ -12314,18 +12447,19 @@
                                     if (document.activeElement && typeof document.activeElement.blur === 'function') document.activeElement.blur();
                                     setCustomerPhone(data.phone);
                                     setCustomerName(data.name);
-                                    setCustomerSex(data.sex);
-                                    setCustomerData(prev => ({
-                                        ...(prev || {}),
-                                        id: data.docId || prev?.id,
-                                        customerId: data.systemCustomerId || prev?.customerId,
-                                        phone: data.phone,
-                                        name: data.name,
-                                        sex: data.sex,
-                                        hasWelcomeDiscount: data.hasWelcomeDiscount
-                                    }));
-                                    setTimeout(() => {
-                                        setShowSetupModal(false);
+                                setCustomerSex(data.sex);
+                                setCustomerData(prev => ({
+                                    ...(prev || {}),
+                                    ...(data.fullData || {}),
+                                    id: data.docId || prev?.id,
+                                    customerId: data.systemCustomerId || prev?.customerId,
+                                    phone: data.phone,
+                                    name: data.name,
+                                    sex: data.sex,
+                                    hasWelcomeDiscount: data.hasWelcomeDiscount
+                                }));
+                                setTimeout(() => {
+                                    setShowSetupModal(false);
                                         window.scrollBy(0, 1);
                                         window.scrollBy(0, -1);
                                     }, 50);
@@ -17619,9 +17753,7 @@
                                                 <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 ml-1">Customer Type</label>
                                                 <select className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium shadow-sm cursor-pointer" value={editCustomerData.customerType || 'Normal'} onChange={e => setEditCustomerData({...editCustomerData, customerType: e.target.value})}>
                                                     <option value="Normal">Normal</option>
-                                                    <option value="Silver">Silver</option>
-                                                    <option value="Gold">Gold</option>
-                                                    <option value="VVIP">VVIP</option>
+                                                    <option value="Member">Member</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -17635,17 +17767,37 @@
                                             </div>
                                             <div>
                                                 <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 ml-1">Charge Status</label>
-                                                <select className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium shadow-sm cursor-pointer" value={editCustomerData.chargeStatus || 'Normal'} onChange={e => setEditCustomerData({...editCustomerData, chargeStatus: e.target.value})}>
+                                                <select className="w-full border border-stone-300 rounded-xl px-4 py-3 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-medium shadow-sm cursor-pointer" value={['Normal', 'FOC', 'COG'].includes(editCustomerData.chargeStatus) ? editCustomerData.chargeStatus : (editCustomerData.chargeStatus ? 'Custom' : 'Normal')} onChange={e => {
+                                                    if (e.target.value === 'Custom') {
+                                                        setEditCustomerData({...editCustomerData, chargeStatus: '10%'});
+                                                    } else {
+                                                        setEditCustomerData({...editCustomerData, chargeStatus: e.target.value});
+                                                    }
+                                                }}>
                                                     <option value="Normal">Normal Price</option>
                                                     <option value="FOC">FOC (Free)</option>
                                                     <option value="COG">COG (Cost Only)</option>
-                                                    <option value="10% Dis">10% Dis</option>
-                                                    <option value="20% Dis">20% Dis</option>
-                                                    <option value="30% Dis">30% Dis</option>
-                                                    <option value="50% Dis">50% Dis</option>
+                                                    <option value="Custom">Custom Discount (%)</option>
                                                 </select>
                                             </div>
                                         </div>
+
+                                        {!['Normal', 'FOC', 'COG'].includes(editCustomerData.chargeStatus) && (
+                                            <div className="animate-fade-in mt-2 bg-stone-50 p-3 rounded-xl border border-stone-200">
+                                                <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2 ml-1">Custom Discount Percentage</label>
+                                                <div className="relative">
+                                                    <input 
+                                                        type="number" 
+                                                        min="1" max="100"
+                                                        placeholder="e.g. 15"
+                                                        className="w-full border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-white text-[16px] font-bold shadow-sm" 
+                                                        value={parseInt(String(editCustomerData.chargeStatus).replace(/\D/g, '')) || ''} 
+                                                        onChange={e => setEditCustomerData({...editCustomerData, chargeStatus: e.target.value ? `${e.target.value}%` : ''})} 
+                                                    />
+                                                    <span className="absolute right-4 top-1/2 -translate-y-1/2 font-bold text-stone-400">%</span>
+                                                </div>
+                                            </div>
+                                        )}
 
                                         <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 shadow-sm animate-fade-in mt-2">
                                             <div className="flex justify-between items-center">
