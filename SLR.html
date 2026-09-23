@@ -4038,126 +4038,186 @@
                     const isGlobalVIP = scope === 'All' || scope === 'Global';
                     const isShopEligible = isGlobalVIP || allowedShops.includes(sessionInfo.shopId);
 
-                    let cartSubtotalForVipDiscount = 0;
-                    let vipDiscountPct = 0;
-                    
-                    if (customerChargeStatus !== 'Normal' && isShopEligible) {
-                        const statusStr = String(customerChargeStatus).toUpperCase();
-                        if (!statusStr.includes('FOC') && !statusStr.includes('COG')) {
-                            const pct = parseInt(statusStr.replace(/\D/g, ''));
-                            if (!isNaN(pct) && pct > 0) {
-                                vipDiscountPct = pct;
-                            }
-                        }
-                    }
-
                     const processed = cart.map(item => {
-                        let effectiveUnitPrice = item.price;
-                        let lineTotal = item.price * item.quantity;
-                        let promoNames = [];
                         let freeQty = 0;
                         let totalQtyForKDS = item.quantity;
                         const redeemedQty = item.redeemedQty || 0;
                         const paidQty = Math.max(0, item.quantity - redeemedQty);
 
-                        // 1. Process Happy Hour / Promos on the PAID portion of the quantity
-                        if (paidQty > 0) {
-                            if (activeHappyHour) {
-                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    const discountAmt = item.price * (activeHappyHour.value / 100);
-                                    effectiveUnitPrice = item.price - discountAmt;
-                                } else {
-                                    effectiveUnitPrice = Math.max(0, item.price - activeHappyHour.value);
+                        // Initialize Baseline Scenario (No Discount)
+                        let bestScenario = {
+                            name: 'None',
+                            effectiveUnitPrice: item.price,
+                            lineTotal: item.price * paidQty,
+                            savings: 0,
+                            totalQtyForKDS: item.quantity,
+                            freeQuantity: 0,
+                            promoNames: []
+                        };
+
+                        // Best Value Evaluator Function
+                        const addScenario = (scenario) => {
+                            // Tie-breaker priority: VIP/Member > Welcome > Happy Hour > General Promo
+                            const getPriority = (name) => {
+                                if (name.includes('VIP')) return 4;
+                                if (name.includes('Welcome')) return 3;
+                                if (name.includes('Happy')) return 2;
+                                return 1;
+                            };
+
+                            if (scenario.savings > bestScenario.savings) {
+                                bestScenario = scenario;
+                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
+                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
+                                    bestScenario = scenario;
                                 }
-                                lineTotal = effectiveUnitPrice * paidQty;
-                                promoNames.push(`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`);
-                            } else {
-                                const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                                if (promo) {
-                                    promoNames.push(promo.name);
-                                    if (promo.type === 'DISCOUNT_PCT') {
-                                        const discountAmt = item.price * (Number(promo.discountValue || 0) / 100);
-                                        effectiveUnitPrice = item.price - discountAmt;
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'DISCOUNT_FIXED') {
-                                        effectiveUnitPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'BOGO') {
-                                        const reqQty = Math.max(1, Number(promo.requiredQty || 1));
-                                        const rewQty = Math.max(1, Number(promo.rewardQty || 1));
-                                        const bogoFreeQty = Math.floor(paidQty / reqQty) * rewQty;
-                                        totalQtyForKDS = item.quantity + bogoFreeQty;
-                                        freeQty += bogoFreeQty;
-                                        if (bogoFreeQty > 0) {
-                                            promoNames.push(`+${bogoFreeQty} Free`);
-                                        }
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'FREE_ITEM') {
-                                        effectiveUnitPrice = 0;
-                                        lineTotal = 0;
-                                    }
+                            }
+                        };
+
+                        if (paidQty > 0) {
+                            // Scenario 1: Happy Hour
+                            if (activeHappyHour) {
+                                let effPrice = item.price;
+                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
                                 } else {
-                                    lineTotal = effectiveUnitPrice * paidQty;
+                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                }
+                                let lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Happy',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                });
+                            }
+
+                            // Scenario 2: Standard Promo (Percentage, Fixed, BOGO, Free Item)
+                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            if (promo) {
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let fQty = 0;
+                                let tQty = item.quantity;
+                                let pName = promo.name;
+                                let savings = 0;
+
+                                if (promo.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'DISCOUNT_FIXED') {
+                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'BOGO') {
+                                    const reqQty = Math.max(1, Number(promo.requiredQty || 1));
+                                    const rewQty = Math.max(1, Number(promo.rewardQty || 1));
+                                    fQty = Math.floor(paidQty / reqQty) * rewQty;
+                                    tQty = item.quantity + fQty;
+                                    lTotal = effPrice * paidQty;
+                                    savings = fQty * item.price; // Savings derived from the value of free items given
+                                    if (fQty > 0) pName += ` (+${fQty} Free)`;
+                                } else if (promo.type === 'FREE_ITEM') {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                }
+
+                                if (savings > 0) {
+                                    addScenario({
+                                        name: 'Promo',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: tQty,
+                                        freeQuantity: fQty,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
 
-                            // Welcome Discount Override
+                            // Scenario 3: Welcome Discount
                             if (sessionInfo.hasWelcomeDiscount && globalPoints?.welcomeDiscountEnabled && globalPoints?.welcomeDiscountPct > 0) {
                                 const welcomePct = Number(globalPoints.welcomeDiscountPct) / 100;
-                                const welcomeDiscountAmt = item.price * welcomePct;
-                                const potentialPrice = item.price - welcomeDiscountAmt;
+                                const effPrice = item.price - (item.price * welcomePct);
+                                const lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Welcome',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`🎉 New Member ${globalPoints.welcomeDiscountPct}%`]
+                                });
+                            }
+
+                            // Scenario 4: VIP / Member Discount
+                            if (customerChargeStatus !== 'Normal' && isShopEligible) {
+                                const tierLabel = customerProfile?.customerType && customerProfile.customerType !== 'Normal' ? customerProfile.customerType : 'Member';
+                                const statusStr = String(customerChargeStatus).toUpperCase();
                                 
-                                if (potentialPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = potentialPrice;
-                                    lineTotal = effectiveUnitPrice * paidQty;
-                                    promoNames = [promoNames.find(n => n.includes('Happy Hour')) || `🎉 New Member ${globalPoints.welcomeDiscountPct}%`];
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let savings = 0;
+                                let pName = '';
+
+                                if (statusStr.includes('FOC')) {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                    pName = `${tierLabel} (FOC)`;
+                                } else if (statusStr.includes('COG')) {
+                                    const product = products.find(p => p.id === item.productId);
+                                    let itemCost = 0;
+                                    if (product) {
+                                        if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
+                                        else if (item.size === 'L') itemCost = product.costLarge || 0;
+                                        else itemCost = product.costSmall || 0; 
+                                    }
+                                    effPrice = itemCost;
+                                    lTotal = itemCost * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                    pName = `${tierLabel} (COG)`;
+                                } else {
+                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
+                                    if (!isNaN(pct) && pct > 0) {
+                                        effPrice = item.price - (item.price * (pct / 100));
+                                        lTotal = effPrice * paidQty;
+                                        savings = (item.price * paidQty) - lTotal;
+                                        pName = `${tierLabel} ${pct}%`;
+                                    }
+                                }
+
+                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
+                                    addScenario({
+                                        name: 'VIP',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: item.quantity,
+                                        freeQuantity: 0,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
                         } else {
-                            effectiveUnitPrice = 0;
-                            lineTotal = 0;
+                            bestScenario.effectiveUnitPrice = 0;
+                            bestScenario.lineTotal = 0;
                         }
 
-                        // 2. VIP Charge Status Override (Applies to paid portion)
-                        if (paidQty > 0 && customerChargeStatus !== 'Normal' && isShopEligible) {
-                            const tierLabel = customerProfile?.customerType && customerProfile.customerType !== 'Normal' ? customerProfile.customerType : 'Member';
-                            let vipPrice = effectiveUnitPrice;
-                            let vipPromoName = null;
-                            const statusStr = String(customerChargeStatus).toUpperCase();
+                        // Apply the winning scenario
+                        let effectiveUnitPrice = bestScenario.effectiveUnitPrice;
+                        let lineTotal = bestScenario.lineTotal;
+                        totalQtyForKDS = bestScenario.totalQtyForKDS;
+                        freeQty = bestScenario.freeQuantity;
+                        let promoNames = [...bestScenario.promoNames];
 
-                            if (statusStr.includes('FOC')) {
-                                vipPrice = 0;
-                                vipPromoName = `${tierLabel} (FOC)`;
-                            } else if (statusStr.includes('COG')) {
-                                let itemCost = 0;
-                                const product = products.find(p => p.id === item.productId);
-                                if (product) {
-                                    if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
-                                    else if (item.size === 'L') itemCost = product.costLarge || 0;
-                                    else itemCost = product.costSmall || 0; 
-                                }
-                                vipPrice = itemCost;
-                                vipPromoName = `${tierLabel} (COG)`;
-                            } else {
-                                // For percentage discounts, we will apply it to the subtotal later
-                                if (vipDiscountPct > 0) {
-                                    cartSubtotalForVipDiscount += effectiveUnitPrice * paidQty;
-                                    vipPromoName = `${tierLabel} ${vipDiscountPct}%`;
-                                    // Do not alter effectiveUnitPrice or lineTotal here for percentage discounts
-                                }
-                            }
-
-                            if (vipPromoName && !statusStr.includes('FOC') && !statusStr.includes('COG')) {
-                                // Just add the promo name, calculations happen on the subtotal
-                                promoNames.push(vipPromoName);
-                            } else if (vipPrice < effectiveUnitPrice) {
-                                effectiveUnitPrice = vipPrice;
-                                lineTotal = effectiveUnitPrice * paidQty;
-                                promoNames.push(vipPromoName); 
-                            }
-                        }
-
-                        // 3. Add Loyalty tag if applicable
+                        // Add Loyalty tag if applicable
                         if (redeemedQty > 0) {
                             promoNames.unshift(redeemedQty === item.quantity ? 'Loyalty Reward' : `Loyalty Reward (${redeemedQty})`);
                             if (item.quantity > 0 && paidQty === 0) {
@@ -4180,12 +4240,6 @@
                             promoName: promoNames.length > 0 ? promoNames.join(' | ') : null
                         };
                     });
-
-                    // Apply VIP Percentage Discount to the Subtotal
-                    if (vipDiscountPct > 0) {
-                        const totalVipDiscount = cartSubtotalForVipDiscount * (vipDiscountPct / 100);
-                        total -= totalVipDiscount;
-                    }
 
                     return { processedCart: processed, cartTotal: Math.max(0, total), cartItemCount: count };
                 }, [cart, activeBranchPromos, sessionInfo.shopId, sessionInfo.hasWelcomeDiscount, customerProfile, products, globalPoints, shops]);
@@ -5158,16 +5212,7 @@
                         } else {
                             // OPTIMIZATION: Removed the sequential getDoc verification block.
                             // Firebase Auth executes immediately, and the Dashboard handles 'Inactive' security live.
-                            const userCred = await signInWithEmailAndPassword(auth, email, password);
-                            
-                            // NEW STRICT LOGIN BLOCK
-                            const userDoc = await getDoc(doc(db, 'admins', userCred.user.uid));
-                            if (userDoc.exists() && userDoc.data().status === 'Inactive') {
-                                await window.FirebaseApp.signOut(auth);
-                                setError('Your account has been deactivated. Please contact an administrator.');
-                                setIsProcessing(false);
-                                return;
-                            }
+                            await signInWithEmailAndPassword(auth, email, password);
                         }
                         onLogin();
                     } catch (err) { 
@@ -10886,10 +10931,8 @@
                     let total = 0;
                     let scpDiscountTotal = 0;
                     const todayStr = getTodayString();
-                    
                     const activePromos = allPromotions.filter(p => p.shopId === cartShopId && p.isActive && (!p.startDate || p.startDate <= todayStr) && (!p.endDate || p.endDate >= todayStr));
 
-                    // HAPPY HOUR CHECK
                     const activeHappyHour = (() => {
                         if (appliedScp) return null; // SCP OVERRIDES HAPPY HOUR
                         
@@ -10931,81 +10974,124 @@
                     const isGlobalVIP = scope === 'All' || scope === 'Global';
                     const isShopEligible = isGlobalVIP || allowedShops.includes(cartShopId);
 
-                    let cartSubtotalForVipDiscount = 0;
-                    let vipDiscountPct = 0;
-
-                    if (customerChargeStatus !== 'Normal' && isShopEligible) {
-                        const statusStr = String(customerChargeStatus).toUpperCase();
-                        if (!statusStr.includes('FOC') && !statusStr.includes('COG')) {
-                            const pct = parseInt(statusStr.replace(/\D/g, ''));
-                            if (!isNaN(pct) && pct > 0) {
-                                vipDiscountPct = pct;
-                            }
-                        }
-                    }
-
                     const processed = cart.map(item => {
                         const product = products.find(p => p.id === item.productId);
                         
-                        let effectiveUnitPrice = item.price;
-                        let lineTotal = item.price * item.quantity;
-                        let promoNames = [];
                         let freeQty = 0;
                         let totalQtyForKDS = item.quantity;
                         const redeemedQty = item.redeemedQty || 0;
                         const paidQty = Math.max(0, item.quantity - redeemedQty);
 
-                        // 1. Process Happy Hour / Promos on the PAID portion of the quantity
-                        if (paidQty > 0) {
-                            if (activeHappyHour) {
-                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    const discountAmt = item.price * (activeHappyHour.value / 100);
-                                    effectiveUnitPrice = item.price - discountAmt;
-                                } else {
-                                    effectiveUnitPrice = Math.max(0, item.price - activeHappyHour.value);
+                        // Initialize Baseline Scenario (No Discount)
+                        let bestScenario = {
+                            name: 'None',
+                            effectiveUnitPrice: item.price,
+                            lineTotal: item.price * paidQty,
+                            savings: 0,
+                            totalQtyForKDS: item.quantity,
+                            freeQuantity: 0,
+                            promoNames: []
+                        };
+
+                        // Best Value Evaluator Function
+                        const addScenario = (scenario) => {
+                            // Priority: VIP > Happy Hour > Promo
+                            const getPriority = (name) => {
+                                if (name.includes('VIP')) return 4;
+                                if (name.includes('Happy')) return 2;
+                                return 1;
+                            };
+
+                            if (scenario.savings > bestScenario.savings) {
+                                bestScenario = scenario;
+                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
+                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
+                                    bestScenario = scenario;
                                 }
-                                lineTotal = effectiveUnitPrice * paidQty;
-                                promoNames.push(`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`);
-                            } else {
-                                const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                                if (promo) {
-                                    promoNames.push(promo.name);
-                                    if (promo.type === 'DISCOUNT_PCT') {
-                                        const discountAmt = item.price * (Number(promo.discountValue || 0) / 100);
-                                        effectiveUnitPrice = item.price - discountAmt;
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'DISCOUNT_FIXED') {
-                                        effectiveUnitPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'BOGO') {
-                                        const reqQty = Math.max(1, Number(promo.requiredQty || 1));
-                                        const rewQty = Math.max(1, Number(promo.rewardQty || 1));
-                                        const bogoFreeQty = Math.floor(paidQty / reqQty) * rewQty;
-                                        totalQtyForKDS = item.quantity + bogoFreeQty;
-                                        freeQty += bogoFreeQty;
-                                        if (bogoFreeQty > 0) {
-                                            promoNames.push(`+${bogoFreeQty} Free`);
-                                        }
-                                        lineTotal = effectiveUnitPrice * paidQty;
-                                    } else if (promo.type === 'FREE_ITEM') {
-                                        effectiveUnitPrice = 0;
-                                        lineTotal = 0;
-                                    }
+                            }
+                        };
+
+                        if (paidQty > 0) {
+                            // Scenario 1: Happy Hour
+                            if (activeHappyHour) {
+                                let effPrice = item.price;
+                                if (activeHappyHour.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
                                 } else {
-                                    lineTotal = effectiveUnitPrice * paidQty;
+                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                }
+                                let lTotal = effPrice * paidQty;
+                                addScenario({
+                                    name: 'Happy',
+                                    effectiveUnitPrice: effPrice,
+                                    lineTotal: lTotal,
+                                    savings: (item.price * paidQty) - lTotal,
+                                    totalQtyForKDS: item.quantity,
+                                    freeQuantity: 0,
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                });
+                            }
+
+                            // Scenario 2: Standard Promo
+                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            if (promo) {
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let fQty = 0;
+                                let tQty = item.quantity;
+                                let pName = promo.name;
+                                let savings = 0;
+
+                                if (promo.type === 'DISCOUNT_PCT') {
+                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'DISCOUNT_FIXED') {
+                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    lTotal = effPrice * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                } else if (promo.type === 'BOGO') {
+                                    const reqQty = Math.max(1, Number(promo.requiredQty || 1));
+                                    const rewQty = Math.max(1, Number(promo.rewardQty || 1));
+                                    fQty = Math.floor(paidQty / reqQty) * rewQty;
+                                    tQty = item.quantity + fQty;
+                                    lTotal = effPrice * paidQty;
+                                    savings = fQty * item.price;
+                                    if (fQty > 0) pName += ` (+${fQty} Free)`;
+                                } else if (promo.type === 'FREE_ITEM') {
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                }
+
+                                if (savings > 0) {
+                                    addScenario({
+                                        name: 'Promo',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: tQty,
+                                        freeQuantity: fQty,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
 
-                            // 2. VIP Charge Status Override (Applies to paid portion)
+                            // Scenario 3: VIP / Charge Status
                             if (customerChargeStatus !== 'Normal' && isShopEligible) {
                                 const tierLabel = customerData?.customerType && customerData.customerType !== 'Normal' ? customerData.customerType : 'Member';
-                                let vipPrice = effectiveUnitPrice;
-                                let vipPromoName = null;
                                 const statusStr = String(customerChargeStatus).toUpperCase();
+                                
+                                let effPrice = item.price;
+                                let lTotal = item.price * paidQty;
+                                let savings = 0;
+                                let pName = '';
 
                                 if (statusStr.includes('FOC')) {
-                                    vipPrice = 0;
-                                    vipPromoName = `${tierLabel} (FOC)`;
+                                    effPrice = 0;
+                                    lTotal = 0;
+                                    savings = item.price * paidQty;
+                                    pName = `${tierLabel} (FOC)`;
                                 } else if (statusStr.includes('COG')) {
                                     let itemCost = 0;
                                     if (product) {
@@ -11013,33 +11099,49 @@
                                         else if (item.size === 'L') itemCost = product.costLarge || 0;
                                         else itemCost = product.costSmall || 0; 
                                     }
-                                    vipPrice = itemCost;
-                                    vipPromoName = `${tierLabel} (COG)`;
+                                    effPrice = itemCost;
+                                    lTotal = itemCost * paidQty;
+                                    savings = (item.price * paidQty) - lTotal;
+                                    pName = `${tierLabel} (COG)`;
                                 } else {
-                                    if (vipDiscountPct > 0) {
-                                        cartSubtotalForVipDiscount += effectiveUnitPrice * paidQty;
-                                        vipPromoName = `${tierLabel} ${vipDiscountPct}%`;
+                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
+                                    if (!isNaN(pct) && pct > 0) {
+                                        effPrice = item.price - (item.price * (pct / 100));
+                                        lTotal = effPrice * paidQty;
+                                        savings = (item.price * paidQty) - lTotal;
+                                        pName = `${tierLabel} ${pct}%`;
                                     }
                                 }
 
-                                if (vipPromoName && !statusStr.includes('FOC') && !statusStr.includes('COG')) {
-                                    promoNames.push(vipPromoName);
-                                } else if (vipPrice < effectiveUnitPrice) {
-                                    effectiveUnitPrice = vipPrice;
-                                    lineTotal = effectiveUnitPrice * paidQty;
-                                    promoNames.push(vipPromoName); 
+                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
+                                    addScenario({
+                                        name: 'VIP',
+                                        effectiveUnitPrice: effPrice,
+                                        lineTotal: lTotal,
+                                        savings: savings,
+                                        totalQtyForKDS: item.quantity,
+                                        freeQuantity: 0,
+                                        promoNames: [pName]
+                                    });
                                 }
                             }
                         } else {
-                            effectiveUnitPrice = 0;
-                            lineTotal = 0;
+                            bestScenario.effectiveUnitPrice = 0;
+                            bestScenario.lineTotal = 0;
                         }
 
-                        // 3. Add Loyalty tag if applicable
+                        // Apply the winning scenario
+                        let effectiveUnitPrice = bestScenario.effectiveUnitPrice;
+                        let lineTotal = bestScenario.lineTotal;
+                        totalQtyForKDS = bestScenario.totalQtyForKDS;
+                        freeQty = bestScenario.freeQuantity;
+                        let promoNames = [...bestScenario.promoNames];
+
+                        // Add Loyalty tag if applicable
                         if (redeemedQty > 0) {
                             promoNames.unshift(redeemedQty === item.quantity ? 'Loyalty Reward' : `Loyalty Reward (${redeemedQty})`);
                             if (item.quantity > 0 && paidQty === 0) {
-                                effectiveUnitPrice = 0; // Fully free
+                                effectiveUnitPrice = 0;
                             }
                         }
 
@@ -11057,12 +11159,6 @@
                             promoName: promoNames.length > 0 ? promoNames.join(' | ') : null
                         };
                     });
-
-                    // Apply VIP Percentage Discount to the Subtotal
-                    if (vipDiscountPct > 0) {
-                        const totalVipDiscount = cartSubtotalForVipDiscount * (vipDiscountPct / 100);
-                        total -= totalVipDiscount;
-                    }
 
                     // PHASE 1: Apply Cart-Level SCP Discount (Intelligent Quantity Limit)
                     let discountedQty = 0;
@@ -11906,20 +12002,20 @@
                                 
                                 <div className="grid grid-cols-2 md:grid-cols-4 gap-2 sm:gap-4 mb-4 sm:mb-6 shrink-0">
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Today's Sales</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-green-600 truncate">{todayOrders.filter(o=>o.paymentStatus==='Paid').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Total Sales</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-green-600 truncate">{displayedOrders.filter(o=>o.paymentStatus==='Paid').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Pending</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-red-500 truncate">{todayOrders.filter(o=>o.paymentStatus!=='Paid' && o.status!=='Cancelled').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Pending Sales</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-red-500 truncate">{displayedOrders.filter(o=>o.paymentStatus!=='Paid' && o.status!=='Cancelled').reduce((s,o)=>s+o.totalAmount,0).toLocaleString()} ៛</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Active Kitchen</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-amber-600 truncate">{activeOrders.filter(o => ['New', 'Preparing', 'Ready'].includes(o.status)).length}</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Active Tickets</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-amber-600 truncate">{displayedOrders.filter(o => ['New', 'Preparing', 'Ready'].includes(o.status)).length}</p>
                                     </div>
                                     <div className="bg-white p-3 sm:p-4 rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-center min-w-0">
-                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Completed</p>
-                                        <p className="text-lg sm:text-2xl font-bold text-stone-700 truncate">{todayOrders.filter(o=>o.status==='Served').length}</p>
+                                        <p className="text-stone-500 text-[10px] sm:text-sm font-medium mb-0.5 sm:mb-1 truncate">Completed Orders</p>
+                                        <p className="text-lg sm:text-2xl font-bold text-stone-700 truncate">{displayedOrders.filter(o=>o.status==='Served').length}</p>
                                     </div>
                                 </div>
 
