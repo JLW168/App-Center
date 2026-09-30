@@ -997,8 +997,9 @@
             // NEW: Calculate Absent days & Penalty for absence on a rejected leave day.
             const attendedDays = new Set(Object.keys(dailyRecords));
             let absentDays = 0;
-            let holidayPaidDays = 0; // Track paid holidays
-            let holidayWorkedDays = 0; // Track holidays actually worked (1x2 Pay)
+            let holidayPaidDays = 0; // Track holidays taken OFF (Paid to maintain base salary)
+            let holidayWorkedDays = 0; // Track holidays actually worked
+            let holidayBonusDays = 0; // NEW: Track the exact multiplier bonus earned automatically
             let rejectedLeavePenaltyAmount = 0; // Initialize penalty amount
             
             // --- PHASE 2: Initialize OT Days to be calculated dynamically ---
@@ -1047,27 +1048,52 @@
                 }
 
                 // --- CRITICAL FIX 2: Decoupled Holiday Logic (Restores 1x2 Pay) ---
-                const isHoliday = (publicHolidays || []).some(h => {
+                const applicableHolidays = (publicHolidays || []).filter(h => {
                     if (dayKey < h.startDate || dayKey > h.endDate) return false;
+                    
+                    // If staff are explicitly targeted, check if this employee is in the list
+                    if (h.targetStaffIds && h.targetStaffIds.length > 0) {
+                        return h.targetStaffIds.includes(employee.id);
+                    }
+
+                    // Otherwise check shops
                     if (!h.targetShops || h.targetShops.length === 0) return true; // Global holiday
                     
                     const empShops = Array.isArray(employee.shop) ? employee.shop : (employee.shop ? [employee.shop] : []);
                     return empShops.some(s => h.targetShops.includes(s));
                 });
                 
+                const isHoliday = applicableHolidays.length > 0;
+                
                 if (isHoliday) {
-                    holidayPaidDays++; // 1x Pay for the holiday itself
-                    let currentDayMultiplier = 1;
+                    // Determine the specific multiplier for this day
+                    let dayMaxHolidayMultiplier = 2.0; // Default
+                    if (employeeShop && employeeShop.holidayOTMultiplier) {
+                        dayMaxHolidayMultiplier = parseFloat(employeeShop.holidayOTMultiplier);
+                    } else if (systemSettings?.holidayOTMultiplier !== undefined) {
+                        dayMaxHolidayMultiplier = parseFloat(systemSettings.holidayOTMultiplier);
+                    }
                     
+                    const customMultipliers = applicableHolidays.map(h => parseFloat(h.multiplier)).filter(m => !isNaN(m));
+                    if (customMultipliers.length > 0) {
+                        dayMaxHolidayMultiplier = Math.max(...customMultipliers);
+                    }
+
                     if (attendedDays.has(dayKey)) {
                         holidayWorkedDays++; 
-                        currentDayMultiplier += 1; 
+                        
+                        // EXPLICIT BONUS CALCULATION:
+                        // If they worked, Base Salary automatically covers the first 1.0x.
+                        // The remaining multiplier (e.g. 2.0x - 1.0x = 1.0x) is granted as an automatic bonus!
+                        holidayBonusDays += Math.max(0, dayMaxHolidayMultiplier - 1);
 
-                        // FIX 1: OT is ONLY allowed if they actually checked in
-                        const availableOTRoom = Math.max(0, Number((dynamicMultiplier - currentDayMultiplier).toFixed(2)));
-                        allowedOTForToday = Math.min(todayOTRequested, availableOTRoom);
+                        // Allow standard OT on top if they worked extra hours beyond the holiday shift
+                        const MAX_NORMAL_OT = 1.0;
+                        allowedOTForToday = Math.min(todayOTRequested, MAX_NORMAL_OT);
                     } else {
-                        // FIX 1: If they didn't check in, they cannot claim OT on a holiday
+                        // They took the holiday OFF.
+                        // We credit them 1 paid day so they don't lose their base salary.
+                        holidayPaidDays++;
                         allowedOTForToday = 0;
                     }
 
@@ -1154,6 +1180,9 @@
             const baseSalaryEarned = salaryPerDay * (daysToPayFor > 0 ? daysToPayFor : 0);
             const otSalary = salaryPerDay * (otDays || 0);
             
+            // --- NEW: Calculate Explicit Holiday Bonus Pay ---
+            const holidayBonusPay = salaryPerDay * (holidayBonusDays || 0);
+            
             // --- NEW (Plan Step 2, Part B): Calculate total savings withdrawal ---
             // Sum up all withdrawal amounts. This will be added to earnings.
             const totalSavingsWithdrawal = (savingsWithdrawals || []).reduce(
@@ -1161,8 +1190,8 @@
             );
             
             // MODIFIED (Plan Step 2, Part B): Add the savings withdrawal to the gross salary.
-            // NEW: Add totalAllowance to the Gross Salary equation!
-            const grossSalary = baseSalaryEarned + otSalary + engagements + totalSavingsWithdrawal + totalAllowance;
+            // NEW: Add totalAllowance and holidayBonusPay to the Gross Salary equation!
+            const grossSalary = baseSalaryEarned + otSalary + engagements + totalSavingsWithdrawal + totalAllowance + holidayBonusPay;
 
             // --- NEW: Step 3 - Calculate Voluntary Savings Deduction ---
             let savingsDeduction = 0;
@@ -1193,7 +1222,7 @@
             // CORRECTED & UPDATED: Added new penalty and savings amounts to the returned calculations object.
             // MODIFIED (Plan Step 2): Add 'totalSavingsWithdrawal' to the calculations object.
             // NEW: Added 'totalAllowance' to calculations for Phase 3 payslip UI
-            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, totalAllowance, totalSavingsWithdrawal, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
+            const calculations = { baseSalary, salaryPerDay, daysInMonth, baseSalaryEarned, otSalary, engagements, totalAllowance, totalSavingsWithdrawal, holidayBonusDays, holidayBonusPay, grossSalary, otherDeductions, totalDeductions, netSalary, lateDeductionsAmount, rejectedLeavePenaltyAmount, savingsDeduction };
 
             return { inputs: autoInputs, calculations };
         };
@@ -5470,17 +5499,21 @@
                                         
                                         {currentRenderData.manualInputs?.holidayPaidDays > 0 && (
                                             <div className="flex justify-between text-sm text-teal-700 font-semibold">
-                                                <p>Public Holidays</p><p>{currentRenderData.manualInputs.holidayPaidDays}</p>
-                                            </div>
-                                        )}
-                                        {currentRenderData.manualInputs?.holidayWorkedDays > 0 && (
-                                            <div className="flex justify-between text-sm text-blue-700 font-bold">
-                                                <p>Holidays Worked</p><p>{currentRenderData.manualInputs.holidayWorkedDays}</p>
+                                                <p>Public Holidays (Off)</p><p>{currentRenderData.manualInputs.holidayPaidDays}</p>
                                             </div>
                                         )}
 
-                                        <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.baseSalaryEarned)}</p></div>
-                                        <div className="flex justify-between text-sm"><p>OT Salary ({currentRenderData.manualInputs?.otDays || 0})</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.otSalary)}</p></div>
+                                        <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Base Salary Earned</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.baseSalaryEarned)}</p></div>
+                                        
+                                        {/* NEW: Explicitly rendering the Holiday Bonus Multiplier */}
+                                        {currentRenderData.manualInputs?.holidayWorkedDays > 0 && (
+                                            <div className="flex justify-between text-sm text-blue-700 font-bold bg-blue-100/50 p-1.5 rounded mt-1 border border-blue-200">
+                                                <p>Holiday Worked Bonus (+{currentRenderData.calculations?.holidayBonusDays}x)</p>
+                                                <p>{Utils.formatCurrency(currentRenderData.calculations?.holidayBonusPay)}</p>
+                                            </div>
+                                        )}
+                                        
+                                        <div className="flex justify-between text-sm mt-1"><p>OT Salary ({currentRenderData.manualInputs?.otDays || 0})</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations?.otSalary)}</p></div>
                                         
                                         {currentRenderData.calculations?.engagements > 0 && (
                                             <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className="font-medium">{Utils.formatCurrency(currentRenderData.calculations.engagements)}</p></div>
@@ -12145,8 +12178,8 @@
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">No. Work Day</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Given Off Day</th>
                                 {/* NEW: Added Holiday Columns for Transparency */}
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase" title="Paid Public Holidays">Holidays</th>
-                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase" title="Worked on Holidays (Bonus)">Hols. Worked</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase" title="Paid Public Holidays Taken OFF">Hols. Off</th>
+                                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase" title="Worked on Holidays (Earns Bonus)">Hols. Worked</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total OT</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total Leave No</th>
                                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Total LATE</th>
@@ -13360,26 +13393,39 @@
                         let allowedOTForToday = todayOTRequested;
 
                         // --- CRITICAL FIX 2: Decoupled Holiday Logic (Restores 1x2 Pay) ---
-                        const isHoliday = (publicHolidays || []).some(h => {
+                        const applicableHolidays = (publicHolidays || []).filter(h => {
                             if (dayKey < h.startDate || dayKey > h.endDate) return false;
+                            
+                            if (h.targetStaffIds && h.targetStaffIds.length > 0) {
+                                return h.targetStaffIds.includes(employee.id);
+                            }
+
                             if (!h.targetShops || h.targetShops.length === 0) return true; // Global holiday
                             
                             const empShops = Array.isArray(employee.shop) ? employee.shop : (employee.shop ? [employee.shop] : []);
                             return empShops.some(s => h.targetShops.includes(s));
                         });
                         
+                        const isHoliday = applicableHolidays.length > 0;
+                        
                         if (isHoliday) {
                             holidayPaidDays++;
                             let currentDayMultiplier = 1;
+                            let dayMaxHolidayMultiplier = maxHolidayMultiplier; // local copy for this day
                             
                             if (attendedDays.has(dayKey)) {
                                 holidayWorkedDays++;
                                 currentDayMultiplier += 1;
                             }
 
+                            const customMultipliers = applicableHolidays.map(h => parseFloat(h.multiplier)).filter(m => !isNaN(m));
+                            if (customMultipliers.length > 0) {
+                                dayMaxHolidayMultiplier = Math.max(...customMultipliers);
+                            }
+
                             // --- PHASE 3 GUARDRAIL: Enforce Holiday OT Policy for the Report ---
                             // FIX: Added Number().toFixed(2) to prevent floating point math errors
-                            const availableOTRoom = Math.max(0, Number((maxHolidayMultiplier - currentDayMultiplier).toFixed(2)));
+                            const availableOTRoom = Math.max(0, Number((dayMaxHolidayMultiplier - currentDayMultiplier).toFixed(2)));
                             allowedOTForToday = Math.min(todayOTRequested, availableOTRoom);
                             
                         } else {
@@ -13546,22 +13592,23 @@
                                 
                                 {/* PHASE 2.1 LOGIC: Explicitly show Paid Holidays if applicable */}
                                 {manualInputs.holidayPaidDays > 0 && (
-                                    <div className="flex justify-between text-sm text-teal-700 font-semibold" title="Public Holidays (Paid)">
-                                        <p>Public Holidays</p>
+                                    <div className="flex justify-between text-sm text-teal-700 font-semibold" title="Public Holidays Taken Off (Paid)">
+                                        <p>Public Holidays (Off)</p>
                                         <p className={getChangeIndicatorClass(manualInputs.holidayPaidDays, oldInputs.holidayPaidDays)}>{manualInputs.holidayPaidDays}</p>
                                     </div>
                                 )}
                                 
-                                {/* NEW: Explicitly show if they worked on a holiday for transparency */}
+                                <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Base Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
+                                
+                                {/* NEW: Explicitly showing the holiday bonus! */}
                                 {manualInputs.holidayWorkedDays > 0 && (
-                                    <div className="flex justify-between text-sm text-blue-700 font-bold" title="Worked on Public Holiday (Bonus 2x Pay applied)">
-                                        <p>Holidays Worked</p>
-                                        <p className={getChangeIndicatorClass(manualInputs.holidayWorkedDays, oldInputs.holidayWorkedDays)}>{manualInputs.holidayWorkedDays}</p>
+                                    <div className="flex justify-between text-sm text-blue-700 font-bold bg-blue-100 p-1.5 rounded mt-1 border border-blue-200" title="Automatic Bonus applied based on Holiday Multiplier">
+                                        <p>Holiday Worked Bonus (+{calculations.holidayBonusDays}x)</p>
+                                        <p className={getChangeIndicatorClass(calculations.holidayBonusPay, oldCalcs.holidayBonusPay)}>{Utils.formatCurrency(calculations.holidayBonusPay)}</p>
                                     </div>
                                 )}
 
-                                <div className="flex justify-between text-sm pt-2 border-t border-slate-200"><p>Salary Earned</p><p className={getChangeIndicatorClass(calculations.baseSalaryEarned, oldCalcs.baseSalaryEarned)}>{Utils.formatCurrency(calculations.baseSalaryEarned)}</p></div>
-                                <div className="flex justify-between text-sm"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
+                                <div className="flex justify-between text-sm mt-1"><p>OT Salary ({manualInputs.otDays || 0})</p><p className={getChangeIndicatorClass(calculations.otSalary, oldCalcs.otSalary)}>{Utils.formatCurrency(calculations.otSalary)}</p></div>
                                 {calculations.engagements > 0 && <div className="flex justify-between text-sm"><p>Engagements (Bonus)</p><p className={getChangeIndicatorClass(calculations.engagements, oldCalcs.engagements)}>{Utils.formatCurrency(calculations.engagements)}</p></div>}
                                 {calculations.totalAllowance > 0 && <div className="flex justify-between text-sm text-blue-600"><p>Allowances</p><p className={getChangeIndicatorClass(calculations.totalAllowance, oldCalcs.totalAllowance)}>{Utils.formatCurrency(calculations.totalAllowance)}</p></div>}
                                 {calculations.totalSavingsWithdrawal > 0 && <div className="flex justify-between text-sm text-indigo-600"><p>Savings Payback</p><p className={getChangeIndicatorClass(calculations.totalSavingsWithdrawal, oldCalcs.totalSavingsWithdrawal)}>{Utils.formatCurrency(calculations.totalSavingsWithdrawal)}</p></div>}
@@ -14072,7 +14119,7 @@
                                 {employeesForDropdown.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
                             </select>
                         </div>
-                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-full text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-star mr-2 text-teal-400"></i>Holidays</label><input type="number" name="holidayPaidDays" value={displayInputs.holidayPaidDays ?? ''} className="input" disabled title="Public Holidays (Paid)" /></div><div><label className="text-sm"><i className="fas fa-briefcase-medical mr-2 text-blue-400"></i>Hols. Worked</label><input type="number" name="holidayWorkedDays" value={displayInputs.holidayWorkedDays ?? ''} className="input" disabled title="Worked on Public Holidays (Bonus)" /></div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div>
+                    </div>{selectedEmployee && (<><div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4 pt-6 border-t border-slate-700"><h3 className="md:col-span-full text-lg font-semibold text-slate-200">Attendance & Deductions</h3><div><label className="text-sm"><i className="fas fa-briefcase mr-2 text-slate-400"></i>Work Days</label><input type="number" name="workDays" value={displayInputs.workDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-gift mr-2 text-pink-400"></i>Given Off Days</label><input type="number" name="givenOffDays" value={displayInputs.givenOffDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-star mr-2 text-teal-400"></i>Hols. Off</label><input type="number" name="holidayPaidDays" value={displayInputs.holidayPaidDays ?? ''} className="input" disabled title="Public Holidays Taken Off (Paid)" /></div><div><label className="text-sm"><i className="fas fa-briefcase-medical mr-2 text-blue-400"></i>Hols. Worked</label><input type="number" name="holidayWorkedDays" value={displayInputs.holidayWorkedDays ?? ''} className="input" disabled title="Worked on Public Holidays (Earns Bonus)" />{displayCalculations.holidayBonusDays > 0 && <span className="text-[10px] text-blue-400 font-bold block mt-1">+{displayCalculations.holidayBonusDays}x Bonus Earned</span>}</div><div><label className="text-sm"><i className="fas fa-clock mr-2 text-purple-400"></i>OT Days</label><input type="number" name="otDays" value={displayInputs.otDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-calendar-minus mr-2 text-orange-400"></i>Leave Days</label><input type="number" name="leaveDays" value={displayInputs.leaveDays ?? ''} className="input" disabled /></div><div><label className="text-sm"><i className="fas fa-user-clock mr-2 text-red-400"></i>Total Late Days</label><input type="number" name="totalLateDays" value={displayInputs.totalLateDays ?? ''} className="input" disabled /></div>
                     
                     {/* CRITICAL FIX 3: UI Transparency for Debt Caps */}
                     <div>
@@ -14310,9 +14357,10 @@
                     'Base Salary': rec.baseSalary || 0,
                     'Work Days': rec.manualInputs?.workDays || 0,
                     'Given Off Days': rec.manualInputs?.givenOffDays || 0,
-                    'Public Holidays': rec.manualInputs?.holidayPaidDays || 0, // Explicitly extracted
-                    'Holidays Worked': rec.manualInputs?.holidayWorkedDays || 0, // NEW
-                    'Salary Earned': rec.calculations?.baseSalaryEarned || 0,
+                    'Holidays (Off)': rec.manualInputs?.holidayPaidDays || 0,
+                    'Holidays Worked': rec.manualInputs?.holidayWorkedDays || 0,
+                    'Base Salary Earned': rec.calculations?.baseSalaryEarned || 0,
+                    'Holiday Bonus (KHR)': rec.calculations?.holidayBonusPay || 0, // NEW EXPORT COLUMN
                     'OT Days': rec.manualInputs?.otDays || 0,
                     'OT Salary (KHR)': rec.calculations?.otSalary || 0,
                     'Engagements/Bonuses': rec.calculations?.engagements || 0,
@@ -16341,6 +16389,217 @@ service cloud.firestore {
         };
         // --- END HOLIDAY POLICY WIDGET ---
 
+        // --- NEW: Custom Holiday Manager Components ---
+        const HolidayModal = ({ isOpen, onClose, onSave, holiday }) => {
+            const { shops, employees } = useAppData();
+            const [formData, setFormData] = useState({});
+
+            useEffect(() => {
+                if (isOpen) {
+                    setFormData(holiday ? { ...holiday, targetShops: holiday.targetShops || [], targetStaffIds: holiday.targetStaffIds || [] } : {
+                        name: '', startDate: '', endDate: '', multiplier: '', targetShops: [], targetStaffIds: []
+                    });
+                }
+            }, [isOpen, holiday]);
+
+            const availableEmployees = useMemo(() => {
+                if (!formData.targetShops || formData.targetShops.length === 0) return [];
+                return employees.filter(e => {
+                    const empShops = Array.isArray(e.shop) ? e.shop : [e.shop];
+                    return empShops.some(s => formData.targetShops.includes(s)) && e.status === 'Active';
+                });
+            }, [employees, formData.targetShops]);
+
+            const handleChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => ({ ...prev, [name]: value }));
+            };
+
+            const handleShopToggle = (shopName) => {
+                setFormData(prev => {
+                    const current = prev.targetShops || [];
+                    const updated = current.includes(shopName) ? current.filter(s => s !== shopName) : [...current, shopName];
+                    const newStaffIds = updated.length === 0 ? [] : prev.targetStaffIds;
+                    return { ...prev, targetShops: updated, targetStaffIds: newStaffIds };
+                });
+            };
+
+            const handleStaffToggle = (staffId) => {
+                setFormData(prev => {
+                    const current = prev.targetStaffIds || [];
+                    const updated = current.includes(staffId) ? current.filter(s => s !== staffId) : [...current, staffId];
+                    return { ...prev, targetStaffIds: updated };
+                });
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                onSave(formData);
+            };
+
+            if (!isOpen) return null;
+
+            return (
+                <Modal isOpen={isOpen} onClose={onClose} maxWidth="max-w-2xl">
+                    <form onSubmit={handleSubmit} className="flex flex-col h-full overflow-hidden">
+                        <ModalHeader title={holiday ? "Edit Public Holiday" : "Add Public Holiday"} onClose={onClose} />
+                        <ModalBody>
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div className="md:col-span-2">
+                                        <label className="text-sm font-medium text-slate-400">Holiday Name <span className="text-red-400">*</span></label>
+                                        <input name="name" value={formData.name || ''} onChange={handleChange} className="input" required placeholder="e.g. Khmer New Year" />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">Start Date <span className="text-red-400">*</span></label>
+                                        <input type="date" name="startDate" value={formData.startDate || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-400">End Date <span className="text-red-400">*</span></label>
+                                        <input type="date" name="endDate" value={formData.endDate || ''} onChange={handleChange} className="input" required />
+                                    </div>
+                                    <div className="md:col-span-2">
+                                        <label className="text-sm font-medium text-slate-400">Custom Pay Multiplier (Optional Override)</label>
+                                        <input type="number" step="0.5" min="1" max="5" name="multiplier" value={formData.multiplier || ''} onChange={handleChange} className="input font-bold text-green-400" placeholder="e.g. 3.0" />
+                                        <p className="text-[10px] text-slate-500 mt-1">If left blank, the global or shop default holiday multiplier will apply.</p>
+                                    </div>
+
+                                    <div className="md:col-span-2">
+                                        <label className="text-sm font-medium text-slate-400 mb-2 block">Target Shops (Leave empty for ALL shops)</label>
+                                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-2 border border-slate-600 rounded bg-slate-700/50 max-h-32 overflow-y-auto">
+                                            {shops.map(shop => (
+                                                <div key={shop.id} className="flex items-center">
+                                                    <input 
+                                                        type="checkbox" 
+                                                        checked={(formData.targetShops || []).includes(shop.name)} 
+                                                        onChange={() => handleShopToggle(shop.name)}
+                                                        className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 bg-slate-600 shrink-0"
+                                                    />
+                                                    <label className="ml-2 text-xs text-slate-300 truncate cursor-pointer">{shop.name}</label>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {(formData.targetShops && formData.targetShops.length > 0) && (
+                                        <div className="md:col-span-2 animate-fade-in">
+                                            <label className="text-sm font-medium text-slate-400 mb-2 block text-emerald-400">Target Specific Staff (Optional)</label>
+                                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-2 border border-emerald-600/50 rounded bg-emerald-900/10 max-h-40 overflow-y-auto">
+                                                {availableEmployees.length > 0 ? availableEmployees.map(emp => (
+                                                    <div key={emp.id} className="flex items-center">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            checked={(formData.targetStaffIds || []).includes(emp.id)} 
+                                                            onChange={() => handleStaffToggle(emp.id)}
+                                                            className="h-4 w-4 rounded border-emerald-500 text-emerald-500 focus:ring-emerald-500 bg-slate-600 shrink-0"
+                                                        />
+                                                        <label className="ml-2 text-xs text-slate-300 truncate cursor-pointer">{emp.name}</label>
+                                                    </div>
+                                                )) : (
+                                                    <div className="col-span-full text-xs text-slate-500 italic p-2">No active staff found in selected shops.</div>
+                                                )}
+                                            </div>
+                                            <p className="text-[10px] text-slate-500 mt-1">If left empty, all staff in the targeted shops will receive the holiday.</p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </ModalBody>
+                        <ModalFooter>
+                            <Button variant="secondary" onClick={onClose}>Cancel</Button>
+                            <Button type="submit" variant="primary">Save Holiday</Button>
+                        </ModalFooter>
+                    </form>
+                </Modal>
+            );
+        };
+
+        const HolidayManagerTab = () => {
+            const { db } = useFirebase();
+            const { publicHolidays, employees } = useAppData();
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [editingHoliday, setEditingHoliday] = useState(null);
+            const [holidayToDelete, setHolidayToDelete] = useState(null);
+
+            const handleSave = async (formData) => {
+                const { addDoc, updateDoc, doc, collection, serverTimestamp } = window.firebaseSDK;
+                try {
+                    if (formData.startDate > formData.endDate) {
+                        alert("Start Date cannot be after End Date.");
+                        return;
+                    }
+                    if (formData.id) {
+                        const { id, ...data } = formData;
+                        await updateDoc(doc(db, 'publicHolidays', id), data);
+                    } else {
+                        await addDoc(collection(db, 'publicHolidays'), formData);
+                    }
+                    setIsModalOpen(false);
+                } catch (e) { console.error(e); alert("Failed to save holiday"); }
+            };
+
+            const handleDelete = async () => {
+                if (!holidayToDelete) return;
+                try {
+                    await window.firebaseSDK.deleteDoc(window.firebaseSDK.doc(db, 'publicHolidays', holidayToDelete.id));
+                    setHolidayToDelete(null);
+                } catch (e) { console.error(e); }
+            };
+
+            return (
+                <Card>
+                    <PageHeader title="Public Holiday Management">
+                        <Button variant="primary" icon="fa-plus" onClick={() => { setEditingHoliday(null); setIsModalOpen(true); }}>Add Holiday</Button>
+                    </PageHeader>
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-slate-700">
+                            <thead className="bg-slate-900/50">
+                                <tr>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Holiday Name</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Multiplier</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Target Shops</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Target Staff</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Start Date</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">End Date</th>
+                                    <th className="px-4 py-3 text-right text-xs font-semibold text-slate-400 uppercase">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-700">
+                                {publicHolidays && publicHolidays.map(h => (
+                                    <tr key={h.id} className="hover:bg-slate-700/50">
+                                        <td className="px-4 py-4 text-sm text-slate-200 font-bold">{h.name}</td>
+                                        <td className="px-4 py-4 text-sm text-green-400 font-bold">{h.multiplier ? `${h.multiplier}x` : <span className="text-slate-500 font-normal italic">Default</span>}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">
+                                            {(h.targetShops && h.targetShops.length > 0) ? h.targetShops.join(', ') : 'All Shops'}
+                                        </td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">
+                                            {(h.targetStaffIds && h.targetStaffIds.length > 0) ? (
+                                                <span className="text-emerald-400 font-semibold">{h.targetStaffIds.length} Staff Selected</span>
+                                            ) : 'All Staff'}
+                                        </td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(h.startDate)}</td>
+                                        <td className="px-4 py-4 text-sm text-slate-300">{Utils.formatISOToDisplay(h.endDate)}</td>
+                                        <td className="px-4 py-4 text-sm text-right">
+                                            <div className="flex items-center justify-end gap-2">
+                                                <Button variant="icon-edit" icon="fa-edit" onClick={() => { setEditingHoliday(h); setIsModalOpen(true); }} />
+                                                <Button variant="icon-delete" icon="fa-trash" onClick={() => setHolidayToDelete(h)} />
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                                {(!publicHolidays || publicHolidays.length === 0) && (
+                                    <tr><td colSpan="7" className="px-4 py-8 text-center text-slate-500">No holidays defined.</td></tr>
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <HolidayModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onSave={handleSave} holiday={editingHoliday} />
+                    <ConfirmationModal isOpen={!!holidayToDelete} onClose={() => setHolidayToDelete(null)} onConfirm={handleDelete} title="Delete Holiday" message="Are you sure you want to delete this holiday?" />
+                </Card>
+            );
+        };
+
         // NEW: QR Code Generator Modal for Shop Settings (Phase 1)
         const ShopQRModal = ({ isOpen, onClose, shop }) => {
             const canvasRef = useRef(null);
@@ -17274,7 +17533,7 @@ service cloud.firestore {
                                 <div className="mb-4 p-4 bg-teal-900/20 border border-teal-500/30 rounded-lg text-teal-200 text-sm">
                                     <i className="fas fa-info-circle mr-2"></i> <strong>System Rule:</strong> Add your official Public Holidays here. The Payroll and Attendance engines will automatically read these dates to calculate holiday pay and excuse staff absences.
                                 </div>
-                                <SettingsCRUD title="Public Holiday" collectionName="publicHolidays" items={publicHolidays || []} formFields={holidayFormFields} listColumns={holidayListColumns} />
+                                <HolidayManagerTab />
                             </div>
                         )}
                     </div>
