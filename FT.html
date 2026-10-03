@@ -94,6 +94,7 @@
       const [isModalOpen, setIsModalOpen] = useState(false);
       const [isShareModalOpen, setIsShareModalOpen] = useState(false);
       const [editingNodeId, setEditingNodeId] = useState(null);
+      const [pendingRelation, setPendingRelation] = useState(null);
       const [formData, setFormData] = useState({ name: '', sex: 'Unknown', dob: '', dod: '', notes: '', spouseId: '', parentId: '' });
 
       const canvasRef = useRef(null);
@@ -121,7 +122,7 @@
 
             const { initializeApp } = await nativeImport('https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js');
             const { getFirestore, doc, getDoc, setDoc } = await nativeImport('https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js');
-            const { getAuth, signInAnonymously } = await nativeImport('https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js');
+            const { getAuth, signInAnonymously, onAuthStateChanged } = await nativeImport('https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js');
 
             const firebaseConfig = {
               apiKey: "AIzaSyBWjcR-oJ0RF0RuId_dDuQ_fJ4pUGwOykI",
@@ -137,9 +138,21 @@
             const db = getFirestore(app);
             const auth = getAuth(app);
 
-            // Sign in to authenticate with Firebase
-            const userCredential = await signInAnonymously(auth);
-            const uid = userCredential.user.uid;
+            // FIX: Wait to see if the browser remembers the user from a previous refresh
+            let user = await new Promise((resolve) => {
+                const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+                    unsubscribe();
+                    resolve(currentUser);
+                });
+            });
+
+            // If no user is remembered, only THEN create a new anonymous account
+            if (!user) {
+                const userCredential = await signInAnonymously(auth);
+                user = userCredential.user;
+            }
+            
+            const uid = user.uid;
 
             setFirebaseInstances({ db, uid, setDoc, doc });
 
@@ -193,7 +206,7 @@
 
       // --- Event Handlers ---
       const handlePointerDownCanvas = (e) => {
-        if (e.target.closest('.node-element') || e.target.closest('.action-panel')) return;
+        if (e.target.closest('.node-element') || e.target.closest('.action-panel') || e.target.closest('.smart-toolbar')) return;
         setIsPanning(true);
         setSelectedNodeId(null);
         setDragInfo({ type: 'pan', startX: e.clientX, startY: e.clientY, startPanX: pan.x, startPanY: pan.y });
@@ -299,9 +312,15 @@
           });
         } else {
           setEditingNodeId(null);
+          setPendingRelation(null);
           setFormData({ name: '', sex: 'Unknown', dob: '', dod: '', notes: '', spouseId: '', parentId: '' });
         }
         setIsModalOpen(true);
+      };
+
+      const handleCloseModal = () => {
+        setIsModalOpen(false);
+        setPendingRelation(null);
       };
 
       const handleSaveMember = (e) => {
@@ -314,12 +333,48 @@
         delete nodeDataToSave.spouseId;
         delete nodeDataToSave.parentId;
 
+        let extraEdges = [];
+
         if (editingNodeId) {
           setNodes(nds => nds.map(n => n.id === editingNodeId ? { ...n, data: nodeDataToSave } : n));
         } else {
-          const selected = nodes.find(n => n.id === selectedNodeId);
-          let startX = selected ? selected.x + NODE_WIDTH + 40 : -pan.x + window.innerWidth / 2 - NODE_WIDTH/2; 
-          let startY = selected ? selected.y : -pan.y + window.innerHeight / 2 - NODE_HEIGHT/2;
+          let startX, startY;
+
+          if (pendingRelation) {
+              const source = nodes.find(n => n.id === pendingRelation.sourceId);
+              startX = source.x;
+              startY = source.y;
+
+              if (pendingRelation.type === 'parent') {
+                  const existingParents = edges.filter(e => e.type === 'child' && e.target === source.id);
+                  if (existingParents.length === 1) {
+                      const firstParent = nodes.find(n => n.id === existingParents[0].source);
+                      if (firstParent) {
+                          startX = firstParent.x + NODE_WIDTH + 60; 
+                          startY = firstParent.y;
+                      }
+                  } else {
+                      startY -= 200;
+                  }
+                  // Link new node as parent to the source node
+                  extraEdges.push({ id: generateId(), source: nodeId, target: source.id, type: 'child' });
+
+              } else if (pendingRelation.type === 'spouse') {
+                  startX += NODE_WIDTH + 60;
+              } else if (pendingRelation.type === 'child') {
+                  startY += 200;
+                  const spouseEdge = edges.find(e => e.type === 'spouse' && (e.source === source.id || e.target === source.id));
+                  if (spouseEdge) {
+                      const spouseId = spouseEdge.source === source.id ? spouseEdge.target : spouseEdge.source;
+                      const spouseNode = nodes.find(n => n.id === spouseId);
+                      if (spouseNode) startX = (source.x + spouseNode.x) / 2;
+                  }
+              }
+          } else {
+              const selected = nodes.find(n => n.id === selectedNodeId);
+              startX = selected ? selected.x + NODE_WIDTH + 40 : -pan.x + window.innerWidth / 2 - NODE_WIDTH/2; 
+              startY = selected ? selected.y : -pan.y + window.innerHeight / 2 - NODE_HEIGHT/2;
+          }
           
           const pos = getSafePosition(startX, startY, nodes);
           setNodes(nds => [...nds, { id: nodeId, x: pos.x, y: pos.y, data: nodeDataToSave }]);
@@ -328,6 +383,7 @@
         // Relationship Syncing
         setEdges(eds => {
           let newEdges = [...eds];
+          if (extraEdges.length > 0) newEdges.push(...extraEdges);
           
           // Sync Spouse
           const spouseEdgeIdx = newEdges.findIndex(edge => edge.type === 'spouse' && (edge.source === nodeId || edge.target === nodeId));
@@ -357,6 +413,7 @@
           return newEdges;
         });
 
+        setPendingRelation(null);
         setIsModalOpen(false);
       };
 
@@ -367,61 +424,29 @@
         setSelectedNodeId(null);
       };
 
-      const handleAddRelative = (relationType) => {
+      const handleAddRelativeInit = (relationType) => {
         if (isViewOnly || !selectedNodeId) return;
         const selected = nodes.find(n => n.id === selectedNodeId);
         if (!selected) return;
 
-        const newNodeId = generateId();
-        let targetX = selected.x;
-        let targetY = selected.y;
-        let newEdgesToAdd = [];
         let formSpouseId = '';
         let formParentId = '';
         
         if (relationType === 'parent') {
            const existingParents = edges.filter(e => e.type === 'child' && e.target === selected.id);
            if (existingParents.length === 1) {
-               // Add second parent and automatically marry them to the first parent
-               const firstParentId = existingParents[0].source;
-               const firstParent = nodes.find(n => n.id === firstParentId);
-               if (firstParent) {
-                   targetX = firstParent.x + NODE_WIDTH + 60; 
-                   targetY = firstParent.y;
-                   newEdgesToAdd.push({ id: generateId(), source: newNodeId, target: selected.id, type: 'child' });
-                   newEdgesToAdd.push({ id: generateId(), source: firstParentId, target: newNodeId, type: 'spouse' });
-                   formSpouseId = firstParentId;
-               }
-           } else {
-               targetY = selected.y - 200;
-               newEdgesToAdd.push({ id: generateId(), source: newNodeId, target: selected.id, type: 'child' });
+               formSpouseId = existingParents[0].source;
            }
         } else if (relationType === 'spouse') {
-           targetX = selected.x + NODE_WIDTH + 60;
-           newEdgesToAdd.push({ id: generateId(), source: selected.id, target: newNodeId, type: 'spouse' });
            formSpouseId = selected.id;
         } else if (relationType === 'child') {
-           targetY = selected.y + 200;
-           newEdgesToAdd.push({ id: generateId(), source: selected.id, target: newNodeId, type: 'child' });
            formParentId = selected.id;
-           
-           const spouseEdge = edges.find(e => e.type === 'spouse' && (e.source === selected.id || e.target === selected.id));
-           if (spouseEdge) {
-               const spouseId = spouseEdge.source === selected.id ? spouseEdge.target : spouseEdge.source;
-               newEdgesToAdd.push({ id: generateId(), source: spouseId, target: newNodeId, type: 'child' });
-               const spouseNode = nodes.find(n => n.id === spouseId);
-               if (spouseNode) targetX = (selected.x + spouseNode.x) / 2;
-           }
         }
 
-        const pos = getSafePosition(targetX, targetY, nodes);
-
-        setNodes(nds => [...nds, { id: newNodeId, x: pos.x, y: pos.y, data: { name: `New ${relationType}`, sex: 'Unknown' } }]);
-        setEdges(eds => [...eds, ...newEdgesToAdd]);
-        setEditingNodeId(newNodeId);
+        setPendingRelation({ type: relationType, sourceId: selected.id });
+        setEditingNodeId(null);
         setFormData({ name: '', sex: 'Unknown', dob: '', dod: '', notes: '', spouseId: formSpouseId, parentId: formParentId });
         setIsModalOpen(true);
-        setSelectedNodeId(newNodeId);
       };
 
       const handleCopyShareLink = () => {
@@ -496,41 +521,63 @@
               ))}
             </div>
 
-            {/* Smart Action Panel */}
+            {/* Smart Contextual Floating Toolbar */}
             {selectedNode && (
-              <div className="action-panel absolute bottom-6 left-1/2 transform -translate-x-1/2 bg-white rounded-xl shadow-xl border border-gray-200 p-4 flex flex-col items-center z-40 max-w-lg w-full">
-                <div className="text-sm font-semibold text-gray-700 mb-3 border-b pb-2 w-full flex items-center justify-between">
-                   <div className="flex-1 text-center truncate pr-4 text-lg">
-                      {selectedNode.data.name || 'Unknown'} 
-                      <span className="text-xs text-gray-500 font-normal ml-2">({selectedNode.data.sex})</span>
-                   </div>
-                   <button onClick={() => setSelectedNodeId(null)} className="text-gray-400 hover:text-gray-600 flex-shrink-0"><X className="w-5 h-5"/></button>
-                </div>
-                
-                {/* View-Only Details Display */}
-                {(isViewOnly || selectedNode.data.notes || selectedNode.data.dob) && (
-                  <div className="w-full text-sm text-gray-600 mb-3 px-2">
-                    {selectedNode.data.dob && <p><strong>Born:</strong> {selectedNode.data.dob} {selectedNode.data.dod && <span> - <strong>Died:</strong> {selectedNode.data.dod}</span>}</p>}
-                    {selectedNode.data.notes && <p className="mt-1"><strong>Notes:</strong> {selectedNode.data.notes}</p>}
+              <div 
+                className="absolute z-50 fade-in pointer-events-none smart-toolbar"
+                style={{ left: selectedNode.x + NODE_WIDTH / 2, top: selectedNode.y }}
+              >
+                  {/* Top Dark Toolbar (Edit/Delete) */}
+                  <div className="absolute pointer-events-auto flex items-center bg-slate-800 text-white rounded-full shadow-xl px-3 py-1.5 gap-1 backdrop-blur-sm transform -translate-x-1/2 -top-16">
+                     <span className="text-sm font-medium px-2 border-r border-slate-600 truncate max-w-[140px]">{selectedNode.data.name || 'Unknown'}</span>
+                     {!isViewOnly && (
+                       <>
+                         <button onClick={() => handleOpenModal(selectedNode)} className="p-1.5 hover:bg-slate-700 rounded-full transition-colors" title="Edit"><Edit className="w-4 h-4" /></button>
+                         <button onClick={() => handleDeleteMember(selectedNode.id)} className="p-1.5 hover:bg-red-500/80 rounded-full transition-colors text-red-300" title="Delete"><Trash2 className="w-4 h-4" /></button>
+                       </>
+                     )}
+                     <button onClick={() => setSelectedNodeId(null)} className="p-1.5 hover:bg-slate-700 rounded-full transition-colors ml-1"><X className="w-4 h-4" /></button>
                   </div>
-                )}
 
-                {/* Edit Controls - Hidden in View Only mode */}
-                {!isViewOnly && (
-                  <div className="flex flex-wrap justify-center gap-2 mt-2 w-full">
-                    <button onClick={() => handleOpenModal(selectedNode)} className="px-3 py-1.5 text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors flex items-center text-sm font-medium">
-                      <Edit className="w-4 h-4 mr-1" /> Edit
-                    </button>
-                    <div className="w-px h-8 bg-gray-200 self-center hidden sm:block"></div>
-                    <button onClick={() => handleAddRelative('parent')} className="px-3 py-1.5 text-sm font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md">Add Parent</button>
-                    <button onClick={() => handleAddRelative('spouse')} className="px-3 py-1.5 text-sm font-medium bg-pink-50 hover:bg-pink-100 text-pink-700 rounded-md">Add Spouse</button>
-                    <button onClick={() => handleAddRelative('child')} className="px-3 py-1.5 text-sm font-medium bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-md">Add Child</button>
-                    <div className="w-px h-8 bg-gray-200 self-center hidden sm:block"></div>
-                    <button onClick={() => handleDeleteMember(selectedNode.id)} className="px-3 py-1.5 text-red-600 bg-red-50 hover:bg-red-100 rounded-md transition-colors flex items-center text-sm font-medium">
-                      <Trash2 className="w-4 h-4 mr-1" /> Delete
-                    </button>
-                  </div>
-                )}
+                  {/* Smart Orbiting Nodes (+ buttons) */}
+                  {!isViewOnly && (
+                     <>
+                       {/* Add Parent (Top) */}
+                       <button onClick={() => handleAddRelativeInit('parent')} className="absolute pointer-events-auto w-7 h-7 bg-white border border-slate-200 text-blue-600 rounded-full flex items-center justify-center shadow-lg hover:bg-blue-50 hover:scale-110 transition-all z-10 transform -translate-x-1/2 -top-4" title="Add Parent">
+                         <Plus className="w-4 h-4" />
+                       </button>
+
+                       {/* Add Spouse (Right) */}
+                       <button onClick={() => handleAddRelativeInit('spouse')} className="absolute pointer-events-auto w-7 h-7 bg-white border border-slate-200 text-pink-600 rounded-full flex items-center justify-center shadow-lg hover:bg-pink-50 hover:scale-110 transition-all z-10 transform -translate-y-1/2" style={{ left: NODE_WIDTH / 2 + 10, top: NODE_HEIGHT / 2 }} title="Add Spouse">
+                         <Plus className="w-4 h-4" />
+                       </button>
+
+                       {/* Add Child (Bottom) */}
+                       <button onClick={() => handleAddRelativeInit('child')} className="absolute pointer-events-auto w-7 h-7 bg-white border border-slate-200 text-indigo-600 rounded-full flex items-center justify-center shadow-lg hover:bg-indigo-50 hover:scale-110 transition-all z-10 transform -translate-x-1/2" style={{ top: NODE_HEIGHT - 10 }} title="Add Child">
+                         <Plus className="w-4 h-4" />
+                       </button>
+                     </>
+                  )}
+
+                  {/* Details Card (View Only or if content exists) */}
+                  {(isViewOnly || selectedNode.data.notes || selectedNode.data.dob) && (
+                      <div className="absolute pointer-events-auto bg-white/95 backdrop-blur-sm rounded-xl shadow-xl border border-gray-200 p-4 w-56 z-20 transform -translate-x-1/2" style={{ top: NODE_HEIGHT + (isViewOnly ? 10 : 25) }}>
+                         <div className="text-sm text-gray-700 space-y-1.5">
+                            {selectedNode.data.dob && <p className="flex justify-between">
+                               <span className="text-gray-400">Born</span>
+                               <span className="font-medium text-right ml-2">{selectedNode.data.dob}</span>
+                            </p>}
+                            {selectedNode.data.dod && <p className="flex justify-between">
+                               <span className="text-gray-400">Died</span>
+                               <span className="font-medium text-right ml-2">{selectedNode.data.dod}</span>
+                            </p>}
+                            {selectedNode.data.notes && <div className="mt-3 pt-3 border-t border-gray-100">
+                               <span className="text-xs text-gray-400 block mb-1">Notes</span>
+                               <p className="italic text-gray-600 leading-snug whitespace-pre-wrap">{selectedNode.data.notes}</p>
+                            </div>}
+                         </div>
+                      </div>
+                  )}
               </div>
             )}
           </div>
@@ -546,18 +593,11 @@
                 <div className="p-6">
                   <p className="text-sm text-gray-600 mb-4">Send this link to family members. They will be able to view the tree and read details, but they <strong>cannot</strong> drag, edit, or delete members.</p>
                   
-                  {}
-                  {window.location.href.startsWith('blob:') && (
-                     <div className="mb-4 p-3 bg-blue-50 text-blue-700 text-xs rounded-lg border border-blue-100 leading-relaxed">
-                        <strong>Note:</strong> You are currently in a temporary preview environment. To share a real link, you must host this file on the internet (e.g., via Firebase Hosting) and append the view ID below to your final URL.
-                     </div>
-                  )}
-
                   <div className="flex gap-2">
                     <input 
                       type="text" 
                       readOnly 
-                      value={window.location.href.startsWith('blob:') ? `https://your-website.com/?view=${firebaseInstances?.uid}` : `${window.location.href.split('?')[0]}?view=${firebaseInstances?.uid}`} 
+                      value={`https://jlw168.github.io/App-Center/FT.html?view=${firebaseInstances?.uid}`} 
                       className="flex-1 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm text-gray-700 outline-none" 
                       id="share-link-input" 
                     />
@@ -575,8 +615,12 @@
             <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100] p-4">
               <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
                 <div className="flex justify-between items-center px-6 py-4 border-b border-gray-100 bg-gray-50">
-                  <h2 className="text-lg font-semibold text-gray-800">{editingNodeId ? 'Edit Family Member' : 'Add Family Member'}</h2>
-                  <button onClick={() => setIsModalOpen(false)} className="text-gray-400 hover:text-gray-600 bg-gray-200/50 hover:bg-gray-200 rounded-full p-1"><X className="w-5 h-5" /></button>
+                  <h2 className="text-lg font-semibold text-gray-800">
+                    {editingNodeId ? 'Edit Family Member' : 
+                     pendingRelation ? `Add ${pendingRelation.type.charAt(0).toUpperCase() + pendingRelation.type.slice(1)} for ${nodes.find(n => n.id === pendingRelation.sourceId)?.data.name || 'Member'}` :
+                     'Add Family Member'}
+                  </h2>
+                  <button onClick={handleCloseModal} className="text-gray-400 hover:text-gray-600 bg-gray-200/50 hover:bg-gray-200 rounded-full p-1"><X className="w-5 h-5" /></button>
                 </div>
                 
                 <form onSubmit={handleSaveMember} className="p-6 space-y-4">
@@ -625,8 +669,8 @@
                     <textarea value={formData.notes} onChange={e => setFormData({...formData, notes: e.target.value})} rows={3} className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white resize-none" placeholder="Additional details..." />
                   </div>
 
-                  <div className="mt-8 flex justify-end space-x-3 pt-4">
-                    <button type="button" onClick={() => setIsModalOpen(false)} className="px-5 py-2.5 rounded-lg text-gray-700 bg-gray-100 hover:bg-gray-200 font-medium">Cancel</button>
+                  <div className="mt-8 flex justify-end space-x-3 pt-4 border-t border-gray-100">
+                    <button type="button" onClick={handleCloseModal} className="px-5 py-2.5 rounded-lg text-gray-700 bg-gray-100 hover:bg-gray-200 font-medium">Cancel</button>
                     <button type="submit" className="px-5 py-2.5 rounded-lg shadow-sm text-white bg-blue-600 hover:bg-blue-700 font-medium">Save Member</button>
                   </div>
                 </form>
