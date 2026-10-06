@@ -1438,6 +1438,7 @@
                 const [view, setView] = useState('customer'); // customer, admin_login, admin_dashboard
                 const [user, setUser] = useState(null);
                 const [authError, setAuthError] = useState(false);
+                const [adminSessionWarning, setAdminSessionWarning] = useState(false);
                 
                 // REDUNDANCY FIX: Cache Hydration (Instant Paint)
                 // Load products and categories from local storage instantly while Firebase syncs in the background.
@@ -1498,6 +1499,25 @@
                     }
                 }, [view]);
 
+                // SECURITY FIX: Active Background Session Monitor
+                // Detects if the device slept, lost its auth token, and woke up in a zombie state
+                useEffect(() => {
+                    if (view === 'admin_dashboard') {
+                        if (user === null || (user && user.isAnonymous)) {
+                            console.warn("Admin session dropped in background. Redirecting to login to prevent zombie state.");
+                            setAdminSessionWarning(true);
+                            setView('admin_login');
+                            
+                            // Attempt to restore anonymous connection for the customer side so it doesn't break
+                            if (window.FirebaseApp && window.FirebaseApp.signInAnonymously && auth) {
+                                if (!auth.currentUser) {
+                                    window.FirebaseApp.signInAnonymously(auth).catch(e => console.warn("Background anon auth failed", e));
+                                }
+                            }
+                        }
+                    }
+                }, [user, view]);
+
                 useEffect(() => {
                     const hideAddressBar = () => {
                         setTimeout(() => window.scrollTo(0, 1), 100);
@@ -1547,13 +1567,21 @@
                     const unsubscribers = [];
 
                     const isAdmin = user && !user.isAnonymous;
+                    
+                    // SELF-HEALING FIX: Aggressive error catching for dead WebSockets on Wake Up
+                    const handleGlobalSnapError = (error) => {
+                        if (error.code === 'permission-denied' || (error.message && error.message.toLowerCase().includes('permission'))) {
+                            console.warn("Global snapshot permission denied. Session dropped. Forcing logout.");
+                            if (auth && window.FirebaseApp) window.FirebaseApp.signOut(auth).catch(e=>console.warn(e));
+                        }
+                    };
 
                     // PRIORITY 1: Live Listener ONLY for Products (To catch "Sold Out" status instantly)
                     // This is required for BOTH views immediately.
                     unsubscribers.push(onSnapshot(getColRef('products'), snap => {
                         const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
                         syncToState('solaris_products', freshProducts, setProducts, setLoadingProducts);
-                    }));
+                    }, handleGlobalSnapError));
 
                     // --- NEW PRE-FETCH STRATEGY ---
                     // Even if we are in the 'customer' view, if the user is an authenticated Admin,
@@ -1564,21 +1592,21 @@
                         // Admins get live WebSockets for EVERYTHING, running continuously in background
                         unsubscribers.push(onSnapshot(getColRef('categories'), snap => {
                             syncToState('solaris_categories', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
-                        }));
+                        }, handleGlobalSnapError));
                         unsubscribers.push(onSnapshot(getColRef('shops'), snap => {
                             syncToState('solaris_shops', snap.docs.map(d => ({ id: d.id, ...d.data() })), setShops, setLoadingShops);
-                        }));
+                        }, handleGlobalSnapError));
                         unsubscribers.push(onSnapshot(getColRef('sugar_options'), snap => {
                             syncToState('solaris_sugar', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
-                        }));
+                        }, handleGlobalSnapError));
                         unsubscribers.push(onSnapshot(getColRef('ice_options'), snap => {
                             syncToState('solaris_ice', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
-                        }));
+                        }, handleGlobalSnapError));
                         unsubscribers.push(onSnapshot(getColRef('tables'), snap => {
                             syncToState('solaris_tables', snap.docs.map(d => ({ id: d.id, ...d.data() })), setTables, setLoadingTables);
-                        }));
-                        unsubscribers.push(onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
-                        unsubscribers.push(onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() })))));
+                        }, handleGlobalSnapError));
+                        unsubscribers.push(onSnapshot(getColRef('ingredients'), snap => setIngredients(snap.docs.map(d => ({ id: d.id, ...d.data() }))), handleGlobalSnapError));
+                        unsubscribers.push(onSnapshot(getColRef('shifts'), snap => setShifts(snap.docs.map(d => ({ id: d.id, ...d.data() }))), handleGlobalSnapError));
                         
                     } else {
                         // Regular anonymous customers still get the lightweight one-time fetch
@@ -1656,7 +1684,16 @@
                                 if (isTargeted && error.message && error.message.includes('index')) {
                                     console.warn("Missing Composite Index in Firebase. Falling back to global query...", error);
                                     const fallbackQ = query(getColRef('orders'), orderBy('createdAt', 'desc'), limit(200));
-                                    unsubO = onSnapshot(fallbackQ, handleSnap);
+                                    unsubO = onSnapshot(fallbackQ, handleSnap, (fallbackErr) => {
+                                        if (fallbackErr.code === 'permission-denied' || (fallbackErr.message && fallbackErr.message.toLowerCase().includes('permission'))) {
+                                            if (auth && window.FirebaseApp) window.FirebaseApp.signOut(auth).catch(e=>console.warn(e));
+                                        }
+                                    });
+                                } else if (error.code === 'permission-denied' || (error.message && error.message.toLowerCase().includes('permission'))) {
+                                    console.warn("Permission denied on Orders snapshot. Token likely expired. Forcing re-authentication.");
+                                    if (auth && window.FirebaseApp) window.FirebaseApp.signOut(auth).catch(e=>console.warn(e));
+                                } else {
+                                    console.error("Order snapshot error:", error);
                                 }
                             });
                         } catch (err) {
@@ -1696,7 +1733,7 @@
                 return (
                     <div className="min-h-screen">
                         {view === 'customer' && <CustomerPortal products={products} categories={categories} tables={tables} orders={orders} shops={shops} currentUser={user} isMenuLoading={isMenuLoading} isSetupLoading={isSetupLoading} sugarOptions={sugarOptions} iceOptions={iceOptions} onAdminClick={() => setView(user && !user.isAnonymous ? 'admin_dashboard' : 'admin_login')} />}
-                        {view === 'admin_login' && <AdminLogin shops={shops} onBack={() => setView('customer')} onLogin={() => setView('admin_dashboard')} />}
+                        {view === 'admin_login' && <AdminLogin shops={shops} warningMessage={adminSessionWarning ? "Your session expired due to background inactivity. Please log in again to sync live data." : null} onBack={() => setView('customer')} onLogin={() => { setAdminSessionWarning(false); setView('admin_dashboard'); }} />}
                         {view === 'admin_dashboard' && <AdminDashboard products={products} categories={categories} tables={tables} orders={orders} ingredients={ingredients} shops={shops} shifts={shifts} currentUser={user} sugarOptions={sugarOptions} iceOptions={iceOptions} onLogout={() => { window.FirebaseApp.signOut(auth).then(() => setView('customer')); }} onBack={() => setView('customer')} />}
                         
                         <AddToHomeScreenPrompt />
@@ -5152,7 +5189,7 @@
             //         ADMIN COMPONENTS & VIEWS
             // ==========================================
 
-            function AdminLogin({ shops, onBack, onLogin }) {
+            function AdminLogin({ shops, onBack, onLogin, warningMessage }) {
                 const [isRegistering, setIsRegistering] = useState(false);
                 const [name, setName] = useState('');
                 const [email, setEmail] = useState('');
@@ -5277,6 +5314,13 @@
                                         {isRegistering ? 'Register a new administrative account.' : 'Sign in to access the management portal.'}
                                     </p>
                                 </div>
+
+                                {warningMessage && (
+                                    <div className="bg-amber-50 text-amber-700 p-4 rounded-2xl mb-6 text-sm font-bold border border-amber-200 flex items-start gap-3 shadow-sm animate-fade-in">
+                                        <i className="fa-solid fa-clock-rotate-left mt-0.5 text-lg"></i>
+                                        <span>{warningMessage}</span>
+                                    </div>
+                                )}
 
                                 {error && (
                                     <div className="bg-red-50 text-red-600 p-4 rounded-2xl mb-6 text-sm font-medium border border-red-100 flex items-start gap-3">
@@ -10693,6 +10737,34 @@
                     return `${day}-${month}-${year} ${hrs}:${mins}:${secs} ${ampm}`;
                 };
 
+                // --- NEW: Calculate counts for POS View ---
+                const { posSizeSCount, posSizeLCount, posScpCount } = useMemo(() => {
+                    let countS = 0, countL = 0, countSCP = 0;
+
+                    for (let i = 0; i < displayedOrders.length; i++) {
+                        const o = displayedOrders[i];
+                        if (o.status === 'Cancelled') continue;
+                        
+                        // Only count items in Served status
+                        if (o.status === 'Served') {
+                             (o.items || []).forEach(item => {
+                                const qty = item.paidQuantity !== undefined ? item.paidQuantity : (item.quantity || 0);
+                                if (item.size === 'S' || item.size === 'Standard') {
+                                    countS += qty;
+                                } else if (item.size === 'L') {
+                                    countL += qty;
+                                }
+                             });
+                             
+                             if (o.appliedScpId) {
+                                 countSCP += o.scpDiscountedQty || 1;
+                             }
+                        }
+                    }
+                    return { posSizeSCount: countS, posSizeLCount: countL, posScpCount: countSCP };
+                }, [displayedOrders]);
+
+
                 const [cart, setCart] = useState([]);
                 const [cartNotes, setCartNotes] = useState('');
                 const [customerName, setCustomerName] = useState('');
@@ -12098,9 +12170,22 @@
 
                                 {/* 2. Unified Filter Card */}
                                 <div className="bg-white rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 mb-4 sm:mb-6 no-print p-3 sm:p-4 shrink-0">
-                                    <div className="flex items-center mb-3">
-                                        <span className="text-[11px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider"><i className="fa-solid fa-sliders mr-1.5"></i> Order Filters & Search</span>
-                                        {isFetchingHistory && <span className="ml-3 text-[10px] text-amber-600 font-bold animate-pulse"><i className="fa-solid fa-spinner fa-spin mr-1"></i> Syncing...</span>}
+                                    <div className="flex items-center justify-between mb-3 border-b border-stone-100 pb-2">
+                                        <div className="flex items-center">
+                                            <span className="text-[11px] sm:text-xs font-bold text-stone-500 uppercase tracking-wider"><i className="fa-solid fa-sliders mr-1.5"></i> Order Filters & Search</span>
+                                            {isFetchingHistory && <span className="ml-3 text-[10px] text-amber-600 font-bold animate-pulse"><i className="fa-solid fa-spinner fa-spin mr-1"></i> Syncing...</span>}
+                                        </div>
+                                        <div className="flex gap-2">
+                                            <span className="text-[10px] sm:text-xs font-bold text-amber-700 bg-amber-50 px-2 py-1 rounded border border-amber-200 shadow-sm" title="Total 'Small' or 'Standard' size items in Served orders">
+                                                S: {posSizeSCount}
+                                            </span>
+                                            <span className="text-[10px] sm:text-xs font-bold text-blue-700 bg-blue-50 px-2 py-1 rounded border border-blue-200 shadow-sm" title="Total 'Large' size items in Served orders">
+                                                L: {posSizeLCount}
+                                            </span>
+                                            <span className="text-[10px] sm:text-xs font-bold text-purple-700 bg-purple-50 px-2 py-1 rounded border border-purple-200 shadow-sm" title="Total SCP items in Served orders">
+                                                SCP: {posScpCount}
+                                            </span>
+                                        </div>
                                     </div>
                                     
                                     <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2 sm:gap-3 mb-3">
