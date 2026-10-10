@@ -4440,10 +4440,10 @@
                     setSessionInfo(prev => ({...prev, hasWelcomeDiscount: false, sessionTimestamp: Date.now()}));
                     setIsSubmitting(false); // Unlock UI instantly
 
-                    // --- BACKGROUND FIREBASE SYNCHRONIZATION ---
+                    // BACKGROUND FIREBASE SYNCHRONIZATION
                     (async () => {
                         try {
-                            const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection } = window.FirebaseApp;
+                            const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection, writeBatch } = window.FirebaseApp;
                             
                             // HIGH-SPEED SYNC: Use local CRM cache to skip blocking network read
                             let realProfile = snapCustomerProfile;
@@ -4462,47 +4462,49 @@
                             // Abort sync if suspended
                             if (realProfile && realProfile.status === 'Inactive') return;
 
-                            // SECURE FIREBASE TRANSACTION
+                            // HIGH-SPEED BATCH OPERATION
+                            // Replace slow, blocking runTransaction with a single network payload writeBatch
+                            const batch = writeBatch(db);
+
                             const counterRef = doc(db, 'invoice_counters', targetShop.id);
                             const newOrderRef = doc(getColRef('orders'));
                             const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
 
-                            const finalQueueString = await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
-                                }
-                                
-                                const queueStr = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
-                                
-                                // Bind the counter increment and order creation into a single atomic operation
-                                // We drop the temporary `isSyncing` flag when writing to the DB
-                                const { isSyncing, ...dbOrderData } = orderData;
-                                transaction.set(newOrderRef, { ...dbOrderData, queueNo: queueStr });
+                            // Calculate Queue locally
+                            let nextVal = maxLocalSeq + 1;
+                            const finalQueueString = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
 
-                                // Calculate and save loyalty points during checkout transaction if enabled
-                                if (customerRef && realProfile) {
-                                    let customerUpdates = { lastVisit: Date.now() };
-                                    
-                                    if (globalPoints?.pointsEnabled) {
-                                        const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0 };
-                                        customerUpdates.loyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
-                                    }
-                                    
-                                    // ONE-TIME BURN: Remove welcome discount flag after first use
-                                    if (snapHasWelcomeDiscount) {
-                                        customerUpdates.hasWelcomeDiscount = false;
-                                    }
-                                    
-                                    transaction.update(customerRef, customerUpdates);
+                            // A. Increment Invoice Counter
+                            batch.set(counterRef, { currentValue: nextVal }, { merge: true });
+                            
+                            // B. Create Order
+                            const { isSyncing, ...dbOrderData } = orderData;
+                            batch.set(newOrderRef, { ...dbOrderData, queueNo: finalQueueString, id: newOrderRef.id });
+
+                            // C. Calculate and save loyalty points during checkout if enabled
+                            if (customerRef && realProfile) {
+                                let customerUpdates = { lastVisit: Date.now() };
+                                
+                                if (globalPoints?.pointsEnabled) {
+                                    const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
+                                    customerUpdates.loyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
                                 }
                                 
-                                return queueStr;
-                            });
+                                // ONE-TIME BURN: Remove welcome discount flag after first use
+                                if (snapHasWelcomeDiscount) {
+                                    customerUpdates.hasWelcomeDiscount = false;
+                                }
+                                
+                                batch.update(customerRef, customerUpdates);
+                            }
+
+                            // D. Lock Table (if dine-in)
+                            if (actualOrderType === 'DINE_IN' && snapTableId) {
+                                batch.update(doc(db, 'tables', snapTableId), { status: 'Occupied' });
+                            }
+
+                            // Commit the atomic payload
+                            await batch.commit();
 
                             // Update the success view UI with the finalized Queue Number so they can track it!
                             setSubmittedOrder(prev => {
@@ -4524,16 +4526,22 @@
                             });
                             // ---------------------------------------------
 
-                            // Run non-critical background updates (Inventory & Table locking)
+                            // Run non-critical background updates (Inventory)
                             Promise.all([
-                                deductInventory(currentCart, products, snapShopId, finalQueueString),
-                                (actualOrderType === 'DINE_IN' && snapTableId) 
-                                    ? updateDoc(doc(getColRef('tables'), snapTableId), { status: 'Occupied' })
-                                    : Promise.resolve()
+                                deductInventory(currentCart, products, snapShopId, finalQueueString)
                             ]).catch(err => console.warn("Background tasks failed:", err));
 
                         } catch (err) {
                             console.error("Checkout sync failed:", err);
+                            
+                            // Safety Catch: Stop the spinner if the network drops completely
+                            setSubmittedOrder(prev => {
+                                if (prev && prev.createdAt === orderData.createdAt) {
+                                    return { ...prev, isSyncing: false }; 
+                                }
+                                return prev;
+                            });
+                            
                             setCustomMessage("Connection drop. The order may have failed. Please check the Live Tracker.");
                             if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
                             toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
