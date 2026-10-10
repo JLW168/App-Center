@@ -4462,49 +4462,52 @@
                             // Abort sync if suspended
                             if (realProfile && realProfile.status === 'Inactive') return;
 
-                            // HIGH-SPEED BATCH OPERATION
-                            // Replace slow, blocking runTransaction with a single network payload writeBatch
-                            const batch = writeBatch(db);
-
                             const counterRef = doc(db, 'invoice_counters', targetShop.id);
                             const newOrderRef = doc(getColRef('orders'));
                             const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
 
-                            // Calculate Queue locally
-                            let nextVal = maxLocalSeq + 1;
-                            const finalQueueString = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+                            let finalQueueString = optimisticQueueNo;
 
-                            // A. Increment Invoice Counter
-                            batch.set(counterRef, { currentValue: nextVal }, { merge: true });
-                            
-                            // B. Create Order
-                            const { isSyncing, ...dbOrderData } = orderData;
-                            batch.set(newOrderRef, { ...dbOrderData, queueNo: finalQueueString, id: newOrderRef.id });
-
-                            // C. Calculate and save loyalty points during checkout if enabled
-                            if (customerRef && realProfile) {
-                                let customerUpdates = { lastVisit: Date.now() };
-                                
-                                if (globalPoints?.pointsEnabled) {
-                                    const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
-                                    customerUpdates.loyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                            // FIX: Customer Portal cannot rely on local array for invoice sequence because it restricts global reads.
+                            // We MUST use a secure atomic transaction to fetch and increment the exact sequence from the database.
+                            await runTransaction(db, async (transaction) => {
+                                const counterDoc = await transaction.get(counterRef);
+                                let nextVal = 1;
+                                if (counterDoc.exists()) {
+                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
+                                    transaction.update(counterRef, { currentValue: nextVal });
+                                } else {
+                                    transaction.set(counterRef, { currentValue: nextVal });
                                 }
                                 
-                                // ONE-TIME BURN: Remove welcome discount flag after first use
-                                if (snapHasWelcomeDiscount) {
-                                    customerUpdates.hasWelcomeDiscount = false;
+                                finalQueueString = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
+
+                                // Create Order
+                                const { isSyncing, ...dbOrderData } = orderData;
+                                transaction.set(newOrderRef, { ...dbOrderData, queueNo: finalQueueString, id: newOrderRef.id });
+
+                                // Calculate and save loyalty points during checkout if enabled
+                                if (customerRef && realProfile) {
+                                    let customerUpdates = { lastVisit: Date.now() };
+                                    
+                                    if (globalPoints?.pointsEnabled) {
+                                        const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
+                                        customerUpdates.loyaltyData = calculateLoyaltyForOrder(currentCartTotal, pointsToRedeem, currentLoyalty, globalPoints);
+                                    }
+                                    
+                                    // ONE-TIME BURN: Remove welcome discount flag after first use
+                                    if (snapHasWelcomeDiscount) {
+                                        customerUpdates.hasWelcomeDiscount = false;
+                                    }
+                                    
+                                    transaction.update(customerRef, customerUpdates);
                                 }
-                                
-                                batch.update(customerRef, customerUpdates);
-                            }
 
-                            // D. Lock Table (if dine-in)
-                            if (actualOrderType === 'DINE_IN' && snapTableId) {
-                                batch.update(doc(db, 'tables', snapTableId), { status: 'Occupied' });
-                            }
-
-                            // Commit the atomic payload
-                            await batch.commit();
+                                // Lock Table (if dine-in)
+                                if (actualOrderType === 'DINE_IN' && snapTableId) {
+                                    transaction.update(doc(db, 'tables', snapTableId), { status: 'Occupied' });
+                                }
+                            });
 
                             // Update the success view UI with the finalized Queue Number so they can track it!
                             setSubmittedOrder(prev => {
