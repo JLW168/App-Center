@@ -962,9 +962,11 @@
             
             const totalLateDays = monthStates.filter(es => {
                 if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return false;
-                // FIX: Read-Model Reconciliation - Void penalty ONLY if Full Day leave exists
-                const hasFullDayLeave = monthLeave.some(lr => es.date >= lr.leaveDate && es.date < lr.returnDate && lr.leaveSession === 'Full Day');
-                return !hasFullDayLeave;
+                // FIX: Read-Model Reconciliation - Void penalty if covered by Full Day leave OR if penalty matches standard morning late on an AM leave day
+                const coveringLeave = monthLeave.find(lr => es.date >= lr.leaveDate && (es.date < lr.returnDate || es.date === lr.leaveDate));
+                if (!coveringLeave) return false;
+                if (coveringLeave.leaveSession === 'Full Day') return true;
+                return false;
             }).length;
 
             const dailyRecords = {};
@@ -1115,8 +1117,8 @@
                 } else {
                     // ONLY if it's not a holiday do we penalize for absence
                     if (!attendedDays.has(dayKey)) {
-                        // FIX: Check for specific leave record to handle half-days precisely
-                        const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                        // FIX: Check for specific leave record to handle half-days and same-day return dates precisely
+                        const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && (dayKey < lr.returnDate || dayKey === lr.leaveDate));
                         
                         if (!todayLeaveRecord) {
                             absentDays++; // Full absence
@@ -1125,7 +1127,7 @@
                             const hadRejectedLeave = (leaveRequests || []).some(
                                 lr => lr.staffId === employee.id &&
                                       lr.status === 'Rejected' &&
-                                      dayKey >= lr.leaveDate && dayKey < lr.returnDate 
+                                      dayKey >= lr.leaveDate && (dayKey < lr.returnDate || dayKey === lr.leaveDate) 
                             );
                             
                             if (hadRejectedLeave) {
@@ -1177,7 +1179,7 @@
             
             const lateDeductionsAmount = monthStates.filter(es => {
                 if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return false;
-                const hasFullDayLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && es.date < lr.returnDate && lr.leaveSession === 'Full Day');
+                const hasFullDayLeave = (leaveRequests || []).some(lr => lr.staffId === es.staffId && lr.status === 'Approved' && es.date >= lr.leaveDate && (es.date < lr.returnDate || es.date === lr.leaveDate) && lr.leaveSession === 'Full Day');
                 return !hasFullDayLeave;
             }).reduce((sum, item) => sum + (parseFloat(item.amount) || 0), 0);
             
@@ -9921,15 +9923,33 @@
                         const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
                         const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
 
-                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups ---
+                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups + Direct DB Verification ---
                         const todayOT = (allData.otRequests || []).find(ot => 
                             ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
                         );
                         
-                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                        // Check memory cache first (handling both exclusive and inclusive returnDate formats)
+                        let todayLeave = (allData.leaveRequests || []).find(lr => 
                             lr.staffId === userProfile.id && lr.status === 'Approved' && 
-                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                            todayStr >= lr.leaveDate && (todayStr < lr.returnDate || todayStr === lr.leaveDate)
                         );
+
+                        // Fallback: Query Firestore directly in case leave was approved on another device or returnDate was today
+                        if (!todayLeave) {
+                            try {
+                                const { query, where, getDocs } = window.firebaseSDK;
+                                const leaveSnap = await getDocs(query(
+                                    collection(db, 'leaveRequests'),
+                                    where('staffId', '==', userProfile.id),
+                                    where('status', '==', 'Approved')
+                                ));
+                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => 
+                                    todayStr >= lr.leaveDate && (todayStr < lr.returnDate || todayStr === lr.leaveDate)
+                                );
+                            } catch (err) {
+                                console.warn("Direct leave verification fallback error:", err);
+                            }
+                        }
 
                         const isHoliday = (allData.publicHolidays || []).some(h => {
                             if (h.isGrouped) {
@@ -9958,7 +9978,9 @@
                             effectiveShiftName = 'AM';
                         }
 
-                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === qrText);
+                        // Find shift details for current shop, or fallback to user's primary shop shift
+                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === qrText) ||
+                                             (allData.shifts || []).find(s => s.name === effectiveShiftName);
                         if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
@@ -9974,86 +9996,83 @@
 
                             let isExcused = isHoliday;
 
-                            // Apply Half-Day Leave Offset Logic
+                            // Apply Half-Day & Full-Day Leave Offset Logic
                             if (!isExcused && todayLeave) {
-                                if (todayLeave.leaveSession === 'Full Day') {
+                                const session = (todayLeave.leaveSession || 'Full Day').trim();
+                                if (session === 'Full Day') {
                                     isExcused = true;
-                                } else if (todayLeave.leaveSession === 'AM') {
+                                } else if (session === 'AM' || session.includes('First Half')) {
                                     // Staff took morning off, shift starts in the afternoon
-                                    if (shiftDetails.amLeaveThreshold) {
-                                        let [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
-                                        // Auto-correct 12-hour format mistakes (e.g. 01:15 instead of 13:15)
-                                        if (amLimitH < startHour && amLimitH < 12) amLimitH += 12;
+                                    const pmShift = (allData.shifts || []).find(s => s.name === 'PM' && s.shopName === qrText) || 
+                                                    (allData.shifts || []).find(s => s.name === 'PM');
+                                    const targetAmThreshold = shiftDetails.amLeaveThreshold || pmShift?.lateThreshold || pmShift?.startTime || '13:00';
+                                    
+                                    let [amLimitH, amLimitM] = targetAmThreshold.split(':').map(Number);
+                                    // Auto-correct 12-hour format mistakes (e.g. 01:00 instead of 13:00 for afternoon start)
+                                    if (amLimitH < 11) amLimitH += 12;
 
-                                        lateLimitMins = amLimitH * 60 + amLimitM;
-                                        startMins = lateLimitMins - standardGraceMins; // Expected start time shifts to the AM Leave limit
-                                    } else {
-                                        isExcused = true; // Fallback if limits aren't configured
-                                    }
-                                } else if (todayLeave.leaveSession === 'PM') {
+                                    lateLimitMins = amLimitH * 60 + (amLimitM || 0);
+                                    startMins = lateLimitMins - Math.max(0, standardGraceMins);
+                                } else if (session === 'PM' || session.includes('Second Half')) {
                                     // Staff works morning, takes afternoon off
                                     if (shiftDetails.pmLeaveThreshold) {
                                         let [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
-                                        // Unlikely, but auto-correct if needed
                                         if (pmLimitH < startHour && pmLimitH < 12 && startHour >= 12) pmLimitH += 12;
 
-                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                        lateLimitMins = pmLimitH * 60 + (pmLimitM || 0);
                                     }
-                                    // startMins remains the morning shift start
                                 }
                             }
 
                             // Handle overnight shifts wrapping past midnight (Re-evaluated after thresholds shift)
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
-                            const allowedLateDelta = lateLimitMins - startMins;
 
                             if (!isExcused) {
                                 // Handle overnight shifts wrapping past midnight
                                 if (checkInMins < startMins - 720) checkInMins += 1440;
 
-                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
-                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
-                                    if (checkInMins > lateLimitMins) {
-                                        
-                                        // Calculate EXACT minutes late from START TIME
-                                        const lateMinutes = checkInMins - startMins;
+                                // Evaluate window: Check-in is AFTER lateLimitMins, and within 14 hours of startMins
+                                if (checkInMins > lateLimitMins && (checkInMins - startMins < 840)) {
+                                    // Calculate EXACT minutes late from expected start time (or afternoon start time)
+                                    const lateMinutes = Math.max(1, checkInMins - startMins);
 
-                                        // Memory Cache check to prevent duplicates
-                                        const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
-                                            stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
-                                            stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
-                                        );
+                                    // Memory Cache check to prevent duplicates
+                                    const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
+                                        stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
+                                        stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
+                                    );
+                                    
+                                    // Strict check to prevent duplicate late penalties on the same day
+                                    if (!existingPenalty) {
+                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // Strict check to prevent duplicate late penalties on the same day
-                                        if (!existingPenalty) {
-                                            const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
-                                            
-                                            // --- Dynamic Tiered Penalty Logic ---
-                                            let penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
-                                            if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
-                                                const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
-                                                let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
-                                                for (const rule of sortedRules) {
-                                                    if (lateMinutes <= rule.limit) {
-                                                        appliedAmount = parseFloat(rule.amount);
-                                                        break;
-                                                    }
+                                        // --- Dynamic Tiered Penalty Logic ---
+                                        let calcPenalty = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
+                                        if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
+                                            const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
+                                            let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || calcPenalty;
+                                            for (const rule of sortedRules) {
+                                                if (lateMinutes <= rule.limit) {
+                                                    appliedAmount = parseFloat(rule.amount);
+                                                    break;
                                                 }
-                                                penaltyAmount = appliedAmount;
                                             }
+                                            calcPenalty = appliedAmount;
+                                        }
+                                        
+                                        penaltyAmount = calcPenalty;
+
+                                        // FIX: Only apply penalty if amount is strictly greater than 0
+                                        if (penaltyAmount > 0) {
+                                            const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
                                             
-                                            // FIX: Only apply penalty if amount is strictly greater than 0
-                                            if (penaltyAmount > 0) {
-                                                const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
-                                                
-                                                const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                                const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
-                                                batch.set(penaltyRef, { 
-                                                    staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
-                                                });
-                                                
-                                                penaltyApplied = true;
-                                            }
+                                            const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                            const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
+                                            batch.set(penaltyRef, { 
+                                                staffId: userProfile.id, staffName: userProfile.name, shop: qrText, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved' 
+                                            });
+                                            
+                                            penaltyApplied = true;
                                         }
                                     }
                                 }
@@ -10125,15 +10144,33 @@
                         const timeInZoneString = checkInTimestamp.toLocaleTimeString('en-GB', { timeZone: shopTz, hour: '2-digit', minute: '2-digit' });
                         const [checkInHour, checkInMinute] = timeInZoneString.split(':').map(Number);
 
-                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups ---
+                        // --- CACHE-DRIVEN FIX: Zero Network Latency Lookups + Direct DB Verification ---
                         const todayOT = (allData.otRequests || []).find(ot => 
                             ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
                         );
                         
-                        const todayLeave = (allData.leaveRequests || []).find(lr => 
+                        // Check memory cache first (handling both exclusive and inclusive returnDate formats)
+                        let todayLeave = (allData.leaveRequests || []).find(lr => 
                             lr.staffId === userProfile.id && lr.status === 'Approved' && 
-                            todayStr >= lr.leaveDate && todayStr < lr.returnDate
+                            todayStr >= lr.leaveDate && (todayStr < lr.returnDate || todayStr === lr.leaveDate)
                         );
+
+                        // Fallback: Query Firestore directly in case leave was approved on another device or returnDate was today
+                        if (!todayLeave) {
+                            try {
+                                const { query, where, getDocs } = window.firebaseSDK;
+                                const leaveSnap = await getDocs(query(
+                                    collection(db, 'leaveRequests'),
+                                    where('staffId', '==', userProfile.id),
+                                    where('status', '==', 'Approved')
+                                ));
+                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => 
+                                    todayStr >= lr.leaveDate && (todayStr < lr.returnDate || todayStr === lr.leaveDate)
+                                );
+                            } catch (err) {
+                                console.warn("Direct leave verification fallback error:", err);
+                            }
+                        }
 
                         const isHoliday = (allData.publicHolidays || []).some(h => {
                             if (h.isGrouped) {
@@ -10165,8 +10202,9 @@
                             effectiveShiftName = 'AM';
                         }
 
-                        // 3. Get Shift Rules
-                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === selectedShopForCheckIn);
+                        // 3. Get Shift Rules (with fallback if employee checks in at another branch)
+                        const shiftDetails = (allData.shifts || []).find(s => s.name === effectiveShiftName && s.shopName === selectedShopForCheckIn) ||
+                                             (allData.shifts || []).find(s => s.name === effectiveShiftName);
                         
                         if (shiftDetails && shiftDetails.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
@@ -10183,85 +10221,82 @@
 
                             let isExcused = isHoliday;
 
-                            // Apply Half-Day Leave Offset Logic
+                            // Apply Half-Day & Full-Day Leave Offset Logic
                             if (!isExcused && todayLeave) {
-                                if (todayLeave.leaveSession === 'Full Day') {
+                                const session = (todayLeave.leaveSession || 'Full Day').trim();
+                                if (session === 'Full Day') {
                                     isExcused = true;
-                                } else if (todayLeave.leaveSession === 'AM') {
+                                } else if (session === 'AM' || session.includes('First Half')) {
                                     // Staff took morning off, shift starts in the afternoon
-                                    if (shiftDetails.amLeaveThreshold) {
-                                        let [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
-                                        // Auto-correct 12-hour format mistakes (e.g. 01:15 instead of 13:15)
-                                        if (amLimitH < startHour && amLimitH < 12) amLimitH += 12;
+                                    const pmShift = (allData.shifts || []).find(s => s.name === 'PM' && s.shopName === selectedShopForCheckIn) || 
+                                                    (allData.shifts || []).find(s => s.name === 'PM');
+                                    const targetAmThreshold = shiftDetails.amLeaveThreshold || pmShift?.lateThreshold || pmShift?.startTime || '13:00';
+                                    
+                                    let [amLimitH, amLimitM] = targetAmThreshold.split(':').map(Number);
+                                    // Auto-correct 12-hour format mistakes (e.g. 01:00 instead of 13:00 for afternoon start)
+                                    if (amLimitH < 11) amLimitH += 12;
 
-                                        lateLimitMins = amLimitH * 60 + amLimitM;
-                                        startMins = lateLimitMins - standardGraceMins; // Expected start time shifts to the AM Leave limit
-                                    } else {
-                                        isExcused = true; // Fallback if limits aren't configured
-                                    }
-                                } else if (todayLeave.leaveSession === 'PM') {
+                                    lateLimitMins = amLimitH * 60 + (amLimitM || 0);
+                                    startMins = lateLimitMins - Math.max(0, standardGraceMins);
+                                } else if (session === 'PM' || session.includes('Second Half')) {
                                     // Staff works morning, takes afternoon off
                                     if (shiftDetails.pmLeaveThreshold) {
                                         let [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
-                                        // Unlikely, but auto-correct if needed
                                         if (pmLimitH < startHour && pmLimitH < 12 && startHour >= 12) pmLimitH += 12;
 
-                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                        lateLimitMins = pmLimitH * 60 + (pmLimitM || 0);
                                     }
-                                    // startMins remains the morning shift start
                                 }
                             }
 
                             // Handle overnight shifts wrapping past midnight (Re-evaluated after thresholds shift)
                             if (lateLimitMins < startMins) lateLimitMins += 1440;
-                            const allowedLateDelta = lateLimitMins - startMins;
 
                             if (!isExcused) {
                                 if (checkInMins < startMins - 720) checkInMins += 1440;
                                 
-                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
-                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
-                                    if (checkInMins > lateLimitMins) {
-                                        
-                                        // Calculate EXACT minutes late from START TIME
-                                        const lateMinutes = checkInMins - startMins;
+                                // Evaluate window: Check-in is AFTER lateLimitMins, and within 14 hours of startMins
+                                if (checkInMins > lateLimitMins && (checkInMins - startMins < 840)) {
+                                    // Calculate EXACT minutes late from expected start time (or afternoon start time)
+                                    const lateMinutes = Math.max(1, checkInMins - startMins);
 
-                                        // Memory Cache check to prevent duplicates
-                                        const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
-                                            stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
-                                            stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
-                                        );
+                                    // Memory Cache check to prevent duplicates
+                                    const existingPenalty = (allData.employeeStates || []).find(stateDoc => 
+                                        stateDoc.staffId === userProfile.id && stateDoc.date === todayStr && 
+                                        stateDoc.statusState === 'Deduction' && stateDoc.note?.includes('CheckIn Late')
+                                    );
+                                    
+                                    // Strict check to prevent duplicate late penalties on the same day
+                                    if (!existingPenalty) {
+                                        const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
                                         
-                                        // Strict check to prevent duplicate late penalties on the same day
-                                        if (!existingPenalty) {
-                                            const formattedTime = checkInTimestamp.toLocaleTimeString('en-US', { timeZone: shopTz, hour: '2-digit', minute: '2-digit', hour12: true });
-                                            
-                                            // --- Dynamic Tiered Penalty Logic ---
-                                            let penaltyAmount = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
-                                            if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
-                                                const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
-                                                let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || penaltyAmount;
-                                                for (const rule of sortedRules) {
-                                                    if (lateMinutes <= rule.limit) {
-                                                        appliedAmount = parseFloat(rule.amount);
-                                                        break;
-                                                    }
+                                        // --- Dynamic Tiered Penalty Logic ---
+                                        let calcPenalty = parseFloat(systemSettings?.lateDeductionAmount) || 5000; // Fallback
+                                        if (systemSettings?.latePenaltyRules && systemSettings.latePenaltyRules.length > 0) {
+                                            const sortedRules = [...systemSettings.latePenaltyRules].sort((a,b) => a.limit - b.limit);
+                                            let appliedAmount = parseFloat(systemSettings?.maxLatePenalty) || calcPenalty;
+                                            for (const rule of sortedRules) {
+                                                if (lateMinutes <= rule.limit) {
+                                                    appliedAmount = parseFloat(rule.amount);
+                                                    break;
                                                 }
-                                                penaltyAmount = appliedAmount;
                                             }
-                                            
-                                            // FIX: Only apply penalty if amount is strictly greater than 0
-                                            if (penaltyAmount > 0) {
-                                                const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
+                                            calcPenalty = appliedAmount;
+                                        }
+                                        
+                                        penaltyAmount = calcPenalty;
 
-                                                const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
-                                                const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
-                                                batch.set(penaltyRef, { 
-                                                    staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
-                                                });
-                                                
-                                                penaltyApplied = true;
-                                            }
+                                        // FIX: Only apply penalty if amount is strictly greater than 0
+                                        if (penaltyAmount > 0) {
+                                            const notePrefix = effectiveShiftName !== userProfile.shift ? `OT (${effectiveShiftName}) CheckIn Late (${lateMinutes}m)` : `CheckIn Late (${lateMinutes}m)`;
+
+                                            const penaltyDocId = `late_${userProfile.id}_${todayStr}`;
+                                            const penaltyRef = doc(db, 'employeeStates', penaltyDocId);
+                                            batch.set(penaltyRef, { 
+                                                staffId: userProfile.id, staffName: userProfile.name, shop: selectedShopForCheckIn, date: todayStr, statusState: 'Deduction', amount: penaltyAmount, note: `${notePrefix} @${formattedTime}`, status: 'Approved'
+                                            });
+                                            
+                                            penaltyApplied = true;
                                         }
                                     }
                                 }
@@ -11195,9 +11230,9 @@
                     // 2. Queue the Penalty Deletions (if applicable)
                     if (collectionName === 'leaveRequests' && status === 'Approved') {
                         const leaveReq = requests.find(r => r.id === id);
-                        // FIX: Only retroactive void penalties if the leave is a Full Day. Half-day leaves should retain legitimate afternoon/morning late penalties.
-                        if (leaveReq && leaveReq.leaveSession === 'Full Day') {
-                            const { staffId, leaveDate, returnDate } = leaveReq;
+                        if (leaveReq) {
+                            const { staffId, leaveDate, returnDate, leaveSession } = leaveReq;
+                            const session = (leaveSession || 'Full Day').trim();
                             
                             const statesQ = query(
                                 collection(db, 'employeeStates'),
@@ -11210,12 +11245,42 @@
 
                             statesSnap.forEach(stateDoc => {
                                 const stateData = stateDoc.data();
-                                // Target exactly the late check-in penalties
+                                // Target the late check-in penalties within the leave range
                                 if (stateData.statusState === 'Deduction' && stateData.note?.includes('CheckIn Late')) {
-                                    // Ensure it's strictly within the active leave boundary
-                                    if (stateData.date >= leaveDate && stateData.date < returnDate) {
-                                        batch.delete(stateDoc.ref);
-                                        penaltiesVoided++;
+                                    if (stateData.date >= leaveDate && (stateData.date < returnDate || stateData.date === leaveDate)) {
+                                        if (session === 'Full Day') {
+                                            batch.delete(stateDoc.ref);
+                                            penaltiesVoided++;
+                                        } else if (session === 'AM' || session.includes('First Half')) {
+                                            // If AM Leave was approved retroactively, void any morning penalty or erroneous 200m+ penalty calculated against morning start
+                                            const emp = employees.find(e => e.id === staffId);
+                                            const empShift = (shifts || []).find(s => s.name === emp?.shift && s.shopName === leaveReq.shop) ||
+                                                             (shifts || []).find(s => s.name === emp?.shift);
+                                            const pmShift = (shifts || []).find(s => s.name === 'PM' && s.shopName === leaveReq.shop) ||
+                                                            (shifts || []).find(s => s.name === 'PM');
+                                            const targetAmThreshold = empShift?.amLeaveThreshold || pmShift?.lateThreshold || pmShift?.startTime || '13:00';
+                                            let [amLimitH, amLimitM] = targetAmThreshold.split(':').map(Number);
+                                            if (amLimitH < 11) amLimitH += 12;
+                                            const amLimitMins = amLimitH * 60 + (amLimitM || 0);
+
+                                            // Parse check-in time from note e.g. "CheckIn Late (279m) @11:09 AM"
+                                            const timeMatch = stateData.note.match(/@(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+                                            if (timeMatch) {
+                                                let h = parseInt(timeMatch[1], 10);
+                                                const m = parseInt(timeMatch[2], 10);
+                                                const ampm = timeMatch[3].toUpperCase();
+                                                if (ampm === 'PM' && h < 12) h += 12;
+                                                if (ampm === 'AM' && h === 12) h = 0;
+                                                const checkInMins = h * 60 + m;
+                                                if (checkInMins <= amLimitMins) {
+                                                    batch.delete(stateDoc.ref);
+                                                    penaltiesVoided++;
+                                                }
+                                            } else {
+                                                batch.delete(stateDoc.ref);
+                                                penaltiesVoided++;
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -11231,7 +11296,7 @@
                     
                 } 
                 catch (error) { console.error(`Error updating status for ${title} ${id}:`, error); }
-            }, [db, collectionName, title, requests]);
+            }, [db, collectionName, title, requests, employees, shifts]);
 
             const confirmDelete = useCallback(async () => {
                 if (!requestToDelete) return;
@@ -12817,12 +12882,13 @@
 
                     // --- OPTIMIZATION: Use Lookup Map instead of .find() ---
                     const employeeLeaves = leaveLookup.get(employee.id) || [];
-                    const approvedLeave = employeeLeaves.find(lr => entry.date >= lr.leaveDate && entry.date < lr.returnDate);
+                    const approvedLeave = employeeLeaves.find(lr => entry.date >= lr.leaveDate && (entry.date < lr.returnDate || entry.date === lr.leaveDate));
                     // --- END OPTIMIZATION ---
 
                     let isLate = false;
                     if (checkIn && employee) {
-                        const shiftDetails = (shifts || []).find(s => s.name === employee.shift && s.shopName === firstCheckInRecord.shop);
+                        const shiftDetails = (shifts || []).find(s => s.name === employee.shift && s.shopName === firstCheckInRecord.shop) ||
+                                             (shifts || []).find(s => s.name === employee.shift);
                         if (shiftDetails?.lateThreshold) {
                             const [lateHour, lateMinute] = shiftDetails.lateThreshold.split(':').map(Number);
                             const [startHour, startMinute] = (shiftDetails.startTime || '00:00').split(':').map(Number);
@@ -12843,30 +12909,28 @@
 
                             // Apply Half-Day Leave Offset Logic exactly like the scanner engine
                             if (!isExcused && approvedLeave) {
-                                if (approvedLeave.leaveSession === 'Full Day') {
+                                const session = (approvedLeave.leaveSession || 'Full Day').trim();
+                                if (session === 'Full Day') {
                                     isExcused = true;
-                                } else if (approvedLeave.leaveSession === 'AM') {
+                                } else if (session === 'AM' || session.includes('First Half')) {
                                     // Staff took morning off, shift starts in the afternoon
-                                    if (shiftDetails.amLeaveThreshold) {
-                                        let [amLimitH, amLimitM] = shiftDetails.amLeaveThreshold.split(':').map(Number);
-                                        // Auto-correct 12-hour format mistakes (e.g. 01:15 instead of 13:15)
-                                        if (amLimitH < startHour && amLimitH < 12) amLimitH += 12;
+                                    const pmShift = (shifts || []).find(s => s.name === 'PM' && s.shopName === firstCheckInRecord.shop) || 
+                                                    (shifts || []).find(s => s.name === 'PM');
+                                    const targetAmThreshold = shiftDetails.amLeaveThreshold || pmShift?.lateThreshold || pmShift?.startTime || '13:00';
 
-                                        lateLimitMins = amLimitH * 60 + amLimitM;
-                                        startMins = lateLimitMins - standardGraceMins; // Expected start time shifts to the AM Leave limit
-                                    } else {
-                                        isExcused = true; // Fallback if limits aren't configured
-                                    }
-                                } else if (approvedLeave.leaveSession === 'PM') {
+                                    let [amLimitH, amLimitM] = targetAmThreshold.split(':').map(Number);
+                                    if (amLimitH < 11) amLimitH += 12;
+
+                                    lateLimitMins = amLimitH * 60 + (amLimitM || 0);
+                                    startMins = lateLimitMins - Math.max(0, standardGraceMins);
+                                } else if (session === 'PM' || session.includes('Second Half')) {
                                     // Staff works morning, takes afternoon off
                                     if (shiftDetails.pmLeaveThreshold) {
                                         let [pmLimitH, pmLimitM] = shiftDetails.pmLeaveThreshold.split(':').map(Number);
-                                        // Unlikely, but auto-correct if needed
                                         if (pmLimitH < startHour && pmLimitH < 12 && startHour >= 12) pmLimitH += 12;
 
-                                        lateLimitMins = pmLimitH * 60 + pmLimitM;
+                                        lateLimitMins = pmLimitH * 60 + (pmLimitM || 0);
                                     }
-                                    // startMins remains morning start
                                 }
                             }
 
@@ -12875,11 +12939,9 @@
                                 if (lateLimitMins < startMins) lateLimitMins += 1440;
                                 if (checkInMins < startMins - 720) checkInMins += 1440;
 
-                                // Evaluate window: Check-in is AFTER start time, but within 14 hours
-                                if (checkInMins >= startMins && (checkInMins - startMins < 840)) {
-                                    if (checkInMins > lateLimitMins) {
-                                        isLate = true;
-                                    }
+                                // Evaluate window: Check-in is AFTER lateLimitMins, and within 14 hours of startMins
+                                if (checkInMins > lateLimitMins && (checkInMins - startMins < 840)) {
+                                    isLate = true;
                                 }
                             }
                         }
