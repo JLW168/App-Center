@@ -1501,6 +1501,136 @@
                 }
             };
 
+            // --- Global Telegram Bot Notification Node (Non-Blocking Singleton) ---
+            window.SolarisTelegramNode = {
+                escapeHtml(str) {
+                    if (str === null || str === undefined) return '';
+                    return String(str)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+                },
+
+                async getEffectiveConfig(shop) {
+                    const localCfg = shop?.telegramBotConfig || {};
+                    let globalCfg = {};
+                    try {
+                        if (!localCfg.botToken || !localCfg.chatId) {
+                            const { doc, getDoc } = window.FirebaseApp;
+                            const snap = await getDoc(doc(safeDB(), 'system_settings', 'telegram_bot'));
+                            if (snap.exists()) globalCfg = snap.data();
+                        }
+                    } catch (e) {
+                        console.warn("Telegram global config fetch warning:", e);
+                    }
+
+                    return {
+                        enabled: localCfg.enabled !== undefined ? localCfg.enabled : (globalCfg.enabled ?? false),
+                        botToken: (localCfg.botToken || globalCfg.botToken || '').trim(),
+                        chatId: (localCfg.chatId || globalCfg.chatId || '').trim(),
+                        notifyShiftClose: localCfg.notifyShiftClose !== undefined ? localCfg.notifyShiftClose : (globalCfg.notifyShiftClose ?? true),
+                        notifyOrderCancel: localCfg.notifyOrderCancel !== undefined ? localCfg.notifyOrderCancel : (globalCfg.notifyOrderCancel ?? true),
+                        notifyLowStock: localCfg.notifyLowStock !== undefined ? localCfg.notifyLowStock : (globalCfg.notifyLowStock ?? true)
+                    };
+                },
+
+                async sendMessage(shop, htmlText, overrideConfig = null) {
+                    try {
+                        const cfg = overrideConfig || await this.getEffectiveConfig(shop);
+                        if (!cfg.enabled && !overrideConfig) return { ok: false, skipped: true, reason: 'Disabled' };
+                        if (!cfg.botToken || !cfg.chatId) return { ok: false, skipped: true, reason: 'Missing Bot Token or Chat ID' };
+
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5-second non-blocking timeout
+
+                        const response = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                chat_id: cfg.chatId,
+                                text: htmlText,
+                                parse_mode: 'HTML',
+                                disable_web_page_preview: true
+                            }),
+                            signal: controller.signal
+                        });
+
+                        clearTimeout(timeoutId);
+                        const result = await response.json();
+                        if (!result.ok) {
+                            console.warn("Telegram API Warning:", result.description);
+                            return { ok: false, error: result.description || 'Telegram API rejected request' };
+                        }
+                        return { ok: true, result };
+                    } catch (err) {
+                        console.warn("Telegram Notification Silent Catch:", err.message || err);
+                        return { ok: false, error: err.name === 'AbortError' ? 'Request timed out (5s)' : err.message };
+                    }
+                },
+
+                async sendTestAlert(shopName, config, triggeredBy) {
+                    const nowStr = new Date().toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+                    const msg = [
+                        `✅ <b>SOLARIS TELEGRAM BOT CONNECTED</b>`,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `🏪 <b>Scope / Branch:</b> ${this.escapeHtml(shopName)}`,
+                        `👤 <b>Tested By:</b> ${this.escapeHtml(triggeredBy || 'Admin')}`,
+                        `🕒 <b>Timestamp:</b> ${this.escapeHtml(nowStr)}`,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `🔔 <b>Active Alert Routing:</b>`,
+                        `• Shift Close (Z-Report): <b>${config.notifyShiftClose ? 'ON' : 'OFF'}</b>`,
+                        `• Order Cancelled / Variance: <b>${config.notifyOrderCancel ? 'ON' : 'OFF'}</b>`,
+                        `• Low Stock (Par Level): <b>${config.notifyLowStock ? 'ON' : 'OFF'}</b>`,
+                        ``,
+                        `<i>Real-time operational alerts are now active for this channel.</i>`
+                    ].join('\n');
+
+                    return await this.sendMessage(null, msg, { ...config, enabled: true });
+                },
+
+                // --- PHASE 2: Shift Closed & High Variance Alert Formatter ---
+                async formatShiftClose(shiftData, currentShift, shop, actualCash, actualBank, varianceNote) {
+                    const cashVar = actualCash - shiftData.expectedCash;
+                    const bankVar = actualBank - shiftData.expectedBank;
+                    const isHighVariance = Math.abs(cashVar) > 100000 || Math.abs(bankVar) > 100000;
+                    
+                    const title = isHighVariance ? `🚨 <b>HIGH VARIANCE ALERT (Z-REPORT)</b> 🚨` : `📊 <b>SHIFT CLOSED (Z-REPORT)</b>`;
+                    
+                    const msg = [
+                        title,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `🏪 <b>Branch:</b> ${this.escapeHtml(shop.name || 'Unknown')}`,
+                        `👤 <b>Closed By:</b> ${this.escapeHtml(currentShift.closedBy || 'Admin')}`,
+                        `🕒 <b>Time:</b> ${new Date().toLocaleString()}`,
+                        `🏷️ <b>Shift:</b> ${this.escapeHtml(currentShift.shiftName || 'Shift')}`,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `💰 <b>FINANCIAL SUMMARY</b>`,
+                        `• Gross Sales: ${shiftData.shiftGrossSale.toLocaleString()} ៛`,
+                        `• Discounts: -${shiftData.shiftDiscountPromo.toLocaleString()} ៛`,
+                        `• <b>Net Revenue: ${(shiftData.shiftGrossSale - shiftData.shiftDiscountPromo).toLocaleString()} ៛</b>`,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `💵 <b>CASH DRAWER</b>`,
+                        `• Starting Float: ${(currentShift.startingCash || 0).toLocaleString()} ៛`,
+                        `• Expected Cash: ${shiftData.expectedCash.toLocaleString()} ៛`,
+                        `• Actual Cash: ${actualCash.toLocaleString()} ៛`,
+                        `• <b>Variance: ${cashVar > 0 ? '+' : ''}${cashVar.toLocaleString()} ៛</b>`,
+                        `━━━━━━━━━━━━━━━━━━━━`,
+                        `🏦 <b>BANK TRANSFERS</b>`,
+                        `• Expected Bank: ${shiftData.expectedBank.toLocaleString()} ៛`,
+                        `• Actual Bank: ${actualBank.toLocaleString()} ៛`,
+                        `• <b>Variance: ${bankVar > 0 ? '+' : ''}${bankVar.toLocaleString()} ៛</b>`
+                    ];
+
+                    if (isHighVariance && varianceNote) {
+                        msg.push(`━━━━━━━━━━━━━━━━━━━━`);
+                        msg.push(`⚠️ <b>VARIANCE EXPLANATION:</b>`);
+                        msg.push(`<i>"${this.escapeHtml(varianceNote)}"</i>`);
+                    }
+
+                    return msg.join('\n');
+                }
+            };
+
             // --- Error Boundary for White Screen Prevention ---
             class ErrorBoundary extends Component {
                 constructor(props) {
@@ -6093,6 +6223,19 @@
                 const activeShopObj = shops.find(s => s.id === filterShop);
                 const shopBrandTitle = activeShopObj?.brandingName || activeShopObj?.name || 'Solaris Cafe';
 
+                const formatTVTimestamp = (ts) => {
+                    if (!ts) return '';
+                    const d = new Date(ts);
+                    const day = String(d.getDate()).padStart(2, '0');
+                    const month = String(d.getMonth() + 1).padStart(2, '0');
+                    const year = String(d.getFullYear()).slice(-2);
+                    let hrs = d.getHours();
+                    const ampm = hrs >= 12 ? 'PM' : 'AM';
+                    hrs = hrs % 12 || 12;
+                    const mins = String(d.getMinutes()).padStart(2, '0');
+                    return `${day}-${month}-${year} | ${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
+                };
+
                 return (
                     <div id="tv-queue-container" className="w-full h-full bg-stone-950 text-white flex flex-col select-none overflow-hidden relative">
                         {/* Top TV Broadcast Bar */}
@@ -6114,6 +6257,17 @@
 
                             {/* TV Controls & Clock */}
                             <div className="flex items-center gap-3">
+                                {onBack && (
+                                    <button 
+                                        onClick={onBack}
+                                        className="px-3.5 py-2 rounded-xl text-xs font-bold bg-orange-600 hover:bg-orange-500 text-white border border-orange-500 transition flex items-center gap-2 shadow-md active:scale-95"
+                                        title="Switch to Kitchen Display System (KDS)"
+                                    >
+                                        <i className="fa-solid fa-tv"></i>
+                                        <span>KDS</span>
+                                    </button>
+                                )}
+
                                 {canSelectMultiple && (
                                     <select 
                                         className="bg-stone-800 border border-stone-700 text-white rounded-xl px-3 py-2 text-sm font-bold outline-none focus:border-amber-500 cursor-pointer"
@@ -6202,34 +6356,96 @@
                                             <p className="text-lg font-bold">No orders currently in preparation</p>
                                         </div>
                                     ) : (
-                                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 content-start">
+                                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 content-start">
                                             {preparingOrders.map(order => {
                                                 const totalItems = order.items?.reduce((s, i) => s + (i.quantity || 1), 0) || 1;
                                                 const doneItems = order.items?.reduce((s, i) => s + (i.done ? (i.quantity || 1) : 0), 0) || 0;
                                                 const progressPct = Math.round((doneItems / totalItems) * 100);
+                                                const isPaid = order.paymentStatus === 'Paid';
 
                                                 return (
-                                                    <div key={order.id} className="bg-stone-900/90 border border-stone-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                                                        <div className="flex justify-between items-start mb-2">
-                                                            <span className="text-3xl sm:text-4xl font-black text-white tracking-tight font-mono">
-                                                                {formatShortQueue(order.queueNo)}
-                                                            </span>
-                                                            <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded border ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-stone-300 border-stone-700' : 'bg-amber-500/20 text-amber-300 border-amber-500/30'}`}>
-                                                                {order.orderType === 'TAKEAWAY' ? 'Takeaway' : `Table ${order.tableName}`}
-                                                            </span>
+                                                    <div key={order.id} className="bg-stone-900/95 border border-stone-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                                                        <div>
+                                                            {/* Header: Queue No, Timestamp & Order Type */}
+                                                            <div className="flex justify-between items-start gap-2 mb-2">
+                                                                <div>
+                                                                    <span className="text-3xl sm:text-4xl font-black text-white tracking-tight font-mono leading-none block">
+                                                                        {formatShortQueue(order.queueNo)}
+                                                                    </span>
+                                                                    <span className="text-[11px] font-bold text-stone-400 font-mono mt-1 block">
+                                                                        <i className="fa-regular fa-clock mr-1 text-amber-400/80"></i>
+                                                                        {formatTVTimestamp(order.createdAt)}
+                                                                    </span>
+                                                                </div>
+                                                                <div className="flex flex-col items-end gap-1">
+                                                                    <span className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded border ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-stone-300 border-stone-700' : 'bg-amber-500/20 text-amber-300 border-amber-500/30'}`}>
+                                                                        {order.orderType === 'TAKEAWAY' ? 'Takeaway' : `Table ${order.tableName}`}
+                                                                    </span>
+                                                                    <span className="text-xs font-bold text-stone-300 truncate max-w-[140px]">
+                                                                        {order.customerName && order.customerName !== 'Walk-in' 
+                                                                            ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
+                                                                            : 'Walk-in Guest'}
+                                                                    </span>
+                                                                </div>
+                                                            </div>
+
+                                                            {/* Product List (Name, Size, QTY, Modifiers) */}
+                                                            <div className="my-2.5 border-t border-b border-stone-800/80 py-2 space-y-1.5 max-h-40 overflow-y-auto no-scrollbar">
+                                                                {(order.items || []).map((item, idx) => {
+                                                                    const mods = [item.gradeName && item.gradeName !== 'Default' ? item.gradeName : null, item.sugar, item.ice].filter(Boolean).join(' • ');
+                                                                    return (
+                                                                        <div key={idx} className={`flex items-start justify-between gap-2 text-xs rounded-lg px-2 py-1 ${item.done ? 'bg-stone-800/40 text-stone-500 line-through' : 'bg-stone-800/70 text-stone-100'}`}>
+                                                                            <div className="flex items-start gap-2 min-w-0">
+                                                                                <span className="bg-amber-500/20 text-amber-300 border border-amber-500/30 font-black px-1.5 py-0.5 rounded text-[11px] shrink-0">
+                                                                                    {item.quantity}x
+                                                                                </span>
+                                                                                <div className="min-w-0">
+                                                                                    <div className="font-bold leading-snug break-words">
+                                                                                        {item.name}
+                                                                                    </div>
+                                                                                    {mods && <div className="text-[10px] text-stone-400 font-medium">{mods}</div>}
+                                                                                </div>
+                                                                            </div>
+                                                                            <span className="bg-stone-950 text-stone-300 border border-stone-700 font-black px-2 py-0.5 rounded text-[10px] uppercase shrink-0">
+                                                                                {item.size}
+                                                                            </span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+
+                                                            {/* Order Note */}
+                                                            {order.notes && (
+                                                                <div className="mb-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2.5 py-1.5 text-[11px] text-amber-300 font-bold flex items-start gap-1.5">
+                                                                    <i className="fa-solid fa-note-sticky mt-0.5 shrink-0"></i>
+                                                                    <span className="break-words">Note: {order.notes}</span>
+                                                                </div>
+                                                            )}
                                                         </div>
 
-                                                        <div className="truncate text-sm font-bold text-stone-300 mb-3">
-                                                            {order.customerName && order.customerName !== 'Walk-in' 
-                                                                ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
-                                                                : 'Walk-in Guest'}
-                                                        </div>
+                                                        {/* Footer: Sub-Total, Payment Status & Progress Bar */}
+                                                        <div>
+                                                            <div className="flex justify-between items-center mb-2 text-xs">
+                                                                <div className="flex items-center gap-1.5">
+                                                                    <span className="text-stone-400 font-bold uppercase text-[10px]">Sub-Total:</span>
+                                                                    <span className="text-sm font-black text-amber-400">{(order.totalAmount || 0).toLocaleString()} ៛</span>
+                                                                </div>
+                                                                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider border ${
+                                                                    isPaid 
+                                                                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' 
+                                                                        : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                                                                }`}>
+                                                                    <i className={`fa-solid ${isPaid ? 'fa-circle-check' : 'fa-circle-exclamation'} mr-1`}></i>
+                                                                    {isPaid ? 'Paid' : 'Unpaid'}
+                                                                </span>
+                                                            </div>
 
-                                                        <div className="w-full bg-stone-800 h-1.5 rounded-full overflow-hidden">
-                                                            <div 
-                                                                className="bg-amber-500 h-full transition-all duration-500" 
-                                                                style={{ width: `${Math.max(15, progressPct)}%` }}
-                                                            ></div>
+                                                            <div className="w-full bg-stone-800 h-1.5 rounded-full overflow-hidden">
+                                                                <div 
+                                                                    className="bg-amber-500 h-full transition-all duration-500" 
+                                                                    style={{ width: `${Math.max(15, progressPct)}%` }}
+                                                                ></div>
+                                                            </div>
                                                         </div>
                                                     </div>
                                                 );
@@ -6263,45 +6479,120 @@
                                             <p className="text-lg font-bold">Ready orders will appear here</p>
                                         </div>
                                     ) : (
-                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 content-start">
+                                        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 content-start">
                                             {readyOrders.map(order => {
                                                 const isJustCalled = recentlyReady?.id === order.id;
+                                                const isPaid = order.paymentStatus === 'Paid';
+
                                                 return (
                                                     <div 
                                                         key={order.id} 
                                                         className={`rounded-3xl p-5 border-2 transition-all duration-500 flex flex-col justify-between shadow-2xl ${
                                                             isJustCalled 
-                                                                ? 'bg-emerald-500 text-stone-950 border-white scale-[1.03] ring-4 ring-emerald-400/50 animate-pulse' 
+                                                                ? 'bg-emerald-500 text-stone-950 border-white scale-[1.02] ring-4 ring-emerald-400/50 animate-pulse' 
                                                                 : 'bg-gradient-to-br from-emerald-900/60 to-stone-900 border-emerald-500/50 text-white'
                                                         }`}
                                                     >
-                                                        <div className="flex justify-between items-start gap-2">
-                                                            <div>
-                                                                <div className={`text-[10px] font-black uppercase tracking-widest mb-1 ${isJustCalled ? 'text-stone-900' : 'text-emerald-400'}`}>
-                                                                    <i className="fa-solid fa-circle-check mr-1"></i> Order Ready
+                                                        <div>
+                                                            <div className="flex justify-between items-start gap-2 mb-2">
+                                                                <div>
+                                                                    <div className={`text-[10px] font-black uppercase tracking-widest mb-0.5 ${isJustCalled ? 'text-stone-900' : 'text-emerald-400'}`}>
+                                                                        <i className="fa-solid fa-circle-check mr-1"></i> Order Ready
+                                                                    </div>
+                                                                    <div className="text-4xl sm:text-5xl font-black tracking-tight font-mono leading-none">
+                                                                        {formatShortQueue(order.queueNo)}
+                                                                    </div>
+                                                                    <div className={`text-[11px] font-bold font-mono mt-1 ${isJustCalled ? 'text-stone-900/80' : 'text-emerald-200/70'}`}>
+                                                                        <i className="fa-regular fa-clock mr-1"></i>
+                                                                        {formatTVTimestamp(order.createdAt)}
+                                                                    </div>
                                                                 </div>
-                                                                <div className="text-4xl sm:text-5xl font-black tracking-tight font-mono leading-none">
-                                                                    {formatShortQueue(order.queueNo)}
+                                                                <div className="flex flex-col items-end gap-1">
+                                                                    <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${
+                                                                        isJustCalled 
+                                                                            ? 'bg-stone-950 text-emerald-400' 
+                                                                            : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                                                    }`}>
+                                                                        {order.orderType === 'TAKEAWAY' ? 'Counter Pickup' : `Table ${order.tableName}`}
+                                                                    </span>
+                                                                    <div className={`truncate font-black text-sm max-w-[150px] ${isJustCalled ? 'text-stone-950' : 'text-white'}`}>
+                                                                        {order.customerName && order.customerName !== 'Walk-in' 
+                                                                            ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
+                                                                            : 'Walk-in Guest'}
+                                                                    </div>
                                                                 </div>
                                                             </div>
-                                                            <span className={`px-3 py-1 rounded-full text-xs font-black uppercase ${
-                                                                isJustCalled 
-                                                                    ? 'bg-stone-950 text-emerald-400' 
-                                                                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                                            }`}>
-                                                                {order.orderType === 'TAKEAWAY' ? 'Counter Pickup' : `Table ${order.tableName}`}
-                                                            </span>
+
+                                                            {/* Product List (Name, Size, QTY) */}
+                                                            <div className={`my-2.5 border-t border-b py-2 space-y-1.5 max-h-40 overflow-y-auto no-scrollbar ${isJustCalled ? 'border-stone-950/20' : 'border-emerald-500/20'}`}>
+                                                                {(order.items || []).map((item, idx) => {
+                                                                    const mods = [item.gradeName && item.gradeName !== 'Default' ? item.gradeName : null, item.sugar, item.ice].filter(Boolean).join(' • ');
+                                                                    return (
+                                                                        <div key={idx} className={`flex items-start justify-between gap-2 text-xs rounded-lg px-2.5 py-1.5 ${
+                                                                            isJustCalled 
+                                                                                ? 'bg-stone-950/10 text-stone-950' 
+                                                                                : 'bg-stone-950/50 text-emerald-50'
+                                                                        }`}>
+                                                                            <div className="flex items-start gap-2 min-w-0">
+                                                                                <span className={`font-black px-1.5 py-0.5 rounded text-[11px] shrink-0 ${
+                                                                                    isJustCalled 
+                                                                                        ? 'bg-stone-950 text-emerald-400' 
+                                                                                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                                                                }`}>
+                                                                                    {item.quantity}x
+                                                                                </span>
+                                                                                <div className="min-w-0">
+                                                                                    <div className="font-bold leading-snug break-words">
+                                                                                        {item.name}
+                                                                                    </div>
+                                                                                    {mods && (
+                                                                                        <div className={`text-[10px] font-medium ${isJustCalled ? 'text-stone-800' : 'text-emerald-200/70'}`}>
+                                                                                            {mods}
+                                                                                        </div>
+                                                                                    )}
+                                                                                </div>
+                                                                            </div>
+                                                                            <span className={`font-black px-2 py-0.5 rounded text-[10px] uppercase shrink-0 ${
+                                                                                isJustCalled 
+                                                                                    ? 'bg-stone-950 text-white' 
+                                                                                    : 'bg-stone-900 text-emerald-300 border border-emerald-500/30'
+                                                                            }`}>
+                                                                                {item.size}
+                                                                            </span>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+
+                                                            {/* Order Note */}
+                                                            {order.notes && (
+                                                                <div className={`mb-2.5 rounded-lg px-2.5 py-1.5 text-[11px] font-bold flex items-start gap-1.5 ${
+                                                                    isJustCalled 
+                                                                        ? 'bg-stone-950/15 text-stone-950' 
+                                                                        : 'bg-amber-500/15 border border-amber-500/30 text-amber-200'
+                                                                }`}>
+                                                                    <i className="fa-solid fa-note-sticky mt-0.5 shrink-0"></i>
+                                                                    <span className="break-words">Note: {order.notes}</span>
+                                                                </div>
+                                                            )}
                                                         </div>
 
-                                                        <div className={`mt-4 pt-3 border-t flex justify-between items-center ${isJustCalled ? 'border-stone-950/20' : 'border-emerald-500/20'}`}>
-                                                            <div className="truncate font-black text-lg">
-                                                                {order.customerName && order.customerName !== 'Walk-in' 
-                                                                    ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
-                                                                    : 'Walk-in Guest'}
+                                                        {/* Footer: Sub-Total & Payment Status */}
+                                                        <div className="flex justify-between items-center pt-1">
+                                                            <div className="flex items-center gap-1.5">
+                                                                <span className={`text-[10px] font-black uppercase ${isJustCalled ? 'text-stone-800' : 'text-emerald-200/70'}`}>Sub-Total:</span>
+                                                                <span className={`text-base font-black ${isJustCalled ? 'text-stone-950' : 'text-amber-300'}`}>
+                                                                    {(order.totalAmount || 0).toLocaleString()} ៛
+                                                                </span>
                                                             </div>
-                                                            <div className={`text-xs font-bold shrink-0 ${isJustCalled ? 'text-stone-900' : 'text-emerald-300'}`}>
-                                                                {order.items?.reduce((s, i) => s + (i.quantity || 1), 0) || 1} Items
-                                                            </div>
+                                                            <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider border ${
+                                                                isJustCalled
+                                                                    ? (isPaid ? 'bg-stone-950 text-emerald-400 border-stone-950' : 'bg-rose-700 text-white border-rose-800')
+                                                                    : (isPaid ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border-rose-500/40')
+                                                            }`}>
+                                                                <i className={`fa-solid ${isPaid ? 'fa-circle-check' : 'fa-circle-exclamation'} mr-1`}></i>
+                                                                {isPaid ? 'Paid' : 'Unpaid'}
+                                                            </span>
                                                         </div>
                                                     </div>
                                                 );
@@ -7123,7 +7414,7 @@
                     }
                 };
 
-                const shopPropertyTabs = ['branches', 'tables', 'loyalty', 'happy_hour', 'receipts', 'printers'];
+                const shopPropertyTabs = ['branches', 'tables', 'loyalty', 'happy_hour', 'receipts', 'printers', 'telegram_bot'];
 
                 return (
                     <div className="max-w-6xl animate-fade-in">
@@ -7156,6 +7447,9 @@
                                         </button>
                                         <button onClick={() => { setActiveTab('printers'); setIsShopPropertyOpen(false); }} className={`w-full text-left px-4 py-2.5 text-sm font-bold flex items-center gap-2.5 hover:bg-stone-50 ${activeTab === 'printers' ? 'text-amber-600 bg-amber-50/50' : 'text-stone-700'}`}>
                                             <i className="fa-solid fa-print w-4 text-center"></i> Printers
+                                        </button>
+                                        <button onClick={() => { setActiveTab('telegram_bot'); setIsShopPropertyOpen(false); }} className={`w-full text-left px-4 py-2.5 text-sm font-bold flex items-center gap-2.5 hover:bg-stone-50 ${activeTab === 'telegram_bot' ? 'text-amber-600 bg-amber-50/50' : 'text-stone-700'}`}>
+                                            <i className="fa-brands fa-telegram w-4 text-center text-sky-500"></i> Telegram Bot Alerts
                                         </button>
                                     </div>
                                 )}
@@ -7192,6 +7486,9 @@
                         )}
                         {activeTab === 'printers' && (
                             <PrintersView shops={shops} currentAdminRecord={currentAdminRecord} />
+                        )}
+                        {activeTab === 'telegram_bot' && (
+                            <TelegramBotSettingsView shops={shops} currentAdminRecord={currentAdminRecord} />
                         )}
                         {activeTab === 'scp' && (
                             <SCPView shops={shops} currentAdminRecord={currentAdminRecord} orders={orders} products={products} />
@@ -7437,6 +7734,332 @@
                                 </form>
                             </div>
                         ) : null}
+                    </div>
+                );
+            }
+
+            function TelegramBotSettingsView({ shops, currentAdminRecord }) {
+                const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
+                const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
+                const [selectedScope, setSelectedScope] = useState(isSuper ? 'GLOBAL' : (allowedShopIds[0] || 'GLOBAL'));
+
+                const [formData, setFormData] = useState({
+                    enabled: false,
+                    botToken: '',
+                    chatId: '',
+                    notifyShiftClose: true,
+                    notifyOrderCancel: true,
+                    notifyLowStock: true
+                });
+
+                const [showToken, setShowToken] = useState(false);
+                const [isLoading, setIsLoading] = useState(false);
+                const [isSaving, setIsSaving] = useState(false);
+                const [isTesting, setIsTesting] = useState(false);
+                const [toast, setToast] = useState({ text: '', type: 'success' });
+
+                const showToast = (text, type = 'success') => {
+                    setToast({ text, type });
+                    setTimeout(() => setToast({ text: '', type: 'success' }), 4500);
+                };
+
+                useEffect(() => {
+                    let isMounted = true;
+                    const loadConfig = async () => {
+                        setIsLoading(true);
+                        try {
+                            const { doc, getDoc } = window.FirebaseApp;
+                            if (selectedScope === 'GLOBAL') {
+                                const snap = await getDoc(doc(safeDB(), 'system_settings', 'telegram_bot'));
+                                if (isMounted) {
+                                    if (snap.exists()) {
+                                        const d = snap.data();
+                                        setFormData({
+                                            enabled: !!d.enabled,
+                                            botToken: d.botToken || '',
+                                            chatId: d.chatId || '',
+                                            notifyShiftClose: d.notifyShiftClose !== false,
+                                            notifyOrderCancel: d.notifyOrderCancel !== false,
+                                            notifyLowStock: d.notifyLowStock !== false
+                                        });
+                                    } else {
+                                        setFormData({ enabled: false, botToken: '', chatId: '', notifyShiftClose: true, notifyOrderCancel: true, notifyLowStock: true });
+                                    }
+                                }
+                            } else {
+                                const shopObj = shops.find(s => s.id === selectedScope);
+                                const cfg = shopObj?.telegramBotConfig;
+                                if (isMounted) {
+                                    if (cfg) {
+                                        setFormData({
+                                            enabled: !!cfg.enabled,
+                                            botToken: cfg.botToken || '',
+                                            chatId: cfg.chatId || '',
+                                            notifyShiftClose: cfg.notifyShiftClose !== false,
+                                            notifyOrderCancel: cfg.notifyOrderCancel !== false,
+                                            notifyLowStock: cfg.notifyLowStock !== false
+                                        });
+                                    } else {
+                                        setFormData({ enabled: false, botToken: '', chatId: '', notifyShiftClose: true, notifyOrderCancel: true, notifyLowStock: true });
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                            console.warn("Failed to load Telegram config:", err);
+                        } finally {
+                            if (isMounted) setIsLoading(false);
+                        }
+                    };
+                    loadConfig();
+                    return () => { isMounted = false; };
+                }, [selectedScope, shops]);
+
+                const handleSave = async (e) => {
+                    e.preventDefault();
+                    setIsSaving(true);
+                    try {
+                        const { doc, setDoc, updateDoc } = window.FirebaseApp;
+                        const cleanPayload = {
+                            enabled: !!formData.enabled,
+                            botToken: formData.botToken.trim(),
+                            chatId: formData.chatId.trim(),
+                            notifyShiftClose: !!formData.notifyShiftClose,
+                            notifyOrderCancel: !!formData.notifyOrderCancel,
+                            notifyLowStock: !!formData.notifyLowStock,
+                            updatedAt: Date.now()
+                        };
+
+                        if (selectedScope === 'GLOBAL') {
+                            await setDoc(doc(safeDB(), 'system_settings', 'telegram_bot'), cleanPayload, { merge: true });
+                        } else {
+                            await updateDoc(doc(safeDB(), 'shops', selectedScope), {
+                                telegramBotConfig: cleanPayload
+                            });
+                        }
+                        showToast("Telegram Bot configuration saved successfully!", "success");
+                    } catch (err) {
+                        showToast("Failed to save settings: " + err.message, "error");
+                    } finally {
+                        setIsSaving(false);
+                    }
+                };
+
+                const handleSendTest = async () => {
+                    if (!formData.botToken.trim() || !formData.chatId.trim()) {
+                        showToast("Please enter both a Bot Token and Chat ID before testing.", "error");
+                        return;
+                    }
+                    setIsTesting(true);
+                    try {
+                        const scopeName = selectedScope === 'GLOBAL'
+                            ? 'Global Master Channel (All Branches)'
+                            : (shops.find(s => s.id === selectedScope)?.name || 'Branch');
+                        const res = await window.SolarisTelegramNode.sendTestAlert(
+                            scopeName,
+                            formData,
+                            currentAdminRecord?.name || 'Admin'
+                        );
+                        if (res.ok) {
+                            showToast("Test alert delivered to Telegram! Check your group/channel.", "success");
+                        } else {
+                            showToast("Telegram Test Failed: " + (res.error || res.reason || 'Unknown error'), "error");
+                        }
+                    } catch (err) {
+                        showToast("Test error: " + err.message, "error");
+                    } finally {
+                        setIsTesting(false);
+                    }
+                };
+
+                return (
+                    <div className="animate-fade-in max-w-4xl relative">
+                        {toast.text && (
+                            <div className={`fixed top-20 left-1/2 -translate-x-1/2 backdrop-blur text-white px-6 py-3 rounded-full shadow-2xl z-[100] flex items-center gap-3 border animate-fade-in transition-all ${toast.type === 'error' ? 'bg-red-600/95 border-red-500' : 'bg-stone-900/95 border-stone-700'}`}>
+                                <i className={`fa-solid ${toast.type === 'error' ? 'fa-triangle-exclamation animate-pulse' : 'fa-circle-check text-emerald-400'}`}></i>
+                                <span className="font-bold text-sm tracking-wide">{toast.text}</span>
+                            </div>
+                        )}
+
+                        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 gap-4">
+                            <div>
+                                <h2 className="text-2xl font-bold flex items-center gap-2.5">
+                                    <i className="fa-brands fa-telegram text-sky-500 text-3xl"></i>
+                                    Telegram Bot Real-Time Alerts
+                                </h2>
+                                <p className="text-sm text-stone-500 mt-1">Push instant Z-Reports, order cancellations, and low stock warnings to your management group.</p>
+                            </div>
+                            <div className="w-full sm:w-auto">
+                                <select
+                                    className="w-full sm:w-auto border border-stone-300 rounded-xl px-4 py-2.5 font-bold outline-none bg-white text-stone-800 shadow-sm cursor-pointer"
+                                    value={selectedScope}
+                                    onChange={e => setSelectedScope(e.target.value)}
+                                >
+                                    {isSuper && <option value="GLOBAL">🌐 Global Default (All Branches)</option>}
+                                    {shops.filter(s => isSuper || allowedShopIds.includes('All') || allowedShopIds.includes(s.id)).map(s => (
+                                        <option key={s.id} value={s.id}>🏪 {s.name}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <div className="lg:col-span-2 bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
+                                {isLoading ? (
+                                    <div className="py-12 text-center text-stone-400 font-bold">
+                                        <i className="fa-solid fa-spinner fa-spin mr-2"></i> Loading configuration...
+                                    </div>
+                                ) : (
+                                    <form onSubmit={handleSave} className="space-y-6">
+                                        <div className="flex items-center justify-between pb-4 border-b border-stone-100">
+                                            <div>
+                                                <h3 className="text-lg font-bold text-stone-800">
+                                                    {selectedScope === 'GLOBAL' ? 'Enable Global Telegram Alerts' : `Enable Override for ${shops.find(s => s.id === selectedScope)?.name || 'Branch'}`}
+                                                </h3>
+                                                <p className="text-xs text-stone-500 mt-0.5">
+                                                    {selectedScope === 'GLOBAL'
+                                                        ? 'Acts as the default fallback for any branch without custom credentials.'
+                                                        : 'Leave empty or disabled to automatically inherit the Global Default Bot.'}
+                                                </p>
+                                            </div>
+                                            <label className="flex items-center cursor-pointer shrink-0 ml-4">
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={formData.enabled} onChange={e => setFormData({ ...formData, enabled: e.target.checked })} />
+                                                    <div className={`block w-12 h-7 rounded-full transition ${formData.enabled ? 'bg-sky-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-5 h-5 rounded-full transition transform ${formData.enabled ? 'translate-x-5' : ''}`}></div>
+                                                </div>
+                                            </label>
+                                        </div>
+
+                                        <div className="space-y-4">
+                                            <div>
+                                                <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">Telegram Bot Token (@BotFather)</label>
+                                                <div className="relative">
+                                                    <i className="fa-solid fa-robot absolute left-4 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                                                    <input
+                                                        type={showToken ? "text" : "password"}
+                                                        placeholder="e.g. 7123456789:AAH_your_secret_bot_token_here"
+                                                        className="w-full border border-stone-300 rounded-xl pl-11 pr-11 py-3 outline-none focus:border-sky-500 bg-stone-50 focus:bg-white font-mono text-sm text-stone-800 transition-colors shadow-sm"
+                                                        value={formData.botToken}
+                                                        onChange={e => setFormData({ ...formData, botToken: e.target.value })}
+                                                    />
+                                                    <button type="button" onClick={() => setShowToken(!showToken)} className="absolute right-3 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-700 p-1">
+                                                        <i className={`fa-solid ${showToken ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-1.5">Target Chat ID / Group ID</label>
+                                                <div className="relative">
+                                                    <i className="fa-solid fa-comments absolute left-4 top-1/2 -translate-y-1/2 text-stone-400"></i>
+                                                    <input
+                                                        type="text"
+                                                        placeholder="e.g. -1001987654321 or @your_channel"
+                                                        className="w-full border border-stone-300 rounded-xl pl-11 pr-4 py-3 outline-none focus:border-sky-500 bg-stone-50 focus:bg-white font-mono text-sm font-bold text-stone-800 transition-colors shadow-sm"
+                                                        value={formData.chatId}
+                                                        onChange={e => setFormData({ ...formData, chatId: e.target.value })}
+                                                    />
+                                                </div>
+                                                <p className="text-[11px] text-stone-400 mt-1.5 font-medium">
+                                                    <i className="fa-solid fa-circle-info mr-1 text-sky-500"></i> Supergroup IDs typically start with <code className="bg-stone-100 px-1 py-0.5 rounded text-stone-600 font-bold">-100</code>.
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="pt-4 border-t border-stone-100">
+                                            <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-3">Real-Time Event Triggers</label>
+                                            <div className="space-y-3">
+                                                <label className="flex items-center justify-between p-3.5 rounded-xl bg-stone-50 border border-stone-200 cursor-pointer hover:border-sky-300 transition">
+                                                    <div className="flex items-start gap-3">
+                                                        <div className="w-9 h-9 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0 mt-0.5">
+                                                            <i className="fa-solid fa-file-invoice-dollar"></i>
+                                                        </div>
+                                                        <div>
+                                                            <div className="font-bold text-sm text-stone-800">Shift Closed (Z-Report) & High Variance</div>
+                                                            <div className="text-xs text-stone-500">Instant summary of Net Sales, Cash/Bank reconciliation, and drawer shortages.</div>
+                                                        </div>
+                                                    </div>
+                                                    <input type="checkbox" className="w-5 h-5 accent-sky-600 rounded cursor-pointer shrink-0 ml-3" checked={formData.notifyShiftClose} onChange={e => setFormData({ ...formData, notifyShiftClose: e.target.checked })} />
+                                                </label>
+
+                                                <label className="flex items-center justify-between p-3.5 rounded-xl bg-stone-50 border border-stone-200 cursor-pointer hover:border-sky-300 transition">
+                                                    <div className="flex items-start gap-3">
+                                                        <div className="w-9 h-9 rounded-lg bg-rose-100 text-rose-600 flex items-center justify-center shrink-0 mt-0.5">
+                                                            <i className="fa-solid fa-ban"></i>
+                                                        </div>
+                                                        <div>
+                                                            <div className="font-bold text-sm text-stone-800">Order Cancelled Alert</div>
+                                                            <div className="text-xs text-stone-500">Immediate alert when an order (especially a PAID order) is voided or cancelled.</div>
+                                                        </div>
+                                                    </div>
+                                                    <input type="checkbox" className="w-5 h-5 accent-sky-600 rounded cursor-pointer shrink-0 ml-3" checked={formData.notifyOrderCancel} onChange={e => setFormData({ ...formData, notifyOrderCancel: e.target.checked })} />
+                                                </label>
+
+                                                <label className="flex items-center justify-between p-3.5 rounded-xl bg-stone-50 border border-stone-200 cursor-pointer hover:border-sky-300 transition">
+                                                    <div className="flex items-start gap-3">
+                                                        <div className="w-9 h-9 rounded-lg bg-amber-100 text-amber-600 flex items-center justify-center shrink-0 mt-0.5">
+                                                            <i className="fa-solid fa-boxes-stacked"></i>
+                                                        </div>
+                                                        <div>
+                                                            <div className="font-bold text-sm text-stone-800">Low Stock (Par Level) Summary</div>
+                                                            <div className="text-xs text-stone-500">Consolidated alert of ingredients at or below Par Level on shift close or waste logging.</div>
+                                                        </div>
+                                                    </div>
+                                                    <input type="checkbox" className="w-5 h-5 accent-sky-600 rounded cursor-pointer shrink-0 ml-3" checked={formData.notifyLowStock} onChange={e => setFormData({ ...formData, notifyLowStock: e.target.checked })} />
+                                                </label>
+                                            </div>
+                                        </div>
+
+                                        <div className="pt-4 border-t border-stone-100 flex flex-col sm:flex-row gap-3">
+                                            <button
+                                                type="button"
+                                                onClick={handleSendTest}
+                                                disabled={isTesting || isSaving}
+                                                className="flex-1 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 font-bold py-3.5 px-4 rounded-xl transition shadow-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                                            >
+                                                {isTesting ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-regular fa-paper-plane"></i>}
+                                                {isTesting ? 'Sending Test...' : 'Send Test Alert'}
+                                            </button>
+                                            <button
+                                                type="submit"
+                                                disabled={isSaving || isTesting}
+                                                className="flex-[1.5] bg-stone-900 hover:bg-stone-800 text-white font-bold py-3.5 px-6 rounded-xl transition shadow-md flex items-center justify-center gap-2 disabled:opacity-50"
+                                            >
+                                                {isSaving ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-save text-sky-400"></i>}
+                                                Save Configuration
+                                            </button>
+                                        </div>
+                                    </form>
+                                )}
+                            </div>
+
+                            <div className="bg-stone-900 text-white p-6 rounded-2xl shadow-lg flex flex-col justify-between">
+                                <div>
+                                    <div className="flex items-center gap-2 text-sky-400 font-black text-sm uppercase tracking-wider mb-4">
+                                        <i className="fa-solid fa-bolt"></i> Quick Setup Guide
+                                    </div>
+                                    <ol className="space-y-4 text-xs text-stone-300 leading-relaxed list-decimal pl-4">
+                                        <li>
+                                            Open Telegram and message <strong className="text-white">@BotFather</strong>, send <code className="bg-stone-800 px-1.5 py-0.5 rounded text-amber-400">/newbot</code>, and copy the HTTP API <strong className="text-white">Bot Token</strong>.
+                                        </li>
+                                        <li>
+                                            Add your new bot to your management <strong className="text-white">Telegram Group</strong> (or Channel as an Admin).
+                                        </li>
+                                        <li>
+                                            To find your Group's <strong className="text-white">Chat ID</strong>, invite <strong className="text-white">@RawDataBot</strong> or <strong className="text-white">@getidsbot</strong> to the group, copy the <code className="bg-stone-800 px-1.5 py-0.5 rounded text-amber-400">-100...</code> ID, then remove the helper bot.
+                                        </li>
+                                        <li>
+                                            Paste both values here, click <strong className="text-sky-400">Send Test Alert</strong> to verify, and click <strong className="text-white">Save Configuration</strong>.
+                                        </li>
+                                    </ol>
+                                </div>
+
+                                <div className="mt-6 pt-4 border-t border-stone-800 text-[11px] text-stone-400 flex items-start gap-2">
+                                    <i className="fa-solid fa-shield-halved text-emerald-400 mt-0.5"></i>
+                                    <span>All alerts run asynchronously with a 5-second timeout so POS and KDS speed is never affected.</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 );
             }
@@ -11147,6 +11770,22 @@
                             bankVariance: calculatedBankVar,
                             varianceNote: varianceNote
                         });
+
+                        // --- TELEGRAM NOTIFICATION (PHASE 2) ---
+                        window.SolarisTelegramNode.getEffectiveConfig(targetShop).then(async (teleConfig) => {
+                            if (teleConfig.enabled && teleConfig.notifyShiftClose) {
+                                const teleMsg = await window.SolarisTelegramNode.formatShiftClose(
+                                    shiftSalesData, 
+                                    { ...currentShift, closedBy: currentAdminRecord?.name || currentAdminRecord?.email || 'Unknown' }, 
+                                    targetShop, 
+                                    actualCashValue, 
+                                    finalActualBank, 
+                                    varianceNote
+                                );
+                                window.SolarisTelegramNode.sendMessage(targetShop, teleMsg, teleConfig);
+                            }
+                        }).catch(e => console.warn("Telegram shift notification failed:", e));
+                        // ---------------------------------------
                         
                         setCloseShiftModal(false);
                         setActualCash('');
