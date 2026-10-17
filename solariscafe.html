@@ -6079,12 +6079,75 @@
                 const [currentTime, setCurrentTime] = useState(new Date());
                 const [isSoundEnabled, setIsSoundEnabled] = useState(true);
                 const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
+                const [voiceLang, setVoiceLang] = useState(() => {
+                    try { return localStorage.getItem('solaris_tv_voice_lang') || 'en'; } catch (e) { return 'en'; }
+                }); // 'en' | 'km' | 'both'
                 const [recentlyReady, setRecentlyReady] = useState(null);
                 const [isFullscreen, setIsFullscreen] = useState(false);
+                const [audioUnlocked, setAudioUnlocked] = useState(false);
 
                 const announcedReadyIds = useRef(new Set());
                 const isInitialMount = useRef(true);
                 const audioCtxRef = useRef(null);
+                const availableVoicesRef = useRef([]);
+                const activeUtteranceRef = useRef(null);
+                const ttsAudioRef = useRef(null);
+                const speechQueueTimerRef = useRef(null);
+
+                // Preload and cache English voices, and unlock WebAudio + HTML5 Audio + SpeechSynthesis on user gesture
+                useEffect(() => {
+                    const loadVoices = () => {
+                        if ('speechSynthesis' in window) {
+                            const voices = window.speechSynthesis.getVoices();
+                            if (voices && voices.length > 0) {
+                                availableVoicesRef.current = voices;
+                            }
+                        }
+                    };
+                    loadVoices();
+                    if ('speechSynthesis' in window && window.speechSynthesis.onvoiceschanged !== undefined) {
+                        window.speechSynthesis.onvoiceschanged = loadVoices;
+                    }
+
+                    // Create a persistent HTML5 Audio element for Cloud TTS fallback (works on Smart TVs/Android WebViews without local TTS voices)
+                    if (!ttsAudioRef.current) {
+                        const audioEl = new Audio();
+                        audioEl.preload = 'auto';
+                        ttsAudioRef.current = audioEl;
+                    }
+
+                    const unlockAudioAndSpeech = () => {
+                        try {
+                            const AudioContext = window.AudioContext || window.webkitAudioContext;
+                            if (!audioCtxRef.current && AudioContext) {
+                                audioCtxRef.current = new AudioContext();
+                            }
+                            if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+                                audioCtxRef.current.resume();
+                            }
+                            if ('speechSynthesis' in window) {
+                                window.speechSynthesis.cancel();
+                                window.speechSynthesis.resume();
+                                const silentUtter = new SpeechSynthesisUtterance(' ');
+                                silentUtter.volume = 0.01;
+                                silentUtter.rate = 2;
+                                window.speechSynthesis.speak(silentUtter);
+                            }
+                            setAudioUnlocked(true);
+                        } catch (e) {}
+                    };
+
+                    document.addEventListener('click', unlockAudioAndSpeech, { capture: true });
+                    document.addEventListener('touchstart', unlockAudioAndSpeech, { capture: true });
+                    document.addEventListener('keydown', unlockAudioAndSpeech, { capture: true });
+
+                    return () => {
+                        document.removeEventListener('click', unlockAudioAndSpeech, { capture: true });
+                        document.removeEventListener('touchstart', unlockAudioAndSpeech, { capture: true });
+                        document.removeEventListener('keydown', unlockAudioAndSpeech, { capture: true });
+                        if (speechQueueTimerRef.current) clearTimeout(speechQueueTimerRef.current);
+                    };
+                }, []);
 
                 // Live Clock & Fullscreen Listener
                 useEffect(() => {
@@ -6109,54 +6172,206 @@
                     return () => { if (wakeLock) wakeLock.release().catch(()=>{}); };
                 }, []);
 
-                // Play Airport-style Ding-Dong Chime + Optional Voice Announcement
-                const triggerReadyAnnouncement = (order) => {
-                    if (!isSoundEnabled) return;
-                    try {
-                        const AudioContext = window.AudioContext || window.webkitAudioContext;
-                        if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
-                        const ctx = audioCtxRef.current;
-                        if (ctx.state === 'suspended') ctx.resume();
+                const formatShortQueue = (queueNo) => {
+                    if (!queueNo) return '---';
+                    const parts = String(queueNo).split('-');
+                    if (parts.length > 1) {
+                        const num = parseInt(parts[1], 10);
+                        return isNaN(num) ? queueNo : `#${String(num).padStart(3, '0')}`;
+                    }
+                    return queueNo;
+                };
 
-                        const playTone = (freq, start, duration, vol = 0.35) => {
-                            const osc = ctx.createOscillator();
-                            const gain = ctx.createGain();
-                            osc.type = 'sine';
-                            osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
-                            gain.gain.setValueAtTime(0, ctx.currentTime + start);
-                            gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.03);
-                            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
-                            osc.connect(gain);
-                            gain.connect(ctx.destination);
-                            osc.start(ctx.currentTime + start);
-                            osc.stop(ctx.currentTime + start + duration);
-                        };
+                const formatSpokenInvoice = (queueNo) => {
+                    if (!queueNo) return '';
+                    const parts = String(queueNo).split('-');
+                    if (parts.length > 1) {
+                        const prefix = parts[0].split('').join(' ');
+                        const num = parseInt(parts[1], 10);
+                        const numStr = isNaN(num) ? parts[1] : String(num);
+                        return `${prefix}, ${numStr}`;
+                    }
+                    return String(queueNo);
+                };
 
-                        // Pleasant two-tone airport chime: E5 -> C5
-                        playTone(659.25, 0, 0.65);
-                        playTone(523.25, 0.45, 1.0);
+                const buildAnnouncementSegments = (order, langMode = voiceLang) => {
+                    const spokenInvoice = formatSpokenInvoice(order.queueNo);
+                    const hasCustomerName = order.customerName && order.customerName.trim() !== '' && order.customerName !== 'Walk-in';
 
-                        // Speech synthesis announcement after chime
-                        if (isVoiceEnabled && 'speechSynthesis' in window) {
-                            setTimeout(() => {
-                                try {
+                    const enHonorific = order.customerSex === 'F' ? 'Ms.' : (order.customerSex === 'M' ? 'Mr.' : '');
+                    const enCustName = hasCustomerName ? `${enHonorific} ${order.customerName.trim()}`.trim() : '';
+                    const enText = enCustName
+                        ? `Attention please. Order for ${enCustName}, invoice number ${spokenInvoice}, is ready for pickup.`
+                        : `Attention please. Invoice number ${spokenInvoice}, is ready for pickup.`;
+
+                    const kmHonorific = order.customerSex === 'F' ? 'អ្នកនាង ' : (order.customerSex === 'M' ? 'លោក ' : '');
+                    const kmCustName = hasCustomerName ? `${kmHonorific}${order.customerName.trim()}`.trim() : '';
+                    const kmText = kmCustName
+                        ? `សូមអញ្ជើញ ${kmCustName} វិក្កយបត្រលេខ ${spokenInvoice} ភេសជ្ជៈរបស់លោកអ្នករួចរាល់ហើយ សូមអញ្ជើញមកទទួលនៅកន្លែង​រងចាំ​ !  សូម​អរគុណ​ !។`
+                        : `សូមអញ្ជើញ វិក្កយបត្រលេខ ${spokenInvoice} ភេសជ្ជៈរបស់លោកអ្នករួចរាល់ហើយ សូមអញ្ជើញមកទទួលនៅកន្លែង​រងចាំ​ !  សូម​អរគុណ​ !។`;
+
+                    if (langMode === 'km') return [{ lang: 'km-KH', tl: 'km', text: kmText }];
+                    if (langMode === 'both') return [
+                        { lang: 'km-KH', tl: 'km', text: kmText },
+                        { lang: 'en-US', tl: 'en', text: enText }
+                    ];
+                    return [{ lang: 'en-US', tl: 'en', text: enText }];
+                };
+
+                const playCloudTTSFallback = (speechText, tl = 'en') => {
+                    return new Promise((resolve) => {
+                        try {
+                            const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encodeURIComponent(speechText)}`;
+                            const audio = ttsAudioRef.current || new Audio();
+                            ttsAudioRef.current = audio;
+                            audio.pause();
+                            audio.src = url;
+                            audio.volume = 1.0;
+                            audio.playbackRate = tl === 'km' ? 0.98 : 0.95;
+                            audio.onended = () => resolve(true);
+                            audio.onerror = () => resolve(false);
+                            const playPromise = audio.play();
+                            if (playPromise !== undefined) {
+                                playPromise.then(() => {}).catch(() => resolve(false));
+                            }
+                        } catch (err) {
+                            resolve(false);
+                        }
+                    });
+                };
+
+                const speakSingleSegment = (segment) => {
+                    return new Promise((resolve) => {
+                        const { lang, tl, text: speechText } = segment;
+
+                        if ('speechSynthesis' in window) {
+                            try {
+                                const voices = availableVoicesRef.current.length > 0
+                                    ? availableVoicesRef.current
+                                    : window.speechSynthesis.getVoices();
+
+                                let matchedVoice = null;
+                                if (tl === 'km') {
+                                    matchedVoice = voices.find(v => (v.lang && v.lang.toLowerCase().includes('km')) || (v.name && v.name.toLowerCase().includes('khmer')));
+                                    // Most desktop/TV browsers do not bundle a native Khmer TTS voice; use Cloud TTS directly for authentic Khmer pronunciation
+                                    if (!matchedVoice) {
+                                        playCloudTTSFallback(speechText, 'km').then(resolve);
+                                        return;
+                                    }
+                                } else {
+                                    matchedVoice = voices.find(v => v.lang === 'en-US' && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Samantha') || v.name.includes('Microsoft')))
+                                        || voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en-us'))
+                                        || voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en'));
+                                }
+
+                                if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
                                     window.speechSynthesis.cancel();
-                                    const shortNo = formatShortQueue(order.queueNo);
-                                    const custName = (order.customerName && order.customerName !== 'Walk-in') 
-                                        ? `${order.customerSex === 'F' ? 'Ms.' : 'Mr.'} ${order.customerName}` 
-                                        : '';
-                                    const text = custName 
-                                        ? `Order ${shortNo}, for ${custName}, is ready for pickup.` 
-                                        : `Order number ${shortNo} is ready for pickup.`;
-                                    const utter = new SpeechSynthesisUtterance(text);
-                                    utter.rate = 0.92;
-                                    utter.pitch = 1.05;
-                                    window.speechSynthesis.speak(utter);
-                                } catch (e) {}
-                            }, 1100);
+                                }
+                                window.speechSynthesis.resume();
+
+                                const utter = new SpeechSynthesisUtterance(speechText);
+                                utter.lang = lang;
+                                utter.rate = tl === 'km' ? 0.95 : 0.92;
+                                utter.pitch = 1.0;
+                                utter.volume = 1.0;
+                                if (matchedVoice) utter.voice = matchedVoice;
+
+                                let hasStartedSpeaking = false;
+                                activeUtteranceRef.current = utter;
+
+                                const watchdogTimer = setTimeout(() => {
+                                    if (!hasStartedSpeaking) {
+                                        playCloudTTSFallback(speechText, tl).then(resolve);
+                                    }
+                                }, 600);
+
+                                utter.onstart = () => {
+                                    hasStartedSpeaking = true;
+                                    clearTimeout(watchdogTimer);
+                                };
+                                utter.onend = () => {
+                                    clearTimeout(watchdogTimer);
+                                    activeUtteranceRef.current = null;
+                                    resolve(true);
+                                };
+                                utter.onerror = () => {
+                                    clearTimeout(watchdogTimer);
+                                    activeUtteranceRef.current = null;
+                                    if (!hasStartedSpeaking) {
+                                        playCloudTTSFallback(speechText, tl).then(resolve);
+                                    } else {
+                                        resolve(false);
+                                    }
+                                };
+
+                                window.speechSynthesis.speak(utter);
+                                window.speechSynthesis.resume();
+                                return;
+                            } catch (e) {
+                                console.warn("Native SpeechSynthesis exception, using Cloud TTS fallback:", e);
+                            }
+                        }
+
+                        playCloudTTSFallback(speechText, tl).then(resolve);
+                    });
+                };
+
+                const speakOrderAnnouncement = async (order, overrideLang = null) => {
+                    const segments = buildAnnouncementSegments(order, overrideLang || voiceLang);
+                    for (const seg of segments) {
+                        await speakSingleSegment(seg);
+                    }
+                };
+
+                // Play Airport-style Ding-Dong Chime + Voice Announcement
+                const triggerReadyAnnouncement = (order, forceVoice = null, overrideLang = null) => {
+                    const shouldPlayVoice = forceVoice !== null ? forceVoice : isVoiceEnabled;
+
+                    if (!isSoundEnabled && !shouldPlayVoice) return;
+
+                    if (speechQueueTimerRef.current) {
+                        clearTimeout(speechQueueTimerRef.current);
+                        speechQueueTimerRef.current = null;
+                    }
+
+                    try {
+                        if (isSoundEnabled) {
+                            const AudioContext = window.AudioContext || window.webkitAudioContext;
+                            if (!audioCtxRef.current && AudioContext) audioCtxRef.current = new AudioContext();
+                            const ctx = audioCtxRef.current;
+                            if (ctx) {
+                                if (ctx.state === 'suspended') ctx.resume();
+
+                                const playTone = (freq, start, duration, vol = 0.35) => {
+                                    const osc = ctx.createOscillator();
+                                    const gain = ctx.createGain();
+                                    osc.type = 'sine';
+                                    osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+                                    gain.gain.setValueAtTime(0, ctx.currentTime + start);
+                                    gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.03);
+                                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+                                    osc.connect(gain);
+                                    gain.connect(ctx.destination);
+                                    osc.start(ctx.currentTime + start);
+                                    osc.stop(ctx.currentTime + start + duration);
+                                };
+
+                                // Pleasant two-tone airport chime: E5 -> C5
+                                playTone(659.25, 0, 0.65);
+                                playTone(523.25, 0.45, 0.95);
+                            }
+                        }
+
+                        // Trigger voice announcement after chime finishes
+                        if (shouldPlayVoice) {
+                            const delayMs = isSoundEnabled ? 1250 : 50;
+                            speechQueueTimerRef.current = setTimeout(() => {
+                                speakOrderAnnouncement(order, overrideLang);
+                            }, delayMs);
                         }
                     } catch (err) {
                         console.warn("TV Audio error:", err);
+                        if (shouldPlayVoice) speakOrderAnnouncement(order, overrideLang);
                     }
                 };
 
@@ -6177,13 +6392,21 @@
                     return { preparingOrders: prep, readyOrders: ready };
                 }, [orders, filterShop]);
 
-                // Detect newly Ready orders and trigger visual flash + chime
+                // Detect newly Ready orders and trigger visual flash + chime + English voice
                 useEffect(() => {
                     if (isInitialMount.current) {
                         readyOrders.forEach(o => announcedReadyIds.current.add(o.id));
                         isInitialMount.current = false;
                         return;
                     }
+
+                    // Clean up IDs of orders that are no longer in 'Ready' status (e.g., moved back to Preparing and then Ready again)
+                    const currentReadySet = new Set(readyOrders.map(o => o.id));
+                    announcedReadyIds.current.forEach(id => {
+                        if (!currentReadySet.has(id)) {
+                            announcedReadyIds.current.delete(id);
+                        }
+                    });
 
                     let newestReadyOrder = null;
                     readyOrders.forEach(o => {
@@ -6199,7 +6422,7 @@
                         const timer = setTimeout(() => setRecentlyReady(null), 8000);
                         return () => clearTimeout(timer);
                     }
-                }, [readyOrders, isSoundEnabled, isVoiceEnabled]);
+                }, [readyOrders, isSoundEnabled, isVoiceEnabled, voiceLang]);
 
                 const toggleFullscreen = () => {
                     const elem = document.getElementById('tv-queue-container');
@@ -6208,16 +6431,6 @@
                     } else {
                         if (document.exitFullscreen) document.exitFullscreen().catch(e => console.warn(e));
                     }
-                };
-
-                const formatShortQueue = (queueNo) => {
-                    if (!queueNo) return '---';
-                    const parts = String(queueNo).split('-');
-                    if (parts.length > 1) {
-                        const num = parseInt(parts[1], 10);
-                        return isNaN(num) ? queueNo : `#${String(num).padStart(3, '0')}`;
-                    }
-                    return queueNo;
                 };
 
                 const activeShopObj = shops.find(s => s.id === filterShop);
@@ -6289,7 +6502,8 @@
                                     onClick={() => {
                                         const next = !isSoundEnabled;
                                         setIsSoundEnabled(next);
-                                        if (next) triggerReadyAnnouncement({ queueNo: '001', customerName: 'Test', customerSex: 'M' });
+                                        setAudioUnlocked(true);
+                                        if (next) triggerReadyAnnouncement({ queueNo: 'SLR-000000001', customerName: 'Alex', customerSex: 'M' }, isVoiceEnabled);
                                     }}
                                     className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-2 ${isSoundEnabled ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30' : 'bg-stone-800 border-stone-700 text-stone-400 hover:bg-stone-700'}`}
                                     title="Toggle Chime Sound"
@@ -6298,16 +6512,54 @@
                                     <span className="hidden md:inline">{isSoundEnabled ? 'Chime On' : 'Muted'}</span>
                                 </button>
 
-                                {isSoundEnabled && (
-                                    <button 
-                                        onClick={() => setIsVoiceEnabled(!isVoiceEnabled)}
-                                        className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-2 ${isVoiceEnabled ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30' : 'bg-stone-800 border-stone-700 text-stone-400 hover:bg-stone-700'}`}
-                                        title="Toggle Voice Reader"
-                                    >
-                                        <i className="fa-solid fa-microphone-lines"></i>
-                                        <span className="hidden md:inline">{isVoiceEnabled ? 'Voice On' : 'Voice Off'}</span>
-                                    </button>
-                                )}
+                                <button 
+                                    onClick={() => {
+                                        const next = !isVoiceEnabled;
+                                        setIsVoiceEnabled(next);
+                                        setAudioUnlocked(true);
+                                        if (next) {
+                                            speakOrderAnnouncement({ queueNo: 'SLR-000000001', customerName: 'Alex', customerSex: 'M' });
+                                        } else if ('speechSynthesis' in window) {
+                                            window.speechSynthesis.cancel();
+                                        }
+                                    }}
+                                    className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-2 ${isVoiceEnabled ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/30' : 'bg-stone-800 border-stone-700 text-stone-400 hover:bg-stone-700'}`}
+                                    title="Toggle English Voice Announcement"
+                                >
+                                    <i className={`fa-solid ${isVoiceEnabled ? 'fa-microphone-lines' : 'fa-microphone-lines-slash'}`}></i>
+                                    <span className="hidden md:inline">{isVoiceEnabled ? 'Voice On' : 'Voice Off'}</span>
+                                </button>
+
+                                <select
+                                    value={voiceLang}
+                                    onChange={(e) => {
+                                        const newLang = e.target.value;
+                                        setVoiceLang(newLang);
+                                        setAudioUnlocked(true);
+                                        try { localStorage.setItem('solaris_tv_voice_lang', newLang); } catch (err) {}
+                                        const sampleOrder = readyOrders[0] || { queueNo: 'SLR-000000001', customerName: 'Alex', customerSex: 'M' };
+                                        triggerReadyAnnouncement(sampleOrder, true, newLang);
+                                    }}
+                                    className="bg-stone-800 border border-stone-700 text-cyan-300 rounded-xl px-3 py-2 text-xs font-bold outline-none focus:border-cyan-500 cursor-pointer"
+                                    title="Select Voice Announcement Language (Khmer / English)"
+                                >
+                                    <option value="en">🇬🇧 Voice: EN</option>
+                                    <option value="km">🇰🇭 Voice: ខ្មែរ</option>
+                                    <option value="both">🇰🇭+🇬🇧 ខ្មែរ & EN</option>
+                                </select>
+
+                                <button 
+                                    onClick={() => {
+                                        setAudioUnlocked(true);
+                                        const sampleOrder = readyOrders[0] || { queueNo: 'SLR-000000001', customerName: 'Guest', customerSex: 'M' };
+                                        triggerReadyAnnouncement(sampleOrder, true);
+                                    }}
+                                    className="px-3.5 py-2 rounded-xl text-xs font-bold bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 transition flex items-center gap-2"
+                                    title="Test Voice & Chime Announcement"
+                                >
+                                    <i className="fa-solid fa-volume-high"></i>
+                                    <span className="hidden xl:inline">Test Voice</span>
+                                </button>
 
                                 <button 
                                     onClick={toggleFullscreen}
@@ -6503,18 +6755,39 @@
                                                                         {formatShortQueue(order.queueNo)}
                                                                     </div>
                                                                     <div className={`text-[11px] font-bold font-mono mt-1 ${isJustCalled ? 'text-stone-900/80' : 'text-emerald-200/70'}`}>
+                                                                        <i className="fa-solid fa-receipt mr-1"></i>
+                                                                        Inv: {order.queueNo}
+                                                                    </div>
+                                                                    <div className={`text-[11px] font-bold font-mono mt-0.5 ${isJustCalled ? 'text-stone-900/80' : 'text-emerald-200/70'}`}>
                                                                         <i className="fa-regular fa-clock mr-1"></i>
                                                                         {formatTVTimestamp(order.createdAt)}
                                                                     </div>
                                                                 </div>
                                                                 <div className="flex flex-col items-end gap-1">
-                                                                    <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${
-                                                                        isJustCalled 
-                                                                            ? 'bg-stone-950 text-emerald-400' 
-                                                                            : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                                                    }`}>
-                                                                        {order.orderType === 'TAKEAWAY' ? 'Counter Pickup' : `Table ${order.tableName}`}
-                                                                    </span>
+                                                                    <div className="flex items-center gap-1.5">
+                                                                        <button
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                setRecentlyReady(order);
+                                                                                triggerReadyAnnouncement(order, true);
+                                                                            }}
+                                                                            className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase transition flex items-center gap-1 ${
+                                                                                isJustCalled
+                                                                                    ? 'bg-stone-950 text-amber-400 hover:bg-stone-800'
+                                                                                    : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30'
+                                                                            }`}
+                                                                            title="Recall / Announce Again in English"
+                                                                        >
+                                                                            <i className="fa-solid fa-bullhorn"></i> Recall
+                                                                        </button>
+                                                                        <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${
+                                                                            isJustCalled 
+                                                                                ? 'bg-stone-950 text-emerald-400' 
+                                                                                : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                                                        }`}>
+                                                                            {order.orderType === 'TAKEAWAY' ? 'Counter Pickup' : `Table ${order.tableName}`}
+                                                                        </span>
+                                                                    </div>
                                                                     <div className={`truncate font-black text-sm max-w-[150px] ${isJustCalled ? 'text-stone-950' : 'text-white'}`}>
                                                                         {order.customerName && order.customerName !== 'Walk-in' 
                                                                             ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
