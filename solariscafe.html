@@ -4788,17 +4788,27 @@
                     const snapNotes = cartNotes;
                     const snapCustomerProfile = customerProfile; // OPTIMIZATION: Pass the local CRM cache
 
-                    // OPTIMIZATION: Generate an optimistic Queue Number based on local orders to eliminate visual waiting
+                    // HIGH-SPEED QUEUE NUMBER GENERATION:
+                    // Generate an immediate deterministic Queue Number so the UI never hangs on "Syncing"
+                    // even if Firestore security rules restrict anonymous read/write transactions on `invoice_counters`.
                     let maxLocalSeq = 0;
-                    orders.forEach(o => {
+                    const combinedKnownOrders = [...orders, ...customerHistory];
+                    combinedKnownOrders.forEach(o => {
                         if (o.shopId === snapShopId && o.queueNo && o.queueNo.startsWith(`${shopPrefix}-`)) {
                             const seq = parseInt(o.queueNo.split('-')[1], 10);
-                            if (!isNaN(seq) && seq > maxLocalSeq) maxLocalSeq = seq;
+                            if (!isNaN(seq) && seq < 100000000 && seq > maxLocalSeq) maxLocalSeq = seq;
                         }
                     });
-                    const optimisticQueueNo = maxLocalSeq > 0 ? `${shopPrefix}-${String(maxLocalSeq + 1).padStart(9, '0')}` : `${shopPrefix}-Syncing`;
+                    const timeBasedSeq = Number(String(Date.now()).slice(-6)) + Math.floor(Math.random() * 90 + 10);
+                    const optimisticSeq = maxLocalSeq > 0 ? (maxLocalSeq + 1) : timeBasedSeq;
+                    const optimisticQueueNo = `${shopPrefix}-${String(optimisticSeq).padStart(9, '0')}`;
+
+                    const { doc: fsDoc } = window.FirebaseApp;
+                    const preAllocatedOrderRef = fsDoc(getColRef('orders'));
+                    const createdTimestamp = Date.now();
 
                     const orderData = {
+                        id: preAllocatedOrderRef.id,
                         userId: currentUser ? currentUser.uid : null,
                         orderType: actualOrderType,
                         tableId: snapTableId || 'TAKEAWAY',
@@ -4820,103 +4830,65 @@
                         paymentStatus: 'Unpaid',
                         paymentMethod: 'N/A',
                         dateString: today,
-                        createdAt: Date.now(),
-                        queueNo: optimisticQueueNo, // Show instantly!
-                        isSyncing: true
+                        createdAt: createdTimestamp,
+                        queueNo: optimisticQueueNo, // Instant valid Queue No!
+                        isSyncing: false
                     };
 
-                    // --- OPTIMISTIC UI UPDATE: Display success immediately, bypass loading screen ---
+                    // --- OPTIMISTIC UI UPDATE: Display success & inject into Live Tracker immediately ---
                     if (navigator.vibrate) navigator.vibrate([50, 50, 50]);
                     
                     setSubmittedOrder(orderData);
+                    setCustomerHistory(prev => [orderData, ...prev.filter(o => o.id !== orderData.id)]);
                     setCart([]);
                     setCartNotes('');
                     setIsCartOpen(false);
                     setSessionInfo(prev => ({...prev, hasWelcomeDiscount: false, sessionTimestamp: Date.now()}));
                     setIsSubmitting(false); // Unlock UI instantly
 
-                    // BACKGROUND FIREBASE SYNCHRONIZATION
+                    // BACKGROUND FIREBASE SYNCHRONIZATION (FAST NON-BLOCKING PIPELINE)
                     (async () => {
                         try {
-                            const { setDoc, updateDoc, doc, runTransaction, getDocs, query, where, collection, writeBatch } = window.FirebaseApp;
+                            const { setDoc, updateDoc, doc, increment, writeBatch } = window.FirebaseApp;
                             
-                            // HIGH-SPEED SYNC: Use local CRM cache to skip blocking network read
-                            let realProfile = snapCustomerProfile;
-                            let customerDocId = snapCustomerProfile ? snapCustomerProfile.id : null;
-                            
-                            // FAST PATH: Only query the network if we have a phone but our local CRM cache missed it
-                            if (snapCustomerPhone && !realProfile) {
-                                const qCheck = query(collection(db, 'customers'), where('phone', '==', snapCustomerPhone));
-                                const checkSnap = await getDocs(qCheck);
-                                if (!checkSnap.empty) {
-                                    realProfile = checkSnap.docs[0].data();
-                                    customerDocId = checkSnap.docs[0].id;
-                                }
-                            }
+                            // Use cached profile directly (eliminates blocking getDocs network round-trip before KDS dispatch)
+                            const realProfile = snapCustomerProfile;
+                            const customerDocId = snapCustomerProfile?.id || sessionInfo.customerDocId || null;
 
                             // Abort sync if suspended
                             if (realProfile && realProfile.status === 'Inactive') return;
 
                             const counterRef = doc(db, 'invoice_counters', targetShop.id);
-                            const newOrderRef = doc(getColRef('orders'));
                             const customerRef = customerDocId ? doc(db, 'customers', customerDocId) : null;
 
-                            let finalQueueString = optimisticQueueNo;
+                            const { isSyncing, ...dbOrderData } = orderData;
 
-                            // FIX: Customer Portal cannot rely on local array for invoice sequence because it restricts global reads.
-                            // We MUST use a secure atomic transaction to fetch and increment the exact sequence from the database.
-                            await runTransaction(db, async (transaction) => {
-                                const counterDoc = await transaction.get(counterRef);
-                                let nextVal = 1;
-                                if (counterDoc.exists()) {
-                                    nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                    transaction.update(counterRef, { currentValue: nextVal });
-                                } else {
-                                    transaction.set(counterRef, { currentValue: nextVal });
+                            // 1. PRIMARY CRITICAL WRITE: Dispatch Order to KDS & Table Status in a single fast atomic batch
+                            const kdsBatch = writeBatch(db);
+                            kdsBatch.set(preAllocatedOrderRef, dbOrderData);
+
+                            if (actualOrderType === 'DINE_IN' && snapTableId) {
+                                kdsBatch.update(doc(db, 'tables', snapTableId), { status: 'Occupied' });
+                            }
+
+                            if (customerRef && realProfile) {
+                                let customerUpdates = { lastVisit: Date.now() };
+                                if (globalPoints?.pointsEnabled && pointsToRedeem > 0) {
+                                    const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
+                                    customerUpdates.loyaltyData = calculateLoyaltyForOrder(0, pointsToRedeem, currentLoyalty, globalPoints);
                                 }
-                                
-                                finalQueueString = `${shopPrefix}-${nextVal.toString().padStart(9, '0')}`;
-
-                                // Create Order
-                                const { isSyncing, ...dbOrderData } = orderData;
-                                transaction.set(newOrderRef, { ...dbOrderData, queueNo: finalQueueString, id: newOrderRef.id });
-
-                                // Calculate and save loyalty points during checkout if enabled
-                                if (customerRef && realProfile) {
-                                    let customerUpdates = { lastVisit: Date.now() };
-                                    
-                                    if (globalPoints?.pointsEnabled) {
-                                        const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
-                                        
-                                        // BUG FIX: Customer Portal orders are always 'Unpaid' at checkout. Do not earn points until paid.
-                                        const newLoyalty = calculateLoyaltyForOrder(0, pointsToRedeem, currentLoyalty, globalPoints);
-                                        customerUpdates.loyaltyData = newLoyalty;
-                                    }
-                                    
-                                    // ONE-TIME BURN: Remove welcome discount flag after first use
-                                    if (snapHasWelcomeDiscount) {
-                                        customerUpdates.hasWelcomeDiscount = false;
-                                    }
-                                    
-                                    transaction.update(customerRef, customerUpdates);
+                                if (snapHasWelcomeDiscount) {
+                                    customerUpdates.hasWelcomeDiscount = false;
                                 }
+                                kdsBatch.update(customerRef, customerUpdates);
+                            }
 
-                                // Lock Table (if dine-in)
-                                if (actualOrderType === 'DINE_IN' && snapTableId) {
-                                    transaction.update(doc(db, 'tables', snapTableId), { status: 'Occupied' });
-                                }
-                            });
+                            await kdsBatch.commit();
 
-                            // Update the success view UI with the finalized Queue Number so they can track it!
-                            setSubmittedOrder(prev => {
-                                if (prev && prev.createdAt === orderData.createdAt) {
-                                    return { ...prev, queueNo: finalQueueString, id: newOrderRef.id, isSyncing: false };
-                                }
-                                return prev;
-                            });
+                            // 2. NON-BLOCKING COUNTER SYNC: Increment invoice counter in background without delaying KDS
+                            setDoc(counterRef, { currentValue: increment(1) }, { merge: true }).catch(() => {});
 
                             // --- HARDWARE AUTO-PRINT (CUSTOMER TO KDS) ---
-                            orderData.queueNo = finalQueueString;
                             const activePrinters = targetShop.printers?.filter(p => p.status === 'Active') || [];
                             activePrinters.forEach(async printer => {
                                 if (printer.printCustomerToKDS) {
@@ -4927,25 +4899,22 @@
                             });
                             // ---------------------------------------------
 
-                            // Run non-critical background updates (Inventory)
-                            Promise.all([
-                                deductInventory(currentCart, products, snapShopId, finalQueueString)
-                            ]).catch(err => console.warn("Background tasks failed:", err));
+                            // 3. Run non-critical background updates (Inventory)
+                            deductInventory(currentCart, products, snapShopId, optimisticQueueNo)
+                                .catch(err => console.warn("Background inventory deduction failed:", err));
 
                         } catch (err) {
-                            console.error("Checkout sync failed:", err);
-                            
-                            // Safety Catch: Stop the spinner if the network drops completely
-                            setSubmittedOrder(prev => {
-                                if (prev && prev.createdAt === orderData.createdAt) {
-                                    return { ...prev, isSyncing: false }; 
-                                }
-                                return prev;
-                            });
-                            
-                            setCustomMessage("Connection drop. The order may have failed. Please check the Live Tracker.");
-                            if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-                            toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
+                            console.error("Checkout batch sync failed, attempting direct order fallback:", err);
+                            try {
+                                const { setDoc } = window.FirebaseApp;
+                                const { isSyncing, ...dbOrderData } = orderData;
+                                await setDoc(preAllocatedOrderRef, dbOrderData);
+                            } catch (fallbackErr) {
+                                console.error("Direct order fallback failed:", fallbackErr);
+                                setCustomMessage("Connection drop. Please verify your order in the Live Tracker.");
+                                if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+                                toastTimerRef.current = setTimeout(() => setCustomMessage(''), 5000);
+                            }
                         }
                     })();
                 };
@@ -6080,7 +6049,7 @@
                 const [isSoundEnabled, setIsSoundEnabled] = useState(true);
                 const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
                 const [voiceLang, setVoiceLang] = useState(() => {
-                    try { return localStorage.getItem('solaris_tv_voice_lang') || 'en'; } catch (e) { return 'en'; }
+                    try { return localStorage.getItem('solaris_tv_voice_lang') || 'both'; } catch (e) { return 'both'; }
                 }); // 'en' | 'km' | 'both'
                 const [recentlyReady, setRecentlyReady] = useState(null);
                 const [isFullscreen, setIsFullscreen] = useState(false);
@@ -6383,7 +6352,7 @@
                         if (filterShop !== 'All' && o.shopId !== filterShop) return;
                         if (o.status === 'New' || o.status === 'Preparing') {
                             prep.push(o);
-                        } else if (o.status === 'Ready') {
+                        } else if (o.status === 'Ready' || (o.status === 'Served' && o.paymentStatus !== 'Paid')) {
                             ready.push(o);
                         }
                     });
@@ -6748,8 +6717,9 @@
                                                         <div>
                                                             <div className="flex justify-between items-start gap-2 mb-2">
                                                                 <div>
-                                                                    <div className={`text-[10px] font-black uppercase tracking-widest mb-0.5 ${isJustCalled ? 'text-stone-900' : 'text-emerald-400'}`}>
-                                                                        <i className="fa-solid fa-circle-check mr-1"></i> Order Ready
+                                                                    <div className={`text-[10px] font-black uppercase tracking-widest mb-0.5 ${isJustCalled ? 'text-stone-900' : (order.status === 'Served' && !isPaid ? 'text-rose-400' : 'text-emerald-400')}`}>
+                                                                        <i className={`fa-solid ${order.status === 'Served' && !isPaid ? 'fa-hand-holding-dollar' : 'fa-circle-check'} mr-1`}></i>
+                                                                        {order.status === 'Served' && !isPaid ? 'Served • Awaiting Payment' : 'Order Ready'}
                                                                     </div>
                                                                     <div className="text-4xl sm:text-5xl font-black tracking-tight font-mono leading-none">
                                                                         {formatShortQueue(order.queueNo)}
