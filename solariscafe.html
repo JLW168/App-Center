@@ -2573,8 +2573,8 @@
                     return false;
                 },
 
-                // Atomically claims an ABA Trx. ID in Firestore (used_aba_trx/{trxId}) and marks the order Paid (Bank)
-                async verifyAndSettleOrder(order, parsedAba, shop, shifts = [], globalPoints = null, actorName = 'ABA PayWay Bot') {
+                // Atomically claims an ABA Trx. ID using permitted collections ('orders' & 'system_settings/aba_payway_ledger') and marks the order Paid (Bank)
+                async verifyAndSettleOrder(order, parsedAba, shop, shifts = [], globalPoints = null, actorName = 'ABA PayWay Bot', liveOrders = []) {
                     if (!order || !parsedAba || !parsedAba.isValid || !parsedAba.trxId) {
                         return { ok: false, error: 'Invalid order or ABA PayWay transaction data.' };
                     }
@@ -2584,17 +2584,42 @@
                         return { ok: false, error: `Transaction ID ${trxId} has already been used.` };
                     }
 
+                    // Fast 0ms in-memory anti-replay check across active/recent orders
+                    const duplicateInMemory = (liveOrders || []).find(o => o.id !== order.id && String(o.abaTrxId || '').trim() === trxId);
+                    if (duplicateInMemory) {
+                        this.processedTrxIdsMemory.add(trxId);
+                        return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${duplicateInMemory.queueNo || duplicateInMemory.id}.` };
+                    }
+
                     try {
                         const { doc, getDoc, writeBatch, collection, query, where, getDocs, limit } = window.FirebaseApp;
                         const database = safeDB();
 
-                        // 1. Anti-Replay Check in Firestore
-                        const trxRef = doc(database, 'used_aba_trx', trxId);
-                        const trxSnap = await getDoc(trxRef);
-                        if (trxSnap.exists()) {
-                            this.processedTrxIdsMemory.add(trxId);
-                            const prevData = trxSnap.data();
-                            return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${prevData.queueNo || prevData.orderId}.` };
+                        // 1A. Anti-Replay Check via 'orders' collection (Permitted by match /orders/{orderId})
+                        const qDupOrder = query(collection(database, 'orders'), where('abaTrxId', '==', trxId), limit(1));
+                        const dupSnap = await getDocs(qDupOrder);
+                        if (!dupSnap.empty) {
+                            const existingOrderDoc = dupSnap.docs[0];
+                            if (existingOrderDoc.id !== order.id) {
+                                this.processedTrxIdsMemory.add(trxId);
+                                const prevData = existingOrderDoc.data();
+                                return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${prevData.queueNo || existingOrderDoc.id}.` };
+                            }
+                        }
+
+                        // 1B. Secondary Anti-Replay Check in 'system_settings/aba_payway_ledger' (Permitted by match /system_settings/{settingId})
+                        const ledgerRef = doc(database, 'system_settings', 'aba_payway_ledger');
+                        try {
+                            const ledgerSnap = await getDoc(ledgerRef);
+                            if (ledgerSnap.exists()) {
+                                const claimedMap = ledgerSnap.data()?.claimedTrx || {};
+                                if (claimedMap[trxId] && claimedMap[trxId].orderId !== order.id) {
+                                    this.processedTrxIdsMemory.add(trxId);
+                                    return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${claimedMap[trxId].queueNo || claimedMap[trxId].orderId}.` };
+                                }
+                            }
+                        } catch (ledgerReadErr) {
+                            console.warn("ABA Ledger read check warning:", ledgerReadErr);
                         }
 
                         // 2. Find Open Shift for this branch so Bank Transfers reconcile automatically in Z-Report
@@ -2625,19 +2650,24 @@
 
                         const batch = writeBatch(database);
 
-                        // A. Lock the Transaction ID globally to prevent replay attacks
-                        batch.set(trxRef, {
-                            trxId,
-                            apv: String(parsedAba.apv || ''),
-                            payer: payerDisplay,
-                            currency: parsedAba.currency,
-                            amount: parsedAba.amount,
-                            orderId: order.id,
-                            queueNo: order.queueNo || '',
-                            shopId: order.shopId || '',
-                            claimedAt: Date.now(),
-                            claimedBy: actorName
-                        });
+                        // A. Record the Transaction ID in 'system_settings/aba_payway_ledger' (fully allowed for Staff)
+                        batch.set(ledgerRef, {
+                            updatedAt: Date.now(),
+                            claimedTrx: {
+                                [trxId]: {
+                                    trxId,
+                                    apv: String(parsedAba.apv || ''),
+                                    payer: payerDisplay,
+                                    currency: parsedAba.currency,
+                                    amount: parsedAba.amount,
+                                    orderId: order.id,
+                                    queueNo: order.queueNo || '',
+                                    shopId: order.shopId || '',
+                                    claimedAt: Date.now(),
+                                    claimedBy: actorName
+                                }
+                            }
+                        }, { merge: true });
 
                         // B. Update the Order to Paid (Bank)
                         batch.update(doc(database, 'orders', order.id), orderUpdatePayload);
@@ -2671,7 +2701,7 @@
                 },
 
                 // Scans live Telegram updates for a branch and auto-verifies any matching pending KHQR orders
-                async pollAndAutoVerifyBranchOrders(shop, pendingKhqrOrders, shifts = [], globalPoints = null) {
+                async pollAndAutoVerifyBranchOrders(shop, pendingKhqrOrders, shifts = [], globalPoints = null, liveOrders = []) {
                     if (!shop || !shop.khqrConfig?.paywayVerifyEnabled) return { verifiedCount: 0, results: [] };
                     if (!pendingKhqrOrders || pendingKhqrOrders.length === 0) return { verifiedCount: 0, results: [] };
 
@@ -2688,6 +2718,11 @@
 
                     const validAbaMessages = updatesRes.messages.filter(m => m.parsedAba?.isValid);
                     if (validAbaMessages.length === 0) return { verifiedCount: 0, results: [] };
+
+                    // Pre-seed memory set with any Trx IDs already present on loaded orders
+                    (liveOrders || []).forEach(o => {
+                        if (o.abaTrxId) this.processedTrxIdsMemory.add(String(o.abaTrxId).trim());
+                    });
 
                     const verifiedResults = [];
                     for (const order of pendingKhqrOrders) {
@@ -2706,7 +2741,8 @@
                                 shop,
                                 shifts,
                                 globalPoints,
-                                'ABA PayWay Auto-Bot'
+                                'ABA PayWay Auto-Bot',
+                                liveOrders
                             );
                             if (res.ok) {
                                 verifiedResults.push({ order, ...res });
@@ -23487,7 +23523,8 @@
                                 shopObj,
                                 shopOrders,
                                 shifts,
-                                globalPoints
+                                globalPoints,
+                                orders
                             );
                             if (res.verifiedCount > 0) {
                                 totalVerified += res.verifiedCount;
@@ -23560,7 +23597,8 @@
                             targetShop,
                             shifts,
                             globalPoints,
-                            staffActor
+                            staffActor,
+                            orders
                         );
                         if (res.ok) {
                             playChime();
