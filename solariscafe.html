@@ -2528,6 +2528,196 @@
                 }
             };
 
+            // --- PHASE 3: Real-Time KDS & POS ABA PayWay Auto-Verifier Singleton ---
+            window.SolarisPayWayVerifier = {
+                processedTrxIdsMemory: new Set(),
+
+                // Checks if a parsed ABA PayWay message matches a specific pending KHQR order
+                doesMessageMatchOrder(parsedAba, order, shop) {
+                    if (!parsedAba || !parsedAba.isValid || !order) return false;
+                    if (order.paymentStatus === 'Paid' || order.status === 'Cancelled') return false;
+
+                    const isKhqrOrder = order.paymentMethod === 'KHQR (ABA)' || order.khqrExpectedKhr > 0;
+                    if (!isKhqrOrder) return false;
+
+                    // 1. Merchant Name Verification (if configured)
+                    const expectedMerchant = (shop?.khqrConfig?.accountName || '').trim().toUpperCase();
+                    if (expectedMerchant && parsedAba.merchantName) {
+                        const actualMerchant = parsedAba.merchantName.trim().toUpperCase();
+                        if (!actualMerchant.includes(expectedMerchant) && !expectedMerchant.includes(actualMerchant)) {
+                            return false;
+                        }
+                    }
+
+                    // 2. Customer Optional APV / Reference Match (if customer typed 4 digits, verify it matches APV or Trx ID)
+                    if (order.khqrCustomerRef && String(order.khqrCustomerRef).trim().length >= 3) {
+                        const refClean = String(order.khqrCustomerRef).trim().toUpperCase();
+                        const apvMatch = String(parsedAba.apv || '').toUpperCase().includes(refClean);
+                        const trxMatch = String(parsedAba.trxId || '').toUpperCase().includes(refClean);
+                        if (!apvMatch && !trxMatch) {
+                            return false;
+                        }
+                    }
+
+                    // 3. Exact Amount Matching (Supports both KHR and USD)
+                    const expectedKhr = Math.round(Number(order.khqrExpectedKhr || order.totalAmount || 0));
+                    const rate = Math.max(100, Number(shop?.khqrConfig?.exchangeRate) || 4000);
+                    const expectedUsd = Number(order.khqrExpectedUsd || (expectedKhr / rate));
+
+                    if (parsedAba.currency === 'KHR') {
+                        return Math.round(parsedAba.amount) === expectedKhr;
+                    } else if (parsedAba.currency === 'USD') {
+                        // Allow 0.02 rounding tolerance on USD conversion
+                        return Math.abs(Number(parsedAba.amount) - expectedUsd) <= 0.02;
+                    }
+                    return false;
+                },
+
+                // Atomically claims an ABA Trx. ID in Firestore (used_aba_trx/{trxId}) and marks the order Paid (Bank)
+                async verifyAndSettleOrder(order, parsedAba, shop, shifts = [], globalPoints = null, actorName = 'ABA PayWay Bot') {
+                    if (!order || !parsedAba || !parsedAba.isValid || !parsedAba.trxId) {
+                        return { ok: false, error: 'Invalid order or ABA PayWay transaction data.' };
+                    }
+
+                    const trxId = String(parsedAba.trxId).trim();
+                    if (this.processedTrxIdsMemory.has(trxId)) {
+                        return { ok: false, error: `Transaction ID ${trxId} has already been used.` };
+                    }
+
+                    try {
+                        const { doc, getDoc, writeBatch, collection, query, where, getDocs, limit } = window.FirebaseApp;
+                        const database = safeDB();
+
+                        // 1. Anti-Replay Check in Firestore
+                        const trxRef = doc(database, 'used_aba_trx', trxId);
+                        const trxSnap = await getDoc(trxRef);
+                        if (trxSnap.exists()) {
+                            this.processedTrxIdsMemory.add(trxId);
+                            const prevData = trxSnap.data();
+                            return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${prevData.queueNo || prevData.orderId}.` };
+                        }
+
+                        // 2. Find Open Shift for this branch so Bank Transfers reconcile automatically in Z-Report
+                        const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
+
+                        const payerDisplay = `${parsedAba.payerName} (${parsedAba.maskedAccount})`;
+                        const amountDisplay = parsedAba.currency === 'KHR'
+                            ? `៛${Number(parsedAba.amount).toLocaleString()}`
+                            : `$${Number(parsedAba.amount).toFixed(2)}`;
+
+                        const orderUpdatePayload = {
+                            paymentStatus: 'Paid',
+                            paymentMethod: 'Bank',
+                            abaVerified: true,
+                            abaTrxId: trxId,
+                            abaApv: String(parsedAba.apv || ''),
+                            abaPayer: payerDisplay,
+                            abaPaidAmountStr: amountDisplay,
+                            abaCurrency: parsedAba.currency,
+                            abaPaidAtStr: parsedAba.paidAtStr || '',
+                            abaVerifiedAt: Date.now(),
+                            abaVerifiedBy: actorName
+                        };
+
+                        if (openShift && !order.shiftId) {
+                            orderUpdatePayload.shiftId = openShift.id;
+                        }
+
+                        const batch = writeBatch(database);
+
+                        // A. Lock the Transaction ID globally to prevent replay attacks
+                        batch.set(trxRef, {
+                            trxId,
+                            apv: String(parsedAba.apv || ''),
+                            payer: payerDisplay,
+                            currency: parsedAba.currency,
+                            amount: parsedAba.amount,
+                            orderId: order.id,
+                            queueNo: order.queueNo || '',
+                            shopId: order.shopId || '',
+                            claimedAt: Date.now(),
+                            claimedBy: actorName
+                        });
+
+                        // B. Update the Order to Paid (Bank)
+                        batch.update(doc(database, 'orders', order.id), orderUpdatePayload);
+
+                        // C. Award Customer Loyalty Points upon verified payment
+                        if (globalPoints?.pointsEnabled && order.totalAmount > 0 && order.customerPhone && order.customerPhone !== 'N/A') {
+                            try {
+                                const qCust = query(collection(database, 'customers'), where('phone', '==', order.customerPhone), limit(1));
+                                const snapCust = await getDocs(qCust);
+                                if (!snapCust.empty) {
+                                    const custDoc = snapCust.docs[0];
+                                    const custData = custDoc.data();
+                                    if (custData.loyaltyData) {
+                                        const newLoyalty = calculateLoyaltyForOrder(order.totalAmount, 0, custData.loyaltyData, globalPoints);
+                                        batch.update(doc(database, 'customers', custDoc.id), { loyaltyData: newLoyalty });
+                                    }
+                                }
+                            } catch (loyaltyErr) {
+                                console.warn("ABA Auto-Verify loyalty update warning:", loyaltyErr);
+                            }
+                        }
+
+                        await batch.commit();
+                        this.processedTrxIdsMemory.add(trxId);
+
+                        return { ok: true, trxId, apv: parsedAba.apv, payerDisplay, amountDisplay };
+                    } catch (err) {
+                        console.error("ABA PayWay verification error:", err);
+                        return { ok: false, error: err.message || 'Verification commit failed.' };
+                    }
+                },
+
+                // Scans live Telegram updates for a branch and auto-verifies any matching pending KHQR orders
+                async pollAndAutoVerifyBranchOrders(shop, pendingKhqrOrders, shifts = [], globalPoints = null) {
+                    if (!shop || !shop.khqrConfig?.paywayVerifyEnabled) return { verifiedCount: 0, results: [] };
+                    if (!pendingKhqrOrders || pendingKhqrOrders.length === 0) return { verifiedCount: 0, results: [] };
+
+                    const effectiveTeleCfg = await window.SolarisTelegramNode.getEffectiveConfig(shop);
+                    const botToken = (shop.khqrConfig?.paywayBotToken || effectiveTeleCfg.botToken || '').trim();
+                    const chatId = (shop.khqrConfig?.paywayChatId || '').trim();
+
+                    if (!botToken) return { verifiedCount: 0, results: [], error: 'Missing Bot Token' };
+
+                    const updatesRes = await window.SolarisKHQREngine.fetchRecentTelegramUpdates(botToken, chatId);
+                    if (!updatesRes.ok || !updatesRes.messages) {
+                        return { verifiedCount: 0, results: [], error: updatesRes.error };
+                    }
+
+                    const validAbaMessages = updatesRes.messages.filter(m => m.parsedAba?.isValid);
+                    if (validAbaMessages.length === 0) return { verifiedCount: 0, results: [] };
+
+                    const verifiedResults = [];
+                    for (const order of pendingKhqrOrders) {
+                        if (order.paymentStatus === 'Paid') continue;
+
+                        // Find a matching ABA message whose Trx. ID hasn't been used in memory yet
+                        const matchingMsg = validAbaMessages.find(m =>
+                            !this.processedTrxIdsMemory.has(String(m.parsedAba.trxId)) &&
+                            this.doesMessageMatchOrder(m.parsedAba, order, shop)
+                        );
+
+                        if (matchingMsg) {
+                            const res = await this.verifyAndSettleOrder(
+                                order,
+                                matchingMsg.parsedAba,
+                                shop,
+                                shifts,
+                                globalPoints,
+                                'ABA PayWay Auto-Bot'
+                            );
+                            if (res.ok) {
+                                verifiedResults.push({ order, ...res });
+                            }
+                        }
+                    }
+
+                    return { verifiedCount: verifiedResults.length, results: verifiedResults };
+                }
+            };
+
             // --- Error Boundary for White Screen Prevention ---
             class ErrorBoundary extends Component {
                 constructor(props) {
@@ -10066,38 +10256,6 @@
                 const [isTesting, setIsTesting] = useState(false);
                 const [toast, setToast] = useState({ text: '', type: 'success' });
 
-                // --- PRO TIP DIAGNOSTIC STATES: ABA Message Listener & Parser ---
-                const [sampleAbaText, setSampleAbaText] = useState('៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.');
-                const [parsedSampleResult, setParsedSampleResult] = useState(() => window.SolarisKHQREngine.parseABAPayWayMessage('៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.'));
-                const [isPollingUpdates, setIsPollingUpdates] = useState(false);
-                const [liveUpdatesResult, setLiveUpdatesResult] = useState(null);
-                const [filterListenerChatId, setFilterListenerChatId] = useState('');
-
-                const handleRunLiveListenerTest = async () => {
-                    if (!formData.botToken.trim()) {
-                        showToast("Please enter a Bot Token first to scan live Telegram updates.", "error");
-                        return;
-                    }
-                    setIsPollingUpdates(true);
-                    try {
-                        const res = await window.SolarisKHQREngine.fetchRecentTelegramUpdates(
-                            formData.botToken.trim(),
-                            filterListenerChatId.trim()
-                        );
-                        setLiveUpdatesResult(res);
-                        if (res.ok) {
-                            const abaCount = res.messages.filter(m => m.parsedAba?.isValid).length;
-                            showToast(`Scanned ${res.messages.length} recent message(s) — Found ${abaCount} ABA PayWay alert(s)!`, "success");
-                        } else {
-                            showToast("Telegram Scan Error: " + res.error, "error");
-                        }
-                    } catch (err) {
-                        showToast("Listener test failed: " + err.message, "error");
-                    } finally {
-                        setIsPollingUpdates(false);
-                    }
-                };
-
                 const showToast = (text, type = 'success') => {
                     setToast({ text, type });
                     setTimeout(() => setToast({ text: '', type: 'success' }), 4500);
@@ -10400,159 +10558,6 @@
                                 </div>
                             </div>
                         </div>
-
-                        {/* PRO TIP DIAGNOSTIC TOOL: Test ABA Message Listener & Parser */}
-                        <div className="mt-6 bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
-                            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 pb-4 border-b border-stone-100">
-                                <div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="bg-red-100 text-red-700 text-[10px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded-full border border-red-200">
-                                            ABA PayWay Diagnostic
-                                        </span>
-                                        <h3 className="text-lg font-black text-stone-800">
-                                            Test ABA Message Listener & Parser
-                                        </h3>
-                                    </div>
-                                    <p className="text-xs text-stone-500 mt-1">
-                                        Verify your ABA PayWay notification format (KHR & USD) and test if your Solaris Bot can read incoming messages from your payment group or channel.
-                                    </p>
-                                </div>
-                            </div>
-
-                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-5">
-                                {/* Left Column: Interactive ABA PayWay Regex Parser Sandbox */}
-                                <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200 flex flex-col justify-between">
-                                    <div>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <label className="text-xs font-bold text-stone-600 uppercase tracking-wider">
-                                                <i className="fa-solid fa-code mr-1.5 text-amber-500"></i> 1. ABA PayWay Message Parser Test
-                                            </label>
-                                            <div className="flex gap-1.5">
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        const msg = '៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.';
-                                                        setSampleAbaText(msg);
-                                                        setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(msg));
-                                                    }}
-                                                    className="text-[10px] font-bold bg-amber-100 hover:bg-amber-200 text-amber-800 px-2.5 py-1 rounded-lg transition"
-                                                >
-                                                    Load KHR Sample (៛3,500)
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        const msg = '$2.88 paid by LEAB SREYMAO (*662) on Aug 18, 05:16 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 178704818611668, APV: 622103.';
-                                                        setSampleAbaText(msg);
-                                                        setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(msg));
-                                                    }}
-                                                    className="text-[10px] font-bold bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-2.5 py-1 rounded-lg transition"
-                                                >
-                                                    Load USD Sample ($2.88)
-                                                </button>
-                                            </div>
-                                        </div>
-
-                                        <textarea
-                                            rows="3"
-                                            className="w-full border border-stone-300 rounded-xl p-3 text-xs font-mono text-stone-800 bg-white outline-none focus:border-sky-500 shadow-inner"
-                                            placeholder="Paste an ABA PayWay notification message here..."
-                                            value={sampleAbaText}
-                                            onChange={e => {
-                                                setSampleAbaText(e.target.value);
-                                                setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(e.target.value));
-                                            }}
-                                        />
-                                    </div>
-
-                                    <div className="mt-3">
-                                        {parsedSampleResult && parsedSampleResult.isValid ? (
-                                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3.5 text-xs space-y-1.5">
-                                                <div className="flex items-center justify-between font-black text-emerald-800 border-b border-emerald-200/70 pb-1.5">
-                                                    <span><i className="fa-solid fa-circle-check mr-1.5 text-emerald-600"></i> VALID ABA PAYWAY FORMAT DETECTED</span>
-                                                    <span className="bg-emerald-600 text-white px-2 py-0.5 rounded text-[11px]">
-                                                        {parsedSampleResult.currency === 'KHR' ? `${parsedSampleResult.amount.toLocaleString()} ៛` : `$${parsedSampleResult.amount.toFixed(2)}`}
-                                                    </span>
-                                                </div>
-                                                <div className="grid grid-cols-2 gap-2 pt-1 text-[11px]">
-                                                    <div><span className="text-stone-500 font-bold">Payer:</span> <span className="font-black text-stone-800">{parsedSampleResult.payerName} ({parsedSampleResult.maskedAccount})</span></div>
-                                                    <div><span className="text-stone-500 font-bold">Merchant:</span> <span className="font-black text-stone-800">{parsedSampleResult.merchantName}</span></div>
-                                                    <div><span className="text-stone-500 font-bold">Trx. ID:</span> <code className="font-mono font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">{parsedSampleResult.trxId}</code></div>
-                                                    <div><span className="text-stone-500 font-bold">APV Code:</span> <code className="font-mono font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">{parsedSampleResult.apv}</code></div>
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs font-bold text-rose-700 flex items-center gap-2">
-                                                <i className="fa-solid fa-circle-exclamation text-rose-500"></i>
-                                                <span>Message does not match the standard ABA PayWay payment pattern.</span>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-
-                                {/* Right Column: Live Telegram getUpdates Scanner */}
-                                <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200 flex flex-col justify-between">
-                                    <div>
-                                        <label className="block text-xs font-bold text-stone-600 uppercase tracking-wider mb-2">
-                                            <i className="fa-solid fa-satellite-dish mr-1.5 text-sky-500"></i> 2. Live Telegram Group / Channel Listener Test
-                                        </label>
-                                        <p className="text-[11px] text-stone-500 leading-relaxed mb-3">
-                                            Click below to poll <code className="bg-white px-1 py-0.5 rounded border border-stone-200 font-mono">getUpdates</code> using your Bot Token above. This checks if your Solaris Bot can directly see ABA PayWay messages in your group/channel.
-                                        </p>
-
-                                        <div className="flex gap-2 mb-3">
-                                            <input
-                                                type="text"
-                                                placeholder="Optional: Filter by Chat ID (e.g. -100...)"
-                                                className="flex-1 border border-stone-300 rounded-xl px-3 py-2 text-xs font-mono bg-white outline-none focus:border-sky-500"
-                                                value={filterListenerChatId}
-                                                onChange={e => setFilterListenerChatId(e.target.value)}
-                                            />
-                                            <button
-                                                type="button"
-                                                onClick={handleRunLiveListenerTest}
-                                                disabled={isPollingUpdates}
-                                                className="bg-sky-600 hover:bg-sky-700 text-white font-bold text-xs px-4 py-2 rounded-xl shadow-sm transition flex items-center gap-1.5 shrink-0 disabled:opacity-50"
-                                            >
-                                                {isPollingUpdates ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-magnifying-glass-chart"></i>}
-                                                {isPollingUpdates ? 'Scanning...' : 'Scan Live Telegram'}
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    <div className="max-h-44 overflow-y-auto space-y-2 pr-1">
-                                        {!liveUpdatesResult ? (
-                                            <div className="text-center py-6 text-stone-400 text-xs font-medium border border-dashed border-stone-300 rounded-xl bg-white">
-                                                Click <strong>Scan Live Telegram</strong> after a payment or message is posted in your group.
-                                            </div>
-                                        ) : !liveUpdatesResult.ok ? (
-                                            <div className="bg-red-50 border border-red-200 text-red-700 p-3 rounded-xl text-xs font-bold">
-                                                <i className="fa-solid fa-triangle-exclamation mr-1.5"></i> {liveUpdatesResult.error}
-                                            </div>
-                                        ) : liveUpdatesResult.messages.length === 0 ? (
-                                            <div className="bg-amber-50 border border-amber-200 text-amber-800 p-3 rounded-xl text-[11px] leading-relaxed">
-                                                <div className="font-black mb-1"><i className="fa-solid fa-circle-info mr-1"></i> No Recent Messages Visible to Bot</div>
-                                                If ABA PayWay Bot just posted in a standard Group, remember Telegram's <strong>Bot-to-Bot Privacy Rule</strong> prevents one bot from reading another bot's group messages unless it is posted in a <strong>Channel</strong> or forwarded/replied to by a staff member.
-                                            </div>
-                                        ) : (
-                                            liveUpdatesResult.messages.slice(0, 6).map((m, idx) => (
-                                                <div key={idx} className={`p-2.5 rounded-xl border text-[11px] ${m.parsedAba?.isValid ? 'bg-emerald-50 border-emerald-300' : 'bg-white border-stone-200'}`}>
-                                                    <div className="flex justify-between items-center font-bold text-stone-700 mb-1">
-                                                        <span className="truncate">
-                                                            {m.parsedAba?.isValid ? '✅ ABA PAYWAY:' : '💬 Msg:'} {m.chatTitle} <code className="text-[10px] text-stone-400">({m.chatId})</code>
-                                                        </span>
-                                                        <span className="text-[10px] text-stone-400 shrink-0 ml-2">
-                                                            {m.date ? new Date(m.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                                                        </span>
-                                                    </div>
-                                                    <div className="font-mono text-[10px] text-stone-600 break-words line-clamp-2">{m.text}</div>
-                                                </div>
-                                            ))
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
                     </div>
                 );
             }
@@ -10578,6 +10583,13 @@
                 const [simAmountKHR, setSimAmountKHR] = useState(14000);
                 const [simInvoiceNo, setSimInvoiceNo] = useState('SLR-000000128');
 
+                // ABA PayWay Diagnostic States (Moved from TelegramBotSettingsView into KHQR & ABA PayWay Configuration)
+                const [sampleAbaText, setSampleAbaText] = useState('៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.');
+                const [parsedSampleResult, setParsedSampleResult] = useState(() => window.SolarisKHQREngine.parseABAPayWayMessage('៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.'));
+                const [isPollingUpdates, setIsPollingUpdates] = useState(false);
+                const [liveUpdatesResult, setLiveUpdatesResult] = useState(null);
+                const [filterListenerChatId, setFilterListenerChatId] = useState('');
+
                 const showToast = (text, type = 'success') => {
                     setToast({ text, type });
                     setTimeout(() => setToast({ text: '', type: 'success' }), 4000);
@@ -10601,12 +10613,40 @@
                             baseEmvPayload: cfg.baseEmvPayload || '',
                             staticQrImage: cfg.staticQrImage || ''
                         });
+                        setFilterListenerChatId(cfg.paywayChatId || '');
                         setPaywayScanSummary(null);
                     } else {
                         setFormData(null);
                         setPaywayScanSummary(null);
                     }
                 }, [filterShop, shops]);
+
+                const handleRunLiveListenerTest = async () => {
+                    const activeShop = shops.find(s => s.id === filterShop);
+                    const effectiveTeleCfg = await window.SolarisTelegramNode.getEffectiveConfig(activeShop);
+                    const tokenToUse = (formData?.paywayBotToken || effectiveTeleCfg.botToken || '').trim();
+
+                    if (!tokenToUse) {
+                        showToast("No Bot Token found. Please enter a Bot Token in 'Telegram Bot Alerts' or in the Dedicated Payment Bot Token field.", "error");
+                        return;
+                    }
+                    setIsPollingUpdates(true);
+                    try {
+                        const targetChat = (filterListenerChatId || formData?.paywayChatId || '').trim();
+                        const res = await window.SolarisKHQREngine.fetchRecentTelegramUpdates(tokenToUse, targetChat);
+                        setLiveUpdatesResult(res);
+                        if (res.ok) {
+                            const abaCount = res.messages.filter(m => m.parsedAba?.isValid).length;
+                            showToast(`Scanned ${res.messages.length} recent message(s) — Found ${abaCount} ABA PayWay alert(s)!`, "success");
+                        } else {
+                            showToast("Telegram Scan Error: " + res.error, "error");
+                        }
+                    } catch (err) {
+                        showToast("Listener test failed: " + err.message, "error");
+                    } finally {
+                        setIsPollingUpdates(false);
+                    }
+                };
 
                 const handleTestPaywayGroupConnection = async () => {
                     if (!formData?.paywayChatId?.trim()) {
@@ -11037,6 +11077,159 @@
                                                 value={simInvoiceNo}
                                                 onChange={e => setSimInvoiceNo(e.target.value)}
                                             />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* ABA PayWay Diagnostic Tool: Test ABA Message Listener & Parser */}
+                                <div className="lg:col-span-3 bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
+                                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 pb-4 border-b border-stone-100">
+                                        <div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="bg-red-100 text-red-700 text-[10px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded-full border border-red-200">
+                                                    ABA PayWay Diagnostic
+                                                </span>
+                                                <h3 className="text-lg font-black text-stone-800">
+                                                    Test ABA Message Listener & Parser
+                                                </h3>
+                                            </div>
+                                            <p className="text-xs text-stone-500 mt-1">
+                                                Verify your ABA PayWay notification format (KHR & USD) and test if your Bot can read incoming messages from your dedicated payment group or channel.
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-5">
+                                        {/* Left Column: Interactive ABA PayWay Regex Parser Sandbox */}
+                                        <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200 flex flex-col justify-between">
+                                            <div>
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <label className="text-xs font-bold text-stone-600 uppercase tracking-wider">
+                                                        <i className="fa-solid fa-code mr-1.5 text-amber-500"></i> 1. ABA PayWay Message Parser Test
+                                                    </label>
+                                                    <div className="flex gap-1.5">
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => {
+                                                                const msg = '៛3,500 paid by KHEY SOMNANG (*244) on Oct 17, 05:43 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 179223378281995, APV: 981298.';
+                                                                setSampleAbaText(msg);
+                                                                setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(msg));
+                                                            }}
+                                                            className="text-[10px] font-bold bg-amber-100 hover:bg-amber-200 text-amber-800 px-2.5 py-1 rounded-lg transition"
+                                                        >
+                                                            Load KHR Sample (៛3,500)
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => {
+                                                                const msg = '$2.88 paid by LEAB SREYMAO (*662) on Aug 18, 05:16 PM via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: 178704818611668, APV: 622103.';
+                                                                setSampleAbaText(msg);
+                                                                setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(msg));
+                                                            }}
+                                                            className="text-[10px] font-bold bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-2.5 py-1 rounded-lg transition"
+                                                        >
+                                                            Load USD Sample ($2.88)
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                <textarea
+                                                    rows="3"
+                                                    className="w-full border border-stone-300 rounded-xl p-3 text-xs font-mono text-stone-800 bg-white outline-none focus:border-red-500 shadow-inner"
+                                                    placeholder="Paste an ABA PayWay notification message here..."
+                                                    value={sampleAbaText}
+                                                    onChange={e => {
+                                                        setSampleAbaText(e.target.value);
+                                                        setParsedSampleResult(window.SolarisKHQREngine.parseABAPayWayMessage(e.target.value));
+                                                    }}
+                                                />
+                                            </div>
+
+                                            <div className="mt-3">
+                                                {parsedSampleResult && parsedSampleResult.isValid ? (
+                                                    <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3.5 text-xs space-y-1.5">
+                                                        <div className="flex items-center justify-between font-black text-emerald-800 border-b border-emerald-200/70 pb-1.5">
+                                                            <span><i className="fa-solid fa-circle-check mr-1.5 text-emerald-600"></i> VALID ABA PAYWAY FORMAT DETECTED</span>
+                                                            <span className="bg-emerald-600 text-white px-2 py-0.5 rounded text-[11px]">
+                                                                {parsedSampleResult.currency === 'KHR' ? `${parsedSampleResult.amount.toLocaleString()} ៛` : `$${parsedSampleResult.amount.toFixed(2)}`}
+                                                            </span>
+                                                        </div>
+                                                        <div className="grid grid-cols-2 gap-2 pt-1 text-[11px]">
+                                                            <div><span className="text-stone-500 font-bold">Payer:</span> <span className="font-black text-stone-800">{parsedSampleResult.payerName} ({parsedSampleResult.maskedAccount})</span></div>
+                                                            <div><span className="text-stone-500 font-bold">Merchant:</span> <span className="font-black text-stone-800">{parsedSampleResult.merchantName}</span></div>
+                                                            <div><span className="text-stone-500 font-bold">Trx. ID:</span> <code className="font-mono font-bold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">{parsedSampleResult.trxId}</code></div>
+                                                            <div><span className="text-stone-500 font-bold">APV Code:</span> <code className="font-mono font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">{parsedSampleResult.apv}</code></div>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs font-bold text-rose-700 flex items-center gap-2">
+                                                        <i className="fa-solid fa-circle-exclamation text-rose-500"></i>
+                                                        <span>Message does not match the standard ABA PayWay payment pattern.</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* Right Column: Live Telegram getUpdates Scanner */}
+                                        <div className="bg-stone-50 p-4 rounded-2xl border border-stone-200 flex flex-col justify-between">
+                                            <div>
+                                                <label className="block text-xs font-bold text-stone-600 uppercase tracking-wider mb-2">
+                                                    <i className="fa-solid fa-satellite-dish mr-1.5 text-red-500"></i> 2. Live Telegram Group / Channel Listener Test
+                                                </label>
+                                                <p className="text-[11px] text-stone-500 leading-relaxed mb-3">
+                                                    Click below to poll <code className="bg-white px-1 py-0.5 rounded border border-stone-200 font-mono">getUpdates</code> using your configured Bot Token. This checks if your Bot can directly see ABA PayWay messages in your payment group/channel.
+                                                </p>
+
+                                                <div className="flex gap-2 mb-3">
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Filter by Payment Chat ID (e.g. -100...)"
+                                                        className="flex-1 border border-stone-300 rounded-xl px-3 py-2 text-xs font-mono bg-white outline-none focus:border-red-500"
+                                                        value={filterListenerChatId}
+                                                        onChange={e => setFilterListenerChatId(e.target.value)}
+                                                    />
+                                                    <button
+                                                        type="button"
+                                                        onClick={handleRunLiveListenerTest}
+                                                        disabled={isPollingUpdates}
+                                                        className="bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-4 py-2 rounded-xl shadow-sm transition flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+                                                    >
+                                                        {isPollingUpdates ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-magnifying-glass-chart"></i>}
+                                                        {isPollingUpdates ? 'Scanning...' : 'Scan Live Telegram'}
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="max-h-44 overflow-y-auto space-y-2 pr-1">
+                                                {!liveUpdatesResult ? (
+                                                    <div className="text-center py-6 text-stone-400 text-xs font-medium border border-dashed border-stone-300 rounded-xl bg-white">
+                                                        Click <strong>Scan Live Telegram</strong> after a payment or message is posted in your group.
+                                                    </div>
+                                                ) : !liveUpdatesResult.ok ? (
+                                                    <div className="bg-red-50 border border-red-200 text-red-700 p-3 rounded-xl text-xs font-bold">
+                                                        <i className="fa-solid fa-triangle-exclamation mr-1.5"></i> {liveUpdatesResult.error}
+                                                    </div>
+                                                ) : liveUpdatesResult.messages.length === 0 ? (
+                                                    <div className="bg-amber-50 border border-amber-200 text-amber-800 p-3 rounded-xl text-[11px] leading-relaxed">
+                                                        <div className="font-black mb-1"><i className="fa-solid fa-circle-info mr-1"></i> No Recent Messages Visible to Bot</div>
+                                                        If ABA PayWay Bot just posted in a standard Group, remember Telegram's <strong>Bot-to-Bot Privacy Rule</strong> prevents one bot from reading another bot's group messages unless it is posted in a <strong>Channel</strong> or forwarded/replied to by a staff member.
+                                                    </div>
+                                                ) : (
+                                                    liveUpdatesResult.messages.slice(0, 6).map((m, idx) => (
+                                                        <div key={idx} className={`p-2.5 rounded-xl border text-[11px] ${m.parsedAba?.isValid ? 'bg-emerald-50 border-emerald-300' : 'bg-white border-stone-200'}`}>
+                                                            <div className="flex justify-between items-center font-bold text-stone-700 mb-1">
+                                                                <span className="truncate">
+                                                                    {m.parsedAba?.isValid ? '✅ ABA PAYWAY:' : '💬 Msg:'} {m.chatTitle} <code className="text-[10px] text-stone-400">({m.chatId})</code>
+                                                                </span>
+                                                                <span className="text-[10px] text-stone-400 shrink-0 ml-2">
+                                                                    {m.date ? new Date(m.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                                                </span>
+                                                            </div>
+                                                            <div className="font-mono text-[10px] text-stone-600 break-words line-clamp-2">{m.text}</div>
+                                                        </div>
+                                                    ))
+                                                )}
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -16823,8 +17016,15 @@
                                                     </td>
                                                     <td className="p-3 border border-stone-300 align-top">
                                                         {order.paymentMethod && order.paymentMethod !== 'N/A' ? (
-                                                            <div className="inline-flex items-center text-[11px] font-bold text-stone-700 uppercase tracking-wider whitespace-nowrap">
-                                                                <i className={`fa-solid ${order.paymentMethod === 'Cash' ? 'fa-money-bill text-green-600' : order.paymentMethod === 'SCPP Settlement' ? 'fa-handshake text-purple-600' : 'fa-building-columns text-blue-600'} mr-1.5`}></i> {order.paymentMethod}
+                                                            <div className="flex flex-col gap-1">
+                                                                <div className="inline-flex items-center text-[11px] font-bold text-stone-700 uppercase tracking-wider whitespace-nowrap">
+                                                                    <i className={`fa-solid ${order.paymentMethod === 'Cash' ? 'fa-money-bill text-green-600' : order.paymentMethod === 'SCPP Settlement' ? 'fa-handshake text-purple-600' : order.paymentMethod === 'KHQR (ABA)' ? 'fa-qrcode text-red-600' : 'fa-building-columns text-blue-600'} mr-1.5`}></i> {order.paymentMethod}
+                                                                </div>
+                                                                {order.abaVerified && (
+                                                                    <div className="text-[9px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded w-fit leading-tight">
+                                                                        ✅ {order.abaPayer} • APV: {order.abaApv}
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                         ) : (
                                                             <span className="text-xs text-stone-400 font-medium italic">Pending</span>
@@ -23052,6 +23252,17 @@
                 const [claimOrder, setClaimOrder] = useState(null);
                 const [isClaiming, setIsClaiming] = useState(false);
 
+                // PHASE 3: Real-Time KDS ABA PayWay Verification States
+                const [verifyingOrderModal, setVerifyingOrderModal] = useState(null);
+                const [manualAbaMessageText, setManualAbaMessageText] = useState('');
+                const [isScanningAba, setIsScanningAba] = useState(false);
+                const [kdsPaywayToast, setKdsPaywayToast] = useState(null);
+
+                const showKdsPaywayToast = (text, type = 'success') => {
+                    setKdsPaywayToast({ text, type });
+                    setTimeout(() => setKdsPaywayToast(null), 4500);
+                };
+
                 // --- FIX: Fetch Customers for accurate KDS Loyalty (including refilledPoints) ---
                 const [kdsCustomers, setKdsCustomers] = useState({});
                 useEffect(() => {
@@ -23243,6 +23454,126 @@
                         (o.status === 'Served' && o.paymentStatus !== 'Paid')
                     )
                 ).sort((a,b) => a.createdAt - b.createdAt);
+
+                // --- PHASE 3: Background Auto-Verifier for Pending KHQR (ABA) Orders on KDS ---
+                const pendingKhqrOrders = useMemo(() => {
+                    return activeOrders.filter(o =>
+                        o.paymentStatus !== 'Paid' &&
+                        o.status !== 'Cancelled' &&
+                        (o.paymentMethod === 'KHQR (ABA)' || o.khqrExpectedKhr > 0)
+                    );
+                }, [activeOrders]);
+
+                const triggerKdsPaywayScan = async (targetOrder = null, isSilentBackground = false) => {
+                    const ordersToScan = targetOrder ? [targetOrder] : pendingKhqrOrders;
+                    if (ordersToScan.length === 0) return;
+
+                    if (!isSilentBackground) setIsScanningAba(true);
+                    try {
+                        // Group pending orders by shopId
+                        const byShop = {};
+                        ordersToScan.forEach(o => {
+                            if (!byShop[o.shopId]) byShop[o.shopId] = [];
+                            byShop[o.shopId].push(o);
+                        });
+
+                        let totalVerified = 0;
+                        let firstVerifiedDetail = null;
+
+                        for (const [sId, shopOrders] of Object.entries(byShop)) {
+                            const shopObj = shops.find(s => s.id === sId);
+                            if (!shopObj) continue;
+                            const res = await window.SolarisPayWayVerifier.pollAndAutoVerifyBranchOrders(
+                                shopObj,
+                                shopOrders,
+                                shifts,
+                                globalPoints
+                            );
+                            if (res.verifiedCount > 0) {
+                                totalVerified += res.verifiedCount;
+                                firstVerifiedDetail = res.results[0];
+                            }
+                        }
+
+                        if (totalVerified > 0 && firstVerifiedDetail) {
+                            playChime();
+                            showKdsPaywayToast(
+                                `✅ ABA PayWay Verified! ${firstVerifiedDetail.order.queueNo} paid by ${firstVerifiedDetail.payerDisplay} (APV: ${firstVerifiedDetail.apv})`,
+                                'success'
+                            );
+                            if (verifyingOrderModal && firstVerifiedDetail.order.id === verifyingOrderModal.id) {
+                                setVerifyingOrderModal(null);
+                                setManualAbaMessageText('');
+                            }
+                        } else if (!isSilentBackground) {
+                            showKdsPaywayToast(
+                                'No new matching ABA PayWay message found in Telegram yet. You can also paste the ABA message directly.',
+                                'warn'
+                            );
+                        }
+                    } catch (err) {
+                        if (!isSilentBackground) {
+                            showKdsPaywayToast('Scan error: ' + err.message, 'error');
+                        }
+                    } finally {
+                        if (!isSilentBackground) setIsScanningAba(false);
+                    }
+                };
+
+                // Background poll every 12 seconds ONLY when there is at least 1 unpaid KHQR order on KDS
+                useEffect(() => {
+                    if (pendingKhqrOrders.length === 0) return;
+                    const initialTimer = setTimeout(() => triggerKdsPaywayScan(null, true), 2500);
+                    const interval = setInterval(() => {
+                        triggerKdsPaywayScan(null, true);
+                    }, 12000);
+                    return () => {
+                        clearTimeout(initialTimer);
+                        clearInterval(interval);
+                    };
+                }, [pendingKhqrOrders.length, filterShop]);
+
+                const handleManualPasteVerify = async (e) => {
+                    e.preventDefault();
+                    if (!verifyingOrderModal || !manualAbaMessageText.trim()) return;
+
+                    const parsed = window.SolarisKHQREngine.parseABAPayWayMessage(manualAbaMessageText);
+                    if (!parsed.isValid) {
+                        showKdsPaywayToast('Invalid ABA PayWay message format. Please paste the full message from ABA PayWay Bot.', 'error');
+                        return;
+                    }
+
+                    const targetShop = shops.find(s => s.id === verifyingOrderModal.shopId);
+                    const matchesAmount = window.SolarisPayWayVerifier.doesMessageMatchOrder(parsed, verifyingOrderModal, targetShop);
+                    if (!matchesAmount) {
+                        const expectedKhr = Number(verifyingOrderModal.khqrExpectedKhr || verifyingOrderModal.totalAmount || 0).toLocaleString();
+                        showKdsPaywayToast(`Amount/Merchant mismatch! Order expects ${expectedKhr} ៛ ($${verifyingOrderModal.khqrExpectedUsd || '0.00'}).`, 'error');
+                        return;
+                    }
+
+                    setIsScanningAba(true);
+                    try {
+                        const staffActor = currentAdminRecord?.name || 'KDS Staff';
+                        const res = await window.SolarisPayWayVerifier.verifyAndSettleOrder(
+                            verifyingOrderModal,
+                            parsed,
+                            targetShop,
+                            shifts,
+                            globalPoints,
+                            staffActor
+                        );
+                        if (res.ok) {
+                            playChime();
+                            showKdsPaywayToast(`✅ Verified ${verifyingOrderModal.queueNo}! Paid by ${res.payerDisplay} (APV: ${res.apv})`, 'success');
+                            setVerifyingOrderModal(null);
+                            setManualAbaMessageText('');
+                        } else {
+                            showKdsPaywayToast(res.error || 'Verification failed.', 'error');
+                        }
+                    } finally {
+                        setIsScanningAba(false);
+                    }
+                };
 
                 // --- NEW: Watch for Incoming Orders & Trigger Chime ---
                 useEffect(() => {
@@ -23491,6 +23822,17 @@
 
                 return (
                     <div className="h-full flex flex-col">
+                        {kdsPaywayToast && (
+                            <div className={`fixed top-20 left-1/2 -translate-x-1/2 z-[220] px-5 py-3 rounded-full shadow-2xl font-bold text-xs sm:text-sm flex items-center gap-2.5 border animate-fade-in ${
+                                kdsPaywayToast.type === 'error' ? 'bg-red-600 text-white border-red-400' :
+                                kdsPaywayToast.type === 'warn' ? 'bg-amber-500 text-stone-950 border-amber-300' :
+                                'bg-emerald-600 text-white border-emerald-400'
+                            }`}>
+                                <i className={`fa-solid ${kdsPaywayToast.type === 'error' ? 'fa-triangle-exclamation' : kdsPaywayToast.type === 'warn' ? 'fa-circle-info' : 'fa-circle-check'}`}></i>
+                                <span>{kdsPaywayToast.text}</span>
+                            </div>
+                        )}
+
                         {/* BROWSER AUTOPLAY POLICY OVERLAY */}
                         {audioNeedsInteraction && (
                             <div className="fixed inset-0 bg-amber-500/90 backdrop-blur-sm z-[200] flex flex-col items-center justify-center p-6 text-white cursor-pointer" onClick={initAndTestAudio}>
@@ -23516,6 +23858,18 @@
                             </h2>
                             
                             <div className="flex gap-2 items-center">
+                                {pendingKhqrOrders.length > 0 && (
+                                    <button
+                                        onClick={() => triggerKdsPaywayScan(null, false)}
+                                        disabled={isScanningAba}
+                                        className="px-3 py-2 rounded-xl font-bold text-xs sm:text-sm shadow-sm border bg-red-50 text-red-700 border-red-200 hover:bg-red-100 transition flex items-center gap-1.5"
+                                        title="Scan Telegram Now for ABA PayWay Confirmations"
+                                    >
+                                        <i className={`fa-solid ${isScanningAba ? 'fa-spinner fa-spin' : 'fa-qrcode'}`}></i>
+                                        <span>Verify ABA ({pendingKhqrOrders.length})</span>
+                                    </button>
+                                )}
+
                                 <button 
                                     onClick={() => isSoundEnabled ? setIsSoundEnabled(false) : initAndTestAudio()} 
                                     className={`px-3 py-2 rounded-xl font-bold text-sm shadow-sm border transition flex items-center gap-2 ${isSoundEnabled ? 'bg-green-100 text-green-700 border-green-300 hover:bg-green-200' : 'bg-stone-100 text-stone-500 border-stone-300 hover:bg-stone-200'}`}
@@ -23730,10 +24084,68 @@
                                         
                                         <div className="flex justify-between items-center">
                                             <div className="text-stone-500 text-sm">Status:</div>
-                                            <div className={`text-[11px] tracking-wider uppercase px-2.5 py-1 rounded-md border ${order.paymentStatus === 'Paid' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : order.totalAmount === 0 ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-rose-50 text-rose-700 border-rose-200'}`}>
-                                                {order.paymentStatus === 'Paid' ? <><i className="fa-solid fa-check-circle mr-1 opacity-80"></i> PAID ({order.paymentMethod})</> : order.totalAmount === 0 ? <><i className="fa-solid fa-gift mr-1 opacity-80"></i> FREE CLAIM</> : <><i className="fa-solid fa-circle-exclamation mr-1 opacity-80"></i> UNPAID</>}
+                                            <div className={`text-[11px] tracking-wider uppercase px-2.5 py-1 rounded-md border font-bold ${
+                                                order.paymentStatus === 'Paid'
+                                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                    : order.totalAmount === 0
+                                                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                                        : order.paymentMethod === 'KHQR (ABA)'
+                                                            ? 'bg-amber-100 text-amber-900 border-amber-300 animate-pulse'
+                                                            : 'bg-rose-50 text-rose-700 border-rose-200'
+                                            }`}>
+                                                {order.paymentStatus === 'Paid' ? (
+                                                    <><i className="fa-solid fa-check-circle mr-1 opacity-80"></i> PAID ({order.abaVerified ? 'ABA KHQR' : order.paymentMethod})</>
+                                                ) : order.totalAmount === 0 ? (
+                                                    <><i className="fa-solid fa-gift mr-1 opacity-80"></i> FREE CLAIM</>
+                                                ) : order.paymentMethod === 'KHQR (ABA)' ? (
+                                                    <><i className="fa-solid fa-qrcode mr-1 text-red-600"></i> ⏳ ABA KHQR PENDING</>
+                                                ) : (
+                                                    <><i className="fa-solid fa-circle-exclamation mr-1 opacity-80"></i> UNPAID</>
+                                                )}
                                             </div>
                                         </div>
+
+                                        {/* Verified ABA PayWay Details Banner */}
+                                        {order.abaVerified && (
+                                            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-2.5 text-[11px] text-emerald-900 space-y-0.5 shadow-sm">
+                                                <div className="font-black flex items-center justify-between">
+                                                    <span><i className="fa-solid fa-shield-check text-emerald-600 mr-1"></i> ABA PayWay Verified</span>
+                                                    <span className="font-mono bg-emerald-600 text-white px-1.5 py-0.5 rounded text-[10px]">{order.abaPaidAmountStr}</span>
+                                                </div>
+                                                <div className="font-bold text-stone-700 truncate">Payer: {order.abaPayer}</div>
+                                                <div className="font-mono text-[10px] text-stone-500 flex justify-between">
+                                                    <span>APV: <b>{order.abaApv}</b></span>
+                                                    <span>Trx: {String(order.abaTrxId || '').slice(-8)}</span>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Pending ABA KHQR Quick-Verify Bar */}
+                                        {order.paymentStatus !== 'Paid' && order.paymentMethod === 'KHQR (ABA)' && (
+                                            <div className="bg-red-50/70 border border-red-200 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                                                <div className="text-[11px] leading-tight">
+                                                    <div className="font-black text-red-800 flex items-center gap-1">
+                                                        <i className="fa-solid fa-satellite-dish animate-pulse"></i>
+                                                        <span>Auto-Listening PayWay</span>
+                                                    </div>
+                                                    <div className="text-[10px] text-stone-500 font-mono mt-0.5">
+                                                        Exp: {(order.khqrExpectedKhr || order.totalAmount || 0).toLocaleString()} ៛ / ${order.khqrExpectedUsd || ((order.totalAmount || 0) / 4000).toFixed(2)}
+                                                        {order.khqrCustomerRef ? ` • Ref: ${order.khqrCustomerRef}` : ''}
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setVerifyingOrderModal(order);
+                                                        setManualAbaMessageText('');
+                                                        triggerKdsPaywayScan(order, false);
+                                                    }}
+                                                    className="px-2.5 py-1.5 rounded-lg bg-[#E1232E] hover:bg-red-700 text-white font-black text-[10px] uppercase tracking-wider shrink-0 shadow-sm transition active:scale-95"
+                                                >
+                                                    <i className="fa-solid fa-bolt mr-1"></i> Verify PayWay
+                                                </button>
+                                            </div>
+                                        )}
 
                                         {/* Immediate Payment Buttons */}
                                         {order.paymentStatus === 'Paid' ? (
@@ -23970,6 +24382,75 @@
                                             )}
                                         </div>
                                     </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* PHASE 3: 1-Tap ABA PayWay Verification Modal (Live Scan + Paste Fallback) */}
+                        {verifyingOrderModal && (
+                            <div className="fixed inset-0 bg-stone-950/75 backdrop-blur-sm z-[210] flex items-center justify-center p-4">
+                                <div className="bg-white rounded-3xl w-full max-w-md p-6 shadow-2xl animate-fade-in relative">
+                                    <button
+                                        type="button"
+                                        onClick={() => { setVerifyingOrderModal(null); setManualAbaMessageText(''); }}
+                                        className="absolute top-4 right-4 w-8 h-8 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-500 flex items-center justify-center transition"
+                                    >
+                                        <i className="fa-solid fa-xmark"></i>
+                                    </button>
+
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <div className="w-11 h-11 rounded-2xl bg-[#E1232E] text-white flex items-center justify-center text-lg shadow-md">
+                                            <i className="fa-solid fa-qrcode"></i>
+                                        </div>
+                                        <div>
+                                            <h3 className="text-lg font-black text-stone-900">Verify ABA KHQR Payment</h3>
+                                            <p className="text-xs text-stone-500 font-mono font-bold">
+                                                Invoice: {verifyingOrderModal.queueNo} • {(verifyingOrderModal.totalAmount || 0).toLocaleString()} ៛ (${verifyingOrderModal.khqrExpectedUsd || ((verifyingOrderModal.totalAmount || 0) / 4000).toFixed(2)})
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-stone-50 border border-stone-200 rounded-2xl p-3.5 mb-4 text-xs space-y-2">
+                                        <div className="flex justify-between items-center">
+                                            <span className="font-bold text-stone-600">1. Auto-Scan Telegram Group/Channel</span>
+                                            <button
+                                                type="button"
+                                                disabled={isScanningAba}
+                                                onClick={() => triggerKdsPaywayScan(verifyingOrderModal, false)}
+                                                className="bg-sky-600 hover:bg-sky-700 text-white font-bold px-3 py-1.5 rounded-xl text-xs transition flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                                            >
+                                                {isScanningAba ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-satellite-dish"></i>}
+                                                <span>{isScanningAba ? 'Scanning...' : 'Scan Telegram Now'}</span>
+                                            </button>
+                                        </div>
+                                        <p className="text-[11px] text-stone-500 leading-relaxed">
+                                            Checks the latest incoming messages in your configured ABA PayWay Telegram chat for a matching KHR or USD amount and unused <code className="font-mono">Trx. ID</code>.
+                                        </p>
+                                    </div>
+
+                                    <form onSubmit={handleManualPasteVerify} className="space-y-3">
+                                        <div>
+                                            <label className="block text-xs font-bold text-stone-700 mb-1">
+                                                2. Or Paste ABA PayWay Telegram Message Directly:
+                                            </label>
+                                            <textarea
+                                                rows="3"
+                                                placeholder="Paste message: ៛14,000 paid by ... via ABA PAY at CHE SOKUNTH SLR.BSL. Trx. ID: ..., APV: ..."
+                                                className="w-full border border-stone-300 rounded-xl p-3 text-xs font-mono text-stone-800 bg-stone-50 focus:bg-white outline-none focus:border-red-500"
+                                                value={manualAbaMessageText}
+                                                onChange={e => setManualAbaMessageText(e.target.value)}
+                                            />
+                                        </div>
+
+                                        <button
+                                            type="submit"
+                                            disabled={isScanningAba || !manualAbaMessageText.trim()}
+                                            className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-3 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-sm disabled:opacity-50"
+                                        >
+                                            <i className="fa-solid fa-shield-check"></i>
+                                            <span>Verify Message & Mark Paid (Bank)</span>
+                                        </button>
+                                    </form>
                                 </div>
                             </div>
                         )}
