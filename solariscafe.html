@@ -1364,10 +1364,13 @@
                     pointBatches.push({
                         points: safeRefill,
                         earnedAt: 0,
-                        expiresAt: null
+                        expiresAt: null,
+                        isRefill: true
                     });
                 }
                 
+                let totalSpent = 0;
+                let totalRedeemed = 0;
                 let runningSpend = 0;
                 const spendReq = Number(globalPointsConfig.spendAmount) || 4000;
                 const ptsEarned = Number(globalPointsConfig.pointsEarned) || 1;
@@ -1387,6 +1390,7 @@
                     // 2. Process Redemption (Deducting oldest valid points first)
                     let redeemedHere = Number(o.redeemedPoints) || 0;
                     if (redeemedHere > 0) {
+                        totalRedeemed += redeemedHere;
                         for (let i = 0; i < pointBatches.length; i++) {
                             if (redeemedHere <= 0) break;
                             if (pointBatches[i].points > 0) {
@@ -1404,6 +1408,7 @@
                     // 3. Earn Points for this order safely
                     // BUG FIX: Only earn points for PAID orders to prevent fake points from Unpaid/Cancelled invoices.
                     const amountSpent = o.paymentStatus === 'Paid' ? (Number(o.totalAmount) || 0) : 0;
+                    totalSpent += amountSpent;
                     runningSpend += amountSpent;
                     
                     // Prevent division by zero or NaN
@@ -1428,8 +1433,12 @@
                 let activePts = 0;
                 let expiredPts = 0;
                 const activeBatches = [];
+                let refilledDeducted = 0;
 
                 pointBatches.forEach(batch => {
+                    if (batch.isRefill) {
+                        refilledDeducted = safeRefill - batch.points;
+                    }
                     if (batch.points > 0) {
                         if (batch.expiresAt && batch.expiresAt < now) {
                             expiredPts += batch.points;
@@ -1501,7 +1510,11 @@
                     expiredClaims,
                     expiringSoon, 
                     activeBatches,
-                    expiringClaims 
+                    pointBatches: activeBatches,
+                    expiringClaims,
+                    totalSpent,
+                    totalRedeemed,
+                    refilledDeducted 
                 };
             };
 
@@ -4604,19 +4617,23 @@
                                         </div>
 
                                         <div>
-                                            <label className="block text-xs font-bold text-stone-600 uppercase tracking-wider mb-1">{t.gender}</label>
+                                            <label className="block text-xs font-bold text-stone-600 uppercase tracking-wider mb-1">
+                                                {t.gender} {foundCustomer && <i className="fa-solid fa-lock ml-1 text-stone-400" title="Locked for registered users"></i>}
+                                            </label>
                                             <div className="grid grid-cols-2 gap-2">
                                                 <button
                                                     type="button"
+                                                    disabled={!!foundCustomer}
                                                     onClick={() => setSex('M')}
-                                                    className={`py-2.5 rounded-xl font-bold text-xs border transition flex items-center justify-center gap-1.5 ${sex === 'M' ? 'bg-stone-900 text-white border-stone-900 shadow-sm' : 'bg-white text-stone-600 border-stone-300 hover:bg-stone-50'}`}
+                                                    className={`py-2.5 rounded-xl font-bold text-xs border transition flex items-center justify-center gap-1.5 ${sex === 'M' ? 'bg-stone-900 text-white border-stone-900 shadow-sm' : 'bg-white text-stone-600 border-stone-300 hover:bg-stone-50'} disabled:opacity-60 disabled:cursor-not-allowed`}
                                                 >
                                                     <i className="fa-solid fa-mars text-blue-400"></i> {t.male}
                                                 </button>
                                                 <button
                                                     type="button"
+                                                    disabled={!!foundCustomer}
                                                     onClick={() => setSex('F')}
-                                                    className={`py-2.5 rounded-xl font-bold text-xs border transition flex items-center justify-center gap-1.5 ${sex === 'F' ? 'bg-stone-900 text-white border-stone-900 shadow-sm' : 'bg-white text-stone-600 border-stone-300 hover:bg-stone-50'}`}
+                                                    className={`py-2.5 rounded-xl font-bold text-xs border transition flex items-center justify-center gap-1.5 ${sex === 'F' ? 'bg-stone-900 text-white border-stone-900 shadow-sm' : 'bg-white text-stone-600 border-stone-300 hover:bg-stone-50'} disabled:opacity-60 disabled:cursor-not-allowed`}
                                                 >
                                                     <i className="fa-solid fa-venus text-pink-400"></i> {t.female}
                                                 </button>
@@ -6231,6 +6248,15 @@
                         const rawOrders = snapOrders.docs.map(d => d.data());
                         const legacyLoyalty = calculateCustomerLoyalty(rawOrders, targetPhone, globalPoints, liveRefilledPoints);
                         setCustomerLoyalty(legacyLoyalty);
+                        
+                        // AUTO-HEAL LEGACY PROFILES: Save precise math permanently to the DB to fix CRM Report inconsistencies
+                        if (customerProfile && customerProfile.id && !customerProfile.loyaltyData && rawOrders.length > 0) {
+                            try {
+                                window.FirebaseApp.updateDoc(window.FirebaseApp.doc(db, 'customers', customerProfile.id), {
+                                    loyaltyData: legacyLoyalty
+                                });
+                            } catch (e) { console.warn("Auto-heal failed:", e); }
+                        }
                     }, (error) => {
                         console.warn("Live CRM Loyalty sync failed:", error);
                     });
@@ -16287,7 +16313,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     const qOrders = query(collection(db, 'orders'), where('customerPhone', '==', customerPhone));
                     
                     const unsub = onSnapshot(qOrders, snap => {
-                        setPosCustomerRawOrders(snap.docs.map(d => d.data()));
+                        const raw = snap.docs.map(d => d.data());
+                        setPosCustomerRawOrders(raw);
+                        
+                        // AUTO-HEAL LEGACY PROFILES: Save precise math permanently to the DB to fix CRM Report inconsistencies
+                        if (customerData && customerData.id && !customerData.loyaltyData && raw.length > 0) {
+                            try {
+                                const legacyLoyalty = calculateCustomerLoyalty(raw, customerPhone, globalPoints, customerData.refilledPoints || 0);
+                                window.FirebaseApp.updateDoc(window.FirebaseApp.doc(db, 'customers', customerData.id), {
+                                    loyaltyData: legacyLoyalty
+                                });
+                            } catch (e) { console.warn("Auto-heal failed:", e); }
+                        }
                     }, (err) => console.warn("Failed to fetch orders for POS Loyalty:", err));
 
                     return () => unsub();
@@ -22456,6 +22493,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [selectedCustomer, setSelectedCustomer] = useState(null);
                 
                 const [globalPoints, setGlobalPoints] = useState({ pointsEnabled: false, spendAmount: 4000, pointsEarned: 1 });
+                const [allPointsConfigs, setAllPointsConfigs] = useState([]);
                 
                 // NEW: States for PIN Management
                 const [realCustomers, setRealCustomers] = useState([]);
@@ -22765,12 +22803,22 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
-                // Fetch Global Points Config
+                // Fetch Global & Branch Points Configs
                 useEffect(() => {
-                    const { doc, onSnapshot } = window.FirebaseApp;
-                    const unsub = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
-                        if (snap.exists()) setGlobalPoints(snap.data());
-                    }, e => console.warn("Failed to load global points in Customers View", e));
+                    const { collection, onSnapshot } = window.FirebaseApp;
+                    const unsub = onSnapshot(collection(db, 'loyalty_settings'), snap => {
+                        const loadedPoints = [];
+                        snap.forEach(d => {
+                            const data = d.data();
+                            if (d.id === 'global_points') {
+                                setGlobalPoints(data);
+                                loadedPoints.push({ shopId: 'global_points', ...data });
+                            } else if (d.id !== 'special_events' && data.pointsConfig) {
+                                loadedPoints.push({ shopId: d.id, ...data.pointsConfig });
+                            }
+                        });
+                        setAllPointsConfigs(loadedPoints);
+                    }, e => console.warn("Failed to load points configs in Customers View", e));
                     return () => unsub();
                 }, []);
 
@@ -22924,6 +22972,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const searchLower = loyaltySearchQuery.toLowerCase();
                         const cleanSearch = searchLower.replace(/\D/g, '');
 
+                        const activePointsConfig = filterShop !== 'All' 
+                            ? (allPointsConfigs.find(p => p.shopId === filterShop) || globalPoints) 
+                            : globalPoints;
+
                         // We map and filter simultaneously to cut loop iterations in half
                         const processedData = customersData.reduce((acc, c) => {
                             // 1. Initial Filtering
@@ -22937,18 +22989,19 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 if (c.lastVisit < startTime || c.lastVisit >= endTime) return acc;
                             }
 
-                            // 2. Heavy Math Calculation (Optimized with DB Data)
+                            // 2. Heavy Math Calculation (Optimized with DB Data & Branch Rules)
                             let loyaltyMath = null;
-                            const lifetimeSpent = c.totalSpent || 0;
-                            const lifetimeEarnedPts = Math.floor(lifetimeSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
-
+                            
                             if (c.dbLoyaltyData) {
                                 // PHASE 1 FIX: Replaced massive inline calculation with centralized engine!
-                                loyaltyMath = computeLiveLoyalty(c.dbLoyaltyData, globalPoints, c.refilledPoints);
+                                loyaltyMath = computeLiveLoyalty(c.dbLoyaltyData, activePointsConfig, c.refilledPoints);
                             } else {
                                 // Fallback to calculation if no DB data exists
-                                loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, globalPoints, c.refilledPoints || 0);
+                                loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, activePointsConfig, c.refilledPoints || 0);
                             }
+
+                            const lifetimeSpent = loyaltyMath.totalSpent || c.totalSpent || 0;
+                            const lifetimeEarnedPts = Math.floor(lifetimeSpent / (activePointsConfig.spendAmount || 4000)) * (activePointsConfig.pointsEarned || 1);
 
                             acc.push({
                                 ...c,
@@ -22964,7 +23017,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }, 50); // Small 50ms delay lets React paint the loading spinner first
 
                     return () => clearTimeout(timer);
-                }, [customersData, filterShop, loyaltySearchQuery, loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth, globalPoints, activeTab]);
+                }, [customersData, filterShop, loyaltySearchQuery, loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth, globalPoints, activeTab, allPointsConfigs]);
 
                 // Loyalty Sub-Reports Logic
                 const sourceLoyaltyOrders = loyaltyDateFilter === 'all' ? orders : historicalLoyaltyOrders;
@@ -23552,7 +23605,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                                 </td>
                                                                 <td className="p-3 border border-stone-300 font-black text-amber-600 text-base">
                                                                     {c.loyaltyData.activePts} Pts
-                                                                    <span className="text-[10px] font-medium text-stone-400 block tracking-normal mt-0.5">Lifetime Earned: {c.lifetimeEarnedPts} | Refilled: {c.refilledPoints || 0} | Used: {c.totalRedeemed}</span>
+                                                                    <span className="text-[10px] font-medium text-stone-400 block tracking-normal mt-0.5">Lifetime Earned: {c.lifetimeEarnedPts} | Refilled: {c.refilledPoints || 0} | Used: {c.loyaltyData.totalRedeemed || c.totalRedeemed || 0}</span>
                                                                 </td>
                                                                 <td className="p-3 border border-stone-300 font-black text-rose-600 text-base">
                                                             {c.loyaltyData.freeClaims > 0 ? <><i className="fa-solid fa-gift mr-1"></i> {c.loyaltyData.freeClaims}</> : <span className="text-stone-400 font-medium text-sm">0</span>}
