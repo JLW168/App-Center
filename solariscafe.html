@@ -15362,6 +15362,12 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [posVerifyingOrderId, setPosVerifyingOrderId] = useState(null);
                 const [posSuccessToast, setPosSuccessToast] = useState('');
 
+                // STRICT 1-USER-1-SHIFT GUARD: Find if the logged-in user already has an Open shift anywhere
+                const myExistingOpenShift = useMemo(() => {
+                    if (!currentAdminRecord?.id || !shifts) return null;
+                    return shifts.find(s => s.status === 'Open' && s.openedByUserId === currentAdminRecord.id) || null;
+                }, [shifts, currentAdminRecord?.id]);
+
                 // FIX: Download SCP data live in POS so the Cart can display the toggles
                 useEffect(() => {
                     const { onSnapshot, collection } = window.FirebaseApp;
@@ -15382,7 +15388,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             clearAutoOpen();
                             return;
                         }
-                        const targetShift = shifts?.find(s => s.shopId === autoOpenShopId && s.status === 'Open' && (s.openedByUserId === currentAdminRecord?.id || isSuper));
+                        const myShiftAnywhere = shifts?.find(s => s.status === 'Open' && s.openedByUserId === currentAdminRecord?.id);
+                        if (myShiftAnywhere && myShiftAnywhere.shopId !== autoOpenShopId) {
+                            const existingShopName = shops.find(sh => sh.id === myShiftAnywhere.shopId)?.name || 'another branch';
+                            setPosShopId(myShiftAnywhere.shopId);
+                            setCartShopId(myShiftAnywhere.shopId);
+                            setMode('pos');
+                            setPosError(`You already have an open shift (${myShiftAnywhere.shiftName || 'Shift'}) at ${existingShopName}. Please close it before opening a new shift.`);
+                            setTimeout(() => setPosError(''), 5500);
+                            clearAutoOpen();
+                            return;
+                        }
+                        const targetShift = myShiftAnywhere || shifts?.find(s => s.shopId === autoOpenShopId && s.status === 'Open' && isSuper);
                         setPosShopId(autoOpenShopId);
                         setCartShopId(autoOpenShopId);
                         if (!targetShift) {
@@ -15392,15 +15409,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         }
                         clearAutoOpen();
                     }
-                }, [autoOpenShopId, shifts, clearAutoOpen, currentAdminRecord]);
+                }, [autoOpenShopId, shifts, clearAutoOpen, currentAdminRecord, shops, isSuper]);
 
                 const currentShift = useMemo(() => {
                     if (adminSelectedShiftId) {
                         const manualShift = shifts?.find(s => s.id === adminSelectedShiftId && s.status === 'Open' && s.shopId === cartShopId);
                         if (manualShift) return manualShift;
                     }
-                    // FIX: Tie currentShift strictly to the cartShopId so the Close Shift modal reflects the active cart context.
-                    return shifts?.find(s => s.shopId === cartShopId && s.status === 'Open' && (s.openedByUserId === currentAdminRecord?.id || isSuper));
+                    // Prioritize the current user's own open shift at this branch first
+                    const ownShiftHere = shifts?.find(s => s.shopId === cartShopId && s.status === 'Open' && s.openedByUserId === currentAdminRecord?.id);
+                    if (ownShiftHere) return ownShiftHere;
+                    // Fallback for Super Admin viewing another staff member's open shift at this branch
+                    return shifts?.find(s => s.shopId === cartShopId && s.status === 'Open' && isSuper);
                 }, [shifts, cartShopId, currentAdminRecord, isSuper, adminSelectedShiftId]);
 
                 const [startingCashInput, setStartingCashInput] = useState('');
@@ -15656,10 +15676,41 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         if (!cartShopId || cartShopId === 'All') {
                             setPosError("Please select a specific branch in the cart before opening a shift.");
                             setTimeout(() => setPosError(''), 4000);
+                            setIsOpeningShift(false);
                             return;
                         }
 
-                        const { addDoc, updateDoc, doc } = window.FirebaseApp;
+                        const { addDoc, updateDoc, doc, getDocs, query, where, collection } = window.FirebaseApp;
+
+                        // --- STRICT 1-USER-1-SHIFT GUARD (In-Memory + Live Firestore Verification) ---
+                        // Prevents any user (including Admin) from opening a second shift while they still have an unclosed shift.
+                        let existingUserOpenShift = shifts?.find(s => s.status === 'Open' && s.openedByUserId === currentAdminRecord?.id);
+
+                        if (!existingUserOpenShift && currentAdminRecord?.id) {
+                            const qOpen = query(
+                                collection(db, 'shifts'),
+                                where('openedByUserId', '==', currentAdminRecord.id),
+                                where('status', '==', 'Open')
+                            );
+                            const openSnap = await getDocs(qOpen);
+                            if (!openSnap.empty) {
+                                existingUserOpenShift = { id: openSnap.docs[0].id, ...openSnap.docs[0].data() };
+                            }
+                        }
+
+                        if (existingUserOpenShift) {
+                            const existingShopName = shops.find(s => s.id === existingUserOpenShift.shopId)?.name || 'another branch';
+                            setOpenShiftModal(false);
+                            setPosShopId(existingUserOpenShift.shopId);
+                            setCartShopId(existingUserOpenShift.shopId);
+                            setAdminSelectedShiftId(existingUserOpenShift.id);
+                            setMode('pos');
+                            setPosError(`Action Denied: You already have an open shift (${existingUserOpenShift.shiftName || 'Shift'} at ${existingShopName}). Please close your active shift before opening a new one.`);
+                            setTimeout(() => setPosError(''), 6000);
+                            setIsOpeningShift(false);
+                            return;
+                        }
+                        // -----------------------------------------------------------------------------
                         
                         const targetShopId = cartShopId;
                         
@@ -17227,11 +17278,32 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     <div className="absolute inset-0 bg-stone-100/80 backdrop-blur-sm z-40 flex items-center justify-center rounded-2xl border border-stone-200">
                                         <div className="bg-white p-8 rounded-3xl shadow-xl text-center max-w-sm animate-fade-in">
                                             <i className="fa-solid fa-cash-register text-5xl text-stone-300 mb-4"></i>
-                                            <h3 className="text-xl font-bold text-stone-800 mb-2">Shift Closed</h3>
-                                            <p className="text-stone-500 mb-6">You must open a shift for <b>{shops.find(s=>s.id===cartShopId)?.name || 'this branch'}</b> under your account before taking orders and adding products to the cart.</p>
-                                            <button onClick={() => { setPosShopId(cartShopId); setOpenShiftModal(true); }} className="w-full bg-green-600 text-white font-bold py-3.5 rounded-xl hover:bg-green-700 shadow-md transition flex items-center justify-center gap-2 active:scale-95">
-                                                <i className="fa-solid fa-lock-open"></i> Open Shift Now
-                                            </button>
+                                            {myExistingOpenShift && myExistingOpenShift.shopId !== cartShopId ? (
+                                                <>
+                                                    <h3 className="text-xl font-bold text-stone-800 mb-2">Active Shift Elsewhere</h3>
+                                                    <p className="text-stone-500 mb-6 text-sm leading-relaxed">
+                                                        You already have an unclosed shift (<b>{myExistingOpenShift.shiftName || 'Shift'}</b>) at <b>{shops.find(s => s.id === myExistingOpenShift.shopId)?.name || 'another branch'}</b>. Each user can only have <b>1 open shift</b> at a time.
+                                                    </p>
+                                                    <button
+                                                        onClick={() => {
+                                                            setPosShopId(myExistingOpenShift.shopId);
+                                                            setCartShopId(myExistingOpenShift.shopId);
+                                                            setAdminSelectedShiftId(myExistingOpenShift.id);
+                                                        }}
+                                                        className="w-full bg-amber-600 text-white font-bold py-3.5 rounded-xl hover:bg-amber-700 shadow-md transition flex items-center justify-center gap-2 active:scale-95"
+                                                    >
+                                                        <i className="fa-solid fa-arrow-right-to-bracket"></i> Switch to Active Shift to Close
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <h3 className="text-xl font-bold text-stone-800 mb-2">Shift Closed</h3>
+                                                    <p className="text-stone-500 mb-6">You must open a shift for <b>{shops.find(s=>s.id===cartShopId)?.name || 'this branch'}</b> under your account before taking orders and adding products to the cart.</p>
+                                                    <button onClick={() => { setPosShopId(cartShopId); setOpenShiftModal(true); }} className="w-full bg-green-600 text-white font-bold py-3.5 rounded-xl hover:bg-green-700 shadow-md transition flex items-center justify-center gap-2 active:scale-95">
+                                                        <i className="fa-solid fa-lock-open"></i> Open Shift Now
+                                                    </button>
+                                                </>
+                                            )}
                                             <button onClick={() => setMode('manage')} className="w-full mt-3 bg-stone-100 text-stone-600 hover:bg-stone-200 font-bold py-3.5 rounded-xl transition active:scale-95">Go Back</button>
                                         </div>
                                     </div>
@@ -17327,9 +17399,22 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 <div className={`w-full md:w-80 lg:w-96 bg-white rounded-2xl shadow-sm border border-stone-200 flex-col shrink-0 h-full ${posMobileView === 'cart' ? 'flex' : 'hidden'} md:flex`}>
                                     <div className="p-4 border-b border-stone-200 bg-stone-50 font-bold text-stone-800 flex justify-between items-center">
                                         <div><i className="fa-solid fa-cart-shopping mr-2 text-amber-600"></i> Current Order</div>
-                                        {!currentShift && cartShopId && cartShopId !== 'All' && (
+                                        {!currentShift && !myExistingOpenShift && cartShopId && cartShopId !== 'All' && (
                                             <button onClick={() => setOpenShiftModal(true)} className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded font-bold hover:bg-green-200 transition shadow-sm">
                                                 <i className="fa-solid fa-lock-open mr-1"></i> Open Shift
+                                            </button>
+                                        )}
+                                        {!currentShift && myExistingOpenShift && myExistingOpenShift.shopId !== cartShopId && (
+                                            <button
+                                                onClick={() => {
+                                                    setPosShopId(myExistingOpenShift.shopId);
+                                                    setCartShopId(myExistingOpenShift.shopId);
+                                                    setAdminSelectedShiftId(myExistingOpenShift.id);
+                                                }}
+                                                className="text-[11px] bg-amber-100 text-amber-800 px-2 py-1 rounded font-bold hover:bg-amber-200 transition shadow-sm"
+                                                title="Switch to your active open shift"
+                                            >
+                                                <i className="fa-solid fa-triangle-exclamation mr-1"></i> Active Shift at {shops.find(s => s.id === myExistingOpenShift.shopId)?.name || 'Branch'}
                                             </button>
                                         )}
                                         {currentShift && (
@@ -17746,6 +17831,19 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </button>
                                         
                                         <button onClick={() => { 
+                                            // If the user already has an open shift, automatically route them to it or warn if they selected a different branch
+                                            if (myExistingOpenShift) {
+                                                if (posShopId !== 'All' && posShopId !== myExistingOpenShift.shopId) {
+                                                    const existingShopName = shops.find(s => s.id === myExistingOpenShift.shopId)?.name || 'another branch';
+                                                    setPosError(`You already have an open shift (${myExistingOpenShift.shiftName || 'Shift'}) at ${existingShopName}. Redirecting you to close it first.`);
+                                                    setTimeout(() => setPosError(''), 5500);
+                                                }
+                                                setPosShopId(myExistingOpenShift.shopId);
+                                                setCartShopId(myExistingOpenShift.shopId);
+                                                setAdminSelectedShiftId(myExistingOpenShift.id);
+                                                setMode('pos');
+                                                return;
+                                            }
                                             if (posShopId === 'All') {
                                                 setPosError("Please select a specific branch from the filters first to open the POS register.");
                                                 setTimeout(() => setPosError(''), 4000);
@@ -22467,35 +22565,32 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 // NEW: States for Edit Customer
                 const [editCustomerModalOpen, setEditCustomerModalOpen] = useState(false);
                 const [editCustomerData, setEditCustomerData] = useState(null);
+                const [isSavingCustomer, setIsSavingCustomer] = useState(false);
                 
-                // --- FIX: Auto-Generate Registration ID in Modals ---
+                // --- FIX: Auto-Generate Registration ID in Modals (Zero Firestore Reads/Writes, No Infinite Loop) ---
                 useEffect(() => {
-                    if (editCustomerModalOpen && editCustomerData) {
-                        const regShopId = editCustomerData.registeredAtShop || (filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN'));
-                        const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
-                        const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                        const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+                    if (!editCustomerModalOpen || !editCustomerData) return;
+                    // Only auto-generate if customerId is completely empty
+                    if (editCustomerData.customerId && String(editCustomerData.customerId).trim() !== '') return;
 
-                        const currentId = editCustomerData.customerId || '';
-                        const isExistingCustomerWithID = editCustomerData.id && currentId && !currentId.startsWith('UNK');
-                        const needsGeneration = !isExistingCustomerWithID && (!currentId || (currentId.includes('-') && !currentId.startsWith(`${shopPrefix}-`)));
+                    const regShopId = editCustomerData.registeredAtShop || (filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN'));
+                    const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
+                    const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                    const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
-                        if (needsGeneration) {
-                            let maxSeq = 0;
-                            realCustomers.forEach(c => {
-                                if (c.customerId && c.customerId.startsWith(`${shopPrefix}-`)) {
-                                    const seq = parseInt(c.customerId.split('-')[1], 10);
-                                    if (!isNaN(seq) && seq > maxSeq) {
-                                        maxSeq = seq;
-                                    }
-                                }
-                            });
-                            const nextSeq = maxSeq + 1;
-                            const newCode = `${shopPrefix}-${String(nextSeq).padStart(6, '0')}`;
-                            setEditCustomerData(prev => ({ ...prev, customerId: newCode }));
+                    let maxSeq = 0;
+                    realCustomers.forEach(c => {
+                        if (c.customerId && c.customerId.startsWith(`${shopPrefix}-`)) {
+                            const seq = parseInt(c.customerId.split('-')[1], 10);
+                            if (!isNaN(seq) && seq < 100000000 && seq > maxSeq) {
+                                maxSeq = seq;
+                            }
                         }
-                    }
-                }, [editCustomerModalOpen, editCustomerData?.registeredAtShop, realCustomers, shops, filterShop]);
+                    });
+                    const nextSeq = maxSeq + 1;
+                    const newCode = `${shopPrefix}-${String(nextSeq).padStart(6, '0')}`;
+                    setEditCustomerData(prev => prev ? ({ ...prev, customerId: newCode }) : prev);
+                }, [editCustomerModalOpen, editCustomerData?.registeredAtShop]);
 
                 // FIX: States for Custom Confirm Modal and Errors
                 const [confirmAction, setConfirmAction] = useState(null);
@@ -22604,52 +22699,71 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                 const handleEditCustomerSubmit = async (e) => {
                     e.preventDefault();
+                    if (isSavingCustomer) return;
                     
-                    if (!editCustomerData.name || !editCustomerData.phone) {
+                    if (!editCustomerData?.name || !editCustomerData?.phone) {
                         setCustomerError("Name and Phone Number are required.");
                         setTimeout(() => setCustomerError(''), 3000);
                         return;
                     }
 
-                    try {
-                        const { doc, collection, setDoc, updateDoc, runTransaction } = window.FirebaseApp;
-                        const cleanPhone = editCustomerData.phone.replace(/\D/g, '');
-                        
-                        if (cleanPhone.length < 8) {
-                            setCustomerError("Please enter a valid phone number.");
+                    const cleanPhone = String(editCustomerData.phone).replace(/\D/g, '');
+                    if (cleanPhone.length < 8) {
+                        setCustomerError("Please enter a valid phone number.");
+                        setTimeout(() => setCustomerError(''), 3000);
+                        return;
+                    }
+
+                    let finalPin = editCustomerData.pin ? String(editCustomerData.pin).trim() : null;
+                    if (finalPin) {
+                        finalPin = finalPin.replace(/\D/g, '');
+                        if (finalPin.length !== 4) {
+                            setCustomerError("Security PIN must be exactly 4 digits.");
                             setTimeout(() => setCustomerError(''), 3000);
                             return;
                         }
+                    } else {
+                        finalPin = null;
+                    }
 
-                        let finalPin = editCustomerData.pin || null;
-                        if (finalPin && finalPin.trim() !== '') {
-                            finalPin = finalPin.replace(/\D/g, '');
-                            if (finalPin.length !== 4) {
-                                setCustomerError("Security PIN must be exactly 4 digits.");
-                                setTimeout(() => setCustomerError(''), 3000);
-                                return;
+                    const formattedPhone = formatPhoneNumber(editCustomerData.phone);
+                    const regShopId = editCustomerData.registeredAtShop || (filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN'));
+
+                    // Compute deterministic Customer ID in memory if still blank (Zero extra Firestore reads!)
+                    let finalCustomerId = editCustomerData.customerId ? String(editCustomerData.customerId).trim() : '';
+                    if (!finalCustomerId) {
+                        const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
+                        const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                        const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+                        let maxSeq = 0;
+                        realCustomers.forEach(c => {
+                            if (c.customerId && c.customerId.startsWith(`${shopPrefix}-`)) {
+                                const seq = parseInt(c.customerId.split('-')[1], 10);
+                                if (!isNaN(seq) && seq < 100000000 && seq > maxSeq) maxSeq = seq;
                             }
-                        } else {
-                            finalPin = null;
-                        }
+                        });
+                        finalCustomerId = `${shopPrefix}-${String(maxSeq + 1).padStart(6, '0')}`;
+                    }
 
-                        let finalCustomerId = editCustomerData.customerId || null;
+                    // Check for duplicate phone number in memory (0 Firestore reads!)
+                    const duplicateInMemory = realCustomers.find(c =>
+                        c.id !== editCustomerData.id &&
+                        String(c.phone || '').replace(/\D/g, '') === cleanPhone
+                    );
+                    if (duplicateInMemory && !editCustomerData.id) {
+                        setCustomerError("A customer with this phone number already exists.");
+                        setTimeout(() => setCustomerError(''), 3000);
+                        return;
+                    }
 
-                        // Extract sequence number to securely sync counter
-                        let sequenceToUpdate = null;
-                        const regShopId = editCustomerData.registeredAtShop || (filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN'));
-                        
-                        if (finalCustomerId && finalCustomerId.includes('-')) {
-                            const seq = parseInt(finalCustomerId.split('-')[1], 10);
-                            if (!isNaN(seq)) {
-                                sequenceToUpdate = seq;
-                            }
-                        }
+                    setIsSavingCustomer(true);
+                    try {
+                        const { doc, collection, setDoc, updateDoc, writeBatch } = window.FirebaseApp;
 
                         const payload = {
                             customerId: finalCustomerId,
-                            name: editCustomerData.name,
-                            phone: editCustomerData.phone,
+                            name: editCustomerData.name.trim(),
+                            phone: formattedPhone,
                             sex: editCustomerData.sex || 'M',
                             pin: finalPin,
                             customerType: editCustomerData.customerType || 'Normal',
@@ -22657,114 +22771,60 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             chargeStatus: editCustomerData.chargeStatus || 'Normal',
                             chargeStatusScope: editCustomerData.chargeStatusScope || 'All',
                             chargeStatusShopIds: editCustomerData.chargeStatusScope === 'Specific' ? (editCustomerData.chargeStatusShopIds || []) : [],
-                            registeredAtShop: editCustomerData.registeredAtShop || '',
-                            hasWelcomeDiscount: editCustomerData.hasWelcomeDiscount || false,
+                            registeredAtShop: regShopId,
+                            hasWelcomeDiscount: !!editCustomerData.hasWelcomeDiscount,
                             updatedAt: Date.now()
                         };
 
+                        // Optimistic local state update so UI reflects changes immediately even under tight quotas
                         if (editCustomerData.id) {
-                            // UPDATE EXISTING CUSTOMER
+                            setRealCustomers(prev => prev.map(c => c.id === editCustomerData.id ? { ...c, ...payload } : c));
                             await updateDoc(doc(db, 'customers', editCustomerData.id), payload);
-                            
-                            // Sync Counter if an ID was assigned to an old legacy customer
-                            if (sequenceToUpdate) {
-                                const counterRef = doc(db, 'customer_counters', regShopId);
-                                await runTransaction(db, async (t) => {
-                                    const cDoc = await t.get(counterRef);
-                                    const currentVal = cDoc.exists() ? (cDoc.data().currentValue || 0) : 0;
-                                    if (sequenceToUpdate > currentVal) {
-                                        t.set(counterRef, { currentValue: sequenceToUpdate }, { merge: true });
-                                    }
-                                });
-                            }
-                            
-                            // If phone number changed, we need to update past orders to maintain linkage
-                            if (editCustomerData.originalPhone && editCustomerData.originalPhone !== editCustomerData.phone) {
-                                const { writeBatch, query, where, getDocs } = window.FirebaseApp;
-                                const q = query(collection(db, 'orders'), where('customerPhone', '==', editCustomerData.originalPhone));
-                                const snap = await getDocs(q);
-                                
-                                if (!snap.empty) {
+
+                            // Only update orders in memory if the phone number was actually changed
+                            if (editCustomerData.originalPhone && editCustomerData.originalPhone !== formattedPhone) {
+                                const matchingOrders = (editCustomerData.orders || orders.filter(o => o.customerPhone === editCustomerData.originalPhone)).slice(0, 50);
+                                if (matchingOrders.length > 0) {
                                     const batch = writeBatch(db);
-                                    snap.docs.forEach(docSnap => {
-                                        batch.update(doc(db, 'orders', docSnap.id), {
-                                            customerPhone: editCustomerData.phone,
-                                            customerName: editCustomerData.name
-                                        });
-                                    });
-                                    await batch.commit();
-                                }
-                            }
-                        } else {
-                            // CREATE NEW CUSTOMER
-                            // Check if phone already exists first
-                            const { query, where, getDocs } = window.FirebaseApp;
-                            const qCheck = query(collection(db, 'customers'), where('phone', '==', editCustomerData.phone));
-                            const checkSnap = await getDocs(qCheck);
-                            
-                            if (!checkSnap.empty) {
-                                setCustomerError("A customer with this phone number already exists.");
-                                setTimeout(() => setCustomerError(''), 3000);
-                                return;
-                            }
-
-                            // Determine Shop ID mapping context for ID generation
-                            const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
-                            const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                            const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
-
-                            const counterRef = doc(db, 'customer_counters', regShopId);
-                            const newRef = doc(collection(db, 'customers'));
-
-                            if (finalCustomerId) {
-                                // Pre-generated or Manual ID provided, save directly
-                                await setDoc(newRef, {
-                                    ...payload,
-                                    createdAt: Date.now(),
-                                    lastVisit: Date.now(),
-                                    registeredAtShop: regShopId
-                                });
-                                
-                                // Sync Counter upward to ensure no collisions for future customers
-                                if (sequenceToUpdate) {
-                                    await runTransaction(db, async (t) => {
-                                        const cDoc = await t.get(counterRef);
-                                        const currentVal = cDoc.exists() ? (cDoc.data().currentValue || 0) : 0;
-                                        if (sequenceToUpdate > currentVal) {
-                                            t.set(counterRef, { currentValue: sequenceToUpdate }, { merge: true });
+                                    matchingOrders.forEach(o => {
+                                        if (o.id) {
+                                            batch.update(doc(db, 'orders', o.id), {
+                                                customerPhone: formattedPhone,
+                                                customerName: payload.name
+                                            });
                                         }
                                     });
+                                    await batch.commit().catch(err => console.warn("Order phone sync skipped:", err));
                                 }
-                            } else {
-                                // Secure atomic transaction fallback (if input was cleared)
-                                await runTransaction(db, async (transaction) => {
-                                    const counterDoc = await transaction.get(counterRef);
-                                    let nextVal = 1;
-                                    if (counterDoc.exists()) {
-                                        nextVal = (counterDoc.data().currentValue || 0) + 1;
-                                        transaction.update(counterRef, { currentValue: nextVal });
-                                    } else {
-                                        transaction.set(counterRef, { currentValue: nextVal });
-                                    }
-                                    const customerIdStr = `${shopPrefix}-${nextVal.toString().padStart(6, '0')}`;
-
-                                    transaction.set(newRef, {
-                                        ...payload,
-                                        customerId: customerIdStr,
-                                        createdAt: Date.now(),
-                                        lastVisit: Date.now(),
-                                        registeredAtShop: regShopId
-                                    });
-                                });
                             }
+                        } else if (duplicateInMemory && duplicateInMemory.id) {
+                            // Legacy order-only customer already had a profile doc under this phone -> merge into existing doc (1 write!)
+                            setRealCustomers(prev => prev.map(c => c.id === duplicateInMemory.id ? { ...c, ...payload } : c));
+                            await setDoc(doc(db, 'customers', duplicateInMemory.id), payload, { merge: true });
+                        } else {
+                            // Create new customer document with a single write (no heavy transaction!)
+                            const newRef = doc(collection(db, 'customers'));
+                            const newDocData = {
+                                ...payload,
+                                createdAt: editCustomerData.createdAt || Date.now(),
+                                lastVisit: editCustomerData.lastVisit || Date.now()
+                            };
+                            setRealCustomers(prev => [{ id: newRef.id, ...newDocData }, ...prev]);
+                            await setDoc(newRef, newDocData);
                         }
 
                         setEditCustomerModalOpen(false);
                         setEditCustomerData(null);
-                        
                     } catch (err) {
-                        setCustomerError("Error saving customer: " + err.message);
-                        setTimeout(() => setCustomerError(''), 3000);
+                        const isQuota = err?.code === 'resource-exhausted' || /quota|exhausted/i.test(err?.message || '');
+                        setCustomerError(
+                            isQuota
+                                ? "Firestore daily free write quota reached, or rate-limited. Changes applied locally in memory—please try saving again in a moment."
+                                : ("Error saving customer: " + err.message)
+                        );
+                        setTimeout(() => setCustomerError(''), 5000);
+                    } finally {
+                        setIsSavingCustomer(false);
                     }
                 };
 
@@ -24036,9 +24096,11 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </button>
                                         <button 
                                             type="submit"
-                                            className="px-6 py-3 rounded-xl bg-amber-600 text-white font-bold hover:bg-amber-700 shadow-md transition-colors cursor-pointer"
+                                            disabled={isSavingCustomer}
+                                            className="px-6 py-3 rounded-xl bg-amber-600 text-white font-bold hover:bg-amber-700 shadow-md transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-2"
                                         >
-                                            {editCustomerData.id ? 'Update Info' : 'Create Profile'}
+                                            {isSavingCustomer && <i className="fa-solid fa-spinner fa-spin"></i>}
+                                            <span>{isSavingCustomer ? 'Saving...' : (editCustomerData.id ? 'Update Info' : 'Create Profile')}</span>
                                         </button>
                                     </div>
                                 </form>
