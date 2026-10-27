@@ -2299,13 +2299,15 @@
                         const currency = (rawSymbol === '៛' || rawSymbol === 'KHR') ? 'KHR' : 'USD';
                         const amount = parseFloat(match[2].replace(/,/g, ''));
                         const cleanedPayer = match[3].replace(/\(\s*\*\s*[0-9A-Za-z]+\s*\)\s*$/, '').trim();
+                        const paidAtStr = match[5].trim();
                         return {
                             isValid: !isNaN(amount) && amount > 0,
                             currency,
                             amount,
                             payerName: cleanedPayer || match[3].trim(),
                             maskedAccount: match[4] ? `*${match[4].trim()}` : '*ABA',
-                            paidAtStr: match[5].trim(),
+                            paidAtStr,
+                            paidTimestamp: this.parseAbaPaidAtToMs(paidAtStr),
                             paymentChannel: match[6].trim(),
                             merchantName: match[7].replace(/\.$/, '').trim(),
                             trxId: match[8].trim(),
@@ -2326,6 +2328,7 @@
                         const onMatch = cleanText.match(/\bon\s+(.+?)\s+via\s+/i);
                         const atMatch = cleanText.match(/\bat\s+(.+?)(?:\.\s*Trx|\s+Trx)/i);
                         const generatedId = trxMatch ? trxMatch[1].trim() : `APV-${apvMatch[1].trim()}`;
+                        const paidAtStr = onMatch ? onMatch[1].trim() : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
                         return {
                             isValid: !isNaN(amount) && amount > 0,
@@ -2333,7 +2336,8 @@
                             amount,
                             payerName: payerMatch ? payerMatch[1].trim() : 'ABA Customer',
                             maskedAccount: (payerMatch && payerMatch[2]) ? `*${payerMatch[2].trim()}` : '*ABA',
-                            paidAtStr: onMatch ? onMatch[1].trim() : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                            paidAtStr,
+                            paidTimestamp: this.parseAbaPaidAtToMs(paidAtStr),
                             paymentChannel: 'ABA PAY',
                             merchantName: atMatch ? atMatch[1].replace(/\.$/, '').trim() : '',
                             trxId: generatedId,
@@ -2343,6 +2347,238 @@
                     }
 
                     return { isValid: false };
+                },
+
+                // PHASE 1.1: Converts ABA PayWay date/time strings (e.g. "Oct 22, 09:42 AM") or Telegram Unix timestamps into exact milliseconds
+                parseAbaPaidAtToMs(paidAtStr, fallbackMs = null) {
+                    const baseFallback = Number(fallbackMs) > 0 ? Number(fallbackMs) : Date.now();
+                    if (!paidAtStr || typeof paidAtStr !== 'string') return baseFallback;
+
+                    const clean = paidAtStr.trim();
+                    const refDate = new Date(baseFallback);
+                    const currentYear = refDate.getFullYear();
+
+                    // Pattern 1: "Oct 22, 09:42 AM" or "Aug 18, 05:16 PM" (Standard ABA PayWay bot format)
+                    const monthDayTimeMatch = clean.match(/^([A-Za-z]{3,9})\s+(\d{1,2})(?:,\s*(\d{4}))?,?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+                    if (monthDayTimeMatch) {
+                        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+                        const mIdx = monthNames.indexOf(monthDayTimeMatch[1].slice(0, 3).toLowerCase());
+                        if (mIdx !== -1) {
+                            const day = parseInt(monthDayTimeMatch[2], 10);
+                            const year = monthDayTimeMatch[3] ? parseInt(monthDayTimeMatch[3], 10) : currentYear;
+                            let hours = parseInt(monthDayTimeMatch[4], 10);
+                            const mins = parseInt(monthDayTimeMatch[5], 10);
+                            const secs = monthDayTimeMatch[6] ? parseInt(monthDayTimeMatch[6], 10) : 0;
+                            const ampm = (monthDayTimeMatch[7] || '').toUpperCase();
+
+                            if (ampm === 'PM' && hours < 12) hours += 12;
+                            if (ampm === 'AM' && hours === 12) hours = 0;
+
+                            const constructed = new Date(year, mIdx, day, hours, mins, secs, 0);
+                            if (!isNaN(constructed.getTime())) {
+                                // Handle Dec -> Jan year boundary rollover
+                                if (!monthDayTimeMatch[3] && constructed.getTime() - baseFallback > 60 * 24 * 60 * 60 * 1000) {
+                                    constructed.setFullYear(year - 1);
+                                }
+                                return constructed.getTime();
+                            }
+                        }
+                    }
+
+                    // Pattern 2: Time-only string (e.g. "09:42 AM") -> Anchor to reference date
+                    const timeOnlyMatch = clean.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+                    if (timeOnlyMatch) {
+                        let hours = parseInt(timeOnlyMatch[1], 10);
+                        const mins = parseInt(timeOnlyMatch[2], 10);
+                        const secs = timeOnlyMatch[3] ? parseInt(timeOnlyMatch[3], 10) : 0;
+                        const ampm = (timeOnlyMatch[4] || '').toUpperCase();
+
+                        if (ampm === 'PM' && hours < 12) hours += 12;
+                        if (ampm === 'AM' && hours === 12) hours = 0;
+
+                        const constructed = new Date(refDate.getFullYear(), refDate.getMonth(), refDate.getDate(), hours, mins, secs, 0);
+                        if (!isNaN(constructed.getTime())) return constructed.getTime();
+                    }
+
+                    const nativeParsed = Date.parse(`${clean} ${currentYear}`);
+                    if (!isNaN(nativeParsed)) return nativeParsed;
+
+                    return baseFallback;
+                },
+
+                // PHASE 1.2: Filters & Auto-Sums ABA PayWay transactions strictly within a Shift's time window [openedAt -> closedAt/Now]
+                getShiftAbaTransactions(allAbaMessages = [], shift = null, shop = null, customWindow = null, orders = []) {
+                    const exchangeRate = Math.max(100, Number(shop?.khqrConfig?.exchangeRate) || 4000);
+                    const shopChatId = String(shop?.khqrConfig?.paywayChatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                    const shopMerchant = String(shop?.khqrConfig?.accountName || shop?.brandingName || shop?.name || '').trim().toUpperCase();
+
+                    // Determine Start & End millisecond boundaries from Shift or Custom Window
+                    let startMs = 0;
+                    let endMs = Date.now() + 365 * 24 * 60 * 60 * 1000;
+                    if (shift && shift.openedAt) {
+                        startMs = Number(shift.openedAt);
+                        endMs = (shift.status === 'Closed' && shift.closedAt) ? Number(shift.closedAt) : Date.now() + 60000;
+                    } else if (customWindow && customWindow.startMs !== undefined) {
+                        startMs = Number(customWindow.startMs) || 0;
+                        endMs = Number(customWindow.endMs) || (Date.now() + 60000);
+                    }
+
+                    // Build O(1) lookup map of orders already linked to an ABA Trx. ID
+                    const orderByTrxId = new Map();
+                    (orders || []).forEach(o => {
+                        if (o && o.abaTrxId && o.status !== 'Cancelled') {
+                            orderByTrxId.set(String(o.abaTrxId).trim(), o);
+                        }
+                    });
+
+                    // Deduplicate strictly by Trx. ID
+                    const uniqueByTrx = new Map();
+                    (allAbaMessages || []).forEach(entry => {
+                        const p = entry?.parsedAba || entry;
+                        if (!p || !p.isValid || !p.trxId) return;
+                        const trxId = String(p.trxId).trim();
+                        if (!uniqueByTrx.has(trxId)) {
+                            uniqueByTrx.set(trxId, entry.parsedAba ? entry : {
+                                updateId: trxId,
+                                messageId: trxId,
+                                chatId: String(p.chatId || ''),
+                                date: Number(p.receivedAt || p.paidTimestamp || Date.now()),
+                                parsedAba: p
+                            });
+                        }
+                    });
+
+                    // Also include any verified ABA orders from the orders collection whose message might not be in the recent buffer
+                    (orders || []).forEach(o => {
+                        if (!o || o.status === 'Cancelled' || !o.abaVerified || !o.abaTrxId) return;
+                        if (shop && o.shopId && o.shopId !== shop.id) return;
+                        const trxId = String(o.abaTrxId).trim();
+                        if (!uniqueByTrx.has(trxId)) {
+                            const rawAmtStr = String(o.abaPaidAmountStr || '');
+                            const isUsd = o.abaCurrency === 'USD' || rawAmtStr.startsWith('$');
+                            const parsedAmt = parseFloat(rawAmtStr.replace(/[^0-9.]/g, '')) || (isUsd ? Number(o.khqrExpectedUsd || 0) : Number(o.totalAmount || 0));
+                            const fallbackTs = Number(o.abaVerifiedAt || o.createdAt || Date.now());
+                            uniqueByTrx.set(trxId, {
+                                updateId: trxId,
+                                messageId: trxId,
+                                chatId: String(shop?.khqrConfig?.paywayChatId || ''),
+                                date: fallbackTs,
+                                claimedByOrderId: o.id,
+                                parsedAba: {
+                                    isValid: true,
+                                    trxId,
+                                    apv: String(o.abaApv || ''),
+                                    currency: isUsd ? 'USD' : 'KHR',
+                                    amount: parsedAmt,
+                                    payerName: String(o.abaPayer || o.customerName || 'ABA Customer').replace(/\s*\(\*[^)]+\)\s*$/, ''),
+                                    maskedAccount: (String(o.abaPayer || '').match(/\(\s*(\*[0-9A-Za-z]+)\s*\)/)?.[1]) || '*ABA',
+                                    paidAtStr: o.abaPaidAtStr || new Date(fallbackTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                                    paidTimestamp: fallbackTs,
+                                    merchantName: shop?.khqrConfig?.accountName || shop?.name || ''
+                                }
+                            });
+                        }
+                    });
+
+                    const matchedTransactions = [];
+                    let totalKhrAmount = 0;
+                    let totalUsdAmount = 0;
+                    let khrCount = 0;
+                    let usdCount = 0;
+                    let linkedOrdersCount = 0;
+                    let directScanCount = 0;
+
+                    uniqueByTrx.forEach((entry, trxId) => {
+                        const p = entry.parsedAba;
+                        const linkedOrder = orderByTrxId.get(trxId) || (entry.claimedByOrderId ? (orders || []).find(o => o.id === entry.claimedByOrderId) : null);
+
+                        // 1. Branch / Group Isolation Check
+                        if (shop) {
+                            if (linkedOrder && linkedOrder.shopId && linkedOrder.shopId !== shop.id) return;
+
+                            const msgChatId = String(entry.chatId || p.chatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                            if (shopChatId && msgChatId && /^\d+$/.test(shopChatId) && /^\d+$/.test(msgChatId)) {
+                                if (!shopChatId.includes(msgChatId) && !msgChatId.includes(shopChatId)) {
+                                    return;
+                                }
+                            } else if (!shopChatId && shopMerchant && p.merchantName) {
+                                const normMsgMerchant = String(p.merchantName).toUpperCase().replace(/[^A-Z0-9]/g, '');
+                                const normShopMerchant = shopMerchant.replace(/[^A-Z0-9]/g, '');
+                                if (normMsgMerchant && normShopMerchant && !normMsgMerchant.includes(normShopMerchant) && !normShopMerchant.includes(normMsgMerchant)) {
+                                    if (!linkedOrder) return;
+                                }
+                            }
+                        }
+
+                        // 2. Resolve Effective Timestamp for Shift Boundary Check
+                        // Prefer exact reception time (`entry.date` from Telegram/Firestore) when within 24h, otherwise parsed `paidTimestamp`
+                        const rawEventMs = Number(entry.date || p.receivedAt || 0);
+                        const parsedPaidMs = Number(p.paidTimestamp) || this.parseAbaPaidAtToMs(p.paidAtStr, rawEventMs || Date.now());
+                        const effectiveMs = (rawEventMs > 0 && Math.abs(rawEventMs - parsedPaidMs) <= 24 * 60 * 60 * 1000)
+                            ? rawEventMs
+                            : (rawEventMs > 0 ? rawEventMs : parsedPaidMs);
+
+                        // If this payment is explicitly linked to an order assigned to this shift, always include it; otherwise enforce [startMs, endMs]
+                        const isExplicitlyInShift = shift && linkedOrder && linkedOrder.shiftId === shift.id;
+                        if (!isExplicitlyInShift && (effectiveMs < startMs || effectiveMs > endMs)) {
+                            return;
+                        }
+
+                        const amt = Number(p.amount) || 0;
+                        const isUsd = p.currency === 'USD';
+                        const convertedKhr = isUsd ? Math.round(amt * exchangeRate) : Math.round(amt);
+
+                        if (isUsd) {
+                            totalUsdAmount += amt;
+                            usdCount++;
+                        } else {
+                            totalKhrAmount += Math.round(amt);
+                            khrCount++;
+                        }
+
+                        if (linkedOrder) linkedOrdersCount++;
+                        else directScanCount++;
+
+                        matchedTransactions.push({
+                            trxId,
+                            apv: String(p.apv || ''),
+                            currency: isUsd ? 'USD' : 'KHR',
+                            amount: amt,
+                            convertedKhr,
+                            exchangeRateUsed: exchangeRate,
+                            payerName: p.payerName || 'ABA Customer',
+                            maskedAccount: p.maskedAccount || '*ABA',
+                            paidAtStr: p.paidAtStr || new Date(effectiveMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                            effectiveTimestamp: effectiveMs,
+                            merchantName: p.merchantName || '',
+                            chatId: String(entry.chatId || p.chatId || ''),
+                            linkedOrder: linkedOrder || null,
+                            linkedInvoiceNo: linkedOrder?.queueNo || null,
+                            linkedShiftId: linkedOrder?.shiftId || (shift ? shift.id : null),
+                            rawText: p.rawText || entry.text || ''
+                        });
+                    });
+
+                    matchedTransactions.sort((a, b) => b.effectiveTimestamp - a.effectiveTimestamp);
+
+                    const usdInKhr = Math.round(totalUsdAmount * exchangeRate);
+                    const combinedInKhr = totalKhrAmount + usdInKhr;
+
+                    return {
+                        transactions: matchedTransactions,
+                        totalKhrAmount,
+                        totalUsdAmount: Number(totalUsdAmount.toFixed(2)),
+                        usdInKhr,
+                        combinedInKhr,
+                        exchangeRate,
+                        khrCount,
+                        usdCount,
+                        totalCount: matchedTransactions.length,
+                        linkedOrdersCount,
+                        directScanCount,
+                        windowStartMs: startMs,
+                        windowEndMs: endMs
+                    };
                 },
 
                 // Reads staff-only Telegram/MTProto credentials from `payway_secrets/{shopId}` AND falls back to Telegram Bot Alerts config
@@ -2389,21 +2625,31 @@
 
                 // Publishes a detected ABA payment into in-memory cache AND Firestore (`aba_payments` + `system_settings/aba_live_feed`)
                 // so Customer QR Modal, POS, and KDS all receive it immediately even if `aba_payments` has strict create rules
-                async broadcastDetectedAbaPayment(parsed, chatId = '', sourceLabel = 'Telegram Live') {
+                async broadcastDetectedAbaPayment(parsed, chatId = '', sourceLabel = 'Telegram Live', messageDateMs = null) {
                     if (!parsed || !parsed.isValid || !parsed.trxId) return;
                     const trxId = String(parsed.trxId).trim();
+                    const effectiveReceivedAt = Number(messageDateMs) > 0
+                        ? Number(messageDateMs)
+                        : (Number(parsed.paidTimestamp) > 0 ? Number(parsed.paidTimestamp) : Date.now());
+
+                    const enrichedParsed = {
+                        ...parsed,
+                        chatId: String(chatId || parsed.chatId || '').trim(),
+                        receivedAt: effectiveReceivedAt,
+                        paidTimestamp: Number(parsed.paidTimestamp) || this.parseAbaPaidAtToMs(parsed.paidAtStr, effectiveReceivedAt)
+                    };
 
                     const entry = {
                         updateId: trxId,
                         messageId: trxId,
-                        chatId: String(chatId || '').trim(),
+                        chatId: enrichedParsed.chatId,
                         chatTitle: sourceLabel,
                         chatType: 'live_bridge',
                         senderName: 'PayWay by ABA',
                         isBotSender: true,
-                        date: Date.now(),
-                        text: parsed.rawText,
-                        parsedAba: parsed,
+                        date: effectiveReceivedAt,
+                        text: enrichedParsed.rawText,
+                        parsedAba: enrichedParsed,
                         fromFirestore: true
                     };
 
@@ -2419,17 +2665,18 @@
                         if (!existing.exists()) {
                             await setDoc(payRef, {
                                 trxId,
-                                apv: String(parsed.apv || ''),
-                                currency: parsed.currency,
-                                amount: Number(parsed.amount),
-                                payerName: parsed.payerName || 'ABA Customer',
-                                maskedAccount: parsed.maskedAccount || '*ABA',
-                                paidAtStr: parsed.paidAtStr || '',
-                                paymentChannel: parsed.paymentChannel || 'ABA PAY',
-                                merchantName: parsed.merchantName || '',
-                                rawText: parsed.rawText || '',
-                                chatId: String(chatId || ''),
-                                receivedAt: Date.now(),
+                                apv: String(enrichedParsed.apv || ''),
+                                currency: enrichedParsed.currency,
+                                amount: Number(enrichedParsed.amount),
+                                payerName: enrichedParsed.payerName || 'ABA Customer',
+                                maskedAccount: enrichedParsed.maskedAccount || '*ABA',
+                                paidAtStr: enrichedParsed.paidAtStr || '',
+                                paidTimestamp: enrichedParsed.paidTimestamp,
+                                paymentChannel: enrichedParsed.paymentChannel || 'ABA PAY',
+                                merchantName: enrichedParsed.merchantName || '',
+                                rawText: enrichedParsed.rawText || '',
+                                chatId: enrichedParsed.chatId,
+                                receivedAt: effectiveReceivedAt,
                                 claimedByOrderId: null
                             });
                         }
@@ -2440,16 +2687,17 @@
                             await setDoc(doc(safeDB(), 'system_settings', 'aba_live_feed'), {
                                 [`payments.${trxId}`]: {
                                     trxId,
-                                    apv: String(parsed.apv || ''),
-                                    currency: parsed.currency,
-                                    amount: Number(parsed.amount),
-                                    payerName: parsed.payerName || 'ABA Customer',
-                                    maskedAccount: parsed.maskedAccount || '*ABA',
-                                    paidAtStr: parsed.paidAtStr || '',
-                                    merchantName: parsed.merchantName || '',
-                                    rawText: parsed.rawText || '',
-                                    chatId: String(chatId || ''),
-                                    receivedAt: Date.now()
+                                    apv: String(enrichedParsed.apv || ''),
+                                    currency: enrichedParsed.currency,
+                                    amount: Number(enrichedParsed.amount),
+                                    payerName: enrichedParsed.payerName || 'ABA Customer',
+                                    maskedAccount: enrichedParsed.maskedAccount || '*ABA',
+                                    paidAtStr: enrichedParsed.paidAtStr || '',
+                                    paidTimestamp: enrichedParsed.paidTimestamp,
+                                    merchantName: enrichedParsed.merchantName || '',
+                                    rawText: enrichedParsed.rawText || '',
+                                    chatId: enrichedParsed.chatId,
+                                    receivedAt: effectiveReceivedAt
                                 },
                                 updatedAt: Date.now()
                             }, { merge: true });
@@ -2496,14 +2744,20 @@
                             for (const txt of candidates) {
                                 const parsed = this.parseABAPayWayMessage(txt);
                                 if (parsed && parsed.isValid && parsed.trxId) {
-                                    const dateMs = (msg.date ? msg.date * 1000 : Date.now());
+                                    const origDateSec = msg.reply_to_message?.date || msg.date;
+                                    const dateMs = origDateSec ? origDateSec * 1000 : Date.now();
                                     extracted.push({
-                                        parsed,
+                                        parsed: {
+                                            ...parsed,
+                                            chatId: msgChatId,
+                                            receivedAt: dateMs,
+                                            paidTimestamp: this.parseAbaPaidAtToMs(parsed.paidAtStr, dateMs)
+                                        },
                                         chatId: msgChatId,
                                         chatTitle: msgChatTitle,
                                         dateMs
                                     });
-                                    await this.broadcastDetectedAbaPayment(parsed, msgChatId, `Telegram Bot (${msgChatTitle})`);
+                                    await this.broadcastDetectedAbaPayment(parsed, msgChatId, `Telegram Bot (${msgChatTitle})`, dateMs);
                                 }
                             }
                         }
@@ -2519,11 +2773,11 @@
                     }
                 },
 
-                // Reads unclaimed ABA PayWay payments from:
+                // Reads ABA PayWay payments from:
                 // 1) In-Memory Live Stream (Browser MTProto / Injected / Bot Poller)
                 // 2) Telegram Bot API getUpdates (auto-resolving Bot Token from payway_secrets OR Telegram Bot Alerts)
                 // 3) Firestore `aba_payments` collection AND `system_settings/aba_live_feed`
-                async fetchRecentAbaPaymentsFromFirestore(filterChatId = '', shopId = '') {
+                async fetchRecentAbaPaymentsFromFirestore(filterChatId = '', shopId = '', includeClaimed = false) {
                     try {
                         const { collection, query, where, orderBy, limit, getDocs, doc, getDoc } = window.FirebaseApp;
                         const database = safeDB();
@@ -2537,7 +2791,7 @@
                         // SOURCE 1: In-Memory Live Payments (Browser MTProto Client or Manual/Bot Broadcasts)
                         if (window.SolarisPayWayVerifier?.inMemoryAbaPayments) {
                             window.SolarisPayWayVerifier.inMemoryAbaPayments.forEach((entry, trxId) => {
-                                if (!window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId)) {
+                                if (includeClaimed || !window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId)) {
                                     mergedByTrxId.set(trxId, entry);
                                 }
                             });
@@ -2552,7 +2806,7 @@
                                 botPolled.items.forEach(item => {
                                     const p = item.parsed;
                                     const trxId = String(p.trxId).trim();
-                                    if (window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
+                                    if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
                                     mergedByTrxId.set(trxId, {
                                         updateId: trxId,
                                         messageId: trxId,
@@ -2576,10 +2830,12 @@
                             if (feedSnap.exists() && feedSnap.data()?.payments) {
                                 const paymentsObj = feedSnap.data().payments;
                                 Object.values(paymentsObj).forEach(d => {
-                                    if (!d || !d.trxId || d.claimedByOrderId) return;
+                                    if (!d || !d.trxId) return;
+                                    if (!includeClaimed && d.claimedByOrderId) return;
                                     const trxId = String(d.trxId).trim();
-                                    if (window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
+                                    if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
                                     if (!mergedByTrxId.has(trxId)) {
+                                        const recMs = Number(d.receivedAt) || Date.now();
                                         const parsedAba = {
                                             isValid: true,
                                             currency: d.currency || 'KHR',
@@ -2587,6 +2843,9 @@
                                             payerName: d.payerName || 'ABA Customer',
                                             maskedAccount: d.maskedAccount || '*ABA',
                                             paidAtStr: d.paidAtStr || '',
+                                            paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                            receivedAt: recMs,
+                                            chatId: String(d.chatId || ''),
                                             paymentChannel: 'ABA PAY',
                                             merchantName: d.merchantName || '',
                                             trxId,
@@ -2601,7 +2860,8 @@
                                             chatType: 'firestore_feed',
                                             senderName: 'PayWay by ABA',
                                             isBotSender: true,
-                                            date: Number(d.receivedAt) || Date.now(),
+                                            date: recMs,
+                                            claimedByOrderId: d.claimedByOrderId || null,
                                             text: parsedAba.rawText,
                                             parsedAba,
                                             fromFirestore: true
@@ -2615,19 +2875,14 @@
                         const colRef = collection(database, 'aba_payments');
                         let snap = null;
                         try {
-                            const q = query(
-                                colRef,
-                                where('claimedByOrderId', '==', null),
-                                orderBy('receivedAt', 'desc'),
-                                limit(30)
-                            );
+                            const q = includeClaimed
+                                ? query(colRef, orderBy('receivedAt', 'desc'), limit(150))
+                                : query(colRef, where('claimedByOrderId', '==', null), orderBy('receivedAt', 'desc'), limit(30));
                             snap = await getDocs(q);
                         } catch (idxErr) {
-                            const qFallback = query(
-                                colRef,
-                                where('claimedByOrderId', '==', null),
-                                limit(30)
-                            );
+                            const qFallback = includeClaimed
+                                ? query(colRef, limit(150))
+                                : query(colRef, where('claimedByOrderId', '==', null), limit(30));
                             snap = await getDocs(qFallback);
                         }
 
@@ -2638,8 +2893,9 @@
                                 const currency = d.currency || 'KHR';
                                 const amount = Number(d.amount || 0);
                                 if (!trxId || isNaN(amount) || amount <= 0) return;
-                                if (window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
+                                if (!includeClaimed && (d.claimedByOrderId || window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId))) return;
 
+                                const recMs = Number(d.receivedAt) || Date.now();
                                 const parsedAba = {
                                     isValid: true,
                                     currency,
@@ -2647,6 +2903,9 @@
                                     payerName: d.payerName || 'ABA Customer',
                                     maskedAccount: d.maskedAccount || '*ABA',
                                     paidAtStr: d.paidAtStr || '',
+                                    paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                    receivedAt: recMs,
+                                    chatId: String(d.chatId || '').trim(),
                                     paymentChannel: d.paymentChannel || 'ABA PAY',
                                     merchantName: d.merchantName || '',
                                     trxId,
@@ -2662,7 +2921,8 @@
                                     chatType: 'firestore',
                                     senderName: 'PayWay by ABA',
                                     isBotSender: true,
-                                    date: Number(d.receivedAt) || Date.now(),
+                                    date: recMs,
+                                    claimedByOrderId: d.claimedByOrderId || null,
                                     text: parsedAba.rawText,
                                     parsedAba,
                                     fromFirestore: true
@@ -2813,13 +3073,12 @@
                 // Attaches a raw update + NewMessage handler that works even without `events/NewMessage` subpath!
                 attachLiveAbaMessageHandler(client, NewMessage) {
                     if (client._solarisHandlerAttached) return;
-                    client._solarisHandlerAttached = true;
-
-                    const processRawText = async (rawText, chatIdStr = '') => {
+                    const processRawText = async (rawText, chatIdStr = '', msgDateSec = null) => {
                         if (!rawText || typeof rawText !== 'string') return;
                         const parsed = window.SolarisKHQREngine.parseABAPayWayMessage(rawText);
                         if (parsed && parsed.isValid && parsed.trxId) {
-                            await window.SolarisKHQREngine.broadcastDetectedAbaPayment(parsed, chatIdStr, 'Browser MTProto Live');
+                            const dateMs = msgDateSec ? Number(msgDateSec) * 1000 : Date.now();
+                            await window.SolarisKHQREngine.broadcastDetectedAbaPayment(parsed, chatIdStr, 'Browser MTProto Live', dateMs);
                         }
                     };
 
@@ -2832,7 +3091,7 @@
                                     if (!message) return;
                                     const rawText = message.message || message.text || '';
                                     const chatId = String(message.chatId || message.peerId?.channelId || message.peerId?.chatId || '');
-                                    await processRawText(rawText, chatId);
+                                    await processRawText(rawText, chatId, message.date);
                                 } catch (e) {}
                             }, new NewMessage({}));
                         } catch (e) {}
@@ -2849,7 +3108,8 @@
                                 if (rawText) {
                                     const peer = msgObj?.peerId || update?.peerId;
                                     const rawId = peer?.chatId || peer?.channelId || peer?.userId || update?.chatId || '';
-                                    await processRawText(rawText, rawId ? String(rawId) : '');
+                                    const msgDateSec = msgObj?.date || update?.date || null;
+                                    await processRawText(rawText, rawId ? String(rawId) : '', msgDateSec);
                                 }
                             } catch (e) {}
                         });
@@ -3025,7 +3285,8 @@
                                     const parsed = window.SolarisKHQREngine.parseABAPayWayMessage(txt);
                                     if (parsed && parsed.isValid && parsed.trxId) {
                                         foundCount++;
-                                        await window.SolarisKHQREngine.broadcastDetectedAbaPayment(parsed, chatId, `MTProto (${title})`);
+                                        const msgDateMs = m.date ? Number(m.date) * 1000 : Date.now();
+                                        await window.SolarisKHQREngine.broadcastDetectedAbaPayment(parsed, chatId, `MTProto (${title})`, msgDateMs);
                                     }
                                 }
                             }
@@ -15372,6 +15633,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [posVerifyingOrderId, setPosVerifyingOrderId] = useState(null);
                 const [posSuccessToast, setPosSuccessToast] = useState('');
 
+                // PHASE 2 & 3: ABA PayWay Live Ledger & Shift Auto-Sum States
+                const [posManageSubTab, setPosManageSubTab] = useState('orders'); // 'orders' | 'aba_live'
+                const [abaLedgerMessages, setAbaLedgerMessages] = useState([]);
+                const [isSyncingAbaLedger, setIsSyncingAbaLedger] = useState(false);
+                const [selectedLedgerShiftId, setSelectedLedgerShiftId] = useState('ACTIVE');
+                const [abaSearchQuery, setAbaSearchQuery] = useState('');
+                const [abaCurrencyFilter, setAbaCurrencyFilter] = useState('ALL'); // 'ALL' | 'KHR' | 'USD'
+
                 // STRICT 1-USER-1-SHIFT GUARD: Find if the logged-in user already has an Open shift anywhere
                 const myExistingOpenShift = useMemo(() => {
                     if (!currentAdminRecord?.id || !shifts) return null;
@@ -16285,6 +16554,199 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                     return { posSizeSCount: countS, posSizeLCount: countL, posScpCount: countSCP };
                 }, [displayedOrders]);
+
+                // =========================================================================
+                // PHASE 2: REAL-TIME ABA PAYWAY LISTENER & SHIFT AUTO-SUM ENGINE IN POSVIEW
+                // =========================================================================
+                const activeLedgerShopObj = useMemo(() => {
+                    const targetId = (posShopId && posShopId !== 'All') ? posShopId : (cartShopId && cartShopId !== 'All' ? cartShopId : (shops[0]?.id || null));
+                    return shops.find(s => s.id === targetId) || null;
+                }, [posShopId, cartShopId, shops]);
+
+                // Resolve shifts available for the selected branch (Open shifts first, then recent Closed shifts)
+                const branchShiftsForLedger = useMemo(() => {
+                    if (!shifts) return [];
+                    return shifts
+                        .filter(s => !activeLedgerShopObj || posShopId === 'All' || s.shopId === activeLedgerShopObj.id)
+                        .sort((a, b) => {
+                            if (a.status === 'Open' && b.status !== 'Open') return -1;
+                            if (a.status !== 'Open' && b.status === 'Open') return 1;
+                            return (b.openedAt || 0) - (a.openedAt || 0);
+                        })
+                        .slice(0, 30);
+                }, [shifts, activeLedgerShopObj, posShopId]);
+
+                // Determine the active Shift object to scope the Auto-Sum calculation
+                const activeShiftForLedger = useMemo(() => {
+                    if (selectedLedgerShiftId === 'ALL_WINDOW') return null;
+                    if (selectedLedgerShiftId && selectedLedgerShiftId !== 'ACTIVE') {
+                        const found = branchShiftsForLedger.find(s => s.id === selectedLedgerShiftId);
+                        if (found) return found;
+                    }
+                    // Default 'ACTIVE': prefer current user's open shift, or any open shift in the selected branch, or the most recent shift from today
+                    const openHere = branchShiftsForLedger.find(s => s.status === 'Open' && s.openedByUserId === currentAdminRecord?.id)
+                        || branchShiftsForLedger.find(s => s.status === 'Open');
+                    if (openHere) return openHere;
+                    const recentToday = branchShiftsForLedger.find(s => (s.openedAt || 0) >= startOfToday);
+                    return recentToday || null;
+                }, [selectedLedgerShiftId, branchShiftsForLedger, currentAdminRecord?.id, startOfToday]);
+
+                // Sync function that pulls from Telegram Bot / MTProto / Firestore `aba_payments` (including claimed payments)
+                const syncAbaLedgerNow = async (showFeedback = false) => {
+                    if (isSyncingAbaLedger && showFeedback) return;
+                    if (showFeedback) setIsSyncingAbaLedger(true);
+                    try {
+                        const targetShopId = activeLedgerShopObj?.id || '';
+                        const targetChatId = String(activeLedgerShopObj?.khqrConfig?.paywayChatId || '').trim();
+                        const res = await window.SolarisKHQREngine.fetchRecentAbaPaymentsFromFirestore(
+                            targetChatId,
+                            targetShopId,
+                            true // includeClaimed = true so all shift transactions are preserved
+                        );
+                        if (res && res.ok) {
+                            setAbaLedgerMessages(res.allAbaMessages || res.messages || []);
+                            if (showFeedback) {
+                                setPosSuccessToast(`✅ Synced Telegram & Cloud Feed (${(res.allAbaMessages || res.messages || []).length} total ABA records).`);
+                                setTimeout(() => setPosSuccessToast(''), 3500);
+                            }
+                        } else if (showFeedback && res?.error) {
+                            setPosError(res.error);
+                            setTimeout(() => setPosError(''), 4000);
+                        }
+                    } catch (e) {
+                        console.warn("ABA Ledger sync warning:", e);
+                    } finally {
+                        if (showFeedback) setIsSyncingAbaLedger(false);
+                    }
+                };
+
+                // Real-time Firestore subscription + periodic Telegram Bot poll while in POSView
+                useEffect(() => {
+                    syncAbaLedgerNow(false);
+
+                    const pollTimer = setInterval(() => {
+                        syncAbaLedgerNow(false);
+                    }, 8000);
+
+                    let unsubAbaCol = null;
+                    let unsubLiveFeed = null;
+                    try {
+                        const { collection, query, limit, onSnapshot, doc } = window.FirebaseApp;
+                        const database = safeDB();
+
+                        const qAllAba = query(collection(database, 'aba_payments'), limit(150));
+                        unsubAbaCol = onSnapshot(qAllAba, () => {
+                            syncAbaLedgerNow(false);
+                        }, () => {});
+
+                        unsubLiveFeed = onSnapshot(doc(database, 'system_settings', 'aba_live_feed'), () => {
+                            syncAbaLedgerNow(false);
+                        }, () => {});
+                    } catch (e) {}
+
+                    return () => {
+                        clearInterval(pollTimer);
+                        if (typeof unsubAbaCol === 'function') unsubAbaCol();
+                        if (typeof unsubLiveFeed === 'function') unsubLiveFeed();
+                    };
+                }, [activeLedgerShopObj?.id, activeLedgerShopObj?.khqrConfig?.paywayChatId]);
+
+                // Compute Shift-Scoped Auto-Sum (KHR, USD, Converted KHR, and Expected POS Bank comparison)
+                const abaShiftAutoSumData = useMemo(() => {
+                    // Determine custom fallback window if no shift is selected (uses current Date Range filter)
+                    let customWindow = null;
+                    if (!activeShiftForLedger) {
+                        const now = new Date();
+                        let startMs = startOfToday;
+                        let endMs = Date.now() + 60000;
+                        if (dateFilter === 'yesterday') {
+                            startMs = startOfToday - 24 * 60 * 60 * 1000;
+                            endMs = startOfToday;
+                        } else if (dateFilter === 'this_week') {
+                            startMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+                        } else if (dateFilter === 'this_month') {
+                            startMs = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                        } else if (dateFilter === 'custom_date' && customDate) {
+                            const [y, m, d] = customDate.split('-');
+                            startMs = new Date(y, m - 1, d).getTime();
+                            endMs = startMs + 24 * 60 * 60 * 1000;
+                        }
+                        customWindow = { startMs, endMs };
+                    }
+
+                    const sourceOrders = dateFilter === 'today' ? orders : [...orders, ...historicalOrders];
+                    const targetShop = posShopId === 'All' ? null : activeLedgerShopObj;
+
+                    const summary = window.SolarisKHQREngine.getShiftAbaTransactions(
+                        abaLedgerMessages,
+                        activeShiftForLedger,
+                        targetShop,
+                        customWindow,
+                        sourceOrders
+                    );
+
+                    // Calculate Expected POS Bank Sales for the exact same Shift / Window so staff can see Variance live
+                    let posExpectedBankKhr = 0;
+                    sourceOrders.forEach(o => {
+                        if (!o || o.status === 'Cancelled' || o.paymentStatus !== 'Paid') return;
+                        if (o.appliedScpId) return; // Exclude SCP credit orders
+                        if (o.paymentMethod !== 'Bank' && !o.abaVerified) return;
+                        if (targetShop && o.shopId !== targetShop.id) return;
+
+                        if (activeShiftForLedger) {
+                            const inShiftById = o.shiftId === activeShiftForLedger.id;
+                            const inShiftByTime = !o.shiftId && o.createdAt >= summary.windowStartMs && o.createdAt <= summary.windowEndMs;
+                            if (inShiftById || inShiftByTime) {
+                                posExpectedBankKhr += Number(o.totalAmount || 0);
+                            }
+                        } else if (o.createdAt >= summary.windowStartMs && o.createdAt <= summary.windowEndMs) {
+                            posExpectedBankKhr += Number(o.totalAmount || 0);
+                        }
+                    });
+
+                    // Apply search & currency filter for the displayed table rows
+                    const searchLower = abaSearchQuery.toLowerCase().trim();
+                    const filteredTransactions = summary.transactions.filter(tx => {
+                        if (abaCurrencyFilter !== 'ALL' && tx.currency !== abaCurrencyFilter) return false;
+                        if (searchLower) {
+                            const matchPayer = (tx.payerName || '').toLowerCase().includes(searchLower);
+                            const matchAcct = (tx.maskedAccount || '').toLowerCase().includes(searchLower);
+                            const matchTrx = (tx.trxId || '').toLowerCase().includes(searchLower);
+                            const matchApv = (tx.apv || '').toLowerCase().includes(searchLower);
+                            const matchInv = (tx.linkedInvoiceNo || '').toLowerCase().includes(searchLower);
+                            const matchAmt = String(tx.amount).includes(searchLower);
+                            return matchPayer || matchAcct || matchTrx || matchApv || matchInv || matchAmt;
+                        }
+                        return true;
+                    });
+
+                    return {
+                        ...summary,
+                        posExpectedBankKhr,
+                        bankVarianceKhr: summary.combinedInKhr - posExpectedBankKhr,
+                        filteredTransactions
+                    };
+                }, [abaLedgerMessages, activeShiftForLedger, activeLedgerShopObj, posShopId, orders, historicalOrders, dateFilter, customDate, startOfToday, abaSearchQuery, abaCurrencyFilter]);
+
+                const exportAbaShiftCSV = () => {
+                    const headers = "No,Payment_Time,Shift_Name,Branch,Payer_Name,Account_Mask,Currency,Amount,Converted_KHR,Trx_ID,APV_Code,Order_Link\n";
+                    const rows = abaShiftAutoSumData.filteredTransactions.map((tx, idx) => {
+                        const shiftObj = shifts?.find(s => s.id === tx.linkedShiftId) || activeShiftForLedger;
+                        const shiftLabel = shiftObj ? `${shiftObj.shiftName || 'Shift'} (${shiftObj.openedBy || 'Staff'})` : 'Unassigned';
+                        const branchLabel = activeLedgerShopObj?.name || 'Branch';
+                        const timeLabel = new Date(tx.effectiveTimestamp).toLocaleString();
+                        const linkLabel = tx.linkedInvoiceNo ? `Invoice ${tx.linkedInvoiceNo}` : 'Direct Scan / Walk-in QR';
+                        return `${idx + 1},"${timeLabel}","${shiftLabel}","${branchLabel}","${(tx.payerName || '').replace(/"/g, '""')}","${tx.maskedAccount}","${tx.currency}",${tx.amount},${tx.convertedKhr},"${tx.trxId}","${tx.apv}","${linkLabel}"`;
+                    }).join("\n");
+
+                    const summaryFooter = `\n\n"SHIFT AUTO-SUM SUMMARY"\n"Total KHR (៛)",${abaShiftAutoSumData.totalKhrAmount}\n"Total USD ($)",${abaShiftAutoSumData.totalUsdAmount}\n"USD Converted to KHR (Rate ${abaShiftAutoSumData.exchangeRate})",${abaShiftAutoSumData.usdInKhr}\n"Grand Total Bank (KHR)",${abaShiftAutoSumData.combinedInKhr}\n"POS Expected Bank (KHR)",${abaShiftAutoSumData.posExpectedBankKhr}\n"Variance (KHR)",${abaShiftAutoSumData.bankVarianceKhr}`;
+
+                    const blob = new Blob([headers + rows + summaryFooter], { type: 'text/csv;charset=utf-8;' });
+                    const link = document.createElement("a");
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `ABA_PayWay_Shift_AutoSum_${getTodayString()}.csv`;
+                    link.click();
+                };
 
 
                 const [cart, setCart] = useState([]);
@@ -17917,6 +18379,75 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     </div>
                                 </div>
 
+                                {/* PHASE 3.1: Sub-Tab Navigation Bar (Store Orders vs. ABA PayWay Live TG Auto-Sum) */}
+                                <div className="flex flex-wrap items-center justify-between gap-2 mb-4 no-print shrink-0">
+                                    <div className="inline-flex bg-stone-200/80 p-1 rounded-2xl border border-stone-300/80 shadow-inner">
+                                        <button
+                                            type="button"
+                                            onClick={() => setPosManageSubTab('orders')}
+                                            className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-black transition-all flex items-center gap-2 ${
+                                                posManageSubTab === 'orders'
+                                                    ? 'bg-white text-stone-900 shadow-sm'
+                                                    : 'text-stone-600 hover:text-stone-900'
+                                            }`}
+                                        >
+                                            <i className="fa-solid fa-receipt text-amber-600"></i>
+                                            <span>Store Orders</span>
+                                            <span className="bg-stone-100 text-stone-700 border border-stone-200 px-2 py-0.5 rounded-full text-[10px] font-black">
+                                                {displayedOrders.length}
+                                            </span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setPosManageSubTab('aba_live');
+                                                syncAbaLedgerNow(false);
+                                            }}
+                                            className={`px-4 py-2 rounded-xl text-xs sm:text-sm font-black transition-all flex items-center gap-2 ${
+                                                posManageSubTab === 'aba_live'
+                                                    ? 'bg-[#E1232E] text-white shadow-md'
+                                                    : 'text-stone-700 hover:text-[#E1232E]'
+                                            }`}
+                                        >
+                                            <span className={`w-2 h-2 rounded-full ${posManageSubTab === 'aba_live' ? 'bg-white animate-ping' : 'bg-[#E1232E]'}`}></span>
+                                            <i className="fa-brands fa-telegram"></i>
+                                            <span>ABA PayWay Live (TG Auto-Sum)</span>
+                                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-black ${
+                                                posManageSubTab === 'aba_live'
+                                                    ? 'bg-white text-[#E1232E]'
+                                                    : 'bg-red-100 text-red-700 border border-red-200'
+                                            }`}>
+                                                {abaShiftAutoSumData.totalCount}
+                                            </span>
+                                        </button>
+                                    </div>
+
+                                    {posManageSubTab === 'aba_live' && (
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                type="button"
+                                                disabled={isSyncingAbaLedger}
+                                                onClick={() => syncAbaLedgerNow(true)}
+                                                className="bg-sky-600 hover:bg-sky-700 text-white px-3.5 py-2 rounded-xl text-xs font-black shadow-sm transition flex items-center gap-1.5 active:scale-95 disabled:opacity-50"
+                                            >
+                                                <i className={`fa-solid ${isSyncingAbaLedger ? 'fa-spinner fa-spin' : 'fa-rotate'}`}></i>
+                                                <span>{isSyncingAbaLedger ? 'Syncing TG...' : 'Sync Telegram Now'}</span>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={exportAbaShiftCSV}
+                                                className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-2 rounded-xl text-xs font-black shadow-sm transition flex items-center gap-1.5 active:scale-95"
+                                                title="Export Shift ABA Transactions to CSV"
+                                            >
+                                                <i className="fa-solid fa-file-csv"></i>
+                                                <span className="hidden sm:inline">Export CSV</span>
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {posManageSubTab === 'orders' ? (
+                                <>
                                 {/* 2. Unified Filter Card */}
                                 <div className="bg-white rounded-xl sm:rounded-2xl shadow-sm border border-stone-200 mb-4 sm:mb-6 no-print p-3 sm:p-4 shrink-0">
                                     <div className="flex items-center justify-between mb-3 border-b border-stone-100 pb-2">
@@ -18156,6 +18687,361 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </tbody>
                                     </table>
                                 </div>
+                                </>
+                                ) : (
+                                /* =====================================================================
+                                   PHASE 3.2 & 3.3: ABA PAYWAY LIVE (TG) SHIFT AUTO-SUM & LEDGER TABLE
+                                   ===================================================================== */
+                                <div className="space-y-4 sm:space-y-5 animate-fade-in">
+                                    {/* Top 4 Shift Auto-Sum Summary Cards */}
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 shrink-0">
+                                        {/* Card 1: Active Shift Time Window */}
+                                        <div className="bg-stone-900 text-white p-4 rounded-2xl shadow-md border border-stone-800 flex flex-col justify-between">
+                                            <div className="flex items-center justify-between gap-2 mb-2">
+                                                <span className="text-[10px] font-black uppercase tracking-widest text-amber-400 flex items-center gap-1.5">
+                                                    <i className="fa-solid fa-clock"></i> Shift Time Window
+                                                </span>
+                                                {activeShiftForLedger ? (
+                                                    <span className={`text-[10px] font-black px-2 py-0.5 rounded-full uppercase ${
+                                                        activeShiftForLedger.status === 'Open'
+                                                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 animate-pulse'
+                                                            : 'bg-stone-700 text-stone-300'
+                                                    }`}>
+                                                        {activeShiftForLedger.status === 'Open' ? '● Live Open' : 'Closed Shift'}
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-[10px] font-bold bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full">
+                                                        Date Filter Window
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {activeShiftForLedger ? (
+                                                <div>
+                                                    <div className="text-base sm:text-lg font-black text-white truncate">
+                                                        {activeShiftForLedger.shiftName || 'Shift'} • {activeShiftForLedger.openedBy}
+                                                    </div>
+                                                    <div className="text-[11px] text-stone-300 font-mono mt-1 space-y-0.5">
+                                                        <div><span className="text-stone-400">Start:</span> {formatDateTime(activeShiftForLedger.openedAt)}</div>
+                                                        <div>
+                                                            <span className="text-stone-400">End:</span>{' '}
+                                                            {activeShiftForLedger.closedAt ? formatDateTime(activeShiftForLedger.closedAt) : 'Now (Listening Live...)'}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div>
+                                                    <div className="text-sm font-bold text-stone-200">No Active Shift Selected</div>
+                                                    <p className="text-[11px] text-stone-400 mt-1 leading-snug">
+                                                        Showing ABA transactions for the selected Date Range filter. Open a shift or select one below.
+                                                    </p>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Card 2: Auto-Sum KHR (៛) */}
+                                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-between">
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-[11px] font-black text-stone-500 uppercase tracking-wider">
+                                                    TG Auto-Sum (KHR ៛)
+                                                </span>
+                                                <span className="bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-black px-2 py-0.5 rounded-full">
+                                                    {abaShiftAutoSumData.khrCount} Trx
+                                                </span>
+                                            </div>
+                                            <div className="text-2xl sm:text-3xl font-black text-stone-900 tracking-tight my-1">
+                                                {abaShiftAutoSumData.totalKhrAmount.toLocaleString()} <span className="text-base font-bold text-amber-600">៛</span>
+                                            </div>
+                                            <div className="text-[11px] text-stone-400 font-medium flex items-center justify-between">
+                                                <span>riel transfers in window</span>
+                                                <span className="font-mono text-stone-500">100% KHR</span>
+                                            </div>
+                                        </div>
+
+                                        {/* Card 3: Auto-Sum USD ($) */}
+                                        <div className="bg-white p-4 rounded-2xl shadow-sm border border-stone-200 flex flex-col justify-between">
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-[11px] font-black text-stone-500 uppercase tracking-wider">
+                                                    TG Auto-Sum (USD $)
+                                                </span>
+                                                <span className="bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-black px-2 py-0.5 rounded-full">
+                                                    {abaShiftAutoSumData.usdCount} Trx
+                                                </span>
+                                            </div>
+                                            <div className="text-2xl sm:text-3xl font-black text-emerald-600 tracking-tight my-1">
+                                                ${abaShiftAutoSumData.totalUsdAmount.toFixed(2)}
+                                            </div>
+                                            <div className="text-[11px] text-stone-500 font-bold flex items-center justify-between bg-emerald-50/70 px-2 py-1 rounded-lg border border-emerald-100">
+                                                <span>≈ {abaShiftAutoSumData.usdInKhr.toLocaleString()} ៛</span>
+                                                <span className="text-[10px] text-stone-400 font-mono">@ {abaShiftAutoSumData.exchangeRate.toLocaleString()}៛</span>
+                                            </div>
+                                        </div>
+
+                                        {/* Card 4: Grand Total Bank (Converted to ៛) + POS Variance */}
+                                        <div className="bg-gradient-to-br from-blue-50 to-indigo-50/70 p-4 rounded-2xl shadow-sm border border-blue-200 flex flex-col justify-between">
+                                            <div className="flex items-center justify-between mb-1">
+                                                <span className="text-[11px] font-black text-blue-900 uppercase tracking-wider flex items-center gap-1">
+                                                    <i className="fa-solid fa-building-columns text-blue-600"></i> Total TG Bank (in ៛)
+                                                </span>
+                                                <span className="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full">
+                                                    {abaShiftAutoSumData.totalCount} Total
+                                                </span>
+                                            </div>
+                                            <div className="text-2xl sm:text-3xl font-black text-blue-950 tracking-tight my-1">
+                                                {abaShiftAutoSumData.combinedInKhr.toLocaleString()} <span className="text-base font-bold text-blue-600">៛</span>
+                                            </div>
+                                            <div className="text-[11px] font-bold flex items-center justify-between pt-1.5 border-t border-blue-200/80">
+                                                <span className="text-stone-600">POS Bank: {abaShiftAutoSumData.posExpectedBankKhr.toLocaleString()} ៛</span>
+                                                <span className={`font-black ${
+                                                    abaShiftAutoSumData.bankVarianceKhr === 0
+                                                        ? 'text-emerald-700'
+                                                        : abaShiftAutoSumData.bankVarianceKhr > 0
+                                                            ? 'text-blue-700'
+                                                            : 'text-red-600'
+                                                }`}>
+                                                    Var: {abaShiftAutoSumData.bankVarianceKhr > 0 ? '+' : ''}{abaShiftAutoSumData.bankVarianceKhr.toLocaleString()} ៛
+                                                </span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Filter & Shift Selector Bar for ABA Live Tab */}
+                                    <div className="bg-white rounded-2xl shadow-sm border border-stone-200 p-3 sm:p-4">
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                                            {/* Branch Selector */}
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Branch & Telegram Group</label>
+                                                {canSelectMultiple ? (
+                                                    <select
+                                                        className="w-full border border-stone-300 rounded-xl px-3 py-2 text-xs sm:text-sm outline-none focus:border-red-500 bg-stone-50 font-bold text-stone-800 cursor-pointer"
+                                                        value={posShopId}
+                                                        onChange={e => {
+                                                            setPosShopId(e.target.value);
+                                                            setSelectedLedgerShiftId('ACTIVE');
+                                                        }}
+                                                    >
+                                                        {(isSuper || allowedShopIds.includes('All')) && <option value="All">All Branches</option>}
+                                                        {shops.filter(s => isSuper || allowedShopIds.includes('All') || allowedShopIds.includes(s.id)).map(s => (
+                                                            <option key={s.id} value={s.id}>
+                                                                {s.name} ({s.khqrConfig?.paywayChatId || 'No Chat ID'})
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                ) : (
+                                                    <div className="w-full bg-stone-100 text-stone-800 px-3 py-2 rounded-xl font-bold border border-stone-200 text-xs sm:text-sm truncate">
+                                                        {activeLedgerShopObj?.name || 'Branch'} ({activeLedgerShopObj?.khqrConfig?.paywayChatId || 'Default'})
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Shift Window Selector */}
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Shift Window Scope</label>
+                                                <select
+                                                    className="w-full border border-stone-300 rounded-xl px-3 py-2 text-xs sm:text-sm outline-none focus:border-red-500 bg-stone-50 font-bold text-stone-800 cursor-pointer"
+                                                    value={selectedLedgerShiftId}
+                                                    onChange={e => setSelectedLedgerShiftId(e.target.value)}
+                                                >
+                                                    <option value="ACTIVE">⚡ Auto: Current / Latest Shift</option>
+                                                    <option value="ALL_WINDOW">📅 Use Date Filter ({dateFilter.toUpperCase()})</option>
+                                                    {branchShiftsForLedger.map(sh => {
+                                                        const shShopName = shops.find(s => s.id === sh.shopId)?.name || '';
+                                                        const openedTime = new Date(sh.openedAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                                                        return (
+                                                            <option key={sh.id} value={sh.id}>
+                                                                {sh.status === 'Open' ? '🟢 OPEN' : '⚪ CLOSED'} • {sh.shiftName || 'Shift'} ({sh.openedBy}) - {openedTime} {posShopId === 'All' ? `[${shShopName}]` : ''}
+                                                            </option>
+                                                        );
+                                                    })}
+                                                </select>
+                                            </div>
+
+                                            {/* Currency Filter */}
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Currency Filter</label>
+                                                <div className="flex bg-stone-100 p-1 rounded-xl border border-stone-200">
+                                                    {['ALL', 'KHR', 'USD'].map(cur => (
+                                                        <button
+                                                            key={cur}
+                                                            type="button"
+                                                            onClick={() => setAbaCurrencyFilter(cur)}
+                                                            className={`flex-1 py-1.5 rounded-lg text-xs font-black transition ${
+                                                                abaCurrencyFilter === cur
+                                                                    ? 'bg-stone-900 text-white shadow-sm'
+                                                                    : 'text-stone-600 hover:text-stone-900'
+                                                            }`}
+                                                        >
+                                                            {cur === 'ALL' ? 'All' : cur === 'KHR' ? '៛ KHR' : '$ USD'}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            {/* Search Box */}
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Search Payer / APV / Trx ID</label>
+                                                <div className="relative">
+                                                    <i className="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-stone-400 text-xs"></i>
+                                                    <input
+                                                        type="text"
+                                                        placeholder="e.g. SOKUNTH, 394131, *636..."
+                                                        className="w-full border border-stone-300 rounded-xl pl-8 pr-7 py-2 text-xs sm:text-sm outline-none focus:border-red-500 bg-stone-50 focus:bg-white font-medium"
+                                                        value={abaSearchQuery}
+                                                        onChange={e => setAbaSearchQuery(e.target.value)}
+                                                    />
+                                                    {abaSearchQuery && (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setAbaSearchQuery('')}
+                                                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-700"
+                                                        >
+                                                            <i className="fa-solid fa-xmark text-xs"></i>
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Live Telegram ABA PayWay Transaction Table */}
+                                    <div className="-mx-4 md:mx-0 bg-white border-y md:border md:rounded-2xl border-stone-200 shadow-sm overflow-x-auto table-wrapper pb-2">
+                                        <table className="w-full min-w-[1100px] text-left text-sm border-collapse border border-stone-300">
+                                            <thead className="sticky top-0 z-20 shadow-sm">
+                                                <tr className="text-stone-700 uppercase tracking-wider bg-stone-100 text-[11px]">
+                                                    <th className="p-3 font-bold border border-stone-300 w-12 text-center">#</th>
+                                                    <th className="p-3 font-bold border border-stone-300">Payment Date & Time</th>
+                                                    <th className="p-3 font-bold border border-stone-300">Payer Name & Account</th>
+                                                    <th className="p-3 font-bold border border-stone-300 text-center">Currency</th>
+                                                    <th className="p-3 font-bold border border-stone-300 text-right">Original Amount</th>
+                                                    <th className="p-3 font-bold border border-stone-300 text-right">Converted (៛)</th>
+                                                    <th className="p-3 font-bold border border-stone-300">ABA Trx. ID & APV</th>
+                                                    <th className="p-3 font-bold border border-stone-300">Order Link Status</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {abaShiftAutoSumData.filteredTransactions.map((tx, idx) => (
+                                                    <tr key={tx.trxId} className="hover:bg-stone-50 bg-white transition-colors">
+                                                        <td className="p-3 border border-stone-300 text-center font-bold text-stone-400 text-xs">
+                                                            {idx + 1}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 whitespace-nowrap">
+                                                            <div className="font-bold text-stone-800 text-xs">
+                                                                {formatDateTime(tx.effectiveTimestamp)}
+                                                            </div>
+                                                            {tx.paidAtStr && (
+                                                                <div className="text-[10px] font-mono text-stone-400 mt-0.5">
+                                                                    ABA Msg: "{tx.paidAtStr}"
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300">
+                                                            <div className="font-black text-stone-900 text-sm flex items-center gap-1.5">
+                                                                <span>{tx.payerName}</span>
+                                                                <span className="text-xs font-mono font-bold bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded border border-stone-200">
+                                                                    ({tx.maskedAccount})
+                                                                </span>
+                                                            </div>
+                                                            {tx.merchantName && (
+                                                                <div className="text-[10px] text-stone-400 font-medium mt-0.5">
+                                                                    at {tx.merchantName}
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-center">
+                                                            <span className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider border ${
+                                                                tx.currency === 'USD'
+                                                                    ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                                                    : 'bg-amber-100 text-amber-900 border-amber-300'
+                                                            }`}>
+                                                                {tx.currency === 'USD' ? '$ USD' : '៛ KHR'}
+                                                            </span>
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-right font-black whitespace-nowrap">
+                                                            {tx.currency === 'USD' ? (
+                                                                <span className="text-emerald-700 text-base">${tx.amount.toFixed(2)}</span>
+                                                            ) : (
+                                                                <span className="text-stone-900 text-base">{tx.amount.toLocaleString()} ៛</span>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-right font-black text-blue-900 whitespace-nowrap bg-blue-50/30">
+                                                            {tx.convertedKhr.toLocaleString()} ៛
+                                                            {tx.currency === 'USD' && (
+                                                                <div className="text-[9px] font-mono text-stone-400 font-normal">
+                                                                    @ {tx.exchangeRateUsed.toLocaleString()}៛
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 font-mono text-xs">
+                                                            <div className="flex items-center gap-1.5">
+                                                                <span className="bg-amber-100 text-amber-900 font-black px-2 py-0.5 rounded border border-amber-200 text-[11px]">
+                                                                    APV: {tx.apv}
+                                                                </span>
+                                                            </div>
+                                                            <div className="text-[10px] text-stone-400 mt-1">
+                                                                Trx: {tx.trxId}
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300">
+                                                            {tx.linkedInvoiceNo ? (
+                                                                <div className="flex flex-col gap-0.5">
+                                                                    <span className="inline-flex items-center gap-1 bg-emerald-50 text-emerald-800 border border-emerald-200 px-2 py-0.5 rounded text-xs font-black w-fit">
+                                                                        <i className="fa-solid fa-link text-emerald-600 text-[10px]"></i>
+                                                                        {tx.linkedInvoiceNo}
+                                                                    </span>
+                                                                    <span className="text-[10px] text-stone-400 font-medium">
+                                                                        Linked to Order
+                                                                    </span>
+                                                                </div>
+                                                            ) : (
+                                                                <div className="flex flex-col gap-0.5">
+                                                                    <span className="inline-flex items-center gap-1 bg-sky-50 text-sky-800 border border-sky-200 px-2 py-0.5 rounded text-xs font-bold w-fit">
+                                                                        <i className="fa-solid fa-qrcode text-sky-600 text-[10px]"></i>
+                                                                        Direct Scan / Walk-in QR
+                                                                    </span>
+                                                                    <span className="text-[10px] text-stone-400 font-medium">
+                                                                        Included in Shift Auto-Sum
+                                                                    </span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                                {abaShiftAutoSumData.filteredTransactions.length === 0 && (
+                                                    <tr>
+                                                        <td colSpan="8" className="text-center py-12 text-stone-400 border border-stone-300">
+                                                            <i className="fa-brands fa-telegram text-4xl mb-2 opacity-30 block"></i>
+                                                            <div className="font-bold text-stone-600">No ABA PayWay messages recorded for this shift window yet.</div>
+                                                            <div className="text-xs text-stone-400 mt-1">
+                                                                Incoming KHR (៛) and USD ($) notifications in your Telegram Group will appear here and auto-sum automatically.
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </tbody>
+                                            {abaShiftAutoSumData.filteredTransactions.length > 0 && (
+                                                <tfoot className="bg-stone-900 text-white font-black text-xs sm:text-sm">
+                                                    <tr>
+                                                        <td colSpan="4" className="p-3 border border-stone-700 text-right uppercase tracking-wider text-stone-300">
+                                                            Shift Auto-Sum Totals ({abaShiftAutoSumData.totalCount} Trx):
+                                                        </td>
+                                                        <td className="p-3 border border-stone-700 text-right whitespace-nowrap">
+                                                            <div className="text-amber-400">{abaShiftAutoSumData.totalKhrAmount.toLocaleString()} ៛</div>
+                                                            {abaShiftAutoSumData.totalUsdAmount > 0 && (
+                                                                <div className="text-emerald-400 text-xs mt-0.5">+ ${abaShiftAutoSumData.totalUsdAmount.toFixed(2)}</div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-700 text-right text-base text-sky-300 whitespace-nowrap">
+                                                            {abaShiftAutoSumData.combinedInKhr.toLocaleString()} ៛
+                                                        </td>
+                                                        <td colSpan="2" className="p-3 border border-stone-700 text-left text-[11px] text-stone-300 font-bold">
+                                                            Linked: {abaShiftAutoSumData.linkedOrdersCount} • Direct Scan: {abaShiftAutoSumData.directScanCount}
+                                                        </td>
+                                                    </tr>
+                                                </tfoot>
+                                            )}
+                                        </table>
+                                    </div>
+                                </div>
+                                )}
                             </div>
                         )}
 
