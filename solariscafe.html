@@ -541,6 +541,85 @@
                 return R * c; // Distance in meters
             };
 
+            // NEW: Centralized CRM Member & Charge Status Discount Evaluator (Used by both Customer Portal & POSView Carts)
+            const evaluateCustomerChargeStatus = (profile, currentShopId, item, product) => {
+                if (!profile) return null;
+                const rawChargeStatus = String(profile.chargeStatus || 'Normal').trim();
+                if (!rawChargeStatus || rawChargeStatus === 'Normal' || rawChargeStatus === 'Normal Price') return null;
+
+                // Evaluate Branch Eligibility (All / Global vs Specific Branches)
+                const scope = profile.chargeStatusScope || 'All';
+                const allowedShops = Array.isArray(profile.chargeStatusShopIds) ? profile.chargeStatusShopIds : [];
+                const isGlobalScope = scope === 'All' || scope === 'Global' || allowedShops.length === 0;
+                const isShopEligible = isGlobalScope || !currentShopId || allowedShops.includes(currentShopId);
+                if (!isShopEligible) return null;
+
+                const tierLabel = (profile.customerType && profile.customerType !== 'Normal') ? profile.customerType : 'Member';
+                const statusUpper = rawChargeStatus.toUpperCase();
+                const basePrice = Number(item.price) || 0;
+                const paidQty = Math.max(0, (Number(item.quantity) || 0) - (Number(item.redeemedQty) || 0));
+
+                if (statusUpper.includes('FOC')) {
+                    return {
+                        name: 'VIP',
+                        effectiveUnitPrice: 0,
+                        lineTotal: 0,
+                        savings: basePrice * paidQty,
+                        totalQtyForKDS: item.quantity,
+                        freeQuantity: 0,
+                        badgeLabel: `${tierLabel} (FOC)`,
+                        promoNames: [`${tierLabel} (FOC)`]
+                    };
+                }
+
+                if (statusUpper.includes('COG')) {
+                    let unitCost = 0;
+                    if (product) {
+                        if (item.size === 'S' || item.size === 'Standard') {
+                            unitCost = Number(product.costSmall) || 0;
+                        } else if (item.size === 'L') {
+                            unitCost = Number(product.costLarge) || Number(product.costSmall) || 0;
+                        } else {
+                            unitCost = Number(product.costSmall) || 0;
+                        }
+                    }
+                    const effectiveUnitPrice = Math.min(basePrice, Math.max(0, unitCost));
+                    const lineTotal = effectiveUnitPrice * paidQty;
+                    return {
+                        name: 'VIP',
+                        effectiveUnitPrice,
+                        lineTotal,
+                        savings: Math.max(0, (basePrice * paidQty) - lineTotal),
+                        totalQtyForKDS: item.quantity,
+                        freeQuantity: 0,
+                        badgeLabel: `${tierLabel} (COG)`,
+                        promoNames: [`${tierLabel} (COG)`]
+                    };
+                }
+
+                // Custom Discount Percentage (Supports "10%", "15% Dis", "12.5%", or plain numeric "20")
+                const pctMatch = statusUpper.match(/(\d+(?:\.\d+)?)/);
+                if (pctMatch) {
+                    const pct = Math.min(100, Math.max(0, parseFloat(pctMatch[1])));
+                    if (pct > 0) {
+                        const effectiveUnitPrice = Math.max(0, Math.round(basePrice * (1 - pct / 100)));
+                        const lineTotal = effectiveUnitPrice * paidQty;
+                        return {
+                            name: 'VIP',
+                            effectiveUnitPrice,
+                            lineTotal,
+                            savings: Math.max(0, (basePrice * paidQty) - lineTotal),
+                            totalQtyForKDS: item.quantity,
+                            freeQuantity: 0,
+                            badgeLabel: `${tierLabel} (-${pct}%)`,
+                            promoNames: [`${tierLabel} ${pct}% Off`]
+                        };
+                    }
+                }
+
+                return null;
+            };
+
             // OPTIMIZATION: Moved from client-side render loop to transaction calculation
             const calculateLoyaltyForOrder = (orderAmount, redeemedPoints, currentLoyaltyData, globalPointsConfig) => {
                 if (!globalPointsConfig?.pointsEnabled) return currentLoyaltyData;
@@ -4929,65 +5008,68 @@
                         const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
 
                         let docId = foundCustomer?.id || null;
-                        let systemCustomerId = foundCustomer?.customerId || null;
-                        let hasWelcomeDiscount = false;
+                    let systemCustomerId = foundCustomer?.customerId || null;
+                    let hasWelcomeDiscount = false;
+                    let syncedCustomerProfile = foundCustomer ? { ...foundCustomer } : null;
 
-                        if (foundCustomer) {
-                            hasWelcomeDiscount = !!foundCustomer.hasWelcomeDiscount;
-                            const updates = {
-                                name: trimmedName,
-                                sex: sex || 'M',
-                                lastVisit: Date.now()
-                            };
-                            if (!bypassPin && !foundCustomer.pin && cleanPin.length === 4) {
-                                updates.pin = cleanPin;
-                            }
-                            await updateDoc(doc(safeDB(), 'customers', foundCustomer.id), updates).catch(err => console.warn("Profile update warning:", err));
-                        } else {
-                            // New Customer Registration
-                            hasWelcomeDiscount = !!(globalPoints?.welcomeDiscountEnabled && Number(globalPoints?.welcomeDiscountPct) > 0);
-                            const randomSeq = String(Date.now()).slice(-6);
-                            systemCustomerId = `${shopPrefix}-${randomSeq}`;
-                            const newCustomerRef = doc(collection(safeDB(), 'customers'));
-                            docId = newCustomerRef.id;
-
-                            const newProfile = {
-                                customerId: systemCustomerId,
-                                phone: formattedPhone,
-                                name: trimmedName,
-                                sex: sex || 'M',
-                                pin: cleanPin.length === 4 ? cleanPin : null,
-                                status: 'Active',
-                                customerType: 'Normal',
-                                chargeStatus: 'Normal',
-                                chargeStatusScope: 'All',
-                                chargeStatusShopIds: [],
-                                hasWelcomeDiscount,
-                                registeredAtShop: targetShopId,
-                                createdAt: Date.now(),
-                                lastVisit: Date.now(),
-                                loyaltyData: {
-                                    activePoints: 0,
-                                    freeClaims: 0,
-                                    pointBatches: [],
-                                    totalSpent: 0,
-                                    totalRedeemed: 0,
-                                    refilledDeducted: 0
-                                }
-                            };
-                            await setDoc(newCustomerRef, newProfile).catch(err => console.warn("New profile creation warning:", err));
+                    if (foundCustomer) {
+                        hasWelcomeDiscount = !!foundCustomer.hasWelcomeDiscount;
+                        const updates = {
+                            name: trimmedName,
+                            sex: sex || 'M',
+                            lastVisit: Date.now()
+                        };
+                        if (!bypassPin && !foundCustomer.pin && cleanPin.length === 4) {
+                            updates.pin = cleanPin;
                         }
+                        syncedCustomerProfile = { ...foundCustomer, ...updates };
+                        await updateDoc(doc(safeDB(), 'customers', foundCustomer.id), updates).catch(err => console.warn("Profile update warning:", err));
+                    } else {
+                        // New Customer Registration
+                        hasWelcomeDiscount = !!(globalPoints?.welcomeDiscountEnabled && Number(globalPoints?.welcomeDiscountPct) > 0);
+                        const randomSeq = String(Date.now()).slice(-6);
+                        systemCustomerId = `${shopPrefix}-${randomSeq}`;
+                        const newCustomerRef = doc(collection(safeDB(), 'customers'));
+                        docId = newCustomerRef.id;
 
-                        onSubmit(e, {
+                        const newProfile = {
+                            customerId: systemCustomerId,
                             phone: formattedPhone,
                             name: trimmedName,
                             sex: sex || 'M',
+                            pin: cleanPin.length === 4 ? cleanPin : null,
+                            status: 'Active',
+                            customerType: 'Normal',
+                            chargeStatus: 'Normal',
+                            chargeStatusScope: 'All',
+                            chargeStatusShopIds: [],
                             hasWelcomeDiscount,
-                            systemCustomerId,
-                            docId,
-                            fullData: foundCustomer || null
-                        });
-                    } catch (err) {
+                            registeredAtShop: targetShopId,
+                            createdAt: Date.now(),
+                            lastVisit: Date.now(),
+                            loyaltyData: {
+                                activePoints: 0,
+                                freeClaims: 0,
+                                pointBatches: [],
+                                totalSpent: 0,
+                                totalRedeemed: 0,
+                                refilledDeducted: 0
+                            }
+                        };
+                        syncedCustomerProfile = { id: docId, ...newProfile };
+                        await setDoc(newCustomerRef, newProfile).catch(err => console.warn("New profile creation warning:", err));
+                    }
+
+                    onSubmit(e, {
+                        phone: formattedPhone,
+                        name: trimmedName,
+                        sex: sex || 'M',
+                        hasWelcomeDiscount,
+                        systemCustomerId,
+                        docId,
+                        fullData: syncedCustomerProfile
+                    });
+                } catch (err) {
                         console.error("Setup submit error:", err);
                         setErrorMsg(err.message || "Failed to save profile.");
                     } finally {
@@ -5986,7 +6068,7 @@
                                 <button
                                     type="button"
                                     onClick={onClose}
-                                    className="w-full py-2.5 rounded-xl font-bold text-xs text-stone-500 hover:bg-stone-100 transition"
+                                    className="w-full bg-stone-100 hover:bg-stone-200 text-stone-600 font-bold py-2.5 px-4 rounded-xl text-xs transition"
                                 >
                                     {cancelBtnText || t.backToCartBtn}
                                 </button>
@@ -5996,7 +6078,7 @@
                 );
             }
 
-            function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem, customerLoyalty, globalPoints, updateRedeemedQty, liveLocationStatus, onEditProfile, lang = 'en', selectedPaymentChoice = 'COUNTER', setSelectedPaymentChoice, isKhqrEnabled = false, isRemoteKhqrRequired = false }) {
+            function CartModal({ cart, products, sessionInfo, setSessionInfo, shops, tables, cartNotes, setCartNotes, cartTotal, updateCartQty, handleCheckout, isSubmitting, onClose, onEditItem, customerLoyalty, globalPoints, updateRedeemedQty, liveLocationStatus, onEditProfile, lang = 'en', selectedPaymentChoice = 'COUNTER', setSelectedPaymentChoice, isKhqrEnabled = false, isRemoteKhqrRequired = false, customerProfile = null }) {
                 const t = SOLARIS_I18N[lang] || SOLARIS_I18N.en;
                 const canCheckout = !isSubmitting && sessionInfo.shopId && (sessionInfo.mode === 'TAKEAWAY' || (sessionInfo.mode === 'DINE_IN' && sessionInfo.tableId)) && !liveLocationStatus?.isForbidden;
                 const totalRedeemedInCart = cart.reduce((sum, i) => sum + (i.redeemedQty || 0), 0);
@@ -6023,11 +6105,21 @@
 
                                     <div className="flex justify-between items-center mb-3">
                                         <span className="text-xs font-bold text-stone-500 uppercase tracking-wider">{t.orderFor}</span>
-                                        <div className="flex items-center gap-1.5 font-bold text-stone-800 text-sm">
+                                        <div className="flex items-center flex-wrap justify-end gap-1.5 font-bold text-stone-800 text-sm">
                                             <span>
                                                 {sessionInfo.customerName === 'Walk-in' ? t.walkIn : 
                                                 `${sessionInfo.customerSex === 'F' ? `${t.ms} ` : `${t.mr} `}${sessionInfo.customerName}`}
                                             </span>
+                                            {customerProfile?.customerType === 'Member' && (
+                                                <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                                                    Member
+                                                </span>
+                                            )}
+                                            {customerProfile?.chargeStatus && customerProfile.chargeStatus !== 'Normal' && customerProfile.chargeStatus !== 'Normal Price' && (
+                                                <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 border border-purple-300">
+                                                    <i className="fa-solid fa-crown mr-0.5"></i>{customerProfile.chargeStatus}
+                                                </span>
+                                            )}
                                             {globalPoints?.pointsEnabled && sessionInfo.isSetup && (
                                                 <>
                                                     <span className="text-stone-300">|</span>
@@ -6810,22 +6902,28 @@
                     }
                     
                     const { query, where, onSnapshot, collection } = window.FirebaseApp;
+                    const formattedTarget = formatPhoneNumber(targetPhone);
+                    const rawDigitsTarget = String(targetPhone).replace(/\D/g, '');
+                    const phoneVariants = Array.from(new Set([targetPhone, formattedTarget, rawDigitsTarget].filter(Boolean)));
                     
-                    // 1. Fetch exact customer DB profile for VIP tiering and manually refilled points
-                    const qCust = query(collection(db, 'customers'), where('phone', '==', targetPhone));
+                    // 1. Fetch exact customer DB profile for VIP/Member tiering (supports both formatted "012 345 678" and raw "012345678")
+                    const qCust = phoneVariants.length > 1
+                        ? query(collection(db, 'customers'), where('phone', 'in', phoneVariants))
+                        : query(collection(db, 'customers'), where('phone', '==', formattedTarget));
                     
                     const unsubCust = onSnapshot(qCust, snap => {
                         if (!snap.empty) {
-                            const data = snap.docs[0].data();
+                            // Prefer the document that has a non-Normal chargeStatus or Member customerType if duplicates exist
+                            const bestDoc = snap.docs.find(d => d.data()?.chargeStatus && d.data()?.chargeStatus !== 'Normal') || snap.docs[0];
+                            const data = bestDoc.data();
                             setLiveRefilledPoints(data.refilledPoints || 0);
                             
-                            // Only lock the profile state if the target matches the actively logged-in session
+                            // Lock the profile state if the target matches the actively logged-in session
                             if (targetPhone === sessionInfo.customerPhone && sessionInfo.isSetup) {
-                                setCustomerProfile(prev => ({ ...(prev || {}), id: snap.docs[0].id, ...data }));
+                                setCustomerProfile(prev => ({ ...(prev || {}), id: bestDoc.id, ...data }));
                             }
                         } else {
                             setLiveRefilledPoints(0);
-                            // BUG FIX: Removed aggressive nullification to preserve data securely passed by SetupModal
                         }
                     });
 
@@ -7141,6 +7239,13 @@
 
                 const handleSetupSubmit = (e, data) => {
                     if (e) e.preventDefault();
+                    if (data?.fullData) {
+                        setCustomerProfile(prev => ({
+                            ...(prev || {}),
+                            ...data.fullData,
+                            id: data.docId || data.fullData.id || prev?.id
+                        }));
+                    }
                     setSessionInfo(prev => ({
                         ...prev,
                         isSetup: true,
@@ -7748,8 +7853,9 @@
                     const activePromos = activeBranchPromos;
 
                     // HAPPY HOUR CHECK
+                    const effectivePortalShopId = sessionInfo.shopId || (detectedShop ? detectedShop.id : null) || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : null);
                     const activeHappyHour = (() => {
-                        const targetShop = shops?.find(s => s.id === sessionInfo.shopId);
+                        const targetShop = shops?.find(s => s.id === effectivePortalShopId);
                         if (!targetShop || !targetShop.happyHourEnabled) return null;
                         const now = new Date();
                         const currentMins = now.getHours() * 60 + now.getMinutes();
@@ -7774,13 +7880,8 @@
                         return null;
                     })();
 
-                    const customerChargeStatus = customerProfile?.chargeStatus || 'Normal';
-                    const scope = customerProfile?.chargeStatusScope || 'All';
-                    const allowedShops = customerProfile?.chargeStatusShopIds || [];
-                    const isGlobalVIP = scope === 'All' || scope === 'Global';
-                    const isShopEligible = isGlobalVIP || allowedShops.includes(sessionInfo.shopId);
-
                     const processed = cart.map(item => {
+                        const product = products.find(p => p.id === item.productId);
                         let freeQty = 0;
                         let totalQtyForKDS = item.quantity;
                         const redeemedQty = item.redeemedQty || 0;
@@ -7821,7 +7922,7 @@
                             if (activeHappyHour) {
                                 let effPrice = item.price;
                                 if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
+                                    effPrice = Math.round(item.price - (item.price * (activeHappyHour.value / 100)));
                                 } else {
                                     effPrice = Math.max(0, item.price - activeHappyHour.value);
                                 }
@@ -7848,7 +7949,7 @@
                                 let savings = 0;
 
                                 if (promo.type === 'DISCOUNT_PCT') {
-                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    effPrice = Math.round(item.price - (item.price * (Number(promo.discountValue || 0) / 100)));
                                     lTotal = effPrice * paidQty;
                                     savings = (item.price * paidQty) - lTotal;
                                 } else if (promo.type === 'DISCOUNT_FIXED') {
@@ -7885,7 +7986,7 @@
                             // Scenario 3: Welcome Discount
                             if (sessionInfo.hasWelcomeDiscount && globalPoints?.welcomeDiscountEnabled && globalPoints?.welcomeDiscountPct > 0) {
                                 const welcomePct = Number(globalPoints.welcomeDiscountPct) / 100;
-                                const effPrice = item.price - (item.price * welcomePct);
+                                const effPrice = Math.round(item.price - (item.price * welcomePct));
                                 const lTotal = effPrice * paidQty;
                                 addScenario({
                                     name: 'Welcome',
@@ -7898,54 +7999,10 @@
                                 });
                             }
 
-                            // Scenario 4: VIP / Member Discount
-                            if (customerChargeStatus !== 'Normal' && isShopEligible) {
-                                const tierLabel = customerProfile?.customerType && customerProfile.customerType !== 'Normal' ? customerProfile.customerType : 'Member';
-                                const statusStr = String(customerChargeStatus).toUpperCase();
-                                
-                                let effPrice = item.price;
-                                let lTotal = item.price * paidQty;
-                                let savings = 0;
-                                let pName = '';
-
-                                if (statusStr.includes('FOC')) {
-                                    effPrice = 0;
-                                    lTotal = 0;
-                                    savings = item.price * paidQty;
-                                    pName = `${tierLabel} (FOC)`;
-                                } else if (statusStr.includes('COG')) {
-                                    const product = products.find(p => p.id === item.productId);
-                                    let itemCost = 0;
-                                    if (product) {
-                                        if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
-                                        else if (item.size === 'L') itemCost = product.costLarge || 0;
-                                        else itemCost = product.costSmall || 0; 
-                                    }
-                                    effPrice = itemCost;
-                                    lTotal = itemCost * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
-                                    pName = `${tierLabel} (COG)`;
-                                } else {
-                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
-                                    if (!isNaN(pct) && pct > 0) {
-                                        effPrice = item.price - (item.price * (pct / 100));
-                                        lTotal = effPrice * paidQty;
-                                        savings = (item.price * paidQty) - lTotal;
-                                        pName = `${tierLabel} ${pct}%`;
-                                    }
-                                }
-
-                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
-                                    addScenario({
-                                        name: 'VIP',
-                                        effectiveUnitPrice: effPrice,
-                                        lineTotal: lTotal,
-                                        savings: savings,
-                                        totalQtyForKDS: item.quantity,
-                                        freeQuantity: 0,
-                                        promoNames: [pName]
-                                    });
-                                }
+                            // Scenario 4: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount %)
+                            const memberScenario = evaluateCustomerChargeStatus(customerProfile, effectivePortalShopId, item, product);
+                            if (memberScenario) {
+                                addScenario(memberScenario);
                             }
                         } else {
                             bestScenario.effectiveUnitPrice = 0;
@@ -8801,11 +8858,21 @@
                                         <div className="bg-stone-50 p-4 rounded-xl border border-stone-200 shadow-sm relative transition-all duration-300">
                                             <div className="flex justify-between items-center mb-3">
                                                 <span className="text-xs font-bold text-stone-500 uppercase tracking-wider">{t.orderFor}</span>
-                                                <div className="flex items-center gap-1.5 font-bold text-stone-800 text-sm">
+                                                <div className="flex items-center flex-wrap justify-end gap-1.5 font-bold text-stone-800 text-sm">
                                                     <span>
                                                         {sessionInfo.customerName === 'Walk-in' ? t.walkIn : 
                                                         `${sessionInfo.customerSex === 'F' ? `${t.ms} ` : `${t.mr} `}${sessionInfo.customerName}`}
                                                     </span>
+                                                    {customerProfile?.customerType === 'Member' && (
+                                                        <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                                                            Member
+                                                        </span>
+                                                    )}
+                                                    {customerProfile?.chargeStatus && customerProfile.chargeStatus !== 'Normal' && customerProfile.chargeStatus !== 'Normal Price' && (
+                                                        <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 border border-purple-300">
+                                                            <i className="fa-solid fa-crown mr-0.5"></i>{customerProfile.chargeStatus}
+                                                        </span>
+                                                    )}
                                                     {globalPoints?.pointsEnabled && sessionInfo.isSetup && (
                                                         <>
                                                             <span className="text-stone-300">|</span>
@@ -9094,6 +9161,7 @@
                                     setSelectedPaymentChoice={setSelectedPaymentChoice}
                                     isKhqrEnabled={activeBranchKhqrStatus.isKhqrEnabled}
                                     isRemoteKhqrRequired={activeBranchKhqrStatus.isRemoteKhqrRequired}
+                                    customerProfile={customerProfile}
                                 />
                             )}
                         </div>
@@ -9458,6 +9526,7 @@
                     { id: 'sales', icon: 'fa-chart-line', label: 'Sales', color: 'from-green-500 to-green-600', shadow: 'shadow-green-500/40' },
                     { id: 'cashflow', icon: 'fa-money-bill-transfer', label: 'CashFlow', color: 'from-emerald-500 to-emerald-600', shadow: 'shadow-emerald-500/40' },
                     { id: 'customers', icon: 'fa-address-book', label: 'CRM', color: 'from-indigo-500 to-indigo-600', shadow: 'shadow-indigo-500/40' },
+                    { id: 'scp_reports', icon: 'fa-handshake', label: 'Cross Promo', color: 'from-violet-500 to-purple-600', shadow: 'shadow-purple-500/40' },
                     { id: 'settings', icon: 'fa-gear', label: 'Settings', color: 'from-stone-600 to-stone-800', shadow: 'shadow-stone-500/40' }
                 ];
 
@@ -9616,6 +9685,7 @@
                             {activeTab === 'sales' && <SalesView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} admins={admins} shifts={shifts} products={products} />}
                             {activeTab === 'cashflow' && <CashflowView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} admins={admins} products={products} />}
                             {activeTab === 'customers' && <CustomersView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} />}
+                            {activeTab === 'scp_reports' && <SCPView shops={shops} currentAdminRecord={currentAdminRecord} orders={orders} products={products} />}
                             {activeTab === 'settings' && <SettingsView currentAdminRecord={currentAdminRecord} shops={shops} tables={tables} products={products} categories={categories} admins={admins} currentUser={currentUser} orders={orders} />}
                         </main>
                     </div>
@@ -14528,6 +14598,1056 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 );
             }
 
+            function SCPView({ shops, currentAdminRecord, orders, products }) {
+                const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
+                const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
+                const canSelectMultiple = isSuper || allowedShopIds.includes('All') || allowedShopIds.length > 1;
+
+                const [scpTab, setScpTab] = useState('promotions'); // 'promotions' | 'partners' | 'codes'
+                const [filterShopId, setFilterShopId] = useState(isSuper || allowedShopIds.includes('All') ? 'All' : allowedShopIds[0] || 'All');
+
+                const [scpList, setScpList] = useState([]);
+                const [partnersList, setPartnersList] = useState([]);
+                const [scpCodes, setScpCodes] = useState([]);
+
+                const [isModalOpen, setIsModalOpen] = useState(false);
+                const [editingId, setEditingId] = useState(null);
+
+                const [isPartnerModalOpen, setIsPartnerModalOpen] = useState(false);
+                const [editingPartnerId, setEditingPartnerId] = useState(null);
+
+                const getTodayString = () => {
+                    const d = new Date();
+                    const year = d.getFullYear();
+                    const month = String(d.getMonth() + 1).padStart(2, '0');
+                    const day = String(d.getDate()).padStart(2, '0');
+                    return `${year}-${month}-${day}`;
+                };
+
+                const [formData, setFormData] = useState({
+                    name: '',
+                    internalShopId: '',
+                    partnerId: '',
+                    direction: 'INBOUND',
+                    type: 'DISCOUNT_PCT',
+                    discountValue: '',
+                    startDate: getTodayString(),
+                    endDate: '',
+                    note: '',
+                    isActive: true,
+                    applicableProductIds: [],
+                    restrictPosMenu: true
+                });
+
+                const [partnerFormData, setPartnerFormData] = useState({
+                    name: '',
+                    contactName: '',
+                    phone: '',
+                    note: '',
+                    isActive: true
+                });
+
+                const [isCodeModalOpen, setIsCodeModalOpen] = useState(false);
+                const [editingCodeId, setEditingCodeId] = useState(null);
+                const [codeFormData, setCodeFormData] = useState({ partnerId: '', customerName: '', customerPhone: '', note: '', usageLimit: 1, startDate: getTodayString(), endDate: '' });
+                const [previewCodeObj, setPreviewCodeObj] = useState(null);
+
+                useEffect(() => {
+                    const { onSnapshot, collection } = window.FirebaseApp;
+                    const unsubScp = onSnapshot(collection(db, 'scp_promotions'), snap => {
+                        setScpList(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    });
+                    const unsubPartners = onSnapshot(collection(db, 'scp_partners'), snap => {
+                        setPartnersList(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    });
+                    const unsubCodes = onSnapshot(collection(db, 'scp_codes'), snap => {
+                        setScpCodes(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    });
+                    return () => { unsubScp(); unsubPartners(); unsubCodes(); };
+                }, []);
+
+                const filteredScp = useMemo(() => {
+                    return scpList.filter(scp => {
+                        // Legacy fallback checks source/target, new schema checks internalShopId
+                        const linkedShop = scp.internalShopId || scp.sourceShopId || scp.targetShopId;
+                        if (filterShopId !== 'All' && linkedShop !== filterShopId) return false;
+                        return true;
+                    });
+                }, [scpList, filterShopId]);
+
+                const handleSubmit = async (e) => {
+                    e.preventDefault();
+                    const { doc, updateDoc, addDoc, collection } = window.FirebaseApp;
+                    
+                    const data = {
+                        ...formData,
+                        discountValue: Number(formData.discountValue),
+                        restrictPosMenu: !!formData.restrictPosMenu,
+                        updatedAt: Date.now()
+                    };
+
+                    try {
+                        if (editingId) {
+                            await updateDoc(doc(db, 'scp_promotions', editingId), data);
+                        } else {
+                            await addDoc(collection(db, 'scp_promotions'), { ...data, createdAt: Date.now() });
+                        }
+                        setIsModalOpen(false);
+                    } catch (err) {
+                        alert("Error saving Cross Promotion: " + err.message);
+                    }
+                };
+
+                const handlePartnerSubmit = async (e) => {
+                    e.preventDefault();
+                    const { doc, updateDoc, addDoc, collection } = window.FirebaseApp;
+                    try {
+                        if (editingPartnerId) {
+                            await updateDoc(doc(db, 'scp_partners', editingPartnerId), { ...partnerFormData, updatedAt: Date.now() });
+                        } else {
+                            await addDoc(collection(db, 'scp_partners'), { ...partnerFormData, createdAt: Date.now() });
+                        }
+                        setIsPartnerModalOpen(false);
+                    } catch (err) {
+                        alert("Error saving Partner: " + err.message);
+                    }
+                };
+
+                const handleDelete = async (id) => {
+                    if (confirm("Are you sure you want to completely remove this Cross Promotion?")) {
+                        try {
+                            const { deleteDoc, doc } = window.FirebaseApp;
+                            await deleteDoc(doc(db, 'scp_promotions', id));
+                        } catch (err) {
+                            alert("Error deleting Cross Promotion: " + err.message);
+                        }
+                    }
+                };
+
+                const handleDeletePartner = async (id) => {
+                    if (confirm("Are you sure you want to delete this Partner? Active SCPs using this partner will be affected.")) {
+                        try {
+                            const { deleteDoc, doc } = window.FirebaseApp;
+                            await deleteDoc(doc(db, 'scp_partners', id));
+                        } catch (err) {
+                            alert("Error deleting Partner: " + err.message);
+                        }
+                    }
+                };
+
+                const handleCodeSubmit = async (e) => {
+                    e.preventDefault();
+                    const { doc, updateDoc, addDoc, collection, query, where, getDocs } = window.FirebaseApp;
+                    
+                    try {
+                        if (editingCodeId) {
+                            await updateDoc(doc(db, 'scp_codes', editingCodeId), {
+                                partnerId: codeFormData.partnerId,
+                                customerName: codeFormData.customerName,
+                                customerPhone: codeFormData.customerPhone,
+                                note: codeFormData.note,
+                                usageLimit: Number(codeFormData.usageLimit) || 1,
+                                startDate: codeFormData.startDate,
+                                endDate: codeFormData.endDate,
+                                updatedAt: Date.now()
+                            });
+                        } else {
+                            let isUnique = false;
+                            let fullCode = '';
+                            
+                            // Loop until we generate a completely unique code
+                            while (!isUnique) {
+                                const generatedCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+                                fullCode = `SCP-${generatedCode}`;
+                                
+                                // Check if this exact code already exists in the database
+                                const qCheck = query(collection(db, 'scp_codes'), where('code', '==', fullCode));
+                                const snap = await getDocs(qCheck);
+                                
+                                if (snap.empty) {
+                                    isUnique = true; // Code is unique, exit loop!
+                                }
+                            }
+
+                            await addDoc(collection(db, 'scp_codes'), {
+                                ...codeFormData,
+                                usageLimit: Number(codeFormData.usageLimit) || 1,
+                                currentUsage: 0,
+                                code: fullCode,
+                                shopId: filterShopId === 'All' ? (shops[0]?.id || '') : filterShopId,
+                                status: 'Active',
+                                createdAt: Date.now()
+                            });
+                        }
+                        setIsCodeModalOpen(false);
+                    } catch (err) {
+                        alert("Error processing code: " + err.message);
+                    }
+                };
+
+                const handleDeleteCode = async (id) => {
+                    if (confirm("Delete this code?")) {
+                        try {
+                            const { deleteDoc, doc } = window.FirebaseApp;
+                            await deleteDoc(doc(db, 'scp_codes', id));
+                        } catch (err) {
+                            alert("Error deleting code: " + err.message);
+                        }
+                    }
+                };
+
+                const toggleCodeStatus = async (id, currentStatus) => {
+                    try {
+                        const { doc, updateDoc } = window.FirebaseApp;
+                        await updateDoc(doc(db, 'scp_codes', id), { status: currentStatus === 'Active' ? 'Inactive' : 'Active' });
+                    } catch (err) {
+                        console.error("Error updating status:", err);
+                    }
+                };
+
+                const downloadCodeAsPDF = async (codeObj) => {
+                    const partnerName = partnersList.find(p=>p.id === codeObj.partnerId)?.name || 'Partner';
+                    const shopName = shops.find(s=>s.id === codeObj.shopId)?.name || 'Solaris Cafe';
+                    const barcodeUrl = `https://bwipjs-api.metafloor.com/?bcid=code128&text=${codeObj.code}&scale=3&height=12&includetext=false`;
+                    const logoUrl = 'https://i.imgur.com/f10UvD6.jpeg';
+
+                    // Preload barcode image to ensure it renders in PDF
+                    await new Promise((resolve) => {
+                        const img = new Image();
+                        img.crossOrigin = 'Anonymous';
+                        img.onload = resolve;
+                        img.onerror = resolve;
+                        img.src = barcodeUrl;
+                    });
+                    
+                    // Preload logo image to ensure it renders in PDF
+                    await new Promise((resolve) => {
+                        const img = new Image();
+                        img.crossOrigin = 'Anonymous';
+                        img.onload = resolve;
+                        img.onerror = resolve;
+                        img.src = logoUrl;
+                    });
+                    
+                    // Create a hidden temporary container for the PDF content
+                    const tempDiv = document.createElement('div');
+                    // FIX: Use fixed positioning at 0,0 with negative z-index to prevent 2-page phantom bug
+                    tempDiv.style.position = 'fixed';
+                    tempDiv.style.left = '0px';
+                    tempDiv.style.top = '0px';
+                    tempDiv.style.zIndex = '-9999';
+                    document.body.appendChild(tempDiv);
+
+                    // Build the HTML structure for the ID Card - PREMIUM REDESIGN
+                    tempDiv.innerHTML = `
+                        <div id="pdf-id-card" style="width: 420px; height: 260px; background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border-radius: 12px; overflow: hidden; font-family: 'Inter', sans-serif; position: relative; color: #fff;">
+                            
+                            <!-- Premium Background Accents -->
+                            <div style="position: absolute; top: -50px; right: -50px; width: 150px; height: 150px; border-radius: 50%; background: radial-gradient(circle, rgba(139,92,246,0.3) 0%, rgba(0,0,0,0) 70%);"></div>
+                            <div style="position: absolute; bottom: -60px; left: -20px; width: 200px; height: 200px; border-radius: 50%; background: radial-gradient(circle, rgba(245,158,11,0.15) 0%, rgba(0,0,0,0) 70%);"></div>
+
+                            <!-- Header -->
+                            <div style="padding: 20px 24px; display: flex; justify-content: space-between; align-items: flex-start; position: relative; z-index: 10;">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <div style="width: 38px; height: 38px; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+                                        <img src="${logoUrl}" style="width: 100%; height: 100%; object-fit: cover;" crossorigin="anonymous" />
+                                    </div>
+                                    <div>
+                                        <div style="font-family: 'Spicy Rice', serif; font-size: 26px; letter-spacing: 1px; color: #ffffff; line-height: 1;">SOLARIS</div>
+                                        <div style="font-size: 8px; letter-spacing: 4px; text-transform: uppercase; color: #94a3b8; margin-top: 4px;">Cross-Promotional Pass</div>
+                                    </div>
+                                </div>
+                                <div style="background: rgba(255,255,255,0.1); backdrop-filter: blur(4px); padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                                    <span style="font-size: 9px; font-weight: bold; color: #e2e8f0; letter-spacing: 1px; text-transform: uppercase;">VIP Access</span>
+                                </div>
+                            </div>
+                            
+                            <!-- Body Content -->
+                            <div style="padding: 0 24px; position: relative; z-index: 10; display: flex; flex-direction: column; justify-content: space-between; height: 170px;">
+                                
+                                <div style="display: flex; justify-content: space-between; align-items: flex-end;">
+                                    <div>
+                                        <div style="font-size: 9px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 1px; margin-bottom: 2px;">Partner Location</div>
+                                        <div style="font-size: 18px; font-weight: 800; color: #f8fafc; text-shadow: 0 2px 4px rgba(0,0,0,0.5);">${partnerName}</div>
+                                    </div>
+                                    <div style="text-align: right;">
+                                        <div style="font-size: 9px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 1px; margin-bottom: 2px;">Member</div>
+                                        <div style="font-size: 14px; font-weight: 700; color: #e2e8f0;">${codeObj.customerName || 'Valued Guest'}</div>
+                                    </div>
+                                </div>
+                                
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                                    <div style="display: flex; gap: 20px;">
+                                        <div>
+                                            <div style="font-size: 8px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 1px;">Usage Limit</div>
+                                            <div style="font-size: 14px; font-weight: 800; color: #fcd34d; margin-top: 2px;">${codeObj.usageLimit || 1}x</div>
+                                        </div>
+                                        <div>
+                                            <div style="font-size: 8px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 1px;">Valid From</div>
+                                            <div style="font-size: 11px; font-weight: 600; color: #cbd5e1; margin-top: 4px;">${codeObj.startDate || '-'}</div>
+                                        </div>
+                                        <div>
+                                            <div style="font-size: 8px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 1px;">Valid Until</div>
+                                            <div style="font-size: 11px; font-weight: 600; color: #cbd5e1; margin-top: 4px;">${codeObj.endDate || 'Ongoing'}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Barcode Area (Embedded perfectly at bottom) -->
+                                <div style="margin-top: 15px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); padding: 8px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.05);">
+                                    <div style="display: flex; flex-direction: column;">
+                                        <span style="font-size: 8px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px;">Scan at Register</span>
+                                        <span style="font-family: monospace; font-size: 15px; font-weight: 900; letter-spacing: 3px; color: #fff;">${codeObj.code}</span>
+                                    </div>
+                                    <div style="background: #fff; padding: 4px 6px; border-radius: 6px;">
+                                        <img src="${barcodeUrl}" style="height: 24px; display: block;" crossorigin="anonymous" />
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+                    `;
+
+                    // Ensure images and fonts are loaded (basic wait)
+                    await new Promise(resolve => setTimeout(resolve, 300));
+
+                    const element = document.getElementById('pdf-id-card');
+                    
+                    const opt = {
+                        margin:       0,
+                        filename:     `SCP_Code_${codeObj.code}.pdf`,
+                        image:        { type: 'jpeg', quality: 1 },
+                        html2canvas:  { scale: 4, useCORS: true, logging: false },
+                        jsPDF:        { unit: 'px', format: [420, 260], orientation: 'landscape' } 
+                    };
+
+                    try {
+                        await html2pdf().set(opt).from(element).save();
+                    } catch (e) {
+                        console.error("PDF generation failed:", e);
+                        alert("Failed to generate PDF. Please try again.");
+                    } finally {
+                        // Cleanup
+                        document.body.removeChild(tempDiv);
+                    }
+                };
+
+                const downloadCodeAsPNG = async (codeObj) => {
+                    const partnerName = partnersList.find(p=>p.id === codeObj.partnerId)?.name || 'Partner';
+                    const shopName = shops.find(s=>s.id === codeObj.shopId)?.name || 'Solaris Cafe';
+                    const barcodeUrl = `https://bwipjs-api.metafloor.com/?bcid=code128&text=${codeObj.code}&scale=3&height=12&includetext=false`;
+                    const logoUrl = 'https://i.imgur.com/f10UvD6.jpeg';
+
+                    // Preload barcode image
+                    await new Promise((resolve) => {
+                        const img = new Image();
+                        img.crossOrigin = 'Anonymous';
+                        img.onload = resolve;
+                        img.onerror = resolve;
+                        img.src = barcodeUrl;
+                    });
+                    
+                    // Preload logo image
+                    await new Promise((resolve) => {
+                        const img = new Image();
+                        img.crossOrigin = 'Anonymous';
+                        img.onload = resolve;
+                        img.onerror = resolve;
+                        img.src = logoUrl;
+                    });
+                    
+                    // Create a hidden temporary container
+                    const tempDiv = document.createElement('div');
+                    tempDiv.style.position = 'fixed';
+                    tempDiv.style.left = '-9999px';
+                    tempDiv.style.top = '-9999px';
+                    document.body.appendChild(tempDiv);
+
+                    // Build the HTML structure
+                    tempDiv.innerHTML = `
+                        <div id="png-id-card" style="width: 840px; height: 520px; background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border-radius: 24px; overflow: hidden; font-family: 'Inter', sans-serif; position: relative; color: #fff;">
+                            
+                            <!-- Premium Background Accents -->
+                            <div style="position: absolute; top: -100px; right: -100px; width: 300px; height: 300px; border-radius: 50%; background: radial-gradient(circle, rgba(139,92,246,0.3) 0%, rgba(0,0,0,0) 70%);"></div>
+                            <div style="position: absolute; bottom: -120px; left: -40px; width: 400px; height: 400px; border-radius: 50%; background: radial-gradient(circle, rgba(245,158,11,0.15) 0%, rgba(0,0,0,0) 70%);"></div>
+
+                            <!-- Header -->
+                            <div style="padding: 40px 48px; display: flex; justify-content: space-between; align-items: flex-start; position: relative; z-index: 10;">
+                                <div style="display: flex; align-items: center; gap: 24px;">
+                                    <div style="width: 76px; height: 76px; border-radius: 16px; overflow: hidden; border: 2px solid rgba(255,255,255,0.2); flex-shrink: 0; box-shadow: 0 8px 12px rgba(0,0,0,0.3);">
+                                        <img src="${logoUrl}" style="width: 100%; height: 100%; object-fit: cover;" crossorigin="anonymous" />
+                                    </div>
+                                    <div>
+                                        <div style="font-family: 'Spicy Rice', serif; font-size: 52px; letter-spacing: 2px; color: #ffffff; line-height: 1;">SOLARIS</div>
+                                        <div style="font-size: 16px; letter-spacing: 8px; text-transform: uppercase; color: #94a3b8; margin-top: 8px;">Cross-Promotional Pass</div>
+                                    </div>
+                                </div>
+                                <div style="background: rgba(255,255,255,0.1); backdrop-filter: blur(8px); padding: 8px 20px; border-radius: 16px; border: 2px solid rgba(255,255,255,0.05);">
+                                    <span style="font-size: 18px; font-weight: bold; color: #e2e8f0; letter-spacing: 2px; text-transform: uppercase;">VIP Access</span>
+                                </div>
+                            </div>
+                            
+                            <!-- Body Content -->
+                            <div style="padding: 0 48px; position: relative; z-index: 10; display: flex; flex-direction: column; justify-content: space-between; height: 340px;">
+                                
+                                <div style="display: flex; justify-content: space-between; align-items: flex-end;">
+                                    <div>
+                                        <div style="font-size: 18px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 2px; margin-bottom: 4px;">Partner Location</div>
+                                        <div style="font-size: 36px; font-weight: 800; color: #f8fafc; text-shadow: 0 4px 8px rgba(0,0,0,0.5);">${partnerName}</div>
+                                    </div>
+                                    <div style="text-align: right;">
+                                        <div style="font-size: 18px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 2px; margin-bottom: 4px;">Member</div>
+                                        <div style="font-size: 28px; font-weight: 700; color: #e2e8f0;">${codeObj.customerName || 'Valued Guest'}</div>
+                                    </div>
+                                </div>
+                                
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 30px; border-top: 2px solid rgba(255,255,255,0.1); padding-top: 30px;">
+                                    <div style="display: flex; gap: 40px;">
+                                        <div>
+                                            <div style="font-size: 16px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 2px;">Usage Limit</div>
+                                            <div style="font-size: 28px; font-weight: 800; color: #fcd34d; margin-top: 4px;">${codeObj.usageLimit || 1}x</div>
+                                        </div>
+                                        <div>
+                                            <div style="font-size: 16px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 2px;">Valid From</div>
+                                            <div style="font-size: 22px; font-weight: 600; color: #cbd5e1; margin-top: 8px;">${codeObj.startDate || '-'}</div>
+                                        </div>
+                                        <div>
+                                            <div style="font-size: 16px; color: #64748b; text-transform: uppercase; font-weight: bold; letter-spacing: 2px;">Valid Until</div>
+                                            <div style="font-size: 22px; font-weight: 600; color: #cbd5e1; margin-top: 8px;">${codeObj.endDate || 'Ongoing'}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Barcode Area -->
+                                <div style="margin-top: 30px; display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); padding: 16px 24px; border-radius: 24px; border: 2px solid rgba(255,255,255,0.05);">
+                                    <div style="display: flex; flex-direction: column;">
+                                        <span style="font-size: 16px; color: #94a3b8; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px;">Scan at Register</span>
+                                        <span style="font-family: monospace; font-size: 30px; font-weight: 900; letter-spacing: 6px; color: #fff;">${codeObj.code}</span>
+                                    </div>
+                                    <div style="background: #fff; padding: 8px 12px; border-radius: 12px;">
+                                        <img src="${barcodeUrl}" style="height: 48px; display: block;" crossorigin="anonymous" />
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+                    `;
+
+                    await new Promise(resolve => setTimeout(resolve, 300));
+
+                    const element = document.getElementById('png-id-card');
+                    
+                    try {
+                        const canvas = await html2canvas(element, {
+                            scale: 2, 
+                            useCORS: true,
+                            backgroundColor: null 
+                        });
+                        
+                        const imgData = canvas.toDataURL('image/png');
+                        const link = document.createElement('a');
+                        link.href = imgData;
+                        link.download = `SCP_Code_${codeObj.code}.png`;
+                        link.click();
+                    } catch (e) {
+                        console.error("PNG generation failed:", e);
+                        alert("Failed to generate PNG. Please try again.");
+                    } finally {
+                        document.body.removeChild(tempDiv);
+                    }
+                };
+
+                return (
+                    <div className="animate-fade-in max-w-6xl h-full flex flex-col">
+                        <div className="flex gap-2 mb-6 border-b border-stone-200 pb-2 shrink-0 overflow-x-auto no-scrollbar">
+                            <button onClick={() => setScpTab('promotions')} className={`px-5 py-2 font-bold whitespace-nowrap transition-colors ${scpTab === 'promotions' ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}>Active Promotions (SCP)</button>
+                            <button onClick={() => setScpTab('partners')} className={`px-5 py-2 font-bold whitespace-nowrap transition-colors ${scpTab === 'partners' ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}>Partners List (SCPP)</button>
+                            <button onClick={() => setScpTab('codes')} className={`px-5 py-2 font-bold whitespace-nowrap transition-colors ${scpTab === 'codes' ? 'text-amber-600 border-b-2 border-amber-600' : 'text-stone-500 hover:text-stone-800'}`}>Code Generator</button>
+                        </div>
+
+                        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 no-print gap-4 shrink-0">
+                            <div>
+                                <h2 className="text-2xl font-bold">
+                                    {scpTab === 'promotions' ? 'Shop Cross Promotions (SCP)' : scpTab === 'partners' ? 'External Partners (SCPP)' : 'SCP Code Generator'}
+                                </h2>
+                                <p className="text-sm text-stone-500 mt-1">
+                                    {scpTab === 'promotions' ? 'Manage discount linkages between internal branches and external partner shops.' : scpTab === 'partners' ? 'Manage directory of external businesses participating in cross-promotions.' : 'Generate unique SCP identification codes for customers to use at partner businesses.'}
+                                </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2 w-full md:w-auto">
+                                {scpTab === 'promotions' && (
+                                    <>
+                                        {canSelectMultiple ? (
+                                            <select className="border border-stone-300 rounded-lg px-3 py-2 bg-white outline-none font-bold text-stone-700 flex-1 md:flex-none shadow-sm cursor-pointer" value={filterShopId} onChange={e=>setFilterShopId(e.target.value)}>
+                                                {isSuper && <option value="All">All Branches</option>}
+                                                {shops.filter(s => isSuper || allowedShopIds.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                            </select>
+                                        ) : (
+                                            <div className="bg-amber-100 text-amber-900 px-4 py-2 rounded-lg font-bold border border-amber-300 shadow-sm flex items-center">
+                                                <i className="fa-solid fa-location-dot mr-2"></i> {shops.find(s => s.id === filterShopId)?.name}
+                                            </div>
+                                        )}
+                                        {scpTab === 'promotions' && (
+                                            <button onClick={() => {
+                                                setFormData({ name: '', internalShopId: filterShopId !== 'All' ? filterShopId : '', partnerId: '', direction: 'INBOUND', type: 'DISCOUNT_PCT', discountValue: '', startDate: getTodayString(), endDate: '', note: '', isActive: true, applicableProductIds: [], restrictPosMenu: true });
+                                                setEditingId(null);
+                                                setIsModalOpen(true);
+                                            }} className="bg-stone-900 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap hover:bg-stone-800 transition flex items-center"><i className="fa-solid fa-plus mr-2"></i> Add Promotion</button>
+                                        )}
+                                    </>
+                                )}
+                                
+                                {scpTab === 'partners' && (
+                                    <button onClick={() => {
+                                        setPartnerFormData({ name: '', contactName: '', phone: '', note: '', isActive: true });
+                                        setEditingPartnerId(null);
+                                        setIsPartnerModalOpen(true);
+                                    }} className="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap hover:bg-indigo-700 transition flex items-center"><i className="fa-solid fa-plus mr-2"></i> Add External Partner</button>
+                                )}
+
+                                {scpTab === 'codes' && (
+                                    <button onClick={() => {
+                                        setCodeFormData({ partnerId: '', customerName: '', customerPhone: '', note: '', usageLimit: 1, startDate: getTodayString(), endDate: '' });
+                                        setEditingCodeId(null);
+                                        setIsCodeModalOpen(true);
+                                    }} className="bg-emerald-600 text-white px-4 py-2 rounded-xl font-bold shadow-md whitespace-nowrap hover:bg-emerald-700 transition flex items-center"><i className="fa-solid fa-qrcode mr-2"></i> Generate Code</button>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="bg-white rounded-2xl border shadow-sm flex-1 overflow-hidden flex flex-col">
+                            <div className="flex-1 overflow-auto p-4">
+                                {scpTab === 'promotions' && (
+                                    <table className="w-full min-w-[1100px] text-left text-sm border-collapse border border-stone-300">
+                                        <thead>
+                                            <tr className="text-stone-700 uppercase tracking-wider bg-stone-100 text-[11px]">
+                                                <th className="p-3 font-bold border border-stone-300">Promo Name & Type</th>
+                                                <th className="p-3 font-bold border border-stone-300">Our Branch (Internal)</th>
+                                                <th className="p-3 font-bold border border-stone-300">Direction</th>
+                                                <th className="p-3 font-bold border border-stone-300">Partner Shop (External)</th>
+                                                <th className="p-3 font-bold border border-stone-300">Date Range</th>
+                                                <th className="p-3 font-bold border border-stone-300">SCP Pro. (Products)</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-center">Status</th>
+                                                <th className="p-3 font-bold border border-stone-300">Note</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-right">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {filteredScp.map(scp => {
+                                                // Handle legacy data fallback gracefully
+                                                const internalId = scp.internalShopId || scp.sourceShopId;
+                                                const dir = scp.direction || 'INBOUND';
+                                                const pName = partnersList.find(p=>p.id === scp.partnerId)?.name || (scp.targetShopId ? (shops.find(s=>s.id === scp.targetShopId)?.name + ' (Legacy)') : 'Unknown');
+
+                                                return (
+                                                    <tr key={scp.id} className="hover:bg-stone-50 bg-white transition-colors">
+                                                        <td className="p-3 border border-stone-300">
+                                                            <div className="font-bold text-stone-800">{scp.name}</div>
+                                                            <div className="text-[10px] font-bold bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded border border-amber-200 uppercase tracking-wider mt-1 w-fit">
+                                                                {scp.type === 'DISCOUNT_PCT' ? `${scp.discountValue}% Off` : scp.type === 'DISCOUNT_FIXED' ? `${scp.discountValue} ៛ Off` : 'Free Item'}
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 font-bold text-emerald-700">
+                                                            <i className="fa-solid fa-store text-emerald-500 mr-1.5"></i>
+                                                            {shops.find(s=>s.id === internalId)?.name || 'Unknown'}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-center">
+                                                            {dir === 'INBOUND' ? (
+                                                                <span className="bg-blue-50 text-blue-600 border border-blue-200 px-2 py-1 rounded text-[10px] font-bold uppercase whitespace-nowrap shadow-sm"><i className="fa-solid fa-arrow-right-to-bracket mr-1"></i>Inbound (We Redeem)</span>
+                                                            ) : (
+                                                                <span className="bg-orange-50 text-orange-600 border border-orange-200 px-2 py-1 rounded text-[10px] font-bold uppercase whitespace-nowrap shadow-sm"><i className="fa-solid fa-arrow-right-from-bracket mr-1"></i>Outbound (Partner Redeems)</span>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 font-bold text-indigo-700">
+                                                            <i className="fa-solid fa-handshake text-indigo-400 mr-1.5"></i>
+                                                            {pName}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-stone-600 font-medium">
+                                                            <div className="flex flex-col gap-1 text-[11px]">
+                                                                <span><i className="fa-solid fa-calendar-days text-stone-400 mr-1"></i> {scp.startDate}</span>
+                                                                <span><i className="fa-solid fa-calendar-check text-stone-400 mr-1"></i> {scp.endDate || 'Ongoing'}</span>
+                                                            </div>
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300">
+                                                            {(!scp.applicableProductIds || scp.applicableProductIds.length === 0) ? (
+                                                                <span className="text-[10px] italic text-stone-500 font-medium">All Products</span>
+                                                            ) : (
+                                                                <div className="flex flex-wrap gap-1">
+                                                                    {scp.applicableProductIds.slice(0, 3).map(id => {
+                                                                        const p = products?.find(prod => prod.id === id);
+                                                                        return p ? <span key={id} className="text-[9px] bg-rose-50 text-rose-700 px-1.5 py-0.5 rounded border border-rose-200 font-bold whitespace-nowrap">{p.name}</span> : null;
+                                                                    })}
+                                                                    {scp.applicableProductIds.length > 3 && <span className="text-[9px] bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded border border-stone-200 font-bold whitespace-nowrap">+{scp.applicableProductIds.length - 3} more</span>}
+                                                                </div>
+                                                            )}
+                                                            {scp.restrictPosMenu && (
+                                                                <div className="mt-1.5 flex">
+                                                                    <span className="text-[9px] bg-indigo-50 text-indigo-700 border border-indigo-200 px-1.5 py-0.5 rounded font-bold inline-flex items-center gap-1" title="Restricts Partner POS Menu">
+                                                                        <i className="fa-solid fa-lock text-[8px] opacity-70"></i> Menu Restricted
+                                                                    </span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-center">
+                                                            <span className={`text-[10px] font-bold px-2.5 py-1 rounded-md uppercase tracking-wider ${scp.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{scp.isActive ? 'Active' : 'Inactive'}</span>
+                                                        </td>
+                                                        <td className="p-3 border border-stone-300 text-stone-600 font-medium">{scp.note || <span className="italic text-stone-400">-</span>}</td>
+                                                        <td className="p-3 border border-stone-300 text-right">
+                                                            <button onClick={() => { setFormData({...scp, internalShopId: internalId, direction: dir, applicableProductIds: scp.applicableProductIds || [], restrictPosMenu: !!scp.restrictPosMenu}); setEditingId(scp.id); setIsModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Promo"><i className="fa-solid fa-pen"></i></button>
+                                                            <button onClick={() => handleDelete(scp.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Promo"><i className="fa-solid fa-trash"></i></button>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                            {filteredScp.length === 0 && (
+                                                <tr><td colSpan="9" className="text-center py-10 text-stone-400 font-medium">No cross promotions found for this branch.</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                )}
+
+                                {scpTab === 'partners' && (
+                                    <table className="w-full min-w-[700px] text-left text-sm border-collapse border border-stone-300">
+                                        <thead>
+                                            <tr className="text-stone-700 uppercase tracking-wider bg-stone-100 text-[11px]">
+                                                <th className="p-3 font-bold border border-stone-300">Partner Business Name</th>
+                                                <th className="p-3 font-bold border border-stone-300">Contact Person</th>
+                                                <th className="p-3 font-bold border border-stone-300">Phone</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-center">Status</th>
+                                                <th className="p-3 font-bold border border-stone-300">Note</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-right">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {partnersList.map(p => (
+                                                <tr key={p.id} className="hover:bg-stone-50 bg-white transition-colors">
+                                                    <td className="p-3 border border-stone-300 font-bold text-indigo-900 text-base">
+                                                        <i className="fa-solid fa-handshake text-indigo-400 mr-2"></i>{p.name}
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 font-medium text-stone-700">{p.contactName || '-'}</td>
+                                                    <td className="p-3 border border-stone-300 font-medium text-stone-700">{p.phone || '-'}</td>
+                                                    <td className="p-3 border border-stone-300 text-center">
+                                                        <span className={`text-[10px] font-bold px-2.5 py-1 rounded-md uppercase tracking-wider ${p.isActive ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{p.isActive ? 'Active' : 'Inactive'}</span>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 font-medium text-stone-600">{p.note || '-'}</td>
+                                                    <td className="p-3 border border-stone-300 text-right">
+                                                        <button onClick={() => { setPartnerFormData(p); setEditingPartnerId(p.id); setIsPartnerModalOpen(true); }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Partner"><i className="fa-solid fa-pen"></i></button>
+                                                        <button onClick={() => handleDeletePartner(p.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Partner"><i className="fa-solid fa-trash"></i></button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                            {partnersList.length === 0 && (
+                                                <tr><td colSpan="6" className="text-center py-10 text-stone-400 font-medium">No external partners have been added yet.</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                )}
+
+                                {scpTab === 'codes' && (
+                                    <table className="w-full min-w-[900px] text-left text-sm border-collapse border border-stone-300">
+                                        <thead>
+                                            <tr className="text-stone-700 uppercase tracking-wider bg-stone-100 text-[11px]">
+                                                <th className="p-3 font-bold border border-stone-300">Generated Code</th>
+                                                <th className="p-3 font-bold border border-stone-300">External Partner</th>
+                                                <th className="p-3 font-bold border border-stone-300">Customer Details</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-center">Usage Limit</th>
+                                                <th className="p-3 font-bold border border-stone-300">Validity Dates</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-center">Status</th>
+                                                <th className="p-3 font-bold border border-stone-300 text-right">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {scpCodes.filter(c => filterShopId === 'All' || c.shopId === filterShopId).sort((a,b) => b.createdAt - a.createdAt).map(codeObj => (
+                                                <tr key={codeObj.id} className="hover:bg-stone-50 bg-white transition-colors">
+                                                    <td className="p-3 border border-stone-300">
+                                                        <span className="font-mono text-base font-black tracking-widest text-emerald-700 bg-emerald-50 px-2 py-1 rounded border border-emerald-200">{codeObj.code}</span>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 font-bold text-indigo-900">
+                                                        <i className="fa-solid fa-handshake text-indigo-400 mr-1.5"></i>
+                                                        {partnersList.find(p=>p.id === codeObj.partnerId)?.name || 'Unknown Partner'}
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300">
+                                                        <div className="font-bold text-stone-800">{codeObj.customerName || 'Walk-in'}</div>
+                                                        <div className="text-xs text-stone-500 font-medium">{codeObj.customerPhone || 'No Phone'}</div>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 text-center">
+                                                        <span className="bg-stone-100 px-2 py-1.5 rounded font-bold border border-stone-200 text-stone-700">
+                                                            {codeObj.currentUsage || 0} / {codeObj.usageLimit || 1}
+                                                        </span>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 text-stone-600 font-medium text-[11px]">
+                                                        <div><span className="font-bold">Start:</span> {codeObj.startDate || '-'}</div>
+                                                        <div className="mt-0.5"><span className="font-bold">End:</span> {codeObj.endDate || 'No Expiry'}</div>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 text-center">
+                                                        <button 
+                                                            onClick={() => toggleCodeStatus(codeObj.id, codeObj.status)}
+                                                            className={`text-[10px] font-bold px-2.5 py-1 rounded-md uppercase tracking-wider transition ${codeObj.status === 'Active' ? 'bg-green-100 text-green-700 hover:bg-green-200' : 'bg-stone-100 text-stone-500 hover:bg-stone-200'}`}
+                                                        >
+                                                            {codeObj.status}
+                                                        </button>
+                                                    </td>
+                                                    <td className="p-3 border border-stone-300 text-right whitespace-nowrap">
+                                                        <button onClick={() => setPreviewCodeObj(codeObj)} className="p-2 text-indigo-500 hover:text-indigo-800 transition mr-1" title="Print Preview"><i className="fa-solid fa-print"></i></button>
+                                                        <button onClick={() => {
+                                                            setCodeFormData({
+                                                                partnerId: codeObj.partnerId || '',
+                                                                customerName: codeObj.customerName || '',
+                                                                customerPhone: codeObj.customerPhone || '',
+                                                                note: codeObj.note || '',
+                                                                usageLimit: codeObj.usageLimit || 1,
+                                                                startDate: codeObj.startDate || getTodayString(),
+                                                                endDate: codeObj.endDate || ''
+                                                            });
+                                                            setEditingCodeId(codeObj.id);
+                                                            setIsCodeModalOpen(true);
+                                                        }} className="p-2 text-blue-500 hover:text-blue-700 transition" title="Edit Code"><i className="fa-solid fa-pen"></i></button>
+                                                        <button onClick={() => handleDeleteCode(codeObj.id)} className="p-2 text-red-500 hover:text-red-700 transition" title="Delete Code"><i className="fa-solid fa-trash"></i></button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                            {scpCodes.filter(c => filterShopId === 'All' || c.shopId === filterShopId).length === 0 && (
+                                                <tr><td colSpan="7" className="text-center py-10 text-stone-400 font-medium">No SCP codes generated yet.</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                )}
+
+                            </div>
+                        </div>
+
+                        {isModalOpen && (
+                            <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <form onSubmit={handleSubmit} className="bg-white rounded-3xl w-full max-w-lg p-6 shadow-2xl animate-fade-in relative max-h-[90vh] overflow-y-auto">
+                                    <button type="button" onClick={() => setIsModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700"><i className="fa-solid fa-xmark text-lg"></i></button>
+                                    <h3 className="text-xl font-bold mb-5 flex items-center"><i className="fa-solid fa-bullhorn text-amber-500 mr-2"></i> {editingId ? 'Edit SCP' : 'Add Cross Promotion (SCP)'}</h3>
+                                    
+                                    <div className="space-y-4 mb-6">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Promotion Name *</label>
+                                            <input type="text" required placeholder="e.g. Amazon Partners 10%" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} autoFocus />
+                                        </div>
+
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                            <div className="bg-emerald-50 p-3 rounded-xl border border-emerald-200">
+                                                <label className="block text-xs font-bold text-emerald-800 mb-1 uppercase tracking-wider"><i className="fa-solid fa-store mr-1.5"></i>Our Branch (Internal) *</label>
+                                                <select required className="w-full border border-emerald-300 rounded-lg px-3 py-2 outline-none focus:border-emerald-600 bg-white text-sm font-bold shadow-sm" value={formData.internalShopId} onChange={e => setFormData({...formData, internalShopId: e.target.value})}>
+                                                    <option value="" disabled>Select Branch...</option>
+                                                    {shops.filter(s => isSuper || allowedShopIds.includes('All') || allowedShopIds.includes(s.id)).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                                </select>
+                                            </div>
+                                            <div className="bg-indigo-50 p-3 rounded-xl border border-indigo-200">
+                                                <label className="block text-xs font-bold text-indigo-800 mb-1 uppercase tracking-wider"><i className="fa-solid fa-handshake mr-1.5"></i>Partner Shop (External) *</label>
+                                                <select required className="w-full border border-indigo-300 rounded-lg px-3 py-2 outline-none focus:border-indigo-600 bg-white text-sm font-bold shadow-sm" value={formData.partnerId} onChange={e => setFormData({...formData, partnerId: e.target.value})}>
+                                                    <option value="" disabled>Select Partner...</option>
+                                                    {partnersList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                                                </select>
+                                                {partnersList.length === 0 && <p className="text-[10px] text-indigo-600 mt-1.5 font-bold"><i className="fa-solid fa-circle-info mr-1"></i> Add partners in SCPP tab first.</p>}
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-stone-50 p-3 rounded-xl border border-stone-200 shadow-sm">
+                                            <label className="block text-xs font-bold text-stone-500 uppercase tracking-wider mb-2"><i className="fa-solid fa-route mr-1.5"></i>Promotion Direction *</label>
+                                            <select required className="w-full border border-stone-300 rounded-lg px-3 py-2 outline-none focus:border-amber-600 bg-white text-sm font-bold shadow-sm" value={formData.direction} onChange={e => setFormData({...formData, direction: e.target.value})}>
+                                                <option value="INBOUND">Inbound: Partner distributes vouchers, We redeem them.</option>
+                                                <option value="OUTBOUND">Outbound: We distribute vouchers, Partner redeems them.</option>
+                                            </select>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Promo Type *</label>
+                                                <select required className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-sm font-bold" value={formData.type} onChange={e => setFormData({...formData, type: e.target.value})}>
+                                                    <option value="DISCOUNT_PCT">Percentage (%) Discount</option>
+                                                    <option value="DISCOUNT_FIXED">Fixed Amount (៛) Discount</option>
+                                                    <option value="FREE_ITEM">Free Item</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Value/Amount *</label>
+                                                <input type="number" required placeholder={formData.type === 'DISCOUNT_PCT' ? 'e.g. 10' : formData.type === 'DISCOUNT_FIXED' ? 'e.g. 1500' : 'e.g. 1 (qty)'} className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px] font-black text-amber-700 shadow-sm" value={formData.discountValue} onChange={e => setFormData({...formData, discountValue: e.target.value})} />
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Start Date *</label>
+                                                <input type="date" required className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-sm font-bold" value={formData.startDate} onChange={e => setFormData({...formData, startDate: e.target.value})} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">End Date</label>
+                                                <input type="date" className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-sm font-bold" value={formData.endDate} onChange={e => setFormData({...formData, endDate: e.target.value})} />
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Note / Description</label>
+                                            <input type="text" placeholder="Optional details..." className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-amber-600 bg-stone-50 text-[16px]" value={formData.note} onChange={e => setFormData({...formData, note: e.target.value})} />
+                                        </div>
+
+                                        <div className="pt-4 border-t border-stone-100">
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Applicable Products</label>
+                                            <div className="bg-stone-50 p-3 rounded-xl border border-stone-200">
+                                                <div className="flex flex-wrap gap-1.5 mb-2 min-h-[28px]">
+                                                    {formData.applicableProductIds?.map(pid => {
+                                                        const p = products?.find(prod => prod.id === pid);
+                                                        return (
+                                                            <div key={pid} className="bg-indigo-50 border border-indigo-200 text-indigo-700 px-2 py-1 rounded text-xs font-bold flex items-center gap-1.5">
+                                                                {p ? p.name : 'Unknown'}
+                                                                <button type="button" onClick={() => {
+                                                                    const newIds = formData.applicableProductIds.filter(id => id !== pid);
+                                                                    setFormData({...formData, applicableProductIds: newIds});
+                                                                }} className="text-indigo-400 hover:text-indigo-600 focus:outline-none"><i className="fa-solid fa-xmark"></i></button>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                    {(!formData.applicableProductIds || formData.applicableProductIds.length === 0) && (
+                                                        <span className="text-xs italic text-stone-400 flex items-center">Applies to all products.</span>
+                                                    )}
+                                                </div>
+                                                <select
+                                                    className="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-xs font-medium outline-none focus:border-indigo-500 bg-white shadow-sm"
+                                                    value=""
+                                                    onChange={(e) => {
+                                                        if (e.target.value && !(formData.applicableProductIds || []).includes(e.target.value)) {
+                                                            const newIds = [...(formData.applicableProductIds || []), e.target.value];
+                                                            setFormData({...formData, applicableProductIds: newIds});
+                                                        }
+                                                    }}
+                                                >
+                                                    <option value="" disabled>Add specific product...</option>
+                                                    {products?.filter(p => !(formData.applicableProductIds || []).includes(p.id)).map(p => (
+                                                        <option key={p.id} value={p.id}>{p.name}</option>
+                                                    ))}
+                                                </select>
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-2 bg-indigo-50 p-3 rounded-xl border border-indigo-200">
+                                            <label className="flex items-center cursor-pointer">
+                                                <div className="relative shrink-0">
+                                                    <input type="checkbox" className="sr-only" checked={formData.restrictPosMenu || false} onChange={e => setFormData({...formData, restrictPosMenu: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${formData.restrictPosMenu ? 'bg-indigo-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${formData.restrictPosMenu ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                                <div className="ml-3 text-xs font-bold text-indigo-800">Restrict Partner POS Menu</div>
+                                            </label>
+                                            <p className="text-[10px] text-indigo-600 mt-1 ml-12">If checked, SCPP Partners will only see the selected products above when they log into the POS.</p>
+                                        </div>
+
+                                        <div className="mt-2 pt-2 border-t border-stone-100">
+                                            <label className="flex items-center cursor-pointer bg-stone-50 p-3 rounded-xl border border-stone-200 shadow-sm transition hover:border-amber-400">
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={formData.isActive} onChange={e => setFormData({...formData, isActive: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${formData.isActive ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${formData.isActive ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                                <div className="ml-3 text-sm font-bold text-stone-700">{formData.isActive ? 'Active Promotion' : 'Inactive Promotion'}</div>
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+                                        <button type="button" onClick={() => setIsModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                        <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-amber-600 text-white hover:bg-amber-700 shadow-md transition flex items-center">
+                                            <i className="fa-solid fa-save mr-2"></i> Save Promotion
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {isPartnerModalOpen && (
+                            <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <form onSubmit={handlePartnerSubmit} className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl animate-fade-in relative max-h-[90vh] overflow-y-auto">
+                                    <button type="button" onClick={() => setIsPartnerModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700"><i className="fa-solid fa-xmark text-lg"></i></button>
+                                    <h3 className="text-xl font-bold mb-5 flex items-center"><i className="fa-solid fa-handshake text-indigo-500 mr-2"></i> {editingPartnerId ? 'Edit Partner' : 'Add External Partner'}</h3>
+                                    
+                                    <div className="space-y-4 mb-6">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Partner Business Name *</label>
+                                            <input type="text" required placeholder="e.g. Amazon Cafe BKK" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-600 bg-stone-50 text-[16px] font-bold" value={partnerFormData.name} onChange={e => setPartnerFormData({...partnerFormData, name: e.target.value})} autoFocus />
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Contact Name</label>
+                                                <input type="text" placeholder="e.g. John Doe" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-600 bg-stone-50 text-[16px]" value={partnerFormData.contactName} onChange={e => setPartnerFormData({...partnerFormData, contactName: e.target.value})} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Phone</label>
+                                                <input type="text" placeholder="e.g. 012 345 678" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-600 bg-stone-50 text-[16px]" value={partnerFormData.phone} onChange={e => setPartnerFormData({...partnerFormData, phone: e.target.value})} />
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Note / Description</label>
+                                            <input type="text" placeholder="Optional details..." className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-600 bg-stone-50 text-[16px]" value={partnerFormData.note} onChange={e => setPartnerFormData({...partnerFormData, note: e.target.value})} />
+                                        </div>
+
+                                        <div className="mt-2">
+                                            <label className="flex items-center cursor-pointer bg-stone-50 p-3 rounded-xl border border-stone-200 shadow-sm transition hover:border-indigo-300">
+                                                <div className="relative">
+                                                    <input type="checkbox" className="sr-only" checked={partnerFormData.isActive} onChange={e => setPartnerFormData({...partnerFormData, isActive: e.target.checked})} />
+                                                    <div className={`block w-10 h-6 rounded-full transition ${partnerFormData.isActive ? 'bg-green-500' : 'bg-stone-300'}`}></div>
+                                                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition transform ${partnerFormData.isActive ? 'translate-x-4' : ''}`}></div>
+                                                </div>
+                                                <div className="ml-3 text-sm font-bold text-stone-700">{partnerFormData.isActive ? 'Active Partner' : 'Inactive Partner'}</div>
+                                            </label>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+                                        <button type="button" onClick={() => setIsPartnerModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                        <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-indigo-600 text-white hover:bg-indigo-700 shadow-md transition flex items-center">
+                                            <i className="fa-solid fa-save mr-2"></i> Save Partner
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {isCodeModalOpen && (
+                            <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <form onSubmit={handleCodeSubmit} className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl animate-fade-in relative max-h-[90vh] overflow-y-auto">
+                                    <button type="button" onClick={() => setIsCodeModalOpen(false)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700"><i className="fa-solid fa-xmark text-lg"></i></button>
+                                    <h3 className="text-xl font-bold mb-5 flex items-center"><i className="fa-solid fa-qrcode text-emerald-600 mr-2"></i> {editingCodeId ? 'Edit SCP Code' : 'Generate SCP Code'}</h3>
+                                    
+                                    <div className="space-y-4 mb-6">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Select Target Partner *</label>
+                                            <select required className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-emerald-600 bg-stone-50 text-[16px] font-bold shadow-sm" value={codeFormData.partnerId} onChange={e => setCodeFormData({...codeFormData, partnerId: e.target.value})}>
+                                                <option value="" disabled>Select Partner...</option>
+                                                {partnersList.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                                            </select>
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-3 pt-3 border-t border-stone-100">
+                                            <div className="col-span-2">
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Max Usage Limit *</label>
+                                                <input type="number" min="1" required placeholder="e.g. 1" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-emerald-600 bg-stone-50 text-[16px] font-bold shadow-sm" value={codeFormData.usageLimit} onChange={e => setCodeFormData({...codeFormData, usageLimit: e.target.value})} />
+                                                <p className="text-[10px] text-stone-400 mt-1 font-medium">How many items or times this code can be applied.</p>
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">Start Date *</label>
+                                                <input type="date" required className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-emerald-600 bg-white shadow-sm text-xs font-bold" value={codeFormData.startDate} onChange={e => setCodeFormData({...codeFormData, startDate: e.target.value})} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-semibold text-stone-700 mb-1">End Date</label>
+                                                <input type="date" className="w-full border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-emerald-600 bg-white shadow-sm text-xs font-bold" value={codeFormData.endDate || ''} onChange={e => setCodeFormData({...codeFormData, endDate: e.target.value})} />
+                                            </div>
+                                        </div>
+
+                                        <div className="pt-3 border-t border-stone-100">
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Customer Name (Optional)</label>
+                                            <input type="text" placeholder="e.g. John Doe" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-emerald-600 bg-stone-50 text-[16px]" value={codeFormData.customerName} onChange={e => setCodeFormData({...codeFormData, customerName: e.target.value})} />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Customer Phone (Optional)</label>
+                                            <input type="text" placeholder="e.g. 012 345 678" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-emerald-600 bg-stone-50 text-[16px]" value={codeFormData.customerPhone} onChange={e => setCodeFormData({...codeFormData, customerPhone: e.target.value})} />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-stone-700 mb-1">Note / Reference</label>
+                                            <input type="text" placeholder="e.g. Issued by staff XYZ" className="w-full border border-stone-300 rounded-xl px-4 py-2.5 outline-none focus:border-emerald-600 bg-stone-50 text-[16px]" value={codeFormData.note} onChange={e => setCodeFormData({...codeFormData, note: e.target.value})} />
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+                                        <button type="button" onClick={() => setIsCodeModalOpen(false)} className="px-5 py-2.5 rounded-xl font-semibold text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                        <button type="submit" className="px-5 py-2.5 rounded-xl font-bold bg-emerald-600 text-white hover:bg-emerald-700 shadow-md transition flex items-center">
+                                            {editingCodeId ? <><i className="fa-solid fa-save mr-2"></i> Save Changes</> : <><i className="fa-solid fa-wand-magic-sparkles mr-2"></i> Generate</>}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {previewCodeObj && (
+                            <div className="fixed inset-0 bg-stone-900/80 backdrop-blur-sm z-[120] flex items-center justify-center p-4">
+                                <div className="bg-white rounded-3xl p-6 shadow-2xl animate-fade-in relative flex flex-col items-center max-w-lg w-full">
+                                    <button type="button" onClick={() => setPreviewCodeObj(null)} className="absolute top-4 right-4 text-stone-400 hover:text-stone-700 w-8 h-8 flex items-center justify-center bg-stone-100 hover:bg-stone-200 rounded-full transition"><i className="fa-solid fa-xmark text-lg"></i></button>
+                                    <h3 className="text-xl font-bold mb-6 text-stone-900 flex items-center"><i className="fa-solid fa-print text-indigo-500 mr-2"></i> Print Preview</h3>
+                                    
+                                    <div className="overflow-x-auto w-full flex justify-center pb-4">
+                                        <div style={{ width: '420px', height: '260px', background: 'linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%)', borderRadius: '12px', overflow: 'hidden', fontFamily: "'Inter', sans-serif", position: 'relative', color: '#fff', flexShrink: 0 }}>
+                                            <div style={{ position: 'absolute', top: '-50px', right: '-50px', width: '150px', height: '150px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(139,92,246,0.3) 0%, rgba(0,0,0,0) 70%)' }}></div>
+                                            <div style={{ position: 'absolute', bottom: '-60px', left: '-20px', width: '200px', height: '200px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(245,158,11,0.15) 0%, rgba(0,0,0,0) 70%)' }}></div>
+
+                                            <div style={{ padding: '20px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', position: 'relative', zIndex: 10 }}>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                                    <div style={{ width: '38px', height: '38px', borderRadius: '8px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.2)', flexShrink: 0, boxShadow: '0 4px 6px rgba(0,0,0,0.3)' }}>
+                                                        <img src="https://i.imgur.com/f10UvD6.jpeg" style={{ width: '100%', height: '100%', objectFit: 'cover' }} crossOrigin="anonymous" />
+                                                    </div>
+                                                    <div>
+                                                        <div style={{ fontFamily: "'Spicy Rice', serif", fontSize: '26px', letterSpacing: '1px', color: '#ffffff', lineHeight: 1 }}>SOLARIS</div>
+                                                        <div style={{ fontSize: '8px', letterSpacing: '4px', textTransform: 'uppercase', color: '#94a3b8', marginTop: '4px' }}>Cross-Promotional Pass</div>
+                                                    </div>
+                                                </div>
+                                                <div style={{ background: 'rgba(255,255,255,0.1)', backdropFilter: 'blur(4px)', padding: '4px 10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                                                    <span style={{ fontSize: '9px', fontWeight: 'bold', color: '#e2e8f0', letterSpacing: '1px', textTransform: 'uppercase' }}>VIP Access</span>
+                                                </div>
+                                            </div>
+                                            
+                                            <div style={{ padding: '0 24px', position: 'relative', zIndex: 10, display: 'flex', flexDirection: 'column', justifyContent: 'space-between', height: '170px' }}>
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end' }}>
+                                                    <div>
+                                                        <div style={{ fontSize: '9px', color: '#94a3b8', textTransform: 'uppercase', fontWeight: 600, letterSpacing: '1px', marginBottom: '2px' }}>Partner Location</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 800, color: '#f8fafc', textShadow: '0 2px 4px rgba(0,0,0,0.5)' }}>{partnersList.find(p=>p.id === previewCodeObj.partnerId)?.name || 'Partner'}</div>
+                                                    </div>
+                                                    <div style={{ textAlign: 'right' }}>
+                                                        <div style={{ fontSize: '9px', color: '#94a3b8', textTransform: 'uppercase', fontWeight: 600, letterSpacing: '1px', marginBottom: '2px' }}>Member</div>
+                                                        <div style={{ fontSize: '14px', fontWeight: 700, color: '#e2e8f0' }}>{previewCodeObj.customerName || 'Valued Guest'}</div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '15px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '15px' }}>
+                                                    <div style={{ display: 'flex', gap: '20px' }}>
+                                                        <div>
+                                                            <div style={{ fontSize: '8px', color: '#64748b', textTransform: 'uppercase', fontWeight: 'bold', letterSpacing: '1px' }}>Usage Limit</div>
+                                                            <div style={{ fontSize: '14px', fontWeight: 800, color: '#fcd34d', marginTop: '2px' }}>{previewCodeObj.usageLimit || 1}x</div>
+                                                        </div>
+                                                        <div>
+                                                            <div style={{ fontSize: '8px', color: '#64748b', textTransform: 'uppercase', fontWeight: 'bold', letterSpacing: '1px' }}>Valid From</div>
+                                                            <div style={{ fontSize: '11px', fontWeight: 600, color: '#cbd5e1', marginTop: '4px' }}>{previewCodeObj.startDate || '-'}</div>
+                                                        </div>
+                                                        <div>
+                                                            <div style={{ fontSize: '8px', color: '#64748b', textTransform: 'uppercase', fontWeight: 'bold', letterSpacing: '1px' }}>Valid Until</div>
+                                                            <div style={{ fontSize: '11px', fontWeight: 600, color: '#cbd5e1', marginTop: '4px' }}>{previewCodeObj.endDate || 'Ongoing'}</div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div style={{ marginTop: '15px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(255,255,255,0.03)', padding: '8px 12px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                                                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                                        <span style={{ fontSize: '8px', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '4px' }}>Scan at Register</span>
+                                                        <span style={{ fontFamily: 'monospace', fontSize: '15px', fontWeight: 900, letterSpacing: '3px', color: '#fff' }}>{previewCodeObj.code}</span>
+                                                    </div>
+                                                    <div style={{ background: '#fff', padding: '4px 6px', borderRadius: '6px' }}>
+                                                        <img src={`https://bwipjs-api.metafloor.com/?bcid=code128&text=${previewCodeObj.code}&scale=3&height=12&includetext=false`} style={{ height: '24px', display: 'block' }} crossOrigin="anonymous" />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex gap-3 mt-4 w-full">
+                                        <button onClick={() => setPreviewCodeObj(null)} className="flex-1 py-3 rounded-xl font-bold bg-stone-100 text-stone-600 hover:bg-stone-200 transition">Cancel</button>
+                                        <button onClick={() => { downloadCodeAsPDF(previewCodeObj); setPreviewCodeObj(null); }} className="flex-1 py-3 rounded-xl font-bold bg-indigo-600 text-white hover:bg-indigo-700 transition shadow-md flex items-center justify-center gap-2">
+                                            <i className="fa-solid fa-file-pdf"></i> Download PDF
+                                        </button>
+                                        <button onClick={() => { downloadCodeAsPNG(previewCodeObj); setPreviewCodeObj(null); }} className="flex-1 py-3 rounded-xl font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition shadow-md flex items-center justify-center gap-2">
+                                            <i className="fa-solid fa-image"></i> Download PNG
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
             function ReceiptsView({ shops, currentAdminRecord }) {
                 const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
                 const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
@@ -17196,12 +18316,17 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         
                         setIsCheckingPhone(true);
                         try {
-                            const { query, where, getDocs, limit, collection } = window.FirebaseApp;
-                            const qCust = query(collection(db, 'customers'), where('phone', '==', customerPhone), limit(1));
+                            const { query, where, getDocs, collection } = window.FirebaseApp;
+                            const formattedPhone = formatPhoneNumber(customerPhone);
+                            const phoneVariants = Array.from(new Set([customerPhone, formattedPhone, cleanedPhone].filter(Boolean)));
+                            const qCust = phoneVariants.length > 1
+                                ? query(collection(db, 'customers'), where('phone', 'in', phoneVariants))
+                                : query(collection(db, 'customers'), where('phone', '==', formattedPhone));
                             const snapCust = await getDocs(qCust);
                             
                             if (!snapCust.empty) {
-                                const data = snapCust.docs[0].data();
+                                const bestDoc = snapCust.docs.find(d => d.data()?.chargeStatus && d.data()?.chargeStatus !== 'Normal') || snapCust.docs[0];
+                                const data = bestDoc.data();
                                 
                                 if (data.status === 'Inactive') {
                                     setCustomerData(null);
@@ -17210,7 +18335,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     return;
                                 }
 
-                                setCustomerData(prev => ({ ...(prev || {}), id: snapCust.docs[0].id, ...data }));
+                                setCustomerData(prev => ({ ...(prev || {}), id: bestDoc.id, ...data }));
                                 if (!customerName) setCustomerName(data.name);
                                 if (data.sex) setCustomerSex(data.sex);
                             }
@@ -17221,7 +18346,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             setIsCheckingPhone(false);
                         }
                     };
-                    const timeoutId = setTimeout(checkPhone, 500);
+                    const timeoutId = setTimeout(checkPhone, 300);
                     return () => clearTimeout(timeoutId);
                 }, [customerPhone]);
 
@@ -17408,11 +18533,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         return null;
                     })();
 
-                    const customerChargeStatus = customerData?.chargeStatus || 'Normal';
-                    const scope = customerData?.chargeStatusScope || 'All';
-                    const allowedShops = customerData?.chargeStatusShopIds || [];
-                    const isGlobalVIP = scope === 'All' || scope === 'Global';
-                    const isShopEligible = isGlobalVIP || allowedShops.includes(cartShopId);
+                    const effectivePosShopId = cartShopId || (posShopId !== 'All' ? posShopId : '');
 
                     const processed = cart.map(item => {
                         const product = products.find(p => p.id === item.productId);
@@ -17456,7 +18577,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             if (activeHappyHour) {
                                 let effPrice = item.price;
                                 if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    effPrice = item.price - (item.price * (activeHappyHour.value / 100));
+                                    effPrice = Math.round(item.price - (item.price * (activeHappyHour.value / 100)));
                                 } else {
                                     effPrice = Math.max(0, item.price - activeHappyHour.value);
                                 }
@@ -17483,7 +18604,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 let savings = 0;
 
                                 if (promo.type === 'DISCOUNT_PCT') {
-                                    effPrice = item.price - (item.price * (Number(promo.discountValue || 0) / 100));
+                                    effPrice = Math.round(item.price - (item.price * (Number(promo.discountValue || 0) / 100)));
                                     lTotal = effPrice * paidQty;
                                     savings = (item.price * paidQty) - lTotal;
                                 } else if (promo.type === 'DISCOUNT_FIXED') {
@@ -17517,53 +18638,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 }
                             }
 
-                            // Scenario 3: VIP / Charge Status
-                            if (customerChargeStatus !== 'Normal' && isShopEligible) {
-                                const tierLabel = customerData?.customerType && customerData.customerType !== 'Normal' ? customerData.customerType : 'Member';
-                                const statusStr = String(customerChargeStatus).toUpperCase();
-                                
-                                let effPrice = item.price;
-                                let lTotal = item.price * paidQty;
-                                let savings = 0;
-                                let pName = '';
-
-                                if (statusStr.includes('FOC')) {
-                                    effPrice = 0;
-                                    lTotal = 0;
-                                    savings = item.price * paidQty;
-                                    pName = `${tierLabel} (FOC)`;
-                                } else if (statusStr.includes('COG')) {
-                                    let itemCost = 0;
-                                    if (product) {
-                                        if (item.size === 'S' || item.size === 'Standard') itemCost = product.costSmall || 0;
-                                        else if (item.size === 'L') itemCost = product.costLarge || 0;
-                                        else itemCost = product.costSmall || 0; 
-                                    }
-                                    effPrice = itemCost;
-                                    lTotal = itemCost * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
-                                    pName = `${tierLabel} (COG)`;
-                                } else {
-                                    const pct = parseInt(statusStr.replace(/\D/g, ''));
-                                    if (!isNaN(pct) && pct > 0) {
-                                        effPrice = item.price - (item.price * (pct / 100));
-                                        lTotal = effPrice * paidQty;
-                                        savings = (item.price * paidQty) - lTotal;
-                                        pName = `${tierLabel} ${pct}%`;
-                                    }
-                                }
-
-                                if (savings > 0 || statusStr.includes('FOC') || statusStr.includes('COG')) {
-                                    addScenario({
-                                        name: 'VIP',
-                                        effectiveUnitPrice: effPrice,
-                                        lineTotal: lTotal,
-                                        savings: savings,
-                                        totalQtyForKDS: item.quantity,
-                                        freeQuantity: 0,
-                                        promoNames: [pName]
-                                    });
-                                }
+                            // Scenario 3: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount %)
+                            const memberScenario = evaluateCustomerChargeStatus(customerData, effectivePosShopId, item, product);
+                            if (memberScenario) {
+                                addScenario(memberScenario);
                             }
                         } else {
                             bestScenario.effectiveUnitPrice = 0;
@@ -18255,8 +19333,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             {(customerPhone && customerData) && (
                                                 <div className="flex flex-col bg-stone-50 p-2.5 rounded-xl border border-stone-200 mb-2">
                                                     <div className="flex justify-between items-center w-full">
-                                                        <div className="flex items-center gap-1.5 font-bold text-stone-800 text-sm">
+                                                        <div className="flex items-center flex-wrap gap-1.5 font-bold text-stone-800 text-sm">
                                                             <span>{customerSex === 'F' ? 'Ms. ' : 'Mr. '}{customerName}</span>
+                                                            {customerData.customerType === 'Member' && (
+                                                                <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                                                                    Member
+                                                                </span>
+                                                            )}
+                                                            {customerData.chargeStatus && customerData.chargeStatus !== 'Normal' && customerData.chargeStatus !== 'Normal Price' && (
+                                                                <span className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 border border-purple-300">
+                                                                    <i className="fa-solid fa-crown mr-0.5"></i>{customerData.chargeStatus}
+                                                                </span>
+                                                            )}
                                                             {globalPoints?.pointsEnabled && customerLoyalty && (
                                                                 <>
                                                                     <span className="text-stone-300">|</span>
