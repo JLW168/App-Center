@@ -459,6 +459,39 @@
                 return `${year}-${month}-${day}`;
             };
 
+            const formatSolarisDateTime = (timestamp, includeSeconds = false) => {
+                if (!timestamp) return '';
+                const d = new Date(timestamp);
+                const day = String(d.getDate()).padStart(2, '0');
+                const month = String(d.getMonth() + 1).padStart(2, '0');
+                const year = String(d.getFullYear()).slice(-2);
+                let hrs = d.getHours();
+                const ampm = hrs >= 12 ? 'PM' : 'AM';
+                hrs = hrs % 12 || 12;
+                const mins = String(d.getMinutes()).padStart(2, '0');
+                if (includeSeconds) {
+                    const secs = String(d.getSeconds()).padStart(2, '0');
+                    return `${day}-${month}-${year} | ${hrs}:${mins}:${secs} ${ampm}`;
+                }
+                return `${day}-${month}-${year} | ${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
+            };
+
+            const SOLARIS_STATUS_COLORS = {
+                'New': 'bg-blue-100 text-blue-800',
+                'Preparing': 'bg-amber-100 text-amber-800',
+                'Ready': 'bg-green-100 text-green-800',
+                'Served': 'bg-stone-100 text-stone-500',
+                'Cancelled': 'bg-red-100 text-red-800'
+            };
+
+            const SOLARIS_KDS_STATUS_COLORS = {
+                'New': 'bg-blue-50 text-blue-800 border-blue-200',
+                'Preparing': 'bg-amber-50 text-amber-800 border-amber-200',
+                'Ready': 'bg-emerald-50 text-emerald-800 border-emerald-200',
+                'Served': 'bg-stone-50 text-stone-500 border-stone-200',
+                'Cancelled': 'bg-red-50 text-red-800 border-red-200'
+            };
+
             // Phone Number Formatting & Validation for Cambodian Operators
             const formatPhoneNumber = (value) => {
                 if (!value) return '';
@@ -1348,160 +1381,71 @@
             };
 
             const calculateCustomerLoyalty = (customerOrders, phone, globalPointsConfig, refilledPoints = 0) => {
-                if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiringSoon: null, activeBatches: [] };
+                if (!phone || !globalPointsConfig?.pointsEnabled) return { activePoints: 0, activePts: 0, freeClaims: 0, expiredPoints: 0, expiredClaims: 0, expiringSoon: null, activeBatches: [], expiringClaims: [] };
 
-                // FIX: Strict Type Casting & Filtering
-                // Count all valid orders, not just paid ones, to maintain consistency with checkout instantly claiming/awarding points.
-                const validOrders = customerOrders
+                const validOrders = (customerOrders || [])
                     .filter(o => o.customerPhone === phone && o.status !== 'Cancelled')
                     .sort((a, b) => Number(a.createdAt) - Number(b.createdAt));
-                
+
                 const pointBatches = [];
-                
-                // Add manually refilled points as a non-expiring base batch, enforcing Number type
-                const safeRefill = Number(refilledPoints) || 0;
-                if (safeRefill > 0) {
-                    pointBatches.push({
-                        points: safeRefill,
-                        earnedAt: 0,
-                        expiresAt: null
-                    });
-                }
-                
-                let runningSpend = 0;
                 const spendReq = Number(globalPointsConfig.spendAmount) || 4000;
                 const ptsEarned = Number(globalPointsConfig.pointsEarned) || 1;
                 const expDays = Number(globalPointsConfig.expirationDays) || 0;
+                const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
 
-                // BUG FIX: Chronological Processing ensures expired points cannot be redeemed later
+                const safeRefill = Number(refilledPoints) || 0;
+                if (safeRefill > 0) pointBatches.push({ points: safeRefill, earnedAt: 0, expiresAt: null });
+
+                let runningSpend = 0;
+                let totalSpent = 0;
+                let totalRedeemed = 0;
+
                 validOrders.forEach(o => {
                     const orderTime = Number(o.createdAt) || 0;
+                    pointBatches.forEach(b => { if (b.points > 0 && b.expiresAt && b.expiresAt < orderTime) b.points = 0; });
 
-                    // 1. Expire batches that passed their lifespan BEFORE this specific order
-                    pointBatches.forEach(b => {
-                        if (b.points > 0 && b.expiresAt && b.expiresAt < orderTime) {
-                            b.points = 0;
-                        }
-                    });
-
-                    // 2. Process Redemption (Deducting oldest valid points first)
                     let redeemedHere = Number(o.redeemedPoints) || 0;
                     if (redeemedHere > 0) {
-                        for (let i = 0; i < pointBatches.length; i++) {
-                            if (redeemedHere <= 0) break;
+                        totalRedeemed += redeemedHere;
+                        for (let i = 0; i < pointBatches.length && redeemedHere > 0; i++) {
                             if (pointBatches[i].points > 0) {
-                                if (pointBatches[i].points <= redeemedHere) {
-                                    redeemedHere -= pointBatches[i].points;
-                                    pointBatches[i].points = 0;
-                                } else {
-                                    pointBatches[i].points -= redeemedHere;
-                                    redeemedHere = 0;
-                                }
+                                const deduct = Math.min(pointBatches[i].points, redeemedHere);
+                                pointBatches[i].points -= deduct;
+                                redeemedHere -= deduct;
                             }
                         }
                     }
 
-                    // 3. Earn Points for this order safely
-                    // BUG FIX: Only earn points for PAID orders to prevent fake points from Unpaid/Cancelled invoices.
                     const amountSpent = o.paymentStatus === 'Paid' ? (Number(o.totalAmount) || 0) : 0;
                     runningSpend += amountSpent;
-                    
-                    // Prevent division by zero or NaN
+                    totalSpent += amountSpent;
                     if (spendReq > 0) {
                         const batchesEarned = Math.floor(runningSpend / spendReq);
-                        
                         if (batchesEarned > 0) {
-                            const earned = batchesEarned * ptsEarned;
                             pointBatches.push({
-                                points: earned,
+                                points: batchesEarned * ptsEarned,
                                 earnedAt: orderTime,
-                                expiresAt: expDays > 0 ? orderTime + (expDays * 24 * 60 * 60 * 1000) : null
+                                expiresAt: expDays > 0 ? orderTime + (expDays * 86400000) : null
                             });
-                            // Subtract exactly what was converted, leaving remainder for next purchase
                             runningSpend -= (batchesEarned * spendReq);
                         }
                     }
                 });
 
-                // 4. Process final Expirations based on Current Time
                 const now = Date.now();
-                let activePts = 0;
                 let expiredPts = 0;
-                const activeBatches = [];
-
-                pointBatches.forEach(batch => {
-                    if (batch.points > 0) {
-                        if (batch.expiresAt && batch.expiresAt < now) {
-                            expiredPts += batch.points;
-                            batch.points = 0; // Point expired and is completely lost
-                        } else {
-                            activePts += batch.points;
-                            if (batch.expiresAt) {
-                                activeBatches.push({ points: batch.points, expiresAt: batch.expiresAt });
-                            }
-                        }
+                pointBatches.forEach(b => {
+                    if (b.points > 0 && b.expiresAt && b.expiresAt < now) {
+                        expiredPts += b.points;
+                        b.points = 0;
                     }
                 });
 
-                // BUG FIX: Secure Redemption Math
-                // Prevent division by zero, string coercion issues, or NaN creating 0 gifts
-                const redemptionCost = Number(globalPointsConfig.redeemPoints) || 10;
-                let freeClaims = 0;
-                let expiredClaims = 0;
-                let displayActivePts = activePts;
-                
-                if (redemptionCost > 0) {
-                    if (activePts > 0) {
-                        freeClaims = Math.floor(activePts / redemptionCost);
-                        displayActivePts = activePts % redemptionCost;
-                    }
-                    if (expiredPts > 0) expiredClaims = Math.floor(expiredPts / redemptionCost);
-                }
-                
-                // --- NEW: PROJECTED CLAIM EXPIRATION LOGIC ---
-                // Calculates when actual "Free Product Claims" are lost, not just individual points
-                const expiringClaims = [];
-                if (freeClaims > 0 && redemptionCost > 0 && activeBatches.length > 0) {
-                    const expBatches = [...activeBatches].filter(b => b.expiresAt).sort((a, b) => a.expiresAt - b.expiresAt);
-                    let currentPtsForProjection = activePts;
-                    let currentClaimsForProjection = freeClaims;
-                    const groupedExpirations = {};
-
-                    expBatches.forEach(b => {
-                        if (!groupedExpirations[b.expiresAt]) groupedExpirations[b.expiresAt] = 0;
-                        groupedExpirations[b.expiresAt] += b.points;
-                    });
-
-                    const sortedExpDates = Object.keys(groupedExpirations).map(Number).sort((a, b) => a - b);
-
-                    sortedExpDates.forEach(expTime => {
-                        const ptsExpiring = groupedExpirations[expTime];
-                        currentPtsForProjection -= ptsExpiring;
-                        const newClaimsCount = Math.max(0, Math.floor(currentPtsForProjection / redemptionCost));
-
-                        if (newClaimsCount < currentClaimsForProjection) {
-                            const claimsLost = currentClaimsForProjection - newClaimsCount;
-                            for (let i = 0; i < claimsLost; i++) {
-                                expiringClaims.push({
-                                    expiresAt: expTime
-                                });
-                            }
-                            currentClaimsForProjection = newClaimsCount;
-                        }
-                    });
-                }
-
-                const expiringSoon = expiringClaims.length > 0 ? expiringClaims[0].expiresAt : null;
-                
-                return { 
-                    activePoints: displayActivePts, 
-                    activePts: displayActivePts, 
-                    freeClaims, 
+                const live = computeLiveLoyalty({ pointBatches, totalSpent, totalRedeemed, refilledDeducted: 0 }, globalPointsConfig, 0);
+                return {
+                    ...live,
                     expiredPoints: expiredPts,
-                    expiredClaims,
-                    expiringSoon, 
-                    activeBatches,
-                    expiringClaims 
+                    expiredClaims: redemptionCost > 0 ? Math.floor(expiredPts / redemptionCost) : 0
                 };
             };
 
@@ -2628,6 +2572,12 @@
                 async broadcastDetectedAbaPayment(parsed, chatId = '', sourceLabel = 'Telegram Live', messageDateMs = null) {
                     if (!parsed || !parsed.isValid || !parsed.trxId) return;
                     const trxId = String(parsed.trxId).trim();
+
+                    // QUOTA GUARD: Skip redundant Firestore writes if this Trx ID is already in memory
+                    if (window.SolarisPayWayVerifier?.inMemoryAbaPayments?.has(trxId)) {
+                        return;
+                    }
+
                     const effectiveReceivedAt = Number(messageDateMs) > 0
                         ? Number(messageDateMs)
                         : (Number(parsed.paidTimestamp) > 0 ? Number(parsed.paidTimestamp) : Date.now());
@@ -2655,53 +2605,35 @@
 
                     if (window.SolarisPayWayVerifier) {
                         window.SolarisPayWayVerifier.inMemoryAbaPayments.set(trxId, entry);
+                        window.SolarisPayWayVerifier.saveLocalAbaCache();
+                        window.SolarisPayWayVerifier.notifySubscribers(entry);
                     }
 
-                    // Attempt write to Firestore `aba_payments/{trxId}` (succeeds if rules allow authenticated create)
+                    // If Firestore quota was recently exceeded, skip cloud write and rely on in-memory + localStorage cache
+                    if (window.SolarisPayWayVerifier?.isQuotaExceeded) return;
+
+                    // Single write with merge: true (eliminates the extra getDoc read before every write!)
                     try {
-                        const { doc, getDoc, setDoc } = window.FirebaseApp;
-                        const payRef = doc(safeDB(), 'aba_payments', trxId);
-                        const existing = await getDoc(payRef);
-                        if (!existing.exists()) {
-                            await setDoc(payRef, {
-                                trxId,
-                                apv: String(enrichedParsed.apv || ''),
-                                currency: enrichedParsed.currency,
-                                amount: Number(enrichedParsed.amount),
-                                payerName: enrichedParsed.payerName || 'ABA Customer',
-                                maskedAccount: enrichedParsed.maskedAccount || '*ABA',
-                                paidAtStr: enrichedParsed.paidAtStr || '',
-                                paidTimestamp: enrichedParsed.paidTimestamp,
-                                paymentChannel: enrichedParsed.paymentChannel || 'ABA PAY',
-                                merchantName: enrichedParsed.merchantName || '',
-                                rawText: enrichedParsed.rawText || '',
-                                chatId: enrichedParsed.chatId,
-                                receivedAt: effectiveReceivedAt,
-                                claimedByOrderId: null
-                            });
-                        }
+                        const { doc, setDoc } = window.FirebaseApp;
+                        await setDoc(doc(safeDB(), 'aba_payments', trxId), {
+                            trxId,
+                            apv: String(enrichedParsed.apv || ''),
+                            currency: enrichedParsed.currency,
+                            amount: Number(enrichedParsed.amount),
+                            payerName: enrichedParsed.payerName || 'ABA Customer',
+                            maskedAccount: enrichedParsed.maskedAccount || '*ABA',
+                            paidAtStr: enrichedParsed.paidAtStr || '',
+                            paidTimestamp: enrichedParsed.paidTimestamp,
+                            paymentChannel: enrichedParsed.paymentChannel || 'ABA PAY',
+                            merchantName: enrichedParsed.merchantName || '',
+                            rawText: enrichedParsed.rawText || '',
+                            chatId: enrichedParsed.chatId,
+                            receivedAt: effectiveReceivedAt
+                        }, { merge: true });
                     } catch (e) {
-                        // Fallback: Also write to `system_settings/aba_live_feed` which is always writable by staff
-                        try {
-                            const { doc, setDoc } = window.FirebaseApp;
-                            await setDoc(doc(safeDB(), 'system_settings', 'aba_live_feed'), {
-                                [`payments.${trxId}`]: {
-                                    trxId,
-                                    apv: String(enrichedParsed.apv || ''),
-                                    currency: enrichedParsed.currency,
-                                    amount: Number(enrichedParsed.amount),
-                                    payerName: enrichedParsed.payerName || 'ABA Customer',
-                                    maskedAccount: enrichedParsed.maskedAccount || '*ABA',
-                                    paidAtStr: enrichedParsed.paidAtStr || '',
-                                    paidTimestamp: enrichedParsed.paidTimestamp,
-                                    merchantName: enrichedParsed.merchantName || '',
-                                    rawText: enrichedParsed.rawText || '',
-                                    chatId: enrichedParsed.chatId,
-                                    receivedAt: effectiveReceivedAt
-                                },
-                                updatedAt: Date.now()
-                            }, { merge: true });
-                        } catch (fallbackErr) {}
+                        if (e?.code === 'resource-exhausted' || /quota|exhausted/i.test(e?.message || '')) {
+                            if (window.SolarisPayWayVerifier) window.SolarisPayWayVerifier.isQuotaExceeded = true;
+                        }
                     }
                 },
 
@@ -2776,8 +2708,8 @@
                 // Reads ABA PayWay payments from:
                 // 1) In-Memory Live Stream (Browser MTProto / Injected / Bot Poller)
                 // 2) Telegram Bot API getUpdates (auto-resolving Bot Token from payway_secrets OR Telegram Bot Alerts)
-                // 3) Firestore `aba_payments` collection AND `system_settings/aba_live_feed`
-                async fetchRecentAbaPaymentsFromFirestore(filterChatId = '', shopId = '', includeClaimed = false) {
+                // 3) Firestore `aba_payments` collection (throttled to protect free-tier quota)
+                async fetchRecentAbaPaymentsFromFirestore(filterChatId = '', shopId = '', includeClaimed = false, forceCloudRead = false) {
                     try {
                         const { collection, query, where, orderBy, limit, getDocs, doc, getDoc } = window.FirebaseApp;
                         const database = safeDB();
@@ -2788,146 +2720,176 @@
                         const mergedByTrxId = new Map();
                         let discoveredChats = [];
 
-                        // SOURCE 1: In-Memory Live Payments (Browser MTProto Client or Manual/Bot Broadcasts)
+                        // Hydrate in-memory cache from localStorage if empty
+                        if (window.SolarisPayWayVerifier) {
+                            window.SolarisPayWayVerifier.loadLocalAbaCache();
+                        }
+
+                        // SOURCE 1: In-Memory Live Payments (Browser MTProto Client + Shared onSnapshot + Local Cache)
                         if (window.SolarisPayWayVerifier?.inMemoryAbaPayments) {
                             window.SolarisPayWayVerifier.inMemoryAbaPayments.forEach((entry, trxId) => {
-                                if (includeClaimed || !window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId)) {
+                                const isClaimed = entry.claimedByOrderId || window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId);
+                                if (includeClaimed || !isClaimed) {
                                     mergedByTrxId.set(trxId, entry);
                                 }
                             });
                         }
 
-                        // SOURCE 2: Poll Telegram Bot API if any Bot Token is available in `payway_secrets` OR `Telegram Bot Alerts`
-                        const secrets = await this.getStaffPaywaySecrets(shopId);
-                        if (secrets?.paywayBotToken) {
-                            const botPolled = await this.pollTelegramBotGetUpdatesToFirestore(secrets.paywayBotToken, cleanFilterId);
-                            if (botPolled.rawChatsSeen) discoveredChats = botPolled.rawChatsSeen;
-                            if (botPolled.items && botPolled.items.length > 0) {
-                                botPolled.items.forEach(item => {
-                                    const p = item.parsed;
-                                    const trxId = String(p.trxId).trim();
-                                    if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
-                                    mergedByTrxId.set(trxId, {
-                                        updateId: trxId,
-                                        messageId: trxId,
-                                        chatId: item.chatId || cleanFilterId,
-                                        chatTitle: item.chatTitle || 'Telegram Bot API',
-                                        chatType: 'telegram_bot',
-                                        senderName: 'PayWay by ABA',
-                                        isBotSender: true,
-                                        date: item.dateMs,
-                                        text: p.rawText,
-                                        parsedAba: p,
-                                        fromFirestore: false
-                                    });
-                                });
-                            }
-                        }
-
-                        // SOURCE 3: Read `system_settings/aba_live_feed` fallback document
-                        try {
-                            const feedSnap = await getDoc(doc(database, 'system_settings', 'aba_live_feed'));
-                            if (feedSnap.exists() && feedSnap.data()?.payments) {
-                                const paymentsObj = feedSnap.data().payments;
-                                Object.values(paymentsObj).forEach(d => {
-                                    if (!d || !d.trxId) return;
-                                    if (!includeClaimed && d.claimedByOrderId) return;
-                                    const trxId = String(d.trxId).trim();
-                                    if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
-                                    if (!mergedByTrxId.has(trxId)) {
-                                        const recMs = Number(d.receivedAt) || Date.now();
-                                        const parsedAba = {
-                                            isValid: true,
-                                            currency: d.currency || 'KHR',
-                                            amount: Number(d.amount || 0),
-                                            payerName: d.payerName || 'ABA Customer',
-                                            maskedAccount: d.maskedAccount || '*ABA',
-                                            paidAtStr: d.paidAtStr || '',
-                                            paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
-                                            receivedAt: recMs,
-                                            chatId: String(d.chatId || ''),
-                                            paymentChannel: 'ABA PAY',
-                                            merchantName: d.merchantName || '',
-                                            trxId,
-                                            apv: String(d.apv || '').trim(),
-                                            rawText: d.rawText || ''
-                                        };
+                        // SOURCE 2: Poll Telegram Bot API (throttled to at most once every 5s to avoid spam)
+                        const nowMs = Date.now();
+                        if (!this._lastBotPollMs || (nowMs - this._lastBotPollMs > 5000) || forceCloudRead) {
+                            this._lastBotPollMs = nowMs;
+                            const secrets = await this.getStaffPaywaySecrets(shopId);
+                            if (secrets?.paywayBotToken) {
+                                const botPolled = await this.pollTelegramBotGetUpdatesToFirestore(secrets.paywayBotToken, cleanFilterId);
+                                if (botPolled.rawChatsSeen) discoveredChats = botPolled.rawChatsSeen;
+                                if (botPolled.items && botPolled.items.length > 0) {
+                                    botPolled.items.forEach(item => {
+                                        const p = item.parsed;
+                                        const trxId = String(p.trxId).trim();
+                                        if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
                                         mergedByTrxId.set(trxId, {
                                             updateId: trxId,
                                             messageId: trxId,
-                                            chatId: String(d.chatId || ''),
-                                            chatTitle: 'Live Cloud Feed',
-                                            chatType: 'firestore_feed',
+                                            chatId: item.chatId || cleanFilterId,
+                                            chatTitle: item.chatTitle || 'Telegram Bot API',
+                                            chatType: 'telegram_bot',
                                             senderName: 'PayWay by ABA',
                                             isBotSender: true,
-                                            date: recMs,
-                                            claimedByOrderId: d.claimedByOrderId || null,
-                                            text: parsedAba.rawText,
-                                            parsedAba,
-                                            fromFirestore: true
+                                            date: item.dateMs,
+                                            text: p.rawText,
+                                            parsedAba: p,
+                                            fromFirestore: false
                                         });
-                                    }
-                                });
+                                    });
+                                }
                             }
-                        } catch (e) {}
-
-                        // SOURCE 4: Read Firestore `aba_payments` collection
-                        const colRef = collection(database, 'aba_payments');
-                        let snap = null;
-                        try {
-                            const q = includeClaimed
-                                ? query(colRef, orderBy('receivedAt', 'desc'), limit(150))
-                                : query(colRef, where('claimedByOrderId', '==', null), orderBy('receivedAt', 'desc'), limit(30));
-                            snap = await getDocs(q);
-                        } catch (idxErr) {
-                            const qFallback = includeClaimed
-                                ? query(colRef, limit(150))
-                                : query(colRef, where('claimedByOrderId', '==', null), limit(30));
-                            snap = await getDocs(qFallback);
                         }
 
-                        if (snap) {
-                            snap.forEach(docSnap => {
-                                const d = docSnap.data() || {};
-                                const trxId = String(d.trxId || docSnap.id).trim();
-                                const currency = d.currency || 'KHR';
-                                const amount = Number(d.amount || 0);
-                                if (!trxId || isNaN(amount) || amount <= 0) return;
-                                if (!includeClaimed && (d.claimedByOrderId || window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId))) return;
+                        // QUOTA OPTIMIZATION: Only run manual `getDocs` on Firestore if shared `onSnapshot` is not active OR `forceCloudRead` is requested,
+                        // and never query Firestore if `isQuotaExceeded` is flagged!
+                        const shouldQueryFirestore = !window.SolarisPayWayVerifier?.isQuotaExceeded &&
+                            (forceCloudRead || mergedByTrxId.size === 0 || !this._lastFirestoreFetchMs || (nowMs - this._lastFirestoreFetchMs > 30000));
 
-                                const recMs = Number(d.receivedAt) || Date.now();
-                                const parsedAba = {
-                                    isValid: true,
-                                    currency,
-                                    amount,
-                                    payerName: d.payerName || 'ABA Customer',
-                                    maskedAccount: d.maskedAccount || '*ABA',
-                                    paidAtStr: d.paidAtStr || '',
-                                    paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
-                                    receivedAt: recMs,
-                                    chatId: String(d.chatId || '').trim(),
-                                    paymentChannel: d.paymentChannel || 'ABA PAY',
-                                    merchantName: d.merchantName || '',
-                                    trxId,
-                                    apv: String(d.apv || '').trim(),
-                                    rawText: d.rawText || `${currency === 'KHR' ? '៛' : '$'}${amount} paid by ${d.payerName || 'ABA'} (${d.maskedAccount || '*ABA'}) at ${d.merchantName || ''}. Trx. ID: ${trxId}, APV: ${d.apv || ''}`
-                                };
+                        if (shouldQueryFirestore) {
+                            this._lastFirestoreFetchMs = nowMs;
+                            // SOURCE 3: Read `system_settings/aba_live_feed` fallback document
+                            try {
+                                const feedSnap = await getDoc(doc(database, 'system_settings', 'aba_live_feed'));
+                                if (feedSnap.exists() && feedSnap.data()?.payments) {
+                                    const paymentsObj = feedSnap.data().payments;
+                                    Object.values(paymentsObj).forEach(d => {
+                                        if (!d || !d.trxId) return;
+                                        if (!includeClaimed && d.claimedByOrderId) return;
+                                        const trxId = String(d.trxId).trim();
+                                        if (!includeClaimed && window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId)) return;
+                                        if (!mergedByTrxId.has(trxId)) {
+                                            const recMs = Number(d.receivedAt) || Date.now();
+                                            const parsedAba = {
+                                                isValid: true,
+                                                currency: d.currency || 'KHR',
+                                                amount: Number(d.amount || 0),
+                                                payerName: d.payerName || 'ABA Customer',
+                                                maskedAccount: d.maskedAccount || '*ABA',
+                                                paidAtStr: d.paidAtStr || '',
+                                                paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                                receivedAt: recMs,
+                                                chatId: String(d.chatId || ''),
+                                                paymentChannel: 'ABA PAY',
+                                                merchantName: d.merchantName || '',
+                                                trxId,
+                                                apv: String(d.apv || '').trim(),
+                                                rawText: d.rawText || ''
+                                            };
+                                            const entryObj = {
+                                                updateId: trxId,
+                                                messageId: trxId,
+                                                chatId: String(d.chatId || ''),
+                                                chatTitle: 'Live Cloud Feed',
+                                                chatType: 'firestore_feed',
+                                                senderName: 'PayWay by ABA',
+                                                isBotSender: true,
+                                                date: recMs,
+                                                claimedByOrderId: d.claimedByOrderId || null,
+                                                text: parsedAba.rawText,
+                                                parsedAba,
+                                                fromFirestore: true
+                                            };
+                                            mergedByTrxId.set(trxId, entryObj);
+                                            window.SolarisPayWayVerifier?.inMemoryAbaPayments?.set(trxId, entryObj);
+                                        }
+                                    });
+                                }
+                            } catch (e) {}
 
-                                mergedByTrxId.set(trxId, {
-                                    updateId: trxId,
-                                    messageId: trxId,
-                                    chatId: String(d.chatId || '').trim() || cleanFilterId,
-                                    chatTitle: 'Firestore aba_payments',
-                                    chatType: 'firestore',
-                                    senderName: 'PayWay by ABA',
-                                    isBotSender: true,
-                                    date: recMs,
-                                    claimedByOrderId: d.claimedByOrderId || null,
-                                    text: parsedAba.rawText,
-                                    parsedAba,
-                                    fromFirestore: true
+                            // SOURCE 4: Read Firestore `aba_payments` collection
+                            const colRef = collection(database, 'aba_payments');
+                            let snap = null;
+                            try {
+                                const q = includeClaimed
+                                    ? query(colRef, orderBy('receivedAt', 'desc'), limit(80))
+                                    : query(colRef, where('claimedByOrderId', '==', null), orderBy('receivedAt', 'desc'), limit(25));
+                                snap = await getDocs(q);
+                            } catch (idxErr) {
+                                if (idxErr?.code === 'resource-exhausted' || /quota|exhausted/i.test(idxErr?.message || '')) {
+                                    if (window.SolarisPayWayVerifier) window.SolarisPayWayVerifier.isQuotaExceeded = true;
+                                } else {
+                                    const qFallback = includeClaimed
+                                        ? query(colRef, limit(80))
+                                        : query(colRef, where('claimedByOrderId', '==', null), limit(25));
+                                    snap = await getDocs(qFallback).catch(() => null);
+                                }
+                            }
+
+                            if (snap) {
+                                snap.forEach(docSnap => {
+                                    const d = docSnap.data() || {};
+                                    const trxId = String(d.trxId || docSnap.id).trim();
+                                    const currency = d.currency || 'KHR';
+                                    const amount = Number(d.amount || 0);
+                                    if (!trxId || isNaN(amount) || amount <= 0) return;
+                                    if (d.claimedByOrderId) {
+                                        window.SolarisPayWayVerifier?.processedTrxIdsMemory?.add(trxId);
+                                    }
+                                    if (!includeClaimed && (d.claimedByOrderId || window.SolarisPayWayVerifier?.processedTrxIdsMemory?.has(trxId))) return;
+
+                                    const recMs = Number(d.receivedAt) || Date.now();
+                                    const parsedAba = {
+                                        isValid: true,
+                                        currency,
+                                        amount,
+                                        payerName: d.payerName || 'ABA Customer',
+                                        maskedAccount: d.maskedAccount || '*ABA',
+                                        paidAtStr: d.paidAtStr || '',
+                                        paidTimestamp: Number(d.paidTimestamp) || this.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                        receivedAt: recMs,
+                                        chatId: String(d.chatId || '').trim(),
+                                        paymentChannel: d.paymentChannel || 'ABA PAY',
+                                        merchantName: d.merchantName || '',
+                                        trxId,
+                                        apv: String(d.apv || '').trim(),
+                                        rawText: d.rawText || `${currency === 'KHR' ? '៛' : '$'}${amount} paid by ${d.payerName || 'ABA'} (${d.maskedAccount || '*ABA'}) at ${d.merchantName || ''}. Trx. ID: ${trxId}, APV: ${d.apv || ''}`
+                                    };
+
+                                    const entryObj = {
+                                        updateId: trxId,
+                                        messageId: trxId,
+                                        chatId: String(d.chatId || '').trim() || cleanFilterId,
+                                        chatTitle: 'Firestore aba_payments',
+                                        chatType: 'firestore',
+                                        senderName: 'PayWay by ABA',
+                                        isBotSender: true,
+                                        date: recMs,
+                                        claimedByOrderId: d.claimedByOrderId || null,
+                                        text: parsedAba.rawText,
+                                        parsedAba,
+                                        fromFirestore: true
+                                    };
+                                    mergedByTrxId.set(trxId, entryObj);
+                                    window.SolarisPayWayVerifier?.inMemoryAbaPayments?.set(trxId, entryObj);
                                 });
-                            });
+                                window.SolarisPayWayVerifier?.saveLocalAbaCache();
+                            }
                         }
 
                         const allMessages = Array.from(mergedByTrxId.values()).sort((a, b) => b.date - a.date);
@@ -3303,7 +3265,235 @@
             window.SolarisPayWayVerifier = {
                 processedTrxIdsMemory: new Set(),
                 inMemoryAbaPayments: new Map(),
+                localVerifiedOrdersMap: new Map(),
+                activeKhqrIntents: new Map(),
                 lastKnownAbaMessages: [],
+                subscribers: new Set(),
+                activeFirestoreUnsub: null,
+                activeFeedUnsub: null,
+                isQuotaExceeded: false,
+                _localCacheLoaded: false,
+
+                // Persists recent ABA payments & verified order overrides in localStorage so Quota Exceeded never loses data
+                loadLocalAbaCache() {
+                    if (this._localCacheLoaded) return;
+                    this._localCacheLoaded = true;
+                    try {
+                        const rawPayments = localStorage.getItem('solaris_aba_payments_cache_v1');
+                        if (rawPayments) {
+                            const arr = JSON.parse(rawPayments);
+                            if (Array.isArray(arr)) {
+                                arr.forEach(item => {
+                                    if (item && item.updateId && item.parsedAba?.trxId) {
+                                        this.inMemoryAbaPayments.set(String(item.updateId), item);
+                                        if (item.claimedByOrderId) {
+                                            this.processedTrxIdsMemory.add(String(item.updateId));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        const rawClaimed = localStorage.getItem('solaris_aba_claimed_trx_v1');
+                        if (rawClaimed) {
+                            const arr = JSON.parse(rawClaimed);
+                            if (Array.isArray(arr)) arr.forEach(id => this.processedTrxIdsMemory.add(String(id)));
+                        }
+                        const rawOrderOverrides = localStorage.getItem('solaris_aba_verified_orders_v1');
+                        if (rawOrderOverrides) {
+                            const obj = JSON.parse(rawOrderOverrides);
+                            if (obj && typeof obj === 'object') {
+                                Object.entries(obj).forEach(([orderId, payload]) => {
+                                    this.localVerifiedOrdersMap.set(orderId, payload);
+                                });
+                            }
+                        }
+                    } catch (e) {}
+                },
+
+                saveLocalAbaCache() {
+                    try {
+                        const recentEntries = Array.from(this.inMemoryAbaPayments.values())
+                            .sort((a, b) => (Number(b.date) || 0) - (Number(a.date) || 0))
+                            .slice(0, 100);
+                        localStorage.setItem('solaris_aba_payments_cache_v1', JSON.stringify(recentEntries));
+                        localStorage.setItem('solaris_aba_claimed_trx_v1', JSON.stringify(Array.from(this.processedTrxIdsMemory).slice(-200)));
+                        const overridesObj = {};
+                        this.localVerifiedOrdersMap.forEach((val, key) => { overridesObj[key] = val; });
+                        localStorage.setItem('solaris_aba_verified_orders_v1', JSON.stringify(overridesObj));
+                    } catch (e) {}
+                },
+
+                // PHASE B: Registers an active KHQR Intent (Silent Temporary Invoice + Timestamp + Valid Window)
+                registerKhqrIntent(intentId, data = {}) {
+                    if (!intentId) return;
+                    this.activeKhqrIntents.set(String(intentId), {
+                        intentId: String(intentId),
+                        shopId: data.shopId || '',
+                        tempInvoiceNo: data.tempInvoiceNo || String(intentId),
+                        expectedKhr: Math.round(Number(data.expectedKhr || 0)),
+                        expectedUsd: Number(data.expectedUsd || 0),
+                        initiatedAt: Number(data.initiatedAt || Date.now()),
+                        expiresAt: Number(data.expiresAt || (Date.now() + 120000))
+                    });
+                },
+
+                unregisterKhqrIntent(intentId) {
+                    if (!intentId) return;
+                    this.activeKhqrIntents.delete(String(intentId));
+                },
+
+                // PHASE B (Option 1): Detects if another active KHQR intent or pending order is waiting for the exact same amount simultaneously
+                hasSimultaneousAmountCollision(expectedKhr, currentOrderOrIntentId, shopId = '', liveOrders = []) {
+                    const now = Date.now();
+                    const targetKhr = Math.round(Number(expectedKhr || 0));
+                    if (targetKhr <= 0) return false;
+                    const selfId = String(currentOrderOrIntentId || '');
+
+                    // 1. Check active open KHQR Modals in memory
+                    for (const [id, intent] of this.activeKhqrIntents.entries()) {
+                        if (now > intent.expiresAt + 60000) {
+                            this.activeKhqrIntents.delete(id);
+                            continue;
+                        }
+                        if (id !== selfId && intent.tempInvoiceNo !== selfId) {
+                            if (!shopId || !intent.shopId || intent.shopId === shopId) {
+                                if (intent.expectedKhr === targetKhr && now <= intent.expiresAt) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Check recent pending KHQR orders in Firestore (< 5 mins old)
+                    const recentCompetingOrders = (liveOrders || []).filter(o => {
+                        if (!o || o.paymentStatus === 'Paid' || o.status === 'Cancelled') return false;
+                        if (o.id === selfId || o.queueNo === selfId) return false;
+                        if (shopId && o.shopId && o.shopId !== shopId) return false;
+                        const isKhqr = o.paymentMethod === 'KHQR (ABA)' || o.khqrExpectedKhr > 0;
+                        if (!isKhqr) return false;
+                        const orderInitiated = Number(o.khqrInitiatedAt || o.createdAt || 0);
+                        if (now - orderInitiated > 5 * 60 * 1000) return false;
+                        return Math.round(Number(o.khqrExpectedKhr || o.totalAmount || 0)) === targetKhr;
+                    });
+
+                    return recentCompetingOrders.length > 0;
+                },
+
+                // Shared Pub-Sub Listener: Consolidates duplicate Firestore snapshots across POSView, KDSView, and KHQRPaymentModal
+                subscribe(callback) {
+                    if (typeof callback !== 'function') return () => {};
+                    this.subscribers.add(callback);
+                    this.ensureSharedListeners();
+                    return () => {
+                        this.subscribers.delete(callback);
+                        if (this.subscribers.size === 0) {
+                            this.stopSharedListeners();
+                        }
+                    };
+                },
+
+                notifySubscribers(payload = null) {
+                    this.subscribers.forEach(fn => {
+                        try { fn(payload); } catch (e) {}
+                    });
+                },
+
+                ensureSharedListeners() {
+                    if (this.activeFirestoreUnsub || !window.FirebaseApp) return;
+                    try {
+                        const { collection, query, limit, onSnapshot, doc } = window.FirebaseApp;
+                        const database = safeDB();
+
+                        const qAba = query(collection(database, 'aba_payments'), limit(120));
+                        this.activeFirestoreUnsub = onSnapshot(qAba, (snap) => {
+                            let changed = false;
+                            snap.docChanges().forEach(change => {
+                                const d = change.doc.data() || {};
+                                const trxId = String(d.trxId || change.doc.id).trim();
+                                if (!trxId) return;
+                                changed = true;
+                                if (d.claimedByOrderId) {
+                                    this.processedTrxIdsMemory.add(trxId);
+                                }
+                                const recMs = Number(d.receivedAt) || Date.now();
+                                const parsedAba = {
+                                    isValid: true,
+                                    currency: d.currency || 'KHR',
+                                    amount: Number(d.amount || 0),
+                                    payerName: d.payerName || 'ABA Customer',
+                                    maskedAccount: d.maskedAccount || '*ABA',
+                                    paidAtStr: d.paidAtStr || '',
+                                    paidTimestamp: Number(d.paidTimestamp) || window.SolarisKHQREngine.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                    receivedAt: recMs,
+                                    chatId: String(d.chatId || '').trim(),
+                                    merchantName: d.merchantName || '',
+                                    trxId,
+                                    apv: String(d.apv || '').trim(),
+                                    rawText: d.rawText || ''
+                                };
+                                this.inMemoryAbaPayments.set(trxId, {
+                                    updateId: trxId,
+                                    messageId: trxId,
+                                    chatId: parsedAba.chatId,
+                                    date: recMs,
+                                    claimedByOrderId: d.claimedByOrderId || null,
+                                    parsedAba,
+                                    fromFirestore: true
+                                });
+                            });
+                            if (changed) this.notifySubscribers();
+                        }, () => {});
+
+                        this.activeFeedUnsub = onSnapshot(doc(database, 'system_settings', 'aba_live_feed'), (docSnap) => {
+                            if (!docSnap.exists()) return;
+                            const paymentsObj = docSnap.data()?.payments || {};
+                            let changed = false;
+                            Object.values(paymentsObj).forEach(d => {
+                                if (!d || !d.trxId) return;
+                                const trxId = String(d.trxId).trim();
+                                if (d.claimedByOrderId) this.processedTrxIdsMemory.add(trxId);
+                                const recMs = Number(d.receivedAt) || Date.now();
+                                const parsedAba = {
+                                    isValid: true,
+                                    currency: d.currency || 'KHR',
+                                    amount: Number(d.amount || 0),
+                                    payerName: d.payerName || 'ABA Customer',
+                                    maskedAccount: d.maskedAccount || '*ABA',
+                                    paidAtStr: d.paidAtStr || '',
+                                    paidTimestamp: Number(d.paidTimestamp) || window.SolarisKHQREngine.parseAbaPaidAtToMs(d.paidAtStr, recMs),
+                                    receivedAt: recMs,
+                                    chatId: String(d.chatId || '').trim(),
+                                    merchantName: d.merchantName || '',
+                                    trxId,
+                                    apv: String(d.apv || '').trim(),
+                                    rawText: d.rawText || ''
+                                };
+                                this.inMemoryAbaPayments.set(trxId, {
+                                    updateId: trxId,
+                                    messageId: trxId,
+                                    chatId: parsedAba.chatId,
+                                    date: recMs,
+                                    claimedByOrderId: d.claimedByOrderId || null,
+                                    parsedAba,
+                                    fromFirestore: true
+                                });
+                                changed = true;
+                            });
+                            if (changed) this.notifySubscribers();
+                        }, () => {});
+                    } catch (e) {}
+                },
+
+                stopSharedListeners() {
+                    if (typeof this.activeFirestoreUnsub === 'function') {
+                        this.activeFirestoreUnsub();
+                        this.activeFirestoreUnsub = null;
+                    }
+                    if (typeof this.activeFeedUnsub === 'function') {
+                        this.activeFeedUnsub();
+                        this.activeFeedUnsub = null;
+                    }
+                },
 
                 // Normalizes a Merchant / Account Holder Name (strips punctuation/extra spaces) for dynamic comparison
                 normalizeMerchantStr(str) {
@@ -3315,7 +3505,7 @@
                 },
 
                 // Checks if a parsed ABA PayWay message matches a specific pending KHQR order
-                // Dynamically validates Amount, Optional APV Ref, Chat ID (if specified), and Merchant Name
+                // Dynamically validates Amount, Chronological Recency Gate (< 5 min & after QR generation), Optional APV Ref, and Chat ID
                 doesMessageMatchOrder(parsedAba, order, shop) {
                     if (!parsedAba || !parsedAba.isValid || !order) return false;
                     if (order.paymentStatus === 'Paid' || order.status === 'Cancelled') return false;
@@ -3334,7 +3524,35 @@
                         }
                     }
 
-                    // 2. Customer Optional APV / Reference Match (if customer/staff typed 3+ digits, verify it matches APV or Trx ID)
+                    // 2. PHASE B: Strict "Egg Before Chicken" Chronological & Recency Gate (< 5 mins configurable)
+                    if (!order.bypassRecencyGate) {
+                        const now = Date.now();
+                        const maxRecencyMinutes = Math.max(1, Number(shop?.khqrConfig?.autoVerifyWindowMinutes) || 5);
+                        const maxAgeMs = maxRecencyMinutes * 60 * 1000;
+
+                        const rawReceivedAt = Number(parsedAba.receivedAt || 0);
+                        const parsedPaidAt = Number(parsedAba.paidTimestamp) || window.SolarisKHQREngine.parseAbaPaidAtToMs(parsedAba.paidAtStr, rawReceivedAt || now);
+                        const effectivePaymentMs = rawReceivedAt > 0 ? rawReceivedAt : parsedPaidAt;
+
+                        // Gate 2A: Reject stale payments older than maxRecencyMinutes (default 5 minutes)
+                        if (effectivePaymentMs > 0 && (now - effectivePaymentMs) > maxAgeMs) {
+                            return false;
+                        }
+
+                        // Gate 2B: Reject payments that arrived BEFORE the QR bill was generated (15s clock-drift grace)
+                        const qrInitiatedAt = Number(order.khqrInitiatedAt || order.createdAt || 0);
+                        if (qrInitiatedAt > 0 && effectivePaymentMs > 0 && effectivePaymentMs < (qrInitiatedAt - 15000)) {
+                            return false;
+                        }
+
+                        // Gate 2C: If order has an explicit valid-until timestamp and customer didn't provide an APV ref, enforce window
+                        const qrExpiresAt = Number(order.khqrExpiresAt || 0);
+                        if (qrExpiresAt > 0 && effectivePaymentMs > (qrExpiresAt + 60000) && !order.khqrCustomerRef) {
+                            return false;
+                        }
+                    }
+
+                    // 3. Customer Optional APV / Reference Match (if customer/staff typed 3+ digits, verify it matches APV or Trx ID)
                     if (order.khqrCustomerRef && String(order.khqrCustomerRef).trim().length >= 3) {
                         const refClean = String(order.khqrCustomerRef).trim().toUpperCase();
                         const apvMatch = String(parsedAba.apv || '').toUpperCase().includes(refClean);
@@ -3344,7 +3562,7 @@
                         }
                     }
 
-                    // 3. Exact Amount Matching (Supports both KHR and USD)
+                    // 4. Exact Amount Matching (Supports both KHR and USD)
                     const expectedKhr = Math.round(Number(order.khqrExpectedKhr || order.totalAmount || 0));
                     const rate = Math.max(100, Number(shop?.khqrConfig?.exchangeRate) || 4000);
                     const expectedUsd = Number(order.khqrExpectedUsd || (expectedKhr / rate));
@@ -3358,139 +3576,130 @@
                     return false;
                 },
 
-                // Atomically claims `aba_payments/{trxId}` (setting claimedByOrderId from null -> order.id) and marks the order Paid (Bank)
+                // Atomically claims `aba_payments/{trxId}` and marks the order Paid (Bank).
+                // Includes Zero-Read Optimistic Batch + Automatic Local Fallback if Firestore Free-Tier Quota is exceeded!
                 async verifyAndSettleOrder(order, parsedAba, shop, shifts = [], globalPoints = null, actorName = 'ABA PayWay Bot', liveOrders = []) {
                     if (!order || !parsedAba || !parsedAba.isValid || !parsedAba.trxId) {
                         return { ok: false, error: 'Invalid order or ABA PayWay transaction data.' };
                     }
 
+                    this.loadLocalAbaCache();
                     const trxId = String(parsedAba.trxId).trim();
                     if (this.processedTrxIdsMemory.has(trxId)) {
                         return { ok: false, error: `Transaction ID ${trxId} has already been used.` };
                     }
 
-                    // Fast 0ms in-memory anti-replay check across active/recent orders
+                    // Fast 0ms in-memory anti-replay check across active/recent orders (Zero Firestore reads!)
                     const duplicateInMemory = (liveOrders || []).find(o => o.id !== order.id && String(o.abaTrxId || '').trim() === trxId);
                     if (duplicateInMemory) {
                         this.processedTrxIdsMemory.add(trxId);
+                        this.saveLocalAbaCache();
                         return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${duplicateInMemory.queueNo || duplicateInMemory.id}.` };
                     }
 
+                    const existingMemEntry = this.inMemoryAbaPayments.get(trxId);
+                    if (existingMemEntry?.claimedByOrderId && existingMemEntry.claimedByOrderId !== order.id) {
+                        this.processedTrxIdsMemory.add(trxId);
+                        this.saveLocalAbaCache();
+                        return { ok: false, error: `Trx. ID ${trxId} was already claimed by Order ${existingMemEntry.claimedByOrderId}.` };
+                    }
+
+                    // Find Open Shift for this branch so Bank Transfers reconcile automatically in Z-Report
+                    const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
+
+                    const payerDisplay = `${parsedAba.payerName} (${parsedAba.maskedAccount})`;
+                    const amountDisplay = parsedAba.currency === 'KHR'
+                        ? `៛${Number(parsedAba.amount).toLocaleString()}`
+                        : `$${Number(parsedAba.amount).toFixed(2)}`;
+
+                    const orderUpdatePayload = {
+                        paymentStatus: 'Paid',
+                        paymentMethod: 'Bank',
+                        abaVerified: true,
+                        abaTrxId: trxId,
+                        abaApv: String(parsedAba.apv || ''),
+                        abaPayer: payerDisplay,
+                        abaPaidAmountStr: amountDisplay,
+                        abaCurrency: parsedAba.currency,
+                        abaPaidAtStr: parsedAba.paidAtStr || '',
+                        abaVerifiedAt: Date.now(),
+                        abaVerifiedBy: actorName
+                    };
+
+                    if (openShift && !order.shiftId) {
+                        orderUpdatePayload.shiftId = openShift.id;
+                    }
+
+                    // Helper to apply instant in-memory & localStorage settlement (works even when Firestore quota is 100% exhausted)
+                    const applyOptimisticMemorySettlement = () => {
+                        this.processedTrxIdsMemory.add(trxId);
+                        if (existingMemEntry) {
+                            existingMemEntry.claimedByOrderId = String(order.id);
+                            this.inMemoryAbaPayments.set(trxId, existingMemEntry);
+                        }
+                        this.localVerifiedOrdersMap.set(String(order.id), orderUpdatePayload);
+                        Object.assign(order, orderUpdatePayload);
+                        this.saveLocalAbaCache();
+                        this.notifySubscribers({ type: 'ORDER_VERIFIED', orderId: order.id, trxId, orderUpdatePayload });
+                    };
+
                     try {
-                        const { doc, getDoc, writeBatch, collection, query, where, getDocs, limit, runTransaction } = window.FirebaseApp;
+                        const { doc, writeBatch } = window.FirebaseApp;
                         const database = safeDB();
 
-                        // 1A. Anti-Replay Check via 'orders' collection
-                        const qDupOrder = query(collection(database, 'orders'), where('abaTrxId', '==', trxId), limit(1));
-                        const dupSnap = await getDocs(qDupOrder);
-                        if (!dupSnap.empty) {
-                            const existingOrderDoc = dupSnap.docs[0];
-                            if (existingOrderDoc.id !== order.id) {
-                                this.processedTrxIdsMemory.add(trxId);
-                                const prevData = existingOrderDoc.data();
-                                return { ok: false, error: `Trx. ID ${trxId} was already claimed by Invoice ${prevData.queueNo || existingOrderDoc.id}.` };
-                            }
-                        }
-
-                        // 1B. Check `aba_payments/{trxId}` document written by the Node listener
-                        const paymentDocRef = doc(database, 'aba_payments', trxId);
-                        let paymentDocExists = false;
-                        try {
-                            const paySnap = await getDoc(paymentDocRef);
-                            if (paySnap.exists()) {
-                                paymentDocExists = true;
-                                const payData = paySnap.data();
-                                if (payData.claimedByOrderId && payData.claimedByOrderId !== order.id) {
-                                    this.processedTrxIdsMemory.add(trxId);
-                                    return { ok: false, error: `Trx. ID ${trxId} was already claimed by Order ${payData.claimedByOrderId}.` };
-                                }
-                            }
-                        } catch (payReadErr) {
-                            console.warn("aba_payments doc read check warning:", payReadErr);
-                        }
-
-                        // 2. Find Open Shift for this branch so Bank Transfers reconcile automatically in Z-Report
-                        const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
-
-                        const payerDisplay = `${parsedAba.payerName} (${parsedAba.maskedAccount})`;
-                        const amountDisplay = parsedAba.currency === 'KHR'
-                            ? `៛${Number(parsedAba.amount).toLocaleString()}`
-                            : `$${Number(parsedAba.amount).toFixed(2)}`;
-
-                        const orderUpdatePayload = {
-                            paymentStatus: 'Paid',
-                            paymentMethod: 'Bank',
-                            abaVerified: true,
-                            abaTrxId: trxId,
-                            abaApv: String(parsedAba.apv || ''),
-                            abaPayer: payerDisplay,
-                            abaPaidAmountStr: amountDisplay,
-                            abaCurrency: parsedAba.currency,
-                            abaPaidAtStr: parsedAba.paidAtStr || '',
-                            abaVerifiedAt: Date.now(),
-                            abaVerifiedBy: actorName
-                        };
-
-                        if (openShift && !order.shiftId) {
-                            orderUpdatePayload.shiftId = openShift.id;
-                        }
-
-                        // 3. Prepare Customer Loyalty Points update if applicable
-                        let custDocRef = null;
-                        let newLoyaltyPayload = null;
-                        if (globalPoints?.pointsEnabled && order.totalAmount > 0 && order.customerPhone && order.customerPhone !== 'N/A') {
-                            try {
-                                const qCust = query(collection(database, 'customers'), where('phone', '==', order.customerPhone), limit(1));
-                                const snapCust = await getDocs(qCust);
-                                if (!snapCust.empty) {
-                                    const custDoc = snapCust.docs[0];
-                                    const custData = custDoc.data();
-                                    if (custData.loyaltyData) {
-                                        custDocRef = doc(database, 'customers', custDoc.id);
-                                        newLoyaltyPayload = calculateLoyaltyForOrder(order.totalAmount, 0, custData.loyaltyData, globalPoints);
-                                    }
-                                }
-                            } catch (loyaltyErr) {
-                                console.warn("ABA Auto-Verify loyalty lookup warning:", loyaltyErr);
-                            }
-                        }
-
+                        // Update only the essential order document first (1 write operation instead of 4 reads + 3 writes!)
+                        const batch = writeBatch(database);
                         const orderDocRef = doc(database, 'orders', order.id);
+                        batch.update(orderDocRef, orderUpdatePayload);
 
-                        if (paymentDocExists && runTransaction) {
-                            // Atomic Transaction: Verify `claimedByOrderId === null` and update ONLY `claimedByOrderId` per strict Firestore rules
-                            await runTransaction(database, async (transaction) => {
-                                const freshPaySnap = await transaction.get(paymentDocRef);
-                                if (freshPaySnap.exists()) {
-                                    const freshClaimed = freshPaySnap.data()?.claimedByOrderId;
-                                    if (freshClaimed && freshClaimed !== order.id) {
-                                        throw new Error(`Trx. ID ${trxId} was just claimed by another order (${freshClaimed}).`);
-                                    }
-                                    transaction.update(paymentDocRef, { claimedByOrderId: String(order.id) });
-                                }
-                                transaction.update(orderDocRef, orderUpdatePayload);
-                                if (custDocRef && newLoyaltyPayload) {
-                                    transaction.update(custDocRef, { loyaltyData: newLoyaltyPayload });
-                                }
-                            });
-                        } else {
-                            // Fallback Batch (e.g. Manual Clipboard Paste when server listener hasn't written the doc yet)
-                            const batch = writeBatch(database);
-                            if (paymentDocExists) {
-                                batch.update(paymentDocRef, { claimedByOrderId: String(order.id) });
-                            }
-                            batch.update(orderDocRef, orderUpdatePayload);
-                            if (custDocRef && newLoyaltyPayload) {
-                                batch.update(custDocRef, { loyaltyData: newLoyaltyPayload });
-                            }
-                            await batch.commit();
+                        // If we know the payment doc is in Firestore, claim it in the same batch
+                        if (existingMemEntry?.fromFirestore) {
+                            const paymentDocRef = doc(database, 'aba_payments', trxId);
+                            batch.update(paymentDocRef, { claimedByOrderId: String(order.id) });
                         }
 
-                        this.processedTrxIdsMemory.add(trxId);
+                        await batch.commit();
+                        applyOptimisticMemorySettlement();
                         return { ok: true, trxId, apv: parsedAba.apv, payerDisplay, amountDisplay };
                     } catch (err) {
-                        console.error("ABA PayWay verification error:", err);
-                        return { ok: false, error: err.message || 'Verification commit failed.' };
+                        const isQuotaErr = err?.code === 'resource-exhausted' || /quota|exhausted/i.test(err?.message || '');
+                        if (isQuotaErr) {
+                            this.isQuotaExceeded = true;
+                            console.warn("Firestore Quota Exceeded — settling ABA PayWay order in Local/Memory Mode:", order.queueNo || order.id);
+                            applyOptimisticMemorySettlement();
+                            return {
+                                ok: true,
+                                quotaFallback: true,
+                                trxId,
+                                apv: parsedAba.apv,
+                                payerDisplay,
+                                amountDisplay
+                            };
+                        }
+
+                        // Secondary fallback: if batch failed because `aba_payments/{trxId}` didn't exist yet, update `orders/{id}` alone
+                        try {
+                            const { doc, updateDoc } = window.FirebaseApp;
+                            await updateDoc(doc(safeDB(), 'orders', order.id), orderUpdatePayload);
+                            applyOptimisticMemorySettlement();
+                            return { ok: true, trxId, apv: parsedAba.apv, payerDisplay, amountDisplay };
+                        } catch (innerErr) {
+                            const isInnerQuota = innerErr?.code === 'resource-exhausted' || /quota|exhausted/i.test(innerErr?.message || '');
+                            if (isInnerQuota) {
+                                this.isQuotaExceeded = true;
+                                applyOptimisticMemorySettlement();
+                                return {
+                                    ok: true,
+                                    quotaFallback: true,
+                                    trxId,
+                                    apv: parsedAba.apv,
+                                    payerDisplay,
+                                    amountDisplay
+                                };
+                            }
+                            console.error("ABA PayWay verification error:", innerErr);
+                            return { ok: false, error: innerErr.message || 'Verification commit failed.' };
+                        }
                     }
                 },
 
@@ -3522,6 +3731,18 @@
                     const verifiedResults = [];
                     for (const order of pendingKhqrOrders) {
                         if (order.paymentStatus === 'Paid') continue;
+
+                        // PHASE B (Option 1 Collision Guard): If two active orders have the exact same KHR amount simultaneously,
+                        // require 1-tap staff/customer confirmation unless this order has an explicit APV ref match.
+                        const hasCollision = this.hasSimultaneousAmountCollision(
+                            order.khqrExpectedKhr || order.totalAmount,
+                            order.id,
+                            order.shopId,
+                            liveOrders
+                        );
+                        if (hasCollision && (!order.khqrCustomerRef || String(order.khqrCustomerRef).trim().length < 3)) {
+                            continue;
+                        }
 
                         const matchingMsg = candidateList.find(m =>
                             !this.processedTrxIdsMemory.has(String(m.parsedAba.trxId).trim()) &&
@@ -4036,12 +4257,15 @@
                         const ordersMap = new Map();
                         const handleSnap = (snap) => {
                             let hasChanges = false;
+                            window.SolarisPayWayVerifier?.loadLocalAbaCache();
                             snap.docChanges().forEach(change => {
                                 hasChanges = true;
                                 if (change.type === 'removed') {
                                     ordersMap.delete(change.doc.id);
                                 } else {
-                                    ordersMap.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
+                                    const rawOrder = { id: change.doc.id, ...change.doc.data() };
+                                    const localOverride = window.SolarisPayWayVerifier?.localVerifiedOrdersMap?.get(change.doc.id);
+                                    ordersMap.set(change.doc.id, localOverride ? { ...rawOrder, ...localOverride } : rawOrder);
                                 }
                             });
                             if (hasChanges) {
@@ -4076,6 +4300,17 @@
                         if(unsubO) unsubO(); 
                     };
                 }, [user, view, adminProfile]);
+
+                // Apply local ABA PayWay verification overrides immediately in memory (even when Firestore Quota is exceeded)
+                useEffect(() => {
+                    if (!window.SolarisPayWayVerifier) return;
+                    window.SolarisPayWayVerifier.loadLocalAbaCache();
+                    return window.SolarisPayWayVerifier.subscribe((evt) => {
+                        if (evt && evt.type === 'ORDER_VERIFIED' && evt.orderId && evt.orderUpdatePayload) {
+                            setOrders(prev => prev.map(o => o.id === evt.orderId ? { ...o, ...evt.orderUpdatePayload } : o));
+                        }
+                    });
+                }, []);
 
                 if (authError) {
                     return (
@@ -4921,10 +5156,16 @@
                 const [fallbackPreviewDataUrl, setFallbackPreviewDataUrl] = useState(null);
                 const [isCheckingLiveAba, setIsCheckingLiveAba] = useState(false);
                 const [verifiedAbaPayload, setVerifiedAbaPayload] = useState(null);
+                const [collisionCandidateAba, setCollisionCandidateAba] = useState(null);
                 const [unmatchedLiveAbaList, setUnmatchedLiveAbaList] = useState([]);
                 const hasAutoConfirmedRef = useRef(false);
-                // Accept any unclaimed payment received within the last 10 minutes or while modal is open
-                const modalOpenedAtRef = useRef(Date.now() - 10 * 60 * 1000);
+
+                // PHASE B: Silent Pre-Check Intent (Temporary Invoice + Exact Initiated Timestamp + 2-Minute Valid Countdown)
+                const [khqrInitiatedAt] = useState(() => Date.now());
+                const [tempInvoiceNo] = useState(() => previewInvoiceNo || `TMP-${String(Date.now()).slice(-6)}`);
+                const validDurationSec = Math.max(60, (Number(shop?.khqrConfig?.qrValidMinutes) || 2) * 60);
+                const [khqrExpiresAt, setKhqrExpiresAt] = useState(() => Date.now() + validDurationSec * 1000);
+                const [remainingValidSec, setRemainingValidSec] = useState(validDurationSec);
 
                 // Fetch fresh khqrConfig from `payway_secrets/{shop.id}` if `shop.khqrConfig` is missing in memory
                 const [freshKhqrConfig, setFreshKhqrConfig] = useState(shop?.khqrConfig || null);
@@ -4956,8 +5197,40 @@
 
                 const dynamicPayload = useMemo(() => {
                     if (!cfg.baseEmvPayload) return null;
-                    return window.SolarisKHQREngine.generateDynamicKHQR(cfg.baseEmvPayload, cartTotal, previewInvoiceNo);
-                }, [cfg.baseEmvPayload, cartTotal, previewInvoiceNo]);
+                    return window.SolarisKHQREngine.generateDynamicKHQR(cfg.baseEmvPayload, cartTotal, tempInvoiceNo);
+                }, [cfg.baseEmvPayload, cartTotal, tempInvoiceNo]);
+
+                // PHASE B: Register this active KHQR intent in memory & run live 1-second countdown timer
+                useEffect(() => {
+                    window.SolarisPayWayVerifier.registerKhqrIntent(tempInvoiceNo, {
+                        shopId: effectiveShop?.id || '',
+                        tempInvoiceNo,
+                        expectedKhr: Number(cartTotal || 0),
+                        expectedUsd: Number(usdEquivalent),
+                        initiatedAt: khqrInitiatedAt,
+                        expiresAt: khqrExpiresAt
+                    });
+                    return () => {
+                        window.SolarisPayWayVerifier.unregisterKhqrIntent(tempInvoiceNo);
+                    };
+                }, [tempInvoiceNo, effectiveShop?.id, cartTotal, usdEquivalent, khqrInitiatedAt, khqrExpiresAt]);
+
+                useEffect(() => {
+                    const tick = () => {
+                        const secLeft = Math.max(0, Math.ceil((khqrExpiresAt - Date.now()) / 1000));
+                        setRemainingValidSec(secLeft);
+                    };
+                    tick();
+                    const timerId = setInterval(tick, 1000);
+                    return () => clearInterval(timerId);
+                }, [khqrExpiresAt]);
+
+                const handleExtendValidTimer = () => {
+                    const newExp = Date.now() + 120 * 1000;
+                    setKhqrExpiresAt(newExp);
+                    setRemainingValidSec(120);
+                    triggerToast("Extended KHQR valid window by +2 minutes!");
+                };
 
                 const triggerToast = (msg) => {
                     setLocalToast(msg);
@@ -4987,9 +5260,14 @@
                     } catch (e) {}
                 };
 
-                // Checks if a parsed ABA PayWay message matches this open KHQR modal's amount & hasn't been used before
+                // PHASE B: Strict candidate check enforcing:
+                // 1) Unused Trx. ID
+                // 2) Exact Bill Amount (KHR or USD)
+                // 3) Chronological Lock (payment arrived AFTER khqrInitiatedAt and within < 5 min recency window)
                 const checkCandidateAbaMatch = (parsedAba) => {
                     if (!parsedAba || !parsedAba.isValid || !parsedAba.trxId) return false;
+                    if (remainingValidSec <= 0 && !apvRefInput.trim()) return false;
+
                     const trxId = String(parsedAba.trxId).trim();
                     if (window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId)) return false;
                     if ((liveOrders || []).some(o => String(o.abaTrxId || '').trim() === trxId)) {
@@ -4997,25 +5275,51 @@
                         return false;
                     }
                     const mockOrder = {
+                        id: tempInvoiceNo,
+                        queueNo: tempInvoiceNo,
                         paymentStatus: 'Unpaid',
                         status: 'New',
                         paymentMethod: 'KHQR (ABA)',
                         totalAmount: Number(cartTotal || 0),
                         khqrExpectedKhr: Number(cartTotal || 0),
                         khqrExpectedUsd: Number(usdEquivalent),
-                        khqrCustomerRef: apvRefInput.trim()
+                        khqrCustomerRef: apvRefInput.trim(),
+                        khqrInitiatedAt: khqrInitiatedAt,
+                        khqrExpiresAt: khqrExpiresAt
                     };
                     return window.SolarisPayWayVerifier.doesMessageMatchOrder(parsedAba, mockOrder, effectiveShop);
                 };
 
-                const handleAutoVerifiedMatch = (parsedAba) => {
+                const handleAutoVerifiedMatch = (parsedAba, forceConfirm = false) => {
                     if (hasAutoConfirmedRef.current) return;
+
+                    // PHASE B (Option 1 Collision Guard): If another bill with the exact same KHR amount is open simultaneously,
+                    // prompt 1-tap Payer Name confirmation instead of blindly auto-closing!
+                    if (!forceConfirm && (!apvRefInput || apvRefInput.trim().length < 3)) {
+                        const hasCollision = window.SolarisPayWayVerifier.hasSimultaneousAmountCollision(
+                            cartTotal,
+                            tempInvoiceNo,
+                            effectiveShop?.id || '',
+                            liveOrders
+                        );
+                        if (hasCollision) {
+                            setCollisionCandidateAba(parsedAba);
+                            playVerifiedChime();
+                            return;
+                        }
+                    }
+
                     hasAutoConfirmedRef.current = true;
+                    setCollisionCandidateAba(null);
                     setVerifiedAbaPayload(parsedAba);
                     playVerifiedChime();
                     triggerToast(t.paymentVerifiedAutoClosing);
                     setTimeout(() => {
-                        onConfirmPaid(parsedAba.apv || apvRefInput.trim(), parsedAba);
+                        onConfirmPaid(parsedAba.apv || apvRefInput.trim(), parsedAba, {
+                            tempInvoiceNo,
+                            khqrInitiatedAt,
+                            khqrExpiresAt
+                        });
                     }, 650);
                 };
 
@@ -5031,32 +5335,38 @@
                                 if (clipText && clipText.trim().length > 15) {
                                     const parsedClip = window.SolarisKHQREngine.parseABAPayWayMessage(clipText);
                                     if (checkCandidateAbaMatch(parsedClip)) {
-                                        handleAutoVerifiedMatch(parsedClip);
+                                        handleAutoVerifiedMatch(parsedClip, true);
                                         return;
                                     }
                                 }
                             } catch (clipErr) {}
                         }
 
-                        // 2. Query Firestore `aba_payments` collection (populated by the Node listener)
+                        // 2. Query Firestore `aba_payments` collection (populated by the Node listener / Telegram Bot)
                         const chatId = (cfg?.paywayChatId || '').trim();
                         const updatesRes = await window.SolarisKHQREngine.fetchRecentAbaPaymentsFromFirestore(chatId, effectiveShop?.id);
                         if (updatesRes.ok) {
                             const candidates = (updatesRes.messages || []).filter(m => m.parsedAba?.isValid);
                             const matchedMsg = candidates.find(m => checkCandidateAbaMatch(m.parsedAba));
                             if (matchedMsg) {
-                                handleAutoVerifiedMatch(matchedMsg.parsedAba);
+                                handleAutoVerifiedMatch(matchedMsg.parsedAba, false);
                                 return;
                             }
-                            // Keep track of any recent unclaimed ABA payments (in case amount/chatId differed slightly so staff can 1-click accept)
-                            const recentUnclaimed = (updatesRes.allAbaMessages || candidates)
-                                .filter(m => m.parsedAba?.isValid && !window.SolarisPayWayVerifier.processedTrxIdsMemory.has(String(m.parsedAba.trxId).trim()))
+                            // Only show unclaimed ABA payments that arrived AFTER this QR modal was opened (prevents showing old payments!)
+                            const recentUnclaimedAfterQr = (updatesRes.allAbaMessages || candidates)
+                                .filter(m => {
+                                    if (!m.parsedAba?.isValid) return false;
+                                    const trxId = String(m.parsedAba.trxId).trim();
+                                    if (window.SolarisPayWayVerifier.processedTrxIdsMemory.has(trxId)) return false;
+                                    const msgMs = Number(m.date || m.parsedAba.receivedAt || m.parsedAba.paidTimestamp || 0);
+                                    return msgMs >= (khqrInitiatedAt - 15000);
+                                })
                                 .slice(0, 3);
-                            setUnmatchedLiveAbaList(recentUnclaimed);
+                            setUnmatchedLiveAbaList(recentUnclaimedAfterQr);
                         }
 
                         if (includeClipboard) {
-                            triggerToast("No exact amount match (" + Number(cartTotal || 0).toLocaleString() + " ៛) detected yet. Still listening...");
+                            triggerToast("No new matching payment (" + Number(cartTotal || 0).toLocaleString() + " ៛) after " + new Date(khqrInitiatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + " yet.");
                         }
                     } catch (err) {
                         console.warn("Live ABA check warning:", err);
@@ -5075,7 +5385,7 @@
                     checkLiveNowRef.current = checkLivePaymentNow;
                 });
 
-                // Real-time Firestore `onSnapshot` listener + 2.5-second active poller while KHQR Modal is open
+                // Real-time shared subscription + active poller while KHQR Modal is open
                 useEffect(() => {
                     checkLiveNowRef.current(false);
 
@@ -5083,76 +5393,25 @@
                         if (!hasAutoConfirmedRef.current) {
                             checkLiveNowRef.current(false);
                         }
-                    }, 2500);
+                    }, 6000);
 
-                    let unsubFirestore = null;
-                    let unsubLiveFeed = null;
-                    try {
-                        const { collection, query, where, onSnapshot, doc } = window.FirebaseApp;
-                        // Listen to ALL unclaimed `aba_payments` documents (without limit(25) cutting off new docs when old unclaimed docs exist!)
-                        const qLive = query(
-                            collection(safeDB(), 'aba_payments'),
-                            where('claimedByOrderId', '==', null)
-                        );
-                        unsubFirestore = onSnapshot(qLive, (snap) => {
-                            if (hasAutoConfirmedRef.current) return;
-                            // Sort docs newest first so the most recent payment is checked first
-                            const docsSorted = snap.docs
-                                .map(d => ({ id: d.id, ...(d.data() || {}) }))
-                                .filter(d => !d.claimedByOrderId)
-                                .sort((a, b) => (Number(b.receivedAt) || 0) - (Number(a.receivedAt) || 0));
+                    const unsubShared = window.SolarisPayWayVerifier.subscribe(() => {
+                        if (hasAutoConfirmedRef.current) return;
+                        const entries = Array.from(window.SolarisPayWayVerifier.inMemoryAbaPayments.values())
+                            .filter(e => !e.claimedByOrderId && e.parsedAba?.isValid)
+                            .sort((a, b) => (Number(b.date) || 0) - (Number(a.date) || 0));
 
-                            for (const d of docsSorted) {
-                                const candidate = {
-                                    isValid: true,
-                                    currency: d.currency || 'KHR',
-                                    amount: Number(d.amount || 0),
-                                    payerName: d.payerName || 'ABA Customer',
-                                    maskedAccount: d.maskedAccount || '*ABA',
-                                    paidAtStr: d.paidAtStr || '',
-                                    merchantName: d.merchantName || '',
-                                    chatId: String(d.chatId || ''),
-                                    trxId: String(d.trxId || d.id).trim(),
-                                    apv: String(d.apv || '').trim()
-                                };
-                                if (checkMatchRef.current(candidate)) {
-                                    handleMatchRef.current(candidate);
-                                    return;
-                                }
+                        for (const entry of entries) {
+                            if (checkMatchRef.current(entry.parsedAba)) {
+                                handleMatchRef.current(entry.parsedAba);
+                                return;
                             }
-                        }, (err) => {
-                            console.warn("KHQR Modal aba_payments snapshot warning:", err);
-                        });
-
-                        // Also watch `system_settings/aba_live_feed` fallback document
-                        unsubLiveFeed = onSnapshot(doc(safeDB(), 'system_settings', 'aba_live_feed'), (docSnap) => {
-                            if (hasAutoConfirmedRef.current || !docSnap.exists()) return;
-                            const paymentsObj = docSnap.data()?.payments || {};
-                            Object.values(paymentsObj).forEach(d => {
-                                if (!d || d.claimedByOrderId) return;
-                                const candidate = {
-                                    isValid: true,
-                                    currency: d.currency || 'KHR',
-                                    amount: Number(d.amount || 0),
-                                    payerName: d.payerName || 'ABA Customer',
-                                    maskedAccount: d.maskedAccount || '*ABA',
-                                    paidAtStr: d.paidAtStr || '',
-                                    merchantName: d.merchantName || '',
-                                    chatId: String(d.chatId || ''),
-                                    trxId: String(d.trxId || '').trim(),
-                                    apv: String(d.apv || '').trim()
-                                };
-                                if (checkMatchRef.current(candidate)) {
-                                    handleMatchRef.current(candidate);
-                                }
-                            });
-                        }, () => {});
-                    } catch (e) {}
+                        }
+                    });
 
                     return () => {
                         clearInterval(pollInterval);
-                        if (typeof unsubFirestore === 'function') unsubFirestore();
-                        if (typeof unsubLiveFeed === 'function') unsubLiveFeed();
+                        unsubShared();
                     };
                 }, [effectiveShop?.id, cfg?.paywayChatId, cartTotal]);
 
@@ -5267,11 +5526,11 @@
                     ctx.fillText(usdText, badgeX + badgeW / 2, badgeY + badgeH / 2 + 2);
 
                     // Invoice No
-                    if (previewInvoiceNo) {
+                    if (tempInvoiceNo) {
                         ctx.textAlign = 'left';
                         ctx.fillStyle = '#a8a29e';
                         ctx.font = 'bold 26px "Courier New", Courier, monospace';
-                        ctx.fillText(`Inv: ${previewInvoiceNo}`, cardX + 55, infoTop + 195);
+                        ctx.fillText(`Inv: ${tempInvoiceNo}`, cardX + 55, infoTop + 195);
                     }
 
                     // Dashed Divider Line
@@ -5449,6 +5708,44 @@
                                 </button>
                             </div>
 
+                            {/* PHASE B: Silent Pre-Check Session Bar (Temporary Invoice + Initiated Timestamp + 2-Min Valid Countdown) */}
+                            <div className="mb-2.5 px-3 py-2 rounded-2xl bg-stone-900 text-white flex items-center justify-between gap-2 text-[11px]">
+                                <div className="flex items-center gap-2 min-w-0">
+                                    <i className="fa-solid fa-fingerprint text-amber-400"></i>
+                                    <div className="truncate">
+                                        <span className="font-mono font-black text-amber-300">{tempInvoiceNo}</span>
+                                        <span className="text-stone-400 mx-1.5">•</span>
+                                        <span className="text-stone-300 font-mono text-[10px]">
+                                            {new Date(khqrInitiatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                    <span className={`font-mono font-black px-2 py-0.5 rounded-lg text-[10px] flex items-center gap-1 ${
+                                        remainingValidSec > 30
+                                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                            : remainingValidSec > 0
+                                                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse'
+                                                : 'bg-red-500/30 text-red-300 border border-red-500/50'
+                                    }`}>
+                                        <i className="fa-regular fa-clock"></i>
+                                        {remainingValidSec > 0
+                                            ? `${String(Math.floor(remainingValidSec / 60)).padStart(2, '0')}:${String(remainingValidSec % 60).padStart(2, '0')}`
+                                            : 'Expired'}
+                                    </span>
+                                    {remainingValidSec < 60 && (
+                                        <button
+                                            type="button"
+                                            onClick={handleExtendValidTimer}
+                                            className="px-2 py-0.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-[10px] transition"
+                                            title="Extend Valid Window by +2 Minutes"
+                                        >
+                                            +2m
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
                             {/* Live ABA PayWay Auto-Detection Banner */}
                             {verifiedAbaPayload ? (
                                 <div className="mb-3 p-3 rounded-2xl bg-emerald-600 text-white shadow-lg flex items-center justify-between gap-2 animate-fade-in">
@@ -5460,6 +5757,31 @@
                                                 {verifiedAbaPayload.payerName} ({verifiedAbaPayload.maskedAccount}) • APV: {verifiedAbaPayload.apv}
                                             </div>
                                         </div>
+                                    </div>
+                                </div>
+                            ) : collisionCandidateAba ? (
+                                /* PHASE B (Option 1 Collision Guard): 1-Tap Payer Confirmation when 2 identical amounts are active simultaneously */
+                                <div className="mb-3 p-3 rounded-2xl bg-amber-50 border-2 border-amber-400 shadow-md space-y-2 animate-fade-in">
+                                    <div className="flex items-start justify-between gap-2">
+                                        <div className="text-[11px] font-black text-amber-950 flex items-center gap-1.5">
+                                            <i className="fa-solid fa-shield-halved text-amber-600"></i>
+                                            <span>Same-Amount Bill Guard — Confirm Payer:</span>
+                                        </div>
+                                        <span className="bg-amber-200 text-amber-900 font-mono font-black px-2 py-0.5 rounded text-[10px]">
+                                            APV: {collisionCandidateAba.apv}
+                                        </span>
+                                    </div>
+                                    <div className="text-xs font-black text-stone-900 bg-white p-2 rounded-xl border border-amber-200 flex items-center justify-between gap-2">
+                                        <div className="truncate">
+                                            {collisionCandidateAba.currency === 'KHR' ? `៛${Number(collisionCandidateAba.amount).toLocaleString()}` : `$${Number(collisionCandidateAba.amount).toFixed(2)}`} from <span className="text-emerald-700">{collisionCandidateAba.payerName} ({collisionCandidateAba.maskedAccount})</span>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => handleAutoVerifiedMatch(collisionCandidateAba, true)}
+                                            className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[11px] shrink-0 shadow-sm active:scale-95 transition"
+                                        >
+                                            Confirm Paid
+                                        </button>
                                     </div>
                                 </div>
                             ) : (
@@ -5482,11 +5804,11 @@
                                 </div>
                             )}
 
-                            {/* Live Incoming Unclaimed ABA Feed (If an unclaimed payment arrived with a different amount, allow 1-Click Use) */}
-                            {!verifiedAbaPayload && unmatchedLiveAbaList.length > 0 && (
+                            {/* Live Incoming Unclaimed ABA Feed (Only payments received AFTER this QR was generated) */}
+                            {!verifiedAbaPayload && !collisionCandidateAba && unmatchedLiveAbaList.length > 0 && (
                                 <div className="mb-3 p-2.5 rounded-2xl bg-sky-50 border border-sky-200 text-[11px] space-y-1.5 animate-fade-in">
                                     <div className="font-black text-sky-900 flex items-center justify-between">
-                                        <span><i className="fa-brands fa-telegram text-sky-500 mr-1"></i> Recent Unclaimed ABA Payment(s):</span>
+                                        <span><i className="fa-brands fa-telegram text-sky-500 mr-1"></i> New Unclaimed ABA Payment(s):</span>
                                         <span className="text-[10px] text-sky-700 font-normal">Expecting {Number(cartTotal || 0).toLocaleString()} ៛</span>
                                     </div>
                                     {unmatchedLiveAbaList.slice(0, 2).map((item, idx) => (
@@ -5501,7 +5823,7 @@
                                             </div>
                                             <button
                                                 type="button"
-                                                onClick={() => handleAutoVerifiedMatch(item.parsedAba)}
+                                                onClick={() => handleAutoVerifiedMatch(item.parsedAba, true)}
                                                 className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[10px] shrink-0 shadow-sm"
                                             >
                                                 Accept Paid
@@ -5527,9 +5849,10 @@
                                             ≈ ${usdEquivalent}
                                         </div>
                                     </div>
-                                    {previewInvoiceNo && (
-                                        <div className="text-[10px] font-mono font-bold text-stone-400 mt-1">
-                                            Inv: {previewInvoiceNo}
+                                    {tempInvoiceNo && (
+                                        <div className="text-[10px] font-mono font-bold text-stone-400 mt-1 flex items-center justify-between">
+                                            <span>Inv: {tempInvoiceNo}</span>
+                                            <span>{new Date(khqrInitiatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                                         </div>
                                     )}
                                 </div>
@@ -5650,7 +5973,11 @@
                                 <button
                                     type="button"
                                     disabled={isSubmitting}
-                                    onClick={() => onConfirmPaid(apvRefInput.trim(), verifiedAbaPayload)}
+                                    onClick={() => onConfirmPaid(apvRefInput.trim(), verifiedAbaPayload, {
+                                        tempInvoiceNo,
+                                        khqrInitiatedAt,
+                                        khqrExpiresAt
+                                    })}
                                     className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-3.5 px-4 rounded-xl shadow-lg transition flex items-center justify-center gap-2 text-sm active:scale-95 disabled:opacity-50"
                                 >
                                     {isSubmitting ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-circle-check"></i>}
@@ -7844,7 +8171,8 @@
                         khqrExpectedKhr: isKhqrOrder ? currentCartTotal : null,
                         khqrExpectedUsd: isKhqrOrder ? expectedUsdAmount : null,
                         khqrCustomerRef: isKhqrOrder && khqrConfirmedData.apvRef ? khqrConfirmedData.apvRef : null,
-                        khqrInitiatedAt: isKhqrOrder ? createdTimestamp : null,
+                        khqrInitiatedAt: isKhqrOrder ? Number(khqrConfirmedData?.intentMeta?.khqrInitiatedAt || createdTimestamp) : null,
+                        khqrExpiresAt: isKhqrOrder ? Number(khqrConfirmedData?.intentMeta?.khqrExpiresAt || (createdTimestamp + 120000)) : null,
                         dateString: today,
                         createdAt: createdTimestamp,
                         queueNo: optimisticQueueNo, // Instant valid Queue No!
@@ -8779,7 +9107,13 @@
                                 lang={lang}
                                 liveOrders={orders}
                                 onClose={() => setIsKhqrModalOpen(false)}
-                                onConfirmPaid={(apvRef, verifiedAba = null) => handleCheckout(null, { isKhqr: true, apvRef, lockedInvoiceNo: pendingKhqrInvoiceNo, verifiedAba })}
+                                onConfirmPaid={(apvRef, verifiedAba = null, intentMeta = null) => handleCheckout(null, {
+                                    isKhqr: true,
+                                    apvRef,
+                                    lockedInvoiceNo: intentMeta?.tempInvoiceNo || pendingKhqrInvoiceNo,
+                                    verifiedAba,
+                                    intentMeta
+                                })}
                             />
                         )}
 
@@ -9812,18 +10146,7 @@
                 const activeShopObj = shops.find(s => s.id === filterShop);
                 const shopBrandTitle = activeShopObj?.brandingName || activeShopObj?.name || 'Solaris Cafe';
 
-                const formatTVTimestamp = (ts) => {
-                    if (!ts) return '';
-                    const d = new Date(ts);
-                    const day = String(d.getDate()).padStart(2, '0');
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const year = String(d.getFullYear()).slice(-2);
-                    let hrs = d.getHours();
-                    const ampm = hrs >= 12 ? 'PM' : 'AM';
-                    hrs = hrs % 12 || 12;
-                    const mins = String(d.getMinutes()).padStart(2, '0');
-                    return `${day}-${month}-${year} | ${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
-                };
+                const formatTVTimestamp = (ts) => formatSolarisDateTime(ts, false);
 
                 const formatTVClock = (dateObj) => {
                     let hrs = dateObj.getHours();
@@ -12063,6 +12386,8 @@
                                 requireRemoteKhqr: cfg.requireRemoteKhqr !== undefined ? !!cfg.requireRemoteKhqr : false,
                                 remoteThresholdMeters: cfg.remoteThresholdMeters !== undefined ? Number(cfg.remoteThresholdMeters) : 100,
                                 paywayVerifyEnabled: cfg.paywayVerifyEnabled !== undefined ? !!cfg.paywayVerifyEnabled : true,
+                                qrValidMinutes: cfg.qrValidMinutes !== undefined ? Number(cfg.qrValidMinutes) : 2,
+                                autoVerifyWindowMinutes: cfg.autoVerifyWindowMinutes !== undefined ? Number(cfg.autoVerifyWindowMinutes) : 5,
                                 paywayChatId: savedPaywayChatId,
                                 accountName: cfg.accountName || emvInfo.merchantName || shopData?.brandingName || shopData?.name || '',
                                 khrAccount: cfg.khrAccount || '070 268 811',
@@ -12145,6 +12470,8 @@
                                 requireRemoteKhqr: !!cfg.requireRemoteKhqr,
                                 remoteThresholdMeters: Number(cfg.remoteThresholdMeters) || 100,
                                 paywayVerifyEnabled: cfg.paywayVerifyEnabled !== undefined ? !!cfg.paywayVerifyEnabled : true,
+                                qrValidMinutes: Number(cfg.qrValidMinutes) || 2,
+                                autoVerifyWindowMinutes: Number(cfg.autoVerifyWindowMinutes) || 5,
                                 paywayChatId: String(cfg.paywayChatId || '').trim(),
                                 accountName: String(cfg.accountName || 'SOLARIS CAFE').trim(),
                                 khrAccount: String(cfg.khrAccount || '070 268 811').trim(),
@@ -12285,6 +12612,8 @@
                             requireRemoteKhqr: !!formData.requireRemoteKhqr,
                             remoteThresholdMeters: Number(formData.remoteThresholdMeters) || 100,
                             paywayVerifyEnabled: !!formData.paywayVerifyEnabled,
+                            qrValidMinutes: Math.max(1, Number(formData.qrValidMinutes) || 2),
+                            autoVerifyWindowMinutes: Math.max(1, Number(formData.autoVerifyWindowMinutes) || 5),
                             paywayChatId: String(formData.paywayChatId || '').trim(),
                             accountName: dynamicAccountName,
                             khrAccount: String(formData.khrAccount || '070 268 811').trim(),
@@ -12513,60 +12842,70 @@
                                                     <i className="fa-solid fa-shield-check text-emerald-600"></i>
                                                     Enable ABA PayWay Auto-Verification (`aba_payments` Feed)
                                                 </div>
-                                                <div className="text-xs text-emerald-700">
-                                                    Automatically matches incoming ABA PayWay payments from your Telegram Group against pending KHQR orders on POS, KDS & Customer Modal.
+                                                <div className="text-xs text-emerald-800/80 mt-0.5">
+                                                    Automatically matches incoming ABA PayWay Telegram payments by Amount, Timestamp (&lt; 5 min), and Payer Guard.
                                                 </div>
                                             </div>
                                             <input type="checkbox" className="w-5 h-5 accent-emerald-600 rounded cursor-pointer shrink-0 ml-3" checked={formData.paywayVerifyEnabled} onChange={e => setFormData({ ...formData, paywayVerifyEnabled: e.target.checked })} />
                                         </label>
 
                                         {formData.paywayVerifyEnabled && (
-                                            <div className="p-4 rounded-2xl bg-sky-50/80 border border-sky-200 space-y-4 animate-fade-in">
-                                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                                                    <div>
-                                                        <label className="block text-xs font-black text-sky-900 uppercase tracking-wider">
-                                                            <i className="fa-brands fa-telegram text-sky-500 mr-1.5"></i>
-                                                            Telegram Account (MTProto) & Server Listener Bridge
+                                            <div className="p-4 rounded-2xl bg-sky-50/60 border border-sky-200 space-y-3 animate-fade-in">
+                                                {/* Step 1: Target Group Chat ID & Recency Window Settings */}
+                                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                                                    <div className="sm:col-span-2">
+                                                        <label className="block text-[10px] font-bold text-sky-900 uppercase mb-1">
+                                                            1. ABA PayWay Telegram Group / Chat ID (`PAYWAY_CHAT_ID`)
                                                         </label>
-                                                        <p className="text-[11px] text-sky-800 mt-0.5 leading-relaxed">
-                                                            Saved securely in the staff-only <code className="bg-white px-1 py-0.5 rounded border border-sky-200 font-mono">payway_secrets/{filterShop}</code> vault (never exposed to customers).
-                                                        </p>
+                                                        <div className="flex gap-2">
+                                                            <input
+                                                                type="text"
+                                                                placeholder="e.g. -5433015912 or -1001987654321"
+                                                                className="flex-1 border border-sky-300 rounded-xl px-3.5 py-2 text-xs font-mono font-bold text-stone-800 bg-white outline-none focus:border-sky-600 shadow-sm"
+                                                                value={formData.paywayChatId}
+                                                                onChange={e => {
+                                                                    setFormData({ ...formData, paywayChatId: e.target.value });
+                                                                    setFilterListenerChatId(e.target.value);
+                                                                }}
+                                                            />
+                                                            <button
+                                                                type="button"
+                                                                disabled={isTestingPaywayGroup}
+                                                                onClick={handleTestPaywayGroupConnection}
+                                                                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3.5 py-2 rounded-xl shadow-sm transition flex items-center justify-center gap-1.5 shrink-0 disabled:opacity-50"
+                                                            >
+                                                                {isTestingPaywayGroup ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-satellite-dish"></i>}
+                                                                <span>{isTestingPaywayGroup ? 'Checking...' : 'Test Feed'}</span>
+                                                            </button>
+                                                        </div>
                                                     </div>
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => setShowSecretFields(!showSecretFields)}
-                                                        className="text-[11px] font-bold text-sky-700 bg-white hover:bg-sky-100 border border-sky-200 px-3 py-1.5 rounded-xl transition shrink-0 flex items-center gap-1.5 self-start sm:self-auto"
-                                                    >
-                                                        <i className={`fa-solid ${showSecretFields ? 'fa-eye-slash' : 'fa-eye'}`}></i>
-                                                        <span>{showSecretFields ? 'Hide Secret Keys' : 'Show Secret Keys'}</span>
-                                                    </button>
-                                                </div>
-
-                                                {/* Step 1: Target Group Chat ID */}
-                                                <div>
-                                                    <label className="block text-[10px] font-bold text-sky-900 uppercase mb-1">
-                                                        1. ABA PayWay Telegram Group / Chat ID (`PAYWAY_CHAT_ID`)
-                                                    </label>
-                                                    <div className="flex flex-col sm:flex-row gap-2">
-                                                        <input
-                                                            type="text"
-                                                            placeholder="e.g. -5433015912 or -1001987654321"
-                                                            className="flex-1 border border-sky-300 rounded-xl px-3.5 py-2 text-xs font-mono font-bold text-stone-800 bg-white outline-none focus:border-sky-600 shadow-sm"
-                                                            value={formData.paywayChatId}
-                                                            onChange={e => {
-                                                                setFormData({ ...formData, paywayChatId: e.target.value });
-                                                                setFilterListenerChatId(e.target.value);
-                                                            }}
-                                                        />
-                                                        <button
-                                                            type="button"
-                                                            disabled={isTestingPaywayGroup}
-                                                            onClick={handleTestPaywayGroupConnection}
-                                                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2 rounded-xl shadow-sm transition flex items-center justify-center gap-1.5 shrink-0 disabled:opacity-50"
-                                                        >
-                                                            {isTestingPaywayGroup ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-satellite-dish"></i>}
-                                                            <span>{isTestingPaywayGroup ? 'Checking...' : 'Test Firestore Feed'}</span>
-                                                        </button>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <div>
+                                                            <label className="block text-[10px] font-bold text-sky-900 uppercase mb-1" title="Countdown timer shown on QR Modal">
+                                                                QR Valid (Min)
+                                                            </label>
+                                                            <input
+                                                                type="number"
+                                                                min="1"
+                                                                max="15"
+                                                                className="w-full border border-sky-300 rounded-xl px-2.5 py-2 text-xs font-black text-stone-800 bg-white outline-none focus:border-sky-600 text-center"
+                                                                value={formData.qrValidMinutes ?? 2}
+                                                                onChange={e => setFormData({ ...formData, qrValidMinutes: e.target.value })}
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-[10px] font-bold text-sky-900 uppercase mb-1" title="Maximum age of an unclaimed payment in Telegram to be eligible for auto-verify">
+                                                                Max Age (&lt; Min)
+                                                            </label>
+                                                            <input
+                                                                type="number"
+                                                                min="1"
+                                                                max="30"
+                                                                className="w-full border border-sky-300 rounded-xl px-2.5 py-2 text-xs font-black text-emerald-700 bg-white outline-none focus:border-sky-600 text-center"
+                                                                value={formData.autoVerifyWindowMinutes ?? 5}
+                                                                onChange={e => setFormData({ ...formData, autoVerifyWindowMinutes: e.target.value })}
+                                                            />
+                                                        </div>
                                                     </div>
                                                 </div>
 
@@ -16495,25 +16834,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     });
                 };
 
-                const statusColors = {
-                    'New': 'bg-blue-100 text-blue-800',
-                    'Preparing': 'bg-amber-100 text-amber-800',
-                    'Ready': 'bg-green-100 text-green-800',
-                    'Served': 'bg-stone-100 text-stone-500',
-                    'Cancelled': 'bg-red-100 text-red-800'
-                };
-
-                const formatDateTime = (timestamp) => {
-                    const d = new Date(timestamp);
-                    const day = String(d.getDate()).padStart(2, '0');
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const year = String(d.getFullYear()).slice(-2);
-                    let hrs = d.getHours();
-                    const ampm = hrs >= 12 ? 'PM' : 'AM';
-                    hrs = hrs % 12 || 12;
-                    const mins = String(d.getMinutes()).padStart(2, '0');
-                    return `${day}-${month}-${year} | ${String(hrs).padStart(2, '0')}:${mins} ${ampm}`;
-                };
+                const statusColors = SOLARIS_STATUS_COLORS;
+                const formatDateTime = (timestamp) => formatSolarisDateTime(timestamp, false);
 
                 const formatShiftDateTime = () => {
                     const d = new Date();
@@ -16601,7 +16923,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const res = await window.SolarisKHQREngine.fetchRecentAbaPaymentsFromFirestore(
                             targetChatId,
                             targetShopId,
-                            true // includeClaimed = true so all shift transactions are preserved
+                            true, // includeClaimed = true so all shift transactions are preserved
+                            showFeedback // Only force a fresh cloud getDocs when user explicitly clicks "Sync Telegram Now"
                         );
                         if (res && res.ok) {
                             setAbaLedgerMessages(res.allAbaMessages || res.messages || []);
@@ -16620,34 +16943,21 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
-                // Real-time Firestore subscription + periodic Telegram Bot poll while in POSView
+                // Real-time shared subscription + periodic Telegram Bot poll while in POSView
                 useEffect(() => {
                     syncAbaLedgerNow(false);
 
                     const pollTimer = setInterval(() => {
                         syncAbaLedgerNow(false);
-                    }, 8000);
+                    }, 18000);
 
-                    let unsubAbaCol = null;
-                    let unsubLiveFeed = null;
-                    try {
-                        const { collection, query, limit, onSnapshot, doc } = window.FirebaseApp;
-                        const database = safeDB();
-
-                        const qAllAba = query(collection(database, 'aba_payments'), limit(150));
-                        unsubAbaCol = onSnapshot(qAllAba, () => {
-                            syncAbaLedgerNow(false);
-                        }, () => {});
-
-                        unsubLiveFeed = onSnapshot(doc(database, 'system_settings', 'aba_live_feed'), () => {
-                            syncAbaLedgerNow(false);
-                        }, () => {});
-                    } catch (e) {}
+                    const unsubShared = window.SolarisPayWayVerifier.subscribe(() => {
+                        setAbaLedgerMessages(Array.from(window.SolarisPayWayVerifier.inMemoryAbaPayments.values()));
+                    });
 
                     return () => {
                         clearInterval(pollTimer);
-                        if (typeof unsubAbaCol === 'function') unsubAbaCol();
-                        if (typeof unsubLiveFeed === 'function') unsubLiveFeed();
+                        unsubShared();
                     };
                 }, [activeLedgerShopObj?.id, activeLedgerShopObj?.khqrConfig?.paywayChatId]);
 
@@ -17579,17 +17889,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             abaCurrency: isPreVerifiedAba ? verifiedAba.currency : null,
                             abaPaidAtStr: isPreVerifiedAba ? (verifiedAba.paidAtStr || '') : null,
                             abaVerifiedAt: isPreVerifiedAba ? createdTimestamp : null,
-                            abaVerifiedBy: isPreVerifiedAba ? (currentAdminRecord?.name || 'POS Live Auto-Verify') : null,
-                            khqrExpectedKhr: isKhqrOrder ? currentTotal : null,
-                            khqrExpectedUsd: isKhqrOrder ? expectedUsdAmount : null,
-                            khqrCustomerRef: isKhqrOrder && khqrConfirmedData?.apvRef ? khqrConfirmedData.apvRef : null,
-                            khqrInitiatedAt: isKhqrOrder ? createdTimestamp : null,
-                            dateString: today,
-                            createdAt: createdTimestamp,
-                            queueNo: queueStr,
-                            shiftId: cartTargetShift ? cartTargetShift.id : null,
-                            scpDiscountedQty: snapScpDiscountedQty || 0
-                        };
+                        abaVerifiedBy: isPreVerifiedAba ? (currentAdminRecord?.name || 'POS Live Auto-Verify') : null,
+                        khqrExpectedKhr: isKhqrOrder ? currentTotal : null,
+                        khqrExpectedUsd: isKhqrOrder ? expectedUsdAmount : null,
+                        khqrCustomerRef: isKhqrOrder && khqrConfirmedData?.apvRef ? khqrConfirmedData.apvRef : null,
+                        khqrInitiatedAt: isKhqrOrder ? Number(khqrConfirmedData?.intentMeta?.khqrInitiatedAt || createdTimestamp) : null,
+                        khqrExpiresAt: isKhqrOrder ? Number(khqrConfirmedData?.intentMeta?.khqrExpiresAt || (createdTimestamp + 120000)) : null,
+                        dateString: today,
+                        createdAt: createdTimestamp,
+                        queueNo: queueStr,
+                        shiftId: cartTargetShift ? cartTargetShift.id : null,
+                        scpDiscountedQty: snapScpDiscountedQty || 0
+                    };
 
                         const { doc, writeBatch, collection, addDoc, setDoc } = window.FirebaseApp;
                         const newOrderRef = doc(collection(db, 'orders'));
@@ -18274,11 +18585,12 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         confirmBtnText="Mark Paid & Send to Kitchen"
                                         cancelBtnText="Back to POS Cart"
                                         onClose={() => setIsPosKhqrModalOpen(false)}
-                                        onConfirmPaid={(apvRef, verifiedAba = null) => handleCheckout('Preparing', 'Paid', 'Bank', {
+                                        onConfirmPaid={(apvRef, verifiedAba = null, intentMeta = null) => handleCheckout('Preparing', 'Paid', 'Bank', {
                                             isKhqr: true,
                                             apvRef,
-                                            lockedInvoiceNo: posPendingKhqrInvoiceNo,
-                                            verifiedAba
+                                            lockedInvoiceNo: intentMeta?.tempInvoiceNo || posPendingKhqrInvoiceNo,
+                                            verifiedAba,
+                                            intentMeta
                                         })}
                                     />
                                 )}
@@ -22281,18 +22593,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     return { expectedCash, actualCash, varianceCash, totalBank };
                 }, [filteredShifts]);
 
-                const formatSalesDateTime = (timestamp) => {
-                    const d = new Date(timestamp);
-                    const day = String(d.getDate()).padStart(2, '0');
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const year = String(d.getFullYear()).slice(-2);
-                    let hrs = d.getHours();
-                    const ampm = hrs >= 12 ? 'PM' : 'AM';
-                    hrs = hrs % 12 || 12;
-                    const mins = String(d.getMinutes()).padStart(2, '0');
-                    const secs = String(d.getSeconds()).padStart(2, '0');
-                    return `${day}-${month}-${year} | ${hrs}:${mins}:${secs} ${ampm}`;
-                };
+                const formatSalesDateTime = (timestamp) => formatSolarisDateTime(timestamp, true);
 
                 const exportCSV = () => {
                     const headers = "Date_Time,Shop_Name,Staff_Name,Invoice,Table,Customer,Phone,Items,Total,Redeemed_Points,Promotions,Payment_Status,Payment_Method,Order_Status\n";
@@ -22380,13 +22681,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     link.click();
                 };
 
-                const statusColors = {
-                    'New': 'bg-blue-100 text-blue-800',
-                    'Preparing': 'bg-amber-100 text-amber-800',
-                    'Ready': 'bg-green-100 text-green-800',
-                    'Served': 'bg-stone-100 text-stone-500',
-                    'Cancelled': 'bg-red-100 text-red-800'
-                };
+                const statusColors = SOLARIS_STATUS_COLORS;
 
                 const updateStatus = async (order, newStatus) => {
                     const { doc, updateDoc } = window.FirebaseApp;
@@ -25581,7 +25876,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
 
                     const targetShop = shops.find(s => s.id === verifyingOrderModal.shopId);
-                    if (!window.SolarisPayWayVerifier.doesMessageMatchOrder(parsed, verifyingOrderModal, targetShop)) {
+                    if (!window.SolarisPayWayVerifier.doesMessageMatchOrder(parsed, { ...verifyingOrderModal, bypassRecencyGate: true }, targetShop)) {
                         const expectedKhr = Number(verifyingOrderModal.khqrExpectedKhr || verifyingOrderModal.totalAmount || 0).toLocaleString();
                         showKdsPaywayToast(
                             `Amount/Merchant mismatch! Message is ${parsed.currency === 'KHR' ? '៛' + parsed.amount.toLocaleString() : '$' + parsed.amount}, order expects ${expectedKhr} ៛.`,
@@ -25620,29 +25915,17 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
-                // Continuous Real-Time Firestore `onSnapshot` Listener on `aba_payments` for Pending KHQR Orders on KDS
+                // Continuous Real-Time Shared Subscription on `aba_payments` for Pending KHQR Orders on KDS
                 useEffect(() => {
                     if (pendingKhqrOrders.length === 0) return;
                     triggerKdsPaywayScan(null, true);
 
-                    let unsubAbaPayments = null;
-                    try {
-                        const { collection, query, where, limit, onSnapshot } = window.FirebaseApp;
-                        const qLive = query(
-                            collection(safeDB(), 'aba_payments'),
-                            where('claimedByOrderId', '==', null),
-                            limit(25)
-                        );
-                        unsubAbaPayments = onSnapshot(qLive, (snap) => {
-                            const hasNewOrUnclaimed = snap.docChanges().some(c => c.type === 'added' || c.type === 'modified');
-                            if (hasNewOrUnclaimed) {
-                                triggerKdsPaywayScan(null, true);
-                            }
-                        }, () => {});
-                    } catch (err) {}
+                    const unsubShared = window.SolarisPayWayVerifier.subscribe(() => {
+                        triggerKdsPaywayScan(null, true);
+                    });
 
                     return () => {
-                        if (typeof unsubAbaPayments === 'function') unsubAbaPayments();
+                        unsubShared();
                     };
                 }, [pendingKhqrOrders, shops, shifts, globalPoints]);
 
@@ -25671,13 +25954,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 }, [activeOrders, isSoundEnabled]);
 
                 // Added Missing Dependencies for the new KDS Card Template
-                const statusColors = {
-                    'New': 'bg-blue-50 text-blue-800 border-blue-200',
-                    'Preparing': 'bg-amber-50 text-amber-800 border-amber-200',
-                    'Ready': 'bg-emerald-50 text-emerald-800 border-emerald-200',
-                    'Served': 'bg-stone-50 text-stone-500 border-stone-200',
-                    'Cancelled': 'bg-red-50 text-red-800 border-red-200'
-                };
+                const statusColors = SOLARIS_KDS_STATUS_COLORS;
 
                 const updateStatus = async (order, newStatus, reason = '') => {
                     const { doc, updateDoc } = window.FirebaseApp;
@@ -27313,4 +27590,4 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
             }
         </script>
     </body>
-    </html>
+</html>
