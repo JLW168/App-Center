@@ -479,7 +479,13 @@
                 <select id="branchSelector" class="shop-select" title="Select Shop Branch">
                     <option value="">Loading...</option>
                 </select>
-                <button class="icon-btn" id="soundBtn" title="Test Sound / Unlock Audio">
+                <select id="voiceLangSelect" class="shop-select" style="max-width:92px;" title="Voice Announcement Language">
+                    <option value="both">🇰🇭+🇬🇧</option>
+                    <option value="km">🇰🇭 ខ្មែរ</option>
+                    <option value="en">🇬🇧 EN</option>
+                    <option value="mute">🔇 Mute</option>
+                </select>
+                <button class="icon-btn" id="soundBtn" title="Test Voice & Chime / Unlock Audio">
                     <i class="fa-solid fa-volume-high"></i>
                 </button>
                 <button class="icon-btn" id="fullscreenBtn" title="Toggle Fullscreen">
@@ -811,6 +817,176 @@
             } catch (e) {}
         }
 
+        // --- 2B. Voice Announcement Engine (Reads Received Amount & Says Thank You in Khmer / English) ---
+        let ttsAudioEl = null;
+        let voiceLang = localStorage.getItem('solaris_companion_voice_lang') || 'both';
+        const voiceLangSelect = document.getElementById('voiceLangSelect');
+        if (voiceLangSelect) {
+            voiceLangSelect.value = voiceLang;
+            voiceLangSelect.addEventListener('change', (e) => {
+                voiceLang = e.target.value;
+                try { localStorage.setItem('solaris_companion_voice_lang', voiceLang); } catch (err) {}
+            });
+        }
+
+        function ensureTtsAudio() {
+            if (!ttsAudioEl) {
+                try {
+                    ttsAudioEl = new Audio();
+                    ttsAudioEl.preload = 'auto';
+                    ttsAudioEl.playsInline = true;
+                    ttsAudioEl.setAttribute('playsinline', '');
+                    ttsAudioEl.setAttribute('webkit-playsinline', '');
+                    ttsAudioEl.referrerPolicy = 'no-referrer';
+                } catch (e) {}
+            }
+            return ttsAudioEl;
+        }
+
+        // Unlock WebAudio + HTML5 Audio + SpeechSynthesis on first tap anywhere on the old phone
+        function unlockAllAudioOnce() {
+            ensureAudio();
+            try {
+                const a = ensureTtsAudio();
+                if (a) {
+                    a.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+                    const p = a.play();
+                    if (p) p.then(() => { a.pause(); a.currentTime = 0; }).catch(() => {});
+                }
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                    window.speechSynthesis.resume();
+                }
+            } catch (e) {}
+        }
+        document.addEventListener('click', unlockAllAudioOnce, { once: true, capture: true });
+        document.addEventListener('touchstart', unlockAllAudioOnce, { once: true, capture: true });
+
+        function playCloudTtsUrl(url, rate = 1.0) {
+            return new Promise((resolve) => {
+                try {
+                    const audio = ensureTtsAudio();
+                    if (!audio) return resolve(false);
+                    audio.pause();
+                    let done = false;
+                    const finish = (ok) => {
+                        if (done) return;
+                        done = true;
+                        clearTimeout(timer);
+                        audio.onended = null;
+                        audio.onerror = null;
+                        resolve(ok);
+                    };
+                    const timer = setTimeout(() => finish(false), 7500);
+                    audio.onended = () => finish(true);
+                    audio.onerror = () => finish(false);
+                    audio.src = url;
+                    audio.volume = 1.0;
+                    audio.playbackRate = rate;
+                    const p = audio.play();
+                    if (p) p.catch(() => finish(false));
+                } catch (e) {
+                    resolve(false);
+                }
+            });
+        }
+
+        async function speakSegment(text, tl = 'en') {
+            const cleanText = String(text || '').trim();
+            if (!cleanText) return false;
+
+            // For English, try native SpeechSynthesis first for zero-network instant speech on old devices
+            if (tl === 'en' && 'speechSynthesis' in window) {
+                const spokeNative = await new Promise((resolve) => {
+                    try {
+                        window.speechSynthesis.cancel();
+                        window.speechSynthesis.resume();
+                        const utter = new SpeechSynthesisUtterance(cleanText);
+                        utter.lang = 'en-US';
+                        utter.rate = 0.95;
+                        utter.pitch = 1.0;
+                        utter.volume = 1.0;
+                        const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+                        const enVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en'));
+                        if (enVoice) utter.voice = enVoice;
+
+                        let started = false;
+                        const guard = setTimeout(() => { if (!started) resolve(false); }, 900);
+                        const maxGuard = setTimeout(() => resolve(true), 6500);
+                        utter.onstart = () => { started = true; clearTimeout(guard); };
+                        utter.onend = () => { clearTimeout(guard); clearTimeout(maxGuard); resolve(true); };
+                        utter.onerror = () => { clearTimeout(guard); clearTimeout(maxGuard); resolve(false); };
+                        window.speechSynthesis.speak(utter);
+                    } catch (e) {
+                        resolve(false);
+                    }
+                });
+                if (spokeNative) return true;
+            }
+
+            // Cloud TTS stream (primary for Khmer 'km', fallback for 'en')
+            const encoded = encodeURIComponent(cleanText);
+            const urls = [
+                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${tl}&q=${encoded}`,
+                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encoded}`
+            ];
+            for (let i = 0; i < urls.length; i++) {
+                const ok = await playCloudTtsUrl(urls[i], tl === 'km' ? 1.0 : 0.98);
+                if (ok) return true;
+            }
+
+            // Final native fallback for Khmer if offline
+            if (tl === 'km' && 'speechSynthesis' in window) {
+                try {
+                    const utter = new SpeechSynthesisUtterance(cleanText);
+                    utter.lang = 'km-KH';
+                    window.speechSynthesis.speak(utter);
+                    return true;
+                } catch (e) {}
+            }
+            return false;
+        }
+
+        function parseAmountAndCurrencyFromInfo(info) {
+            const rawDisp = String(info?.amountDisplay || '').trim();
+            if (rawDisp.includes('$') || String(info?.currency || '').toUpperCase() === 'USD') {
+                const num = parseFloat(rawDisp.replace(/[^0-9.]/g, '')) || Number(info?.amount || info?.amountUsd || 0);
+                return { currency: 'USD', amount: num };
+            }
+            const numKhr = Math.round(parseFloat(rawDisp.replace(/[^0-9.]/g, '')) || Number(info?.amount || info?.amountKhr || 0));
+            return { currency: 'KHR', amount: numKhr };
+        }
+
+        async function announceReceivedPaymentVoice(info) {
+            if (voiceLang === 'mute') return;
+            const { currency, amount } = parseAmountAndCurrencyFromInfo(info);
+
+            let kmText = '';
+            let enText = '';
+
+            if (currency === 'USD') {
+                const formattedUsd = amount % 1 === 0 ? String(amount) : amount.toFixed(2);
+                kmText = `ទទួលបានប្រាក់ចំនួន ${formattedUsd} ដុល្លារ ដោយជោគជ័យ។ សូមអរគុណ!`;
+                enText = `Payment received, ${formattedUsd} dollars. Thank you!`;
+            } else {
+                const formattedKhr = Math.round(amount).toLocaleString();
+                kmText = `ទទួលបានប្រាក់ចំនួន ${formattedKhr} រៀល ដោយជោគជ័យ។ សូមអរគុណ!`;
+                enText = `Payment received, ${formattedKhr} Riel. Thank you!`;
+            }
+
+            // Wait 550ms so the celebratory fanfare chime finishes its opening notes first
+            await new Promise(r => setTimeout(r, 550));
+
+            if (voiceLang === 'km') {
+                await speakSegment(kmText, 'km');
+            } else if (voiceLang === 'en') {
+                await speakSegment(enText, 'en');
+            } else {
+                await speakSegment(kmText, 'km');
+                await speakSegment(enText, 'en');
+            }
+        }
+
         // --- 3. State & DOM References ---
         const screenIdle = document.getElementById('screenIdle');
         const screenKhqr = document.getElementById('screenKhqr');
@@ -920,12 +1096,13 @@
             document.getElementById('tyApv').textContent = 'APV: ' + (info.apv || 'VERIFIED');
 
             playSuccessFanfare();
+            announceReceivedPaymentVoice(info);
             showScreen('THANKYOU');
 
-            // Automatically return to Standby after 6 seconds ("Thank You modal, Done!")
+            // Automatically return to Standby after 7.5 seconds ("Thank You modal, Done!")
             thankYouAutoCloseTimer = setTimeout(() => {
                 showScreen('IDLE');
-            }, 6000);
+            }, 7500);
         }
 
         // Check if an incoming `aba_payments` document matches the currently displayed KHQR session
@@ -1081,7 +1258,9 @@
             showScreen('IDLE');
         });
         document.getElementById('soundBtn').addEventListener('click', () => {
+            unlockAllAudioOnce();
             playSuccessFanfare();
+            announceReceivedPaymentVoice({ amountDisplay: '6,000 ៛', amountKhr: 6000, currency: 'KHR' });
         });
         document.getElementById('fullscreenBtn').addEventListener('click', () => {
             const docEl = document.documentElement;
