@@ -819,13 +819,46 @@
 
         // --- 2B. Voice Announcement Engine (Reads Received Amount & Says Thank You in Khmer / English) ---
         let ttsAudioEl = null;
-        let voiceLang = localStorage.getItem('solaris_companion_voice_lang') || 'both';
+        let activeSpeechRunId = 0;
+
+        function getCurrentVoiceLang() {
+            const sel = document.getElementById('voiceLangSelect');
+            if (sel && sel.value) return sel.value;
+            try {
+                return localStorage.getItem('solaris_companion_voice_lang') || 'both';
+            } catch (e) {
+                return 'both';
+            }
+        }
+
+        function stopAllVoicePlayback() {
+            activeSpeechRunId++;
+            try {
+                if (ttsAudioEl) {
+                    ttsAudioEl.onended = null;
+                    ttsAudioEl.onerror = null;
+                    ttsAudioEl.pause();
+                }
+            } catch (e) {}
+            try {
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.cancel();
+                }
+            } catch (e) {}
+        }
+
         const voiceLangSelect = document.getElementById('voiceLangSelect');
         if (voiceLangSelect) {
-            voiceLangSelect.value = voiceLang;
+            const savedLang = localStorage.getItem('solaris_companion_voice_lang') || 'both';
+            voiceLangSelect.value = savedLang;
             voiceLangSelect.addEventListener('change', (e) => {
-                voiceLang = e.target.value;
-                try { localStorage.setItem('solaris_companion_voice_lang', voiceLang); } catch (err) {}
+                const chosen = e.target.value;
+                try { localStorage.setItem('solaris_companion_voice_lang', chosen); } catch (err) {}
+                stopAllVoicePlayback();
+                if (chosen !== 'mute') {
+                    // Immediately preview the newly selected language so staff can confirm it
+                    announceReceivedPaymentVoice({ amountDisplay: '6,000 ៛', amountKhr: 6000, currency: 'KHR' }, chosen);
+                }
             });
         }
 
@@ -848,13 +881,12 @@
             ensureAudio();
             try {
                 const a = ensureTtsAudio();
-                if (a) {
+                if (a && a.paused) {
                     a.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
                     const p = a.play();
                     if (p) p.then(() => { a.pause(); a.currentTime = 0; }).catch(() => {});
                 }
-                if ('speechSynthesis' in window) {
-                    window.speechSynthesis.cancel();
+                if ('speechSynthesis' in window && !window.speechSynthesis.speaking) {
                     window.speechSynthesis.resume();
                 }
             } catch (e) {}
@@ -862,13 +894,76 @@
         document.addEventListener('click', unlockAllAudioOnce, { once: true, capture: true });
         document.addEventListener('touchstart', unlockAllAudioOnce, { once: true, capture: true });
 
-        function playCloudTtsUrl(url, rate = 1.0) {
+        // Converts numbers into natural Khmer words so Khmer TTS reads the exact Khmer amount instead of English digits
+        function numberToKhmerWords(num) {
+            const n = Math.round(Number(num) || 0);
+            if (n === 0) return 'សូន្យ';
+            const units = ['', 'មួយ', 'ពីរ', 'បី', 'បួន', 'ប្រាំ', 'ប្រាំមួយ', 'ប្រាំពីរ', 'ប្រាំបី', 'ប្រាំបួន'];
+            const tens = ['', 'ដប់', 'ម្ភៃ', 'សាមសិប', 'សែសិប', 'ហាសិប', 'ហុកសិប', 'ចិតសិប', 'ប៉ែតសិប', 'កៅសិប'];
+
+            if (n < 0) return String(n);
+            let rem = n;
+            const parts = [];
+
+            if (rem >= 1000000) {
+                const m = Math.floor(rem / 1000000);
+                parts.push(numberToKhmerWords(m) + 'លាន');
+                rem %= 1000000;
+            }
+            if (rem >= 100000) {
+                const saen = Math.floor(rem / 100000);
+                parts.push(units[saen] + 'សែន');
+                rem %= 100000;
+            }
+            if (rem >= 10000) {
+                const muen = Math.floor(rem / 10000);
+                parts.push(units[muen] + 'ម៉ឺន');
+                rem %= 10000;
+            }
+            if (rem >= 1000) {
+                const phan = Math.floor(rem / 1000);
+                parts.push(units[phan] + 'ពាន់');
+                rem %= 1000;
+            }
+            if (rem >= 100) {
+                const roy = Math.floor(rem / 100);
+                parts.push(units[roy] + 'រយ');
+                rem %= 100;
+            }
+            if (rem >= 10) {
+                const t = Math.floor(rem / 10);
+                parts.push(tens[t]);
+                rem %= 10;
+            }
+            if (rem > 0) {
+                parts.push(units[rem]);
+            }
+            return parts.join(' ');
+        }
+
+        function formatUsdToKhmerWords(amount) {
+            const num = Number(amount) || 0;
+            const whole = Math.floor(num);
+            const cents = Math.round((num - whole) * 100);
+            if (cents > 0) {
+                return `${numberToKhmerWords(whole)} ដុល្លារ និង ${numberToKhmerWords(cents)} សេន`;
+            }
+            return `${numberToKhmerWords(whole)} ដុល្លារ`;
+        }
+
+        function playCloudTtsUrl(url, rate, runId) {
             return new Promise((resolve) => {
+                if (runId !== activeSpeechRunId) return resolve(false);
                 try {
                     const audio = ensureTtsAudio();
                     if (!audio) return resolve(false);
+                    audio.onended = null;
+                    audio.onerror = null;
                     audio.pause();
+
                     let done = false;
+                    let hasStartedPlaying = false;
+
                     const finish = (ok) => {
                         if (done) return;
                         done = true;
@@ -877,74 +972,88 @@
                         audio.onerror = null;
                         resolve(ok);
                     };
-                    const timer = setTimeout(() => finish(false), 7500);
+
+                    const timer = setTimeout(() => finish(hasStartedPlaying), 9000);
+                    audio.onplay = () => { hasStartedPlaying = true; };
                     audio.onended = () => finish(true);
                     audio.onerror = () => finish(false);
                     audio.src = url;
                     audio.volume = 1.0;
                     audio.playbackRate = rate;
+
                     const p = audio.play();
-                    if (p) p.catch(() => finish(false));
+                    if (p !== undefined) {
+                        p.then(() => { hasStartedPlaying = true; }).catch(() => finish(false));
+                    }
                 } catch (e) {
                     resolve(false);
                 }
             });
         }
 
-        async function speakSegment(text, tl = 'en') {
+        async function speakSegment(text, tl, runId) {
+            if (runId !== activeSpeechRunId) return false;
             const cleanText = String(text || '').trim();
             if (!cleanText) return false;
 
-            // For English, try native SpeechSynthesis first for zero-network instant speech on old devices
-            if (tl === 'en' && 'speechSynthesis' in window) {
-                const spokeNative = await new Promise((resolve) => {
-                    try {
-                        window.speechSynthesis.cancel();
-                        window.speechSynthesis.resume();
-                        const utter = new SpeechSynthesisUtterance(cleanText);
-                        utter.lang = 'en-US';
-                        utter.rate = 0.95;
-                        utter.pitch = 1.0;
-                        utter.volume = 1.0;
-                        const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
-                        const enVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en'));
-                        if (enVoice) utter.voice = enVoice;
+            const langCode = tl === 'km' ? 'km' : 'en';
 
-                        let started = false;
-                        const guard = setTimeout(() => { if (!started) resolve(false); }, 900);
-                        const maxGuard = setTimeout(() => resolve(true), 6500);
-                        utter.onstart = () => { started = true; clearTimeout(guard); };
-                        utter.onend = () => { clearTimeout(guard); clearTimeout(maxGuard); resolve(true); };
-                        utter.onerror = () => { clearTimeout(guard); clearTimeout(maxGuard); resolve(false); };
-                        window.speechSynthesis.speak(utter);
-                    } catch (e) {
-                        resolve(false);
-                    }
-                });
-                if (spokeNative) return true;
-            }
-
-            // Cloud TTS stream (primary for Khmer 'km', fallback for 'en')
+            // 1. Primary: Play via single sequential HTML5 <audio> element (Cloud TTS)
+            // Using the same HTML5 Audio element for both Khmer ('km') and English ('en') guarantees
+            // they NEVER play at the same time and `km` always speaks authentic Khmer voice!
             const encoded = encodeURIComponent(cleanText);
             const urls = [
-                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${tl}&q=${encoded}`,
-                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${tl}&q=${encoded}`
+                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${langCode}&q=${encoded}`,
+                `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${langCode}&q=${encoded}`,
+                `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${langCode}&q=${encoded}`
             ];
+
             for (let i = 0; i < urls.length; i++) {
-                const ok = await playCloudTtsUrl(urls[i], tl === 'km' ? 1.0 : 0.98);
+                if (runId !== activeSpeechRunId) return false;
+                const ok = await playCloudTtsUrl(urls[i], langCode === 'km' ? 1.0 : 0.96, runId);
                 if (ok) return true;
             }
 
-            // Final native fallback for Khmer if offline
-            if (tl === 'km' && 'speechSynthesis' in window) {
+            // 2. Fallback: Native SpeechSynthesis (ONLY if Cloud TTS was unreachable/offline)
+            if (runId !== activeSpeechRunId || !('speechSynthesis' in window)) return false;
+
+            return await new Promise((resolve) => {
                 try {
-                    const utter = new SpeechSynthesisUtterance(cleanText);
-                    utter.lang = 'km-KH';
-                    window.speechSynthesis.speak(utter);
-                    return true;
-                } catch (e) {}
-            }
-            return false;
+                    const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+                    if (langCode === 'km') {
+                        // CRITICAL FIX: Never let an English voice read Khmer text!
+                        // Only use native speechSynthesis for Khmer if the device actually has a Khmer ('km') voice installed.
+                        const kmVoice = voices.find(v =>
+                            (v.lang && v.lang.toLowerCase().includes('km')) ||
+                            (v.name && v.name.toLowerCase().includes('khmer'))
+                        );
+                        if (!kmVoice) return resolve(false);
+
+                        window.speechSynthesis.cancel();
+                        const utter = new SpeechSynthesisUtterance(cleanText);
+                        utter.lang = 'km-KH';
+                        utter.voice = kmVoice;
+                        utter.rate = 0.95;
+                        const maxGuard = setTimeout(() => resolve(true), 7000);
+                        utter.onend = () => { clearTimeout(maxGuard); resolve(true); };
+                        utter.onerror = () => { clearTimeout(maxGuard); resolve(false); };
+                        window.speechSynthesis.speak(utter);
+                    } else {
+                        window.speechSynthesis.cancel();
+                        const utter = new SpeechSynthesisUtterance(cleanText);
+                        utter.lang = 'en-US';
+                        utter.rate = 0.95;
+                        const enVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en'));
+                        if (enVoice) utter.voice = enVoice;
+                        const maxGuard = setTimeout(() => resolve(true), 7000);
+                        utter.onend = () => { clearTimeout(maxGuard); resolve(true); };
+                        utter.onerror = () => { clearTimeout(maxGuard); resolve(false); };
+                        window.speechSynthesis.speak(utter);
+                    }
+                } catch (e) {
+                    resolve(false);
+                }
+            });
         }
 
         function parseAmountAndCurrencyFromInfo(info) {
@@ -957,8 +1066,14 @@
             return { currency: 'KHR', amount: numKhr };
         }
 
-        async function announceReceivedPaymentVoice(info) {
-            if (voiceLang === 'mute') return;
+        async function announceReceivedPaymentVoice(info, overrideLang = null) {
+            const activeMode = overrideLang || getCurrentVoiceLang();
+            if (activeMode === 'mute') return;
+
+            // Cancel any previous in-flight speech and lock a new run ID
+            stopAllVoicePlayback();
+            const myRunId = activeSpeechRunId;
+
             const { currency, amount } = parseAmountAndCurrencyFromInfo(info);
 
             let kmText = '';
@@ -966,24 +1081,32 @@
 
             if (currency === 'USD') {
                 const formattedUsd = amount % 1 === 0 ? String(amount) : amount.toFixed(2);
-                kmText = `ទទួលបានប្រាក់ចំនួន ${formattedUsd} ដុល្លារ ដោយជោគជ័យ។ សូមអរគុណ!`;
+                const kmUsdWords = formatUsdToKhmerWords(amount);
+                kmText = `ទទួលបានប្រាក់ចំនួន ${kmUsdWords} ដោយជោគជ័យ សូមអរគុណ`;
                 enText = `Payment received, ${formattedUsd} dollars. Thank you!`;
             } else {
-                const formattedKhr = Math.round(amount).toLocaleString();
-                kmText = `ទទួលបានប្រាក់ចំនួន ${formattedKhr} រៀល ដោយជោគជ័យ។ សូមអរគុណ!`;
+                const roundedKhr = Math.round(amount);
+                const formattedKhr = roundedKhr.toLocaleString();
+                const kmKhrWords = numberToKhmerWords(roundedKhr);
+                kmText = `ទទួលបានប្រាក់ចំនួន ${kmKhrWords} រៀល ដោយជោគជ័យ សូមអរគុណ`;
                 enText = `Payment received, ${formattedKhr} Riel. Thank you!`;
             }
 
             // Wait 550ms so the celebratory fanfare chime finishes its opening notes first
             await new Promise(r => setTimeout(r, 550));
+            if (myRunId !== activeSpeechRunId) return;
 
-            if (voiceLang === 'km') {
-                await speakSegment(kmText, 'km');
-            } else if (voiceLang === 'en') {
-                await speakSegment(enText, 'en');
-            } else {
-                await speakSegment(kmText, 'km');
-                await speakSegment(enText, 'en');
+            if (activeMode === 'km') {
+                await speakSegment(kmText, 'km', myRunId);
+            } else if (activeMode === 'en') {
+                await speakSegment(enText, 'en', myRunId);
+            } else if (activeMode === 'both') {
+                await speakSegment(kmText, 'km', myRunId);
+                if (myRunId !== activeSpeechRunId) return;
+                // Brief natural pause between Khmer and English so they never overlap
+                await new Promise(r => setTimeout(r, 350));
+                if (myRunId !== activeSpeechRunId) return;
+                await speakSegment(enText, 'en', myRunId);
             }
         }
 
