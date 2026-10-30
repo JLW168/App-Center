@@ -428,29 +428,6 @@
                 return collection(safeDB(), colName);
             };
 
-            // Centralized Invoice Number Helper: Formats as {Shop ID}-{XXXXXXXXX} (9-digit sequence)
-            const getShopInvoicePrefix = (shop) => {
-                const customId = String(shop?.customShopId || '').trim().toUpperCase();
-                if (customId) return customId;
-                const cleanShopName = String(shop?.name || 'UNK').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                return cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
-            };
-
-            const extractInvoiceSequenceNumber = (queueNo) => {
-                if (!queueNo) return NaN;
-                const str = String(queueNo).trim();
-                const lastDashIdx = str.lastIndexOf('-');
-                const seqPart = lastDashIdx !== -1 ? str.slice(lastDashIdx + 1) : str;
-                if (!/^\d+$/.test(seqPart)) return NaN;
-                return parseInt(seqPart, 10);
-            };
-
-            const formatShopInvoiceNumber = (shop, seqNumber) => {
-                const prefix = getShopInvoicePrefix(shop);
-                const safeSeq = Math.max(1, Number(seqNumber) || 1);
-                return `${prefix}-${String(safeSeq).padStart(9, '0')}`;
-            };
-
             const resizeImage = (file) => {
                 return new Promise((resolve) => {
                     const reader = new FileReader();
@@ -3718,17 +3695,28 @@
                     } catch (e) {}
                 },
 
-                saveLocalAbaCache() {
+                // Publishes or clears the active KHQR Display Session in Firestore (`system_settings/khqr_display_{shopId}`)
+                // so a dedicated Customer-Facing Old Smartphone Display (`khqr-display.html`) pops up the KHQR immediately!
+                async broadcastCustomerDisplaySession(shopId, sessionPayload = null) {
+                    if (!shopId || shopId === 'All') return;
                     try {
-                        const recentEntries = Array.from(this.inMemoryAbaPayments.values())
-                            .sort((a, b) => (Number(b.date) || 0) - (Number(a.date) || 0))
-                            .slice(0, 100);
-                        localStorage.setItem('solaris_aba_payments_cache_v1', JSON.stringify(recentEntries));
-                        localStorage.setItem('solaris_aba_claimed_trx_v1', JSON.stringify(Array.from(this.processedTrxIdsMemory).slice(-200)));
-                        const overridesObj = {};
-                        this.localVerifiedOrdersMap.forEach((val, key) => { overridesObj[key] = val; });
-                        localStorage.setItem('solaris_aba_verified_orders_v1', JSON.stringify(overridesObj));
-                    } catch (e) {}
+                        const { doc, setDoc } = window.FirebaseApp;
+                        const docRef = doc(safeDB(), 'system_settings', `khqr_display_${shopId}`);
+                        if (!sessionPayload) {
+                            await setDoc(docRef, {
+                                status: 'IDLE',
+                                updatedAt: Date.now()
+                            }, { merge: true });
+                        } else {
+                            await setDoc(docRef, {
+                                ...sessionPayload,
+                                shopId,
+                                updatedAt: Date.now()
+                            }, { merge: true });
+                        }
+                    } catch (e) {
+                        console.warn('Customer KHQR Display broadcast warning:', e);
+                    }
                 },
 
                 // PHASE B: Registers an active KHQR Intent (Silent Temporary Invoice + Timestamp + Valid Window)
@@ -5759,10 +5747,50 @@
                         initiatedAt: khqrInitiatedAt,
                         expiresAt: khqrExpiresAt
                     });
+
+                    // Broadcast active KHQR bill to the standalone Customer-Facing Old Smartphone Display (`khqr-display.html`)
+                    if (effectiveShop?.id) {
+                        window.SolarisPayWayVerifier.broadcastCustomerDisplaySession(effectiveShop.id, {
+                            status: 'ACTIVE',
+                            sessionId: `${tempInvoiceNo}_${khqrInitiatedAt}`,
+                            shopId: effectiveShop.id,
+                            shopName: effectiveShop.brandingName || effectiveShop.name || 'Solaris Cafe',
+                            accountName,
+                            khrAccount,
+                            usdAccount,
+                            exchangeRate,
+                            baseEmvPayload: cfg.baseEmvPayload || '',
+                            staticQrImage: cfg.staticQrImage || '',
+                            amountKhr: Number(cartTotal || 0),
+                            amountUsd: Number(usdEquivalent),
+                            selectedCurrency: selectedQrCurrency,
+                            invoiceNo: tempInvoiceNo,
+                            initiatedAt: khqrInitiatedAt,
+                            expiresAt: khqrExpiresAt
+                        });
+                    }
+
                     return () => {
                         window.SolarisPayWayVerifier.unregisterKhqrIntent(tempInvoiceNo);
+                        if (effectiveShop?.id && !hasAutoConfirmedRef.current) {
+                            window.SolarisPayWayVerifier.broadcastCustomerDisplaySession(effectiveShop.id, null);
+                        }
                     };
                 }, [tempInvoiceNo, effectiveShop?.id, cartTotal, usdEquivalent, selectedQrCurrency, khqrInitiatedAt, khqrExpiresAt]);
+
+                // Listen for external payment verification completed by the standalone Customer-Facing Display (`khqr-display.html`)
+                useEffect(() => {
+                    if (!effectiveShop?.id || !window.FirebaseApp) return;
+                    const { doc, onSnapshot } = window.FirebaseApp;
+                    const unsubDisplay = onSnapshot(doc(safeDB(), 'system_settings', `khqr_display_${effectiveShop.id}`), (snap) => {
+                        if (!snap.exists() || hasAutoConfirmedRef.current) return;
+                        const d = snap.data();
+                        if (d && d.status === 'PAID' && d.invoiceNo === tempInvoiceNo && d.verifiedAbaPayload) {
+                            handleMatchRef.current(d.verifiedAbaPayload, true);
+                        }
+                    }, () => {});
+                    return () => unsubDisplay();
+                }, [effectiveShop?.id, tempInvoiceNo]);
 
                 useEffect(() => {
                     const tick = () => {
@@ -5863,6 +5891,25 @@
                     setVerifiedAbaPayload(parsedAba);
                     playVerifiedChime();
                     triggerToast(t.paymentVerifiedAutoClosing);
+
+                    // Notify standalone Customer-Facing Display (`khqr-display.html`) to show the celebratory "Thank You!" screen
+                    if (effectiveShop?.id) {
+                        window.SolarisPayWayVerifier.broadcastCustomerDisplaySession(effectiveShop.id, {
+                            status: 'PAID',
+                            invoiceNo: tempInvoiceNo,
+                            amountKhr: Number(cartTotal || 0),
+                            amountUsd: Number(usdEquivalent),
+                            payerDisplay: `${parsedAba.payerName || 'ABA Customer'} (${parsedAba.maskedAccount || '*ABA'})`,
+                            amountDisplay: parsedAba.currency === 'KHR'
+                                ? `៛${Number(parsedAba.amount).toLocaleString()}`
+                                : `$${Number(parsedAba.amount).toFixed(2)}`,
+                            apv: String(parsedAba.apv || 'VERIFIED'),
+                            trxId: String(parsedAba.trxId || ''),
+                            verifiedAbaPayload: parsedAba,
+                            paidAt: Date.now()
+                        });
+                    }
+
                     setTimeout(() => {
                         onConfirmPaid(parsedAba.apv || apvRefInput.trim(), parsedAba, {
                             tempInvoiceNo,
@@ -8785,6 +8832,9 @@
                         toastTimerRef.current = setTimeout(() => setCustomMessage(''), 4000);
                         return;
                     }
+                    const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                    const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+
                     // ANTI-FAKE ORDER CHECK
                     if (liveLocationStatus.isForbidden) {
                         setIsSubmitting(false);
@@ -8796,14 +8846,14 @@
                         return;
                     }
 
-                    // Pre-calculate deterministic Queue Number ({Shop ID}-{XXXXXXXXX}) so KHQR Tag 62 embeds the exact same Invoice No.
+                    // Pre-calculate deterministic Queue Number so KHQR Tag 62 embeds the exact same Invoice No.
                     let maxLocalSeq = 0;
                     const resetAfterMs = Number(targetShop?.invoiceCounterResetAt || 0);
                     const combinedKnownOrders = [...orders, ...customerHistory];
                     combinedKnownOrders.forEach(o => {
-                        if (o.shopId === sessionInfo.shopId && o.queueNo) {
+                        if (o.shopId === sessionInfo.shopId && o.queueNo && o.queueNo.startsWith(`${shopPrefix}-`)) {
                             if (resetAfterMs > 0 && Number(o.createdAt || 0) < resetAfterMs) return;
-                            const seq = extractInvoiceSequenceNumber(o.queueNo);
+                            const seq = parseInt(o.queueNo.split('-')[1], 10);
                             if (!isNaN(seq) && seq < 100000000 && seq > maxLocalSeq) maxLocalSeq = seq;
                         }
                     });
@@ -8811,7 +8861,7 @@
                     const optimisticSeq = maxLocalSeq > 0 ? (maxLocalSeq + 1) : (resetAfterMs > 0 ? 1 : timeBasedSeq);
                     const optimisticQueueNo = (khqrConfirmedData && khqrConfirmedData.lockedInvoiceNo)
                         ? khqrConfirmedData.lockedInvoiceNo
-                        : formatShopInvoiceNumber(targetShop, optimisticSeq);
+                        : `${shopPrefix}-${String(optimisticSeq).padStart(9, '0')}`;
 
                     // Intercept & open Branded KHQR Modal if customer chose ABA KHQR and hasn't confirmed payment yet
                     if (activeBranchKhqrStatus.isKhqrEnabled && selectedPaymentChoice === 'KHQR' && cartTotal > 0 && !khqrConfirmedData) {
@@ -10621,23 +10671,24 @@
 
                 const formatShortQueue = (queueNo) => {
                     if (!queueNo) return '---';
-                    const num = extractInvoiceSequenceNumber(queueNo);
-                    return isNaN(num) ? queueNo : `#${String(num).padStart(3, '0')}`;
+                    const parts = String(queueNo).split('-');
+                    if (parts.length > 1) {
+                        const num = parseInt(parts[1], 10);
+                        return isNaN(num) ? queueNo : `#${String(num).padStart(3, '0')}`;
+                    }
+                    return queueNo;
                 };
 
                 const formatSpokenInvoice = (queueNo) => {
                     if (!queueNo) return '';
-                    const str = String(queueNo).trim();
-                    const lastDashIdx = str.lastIndexOf('-');
-                    if (lastDashIdx !== -1) {
-                        const prefixPart = str.slice(0, lastDashIdx);
-                        const seqPart = str.slice(lastDashIdx + 1);
-                        const prefixSpoken = prefixPart.replace(/-/g, ' ').split('').join(' ');
-                        const num = parseInt(seqPart, 10);
-                        const numStr = isNaN(num) ? seqPart : String(num);
-                        return `${prefixSpoken}, ${numStr}`;
+                    const parts = String(queueNo).split('-');
+                    if (parts.length > 1) {
+                        const prefix = parts[0].split('').join(' ');
+                        const num = parseInt(parts[1], 10);
+                        const numStr = isNaN(num) ? parts[1] : String(num);
+                        return `${prefix}, ${numStr}`;
                     }
-                    return str;
+                    return String(queueNo);
                 };
 
                 const formatKhmerSpokenInvoice = (queueNo) => {
@@ -10646,9 +10697,8 @@
                         '0': 'សូន្យ', '1': 'មួយ', '2': 'ពីរ', '3': 'បី', '4': 'បួន',
                         '5': 'ប្រាំ', '6': 'ប្រាំមួយ', '7': 'ប្រាំពីរ', '8': 'ប្រាំបី', '9': 'ប្រាំបួន'
                     };
-                    const str = String(queueNo).trim();
-                    const lastDashIdx = str.lastIndexOf('-');
-                    const rawNum = lastDashIdx !== -1 ? str.slice(lastDashIdx + 1) : str;
+                    const parts = String(queueNo).split('-');
+                    const rawNum = parts.length > 1 ? parts[1] : parts[0];
                     const parsedNum = parseInt(rawNum, 10);
                     const cleanDigits = isNaN(parsedNum) ? String(rawNum) : String(parsedNum);
                     return cleanDigits.split('').map(ch => khmerDigits[ch] || ch).join(' ');
@@ -17496,8 +17546,9 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 invoiceCounterResetAt: resetTimestamp
                             })
                         ]);
-                        const nextInvoicePreview = formatShopInvoiceNumber(resetInvoiceShop, 1);
-                        setShopToastMsg(`Invoice counter for ${resetInvoiceShop.name} reset to 000000000! Next invoice: ${nextInvoicePreview}`);
+                        const cleanName = (resetInvoiceShop.name || 'UNK').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                        const prefix = cleanName.length >= 3 ? cleanName.slice(-3) : cleanName.padStart(3, 'X');
+                        setShopToastMsg(`Invoice counter for ${resetInvoiceShop.name} reset to 0000000! Next invoice: ${prefix}-000000001`);
                         setTimeout(() => setShopToastMsg(''), 4500);
                         setResetInvoiceShop(null);
                     } catch (err) {
@@ -20443,12 +20494,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                 const computeNextPosQueueNo = (targetShopId) => {
                     const targetShop = shops.find(s => s.id === targetShopId) || { name: 'UNK', id: 'UNKNOWN' };
+                    const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                    const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
                     const resetAfterMs = Number(targetShop?.invoiceCounterResetAt || 0);
                     let maxLocalSeq = 0;
                     orders.forEach(o => {
-                        if (o.shopId === targetShopId && o.queueNo) {
+                        if (o.shopId === targetShopId && o.queueNo && o.queueNo.startsWith(`${shopPrefix}-`)) {
                             if (resetAfterMs > 0 && Number(o.createdAt || 0) < resetAfterMs) return;
-                            const seq = extractInvoiceSequenceNumber(o.queueNo);
+                            const seq = parseInt(o.queueNo.split('-')[1], 10);
                             if (!isNaN(seq) && seq < 100000000 && seq > maxLocalSeq) maxLocalSeq = seq;
                         }
                     });
@@ -20456,7 +20509,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     return {
                         targetShop,
                         nextSeq,
-                        queueStr: formatShopInvoiceNumber(targetShop, nextSeq)
+                        queueStr: `${shopPrefix}-${String(nextSeq).padStart(9, '0')}`
                     };
                 };
 
