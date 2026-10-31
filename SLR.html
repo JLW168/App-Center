@@ -18807,6 +18807,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [selectedLedgerShiftId, setSelectedLedgerShiftId] = useState('ACTIVE');
                 const [abaSearchQuery, setAbaSearchQuery] = useState('');
                 const [abaCurrencyFilter, setAbaCurrencyFilter] = useState('ALL'); // 'ALL' | 'KHR' | 'USD'
+                const [isDeletingAbaRange, setIsDeletingAbaRange] = useState(false);
+                const [deleteAbaConfirmModal, setDeleteAbaConfirmModal] = useState(null);
 
                 // STRICT 1-USER-1-SHIFT GUARD: Find if the logged-in user already has an Open shift anywhere
                 const myExistingOpenShift = useMemo(() => {
@@ -19907,6 +19909,207 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     link.click();
                 };
 
+                // ADMIN-ONLY: Delete all Telegram-synced ABA PayWay transactions in the selected Date Range filter
+                const getSelectedDateRangeWindowMs = () => {
+                    const now = new Date();
+                    let startMs = startOfToday;
+                    let endMs = Date.now() + 60000;
+                    let rangeLabel = 'Today';
+
+                    if (dateFilter === 'yesterday') {
+                        startMs = startOfToday - 24 * 60 * 60 * 1000;
+                        endMs = startOfToday;
+                        rangeLabel = 'Yesterday';
+                    } else if (dateFilter === 'this_week') {
+                        startMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+                        rangeLabel = 'This Week';
+                    } else if (dateFilter === 'last_week') {
+                        startMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
+                        endMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+                        rangeLabel = 'Last Week';
+                    } else if (dateFilter === 'this_month') {
+                        startMs = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                        rangeLabel = 'This Month';
+                    } else if (dateFilter === 'last_month') {
+                        startMs = new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime();
+                        endMs = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+                        rangeLabel = 'Last Month';
+                    } else if (dateFilter === 'this_year') {
+                        startMs = new Date(now.getFullYear(), 0, 1).getTime();
+                        rangeLabel = 'This Year';
+                    } else if (dateFilter === 'last_year') {
+                        startMs = new Date(now.getFullYear() - 1, 0, 1).getTime();
+                        endMs = new Date(now.getFullYear(), 0, 1).getTime();
+                        rangeLabel = 'Last Year';
+                    } else if (dateFilter === 'custom_date' && customDate) {
+                        const [y, m, d] = customDate.split('-');
+                        startMs = new Date(y, m - 1, d).getTime();
+                        endMs = startMs + 24 * 60 * 60 * 1000;
+                        rangeLabel = `Custom Date (${customDate})`;
+                    }
+
+                    return { startMs, endMs, rangeLabel };
+                };
+
+                const handleOpenDeleteAbaRangeModal = () => {
+                    if (!isSuper) return;
+                    if (dateFilter === 'custom_date' && !customDate) {
+                        setPosError('Please select a Custom Date first before deleting ABA transactions.');
+                        setTimeout(() => setPosError(''), 4000);
+                        return;
+                    }
+                    const { startMs, endMs, rangeLabel } = getSelectedDateRangeWindowMs();
+                    const branchLabel = posShopId === 'All' ? 'All Branches' : (activeLedgerShopObj?.name || 'Selected Branch');
+                    setDeleteAbaConfirmModal({
+                        startMs,
+                        endMs,
+                        rangeLabel,
+                        branchLabel,
+                        previewCount: abaShiftAutoSumData.transactions.length
+                    });
+                };
+
+                const executeDeleteAbaTransactionsByDateRange = async () => {
+                    if (!isSuper || !deleteAbaConfirmModal || isDeletingAbaRange) return;
+                    const { startMs, endMs, rangeLabel } = deleteAbaConfirmModal;
+                    setIsDeletingAbaRange(true);
+
+                    try {
+                        const { collection, getDocs, doc, getDoc, setDoc, writeBatch } = window.FirebaseApp;
+                        const database = safeDB();
+
+                        const targetShop = posShopId === 'All' ? null : activeLedgerShopObj;
+                        const shopChatId = String(targetShop?.khqrConfig?.paywayChatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                        const shopMerchant = String(targetShop?.khqrConfig?.accountName || targetShop?.brandingName || targetShop?.name || '').trim().toUpperCase();
+
+                        const matchesShopFilter = (chatIdVal, merchantNameVal) => {
+                            if (!targetShop) return true;
+                            const msgChatId = String(chatIdVal || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                            if (shopChatId && msgChatId && /^\d+$/.test(shopChatId) && /^\d+$/.test(msgChatId)) {
+                                return shopChatId.includes(msgChatId) || msgChatId.includes(shopChatId);
+                            }
+                            if (!shopChatId && shopMerchant && merchantNameVal) {
+                                const normMsgMerchant = String(merchantNameVal).toUpperCase().replace(/[^A-Z0-9]/g, '');
+                                const normShopMerchant = shopMerchant.replace(/[^A-Z0-9]/g, '');
+                                if (normMsgMerchant && normShopMerchant) {
+                                    return normMsgMerchant.includes(normShopMerchant) || normShopMerchant.includes(normMsgMerchant);
+                                }
+                            }
+                            return true;
+                        };
+
+                        const resolveDocEffectiveMs = (d) => {
+                            const rawRec = Number(d?.receivedAt?.toMillis ? d.receivedAt.toMillis() : (d?.receivedAt || d?.date || 0));
+                            const parsedPaid = Number(d?.paidTimestamp) || window.SolarisKHQREngine.parseAbaPaidAtToMs(d?.paidAtStr, rawRec || Date.now());
+                            return (rawRec > 0 && Math.abs(rawRec - parsedPaid) <= 24 * 60 * 60 * 1000)
+                                ? rawRec
+                                : (rawRec > 0 ? rawRec : parsedPaid);
+                        };
+
+                        const trxIdsToDelete = new Set();
+
+                        // 1. Collect matching transactions currently visible in the ABA Live Ledger
+                        abaShiftAutoSumData.transactions.forEach(tx => {
+                            if (tx.trxId && tx.effectiveTimestamp >= startMs && tx.effectiveTimestamp <= endMs) {
+                                trxIdsToDelete.add(String(tx.trxId).trim());
+                            }
+                        });
+
+                        // 2. Scan full `aba_payments` collection in Firestore to catch all documents in the selected Date Range
+                        const colSnap = await getDocs(collection(database, 'aba_payments'));
+                        const docRefsToDelete = [];
+                        colSnap.forEach(docSnap => {
+                            const d = docSnap.data() || {};
+                            const trxId = String(d.trxId || docSnap.id).trim();
+                            const effMs = resolveDocEffectiveMs(d);
+                            const inDateRange = effMs >= startMs && effMs <= endMs;
+                            const inBranch = matchesShopFilter(d.chatId, d.merchantName);
+
+                            if ((inDateRange && inBranch) || trxIdsToDelete.has(trxId)) {
+                                trxIdsToDelete.add(trxId);
+                                docRefsToDelete.push(docSnap.ref);
+                            }
+                        });
+
+                        // 3. Commit batch deletions in chunks of 400 (Firestore 500-op limit safety)
+                        for (let i = 0; i < docRefsToDelete.length; i += 400) {
+                            const chunk = docRefsToDelete.slice(i, i + 400);
+                            const batch = writeBatch(database);
+                            chunk.forEach(ref => batch.delete(ref));
+                            await batch.commit();
+                        }
+
+                        // 4. Clean matching entries from `system_settings/aba_live_feed` fallback document if present
+                        try {
+                            const feedRef = doc(database, 'system_settings', 'aba_live_feed');
+                            const feedSnap = await getDoc(feedRef);
+                            if (feedSnap.exists() && feedSnap.data()?.payments) {
+                                const paymentsObj = { ...feedSnap.data().payments };
+                                let feedChanged = false;
+                                Object.keys(paymentsObj).forEach(key => {
+                                    const item = paymentsObj[key];
+                                    const trxId = String(item?.trxId || key).trim();
+                                    const effMs = resolveDocEffectiveMs(item);
+                                    if (trxIdsToDelete.has(trxId) || (effMs >= startMs && effMs <= endMs && matchesShopFilter(item?.chatId, item?.merchantName))) {
+                                        trxIdsToDelete.add(trxId);
+                                        delete paymentsObj[key];
+                                        feedChanged = true;
+                                    }
+                                });
+                                if (feedChanged) {
+                                    await setDoc(feedRef, { payments: paymentsObj, updatedAt: Date.now() }, { merge: true });
+                                }
+                            }
+                        } catch (feedErr) {
+                            console.warn("Live feed cleanup warning:", feedErr);
+                        }
+
+                        // 5. Also clear ABA verification tags on any orders within the date range that were linked to these deleted Trx IDs
+                        // so they no longer resurrect ghost rows in the ABA Live Ledger
+                        const linkedOrdersToClean = orders.filter(o =>
+                            o && o.abaTrxId && trxIdsToDelete.has(String(o.abaTrxId).trim())
+                        );
+                        for (let i = 0; i < linkedOrdersToClean.length; i += 400) {
+                            const chunk = linkedOrdersToClean.slice(i, i + 400);
+                            const batch = writeBatch(database);
+                            chunk.forEach(o => {
+                                batch.update(doc(database, 'orders', o.id), {
+                                    abaVerified: false,
+                                    abaTrxId: null,
+                                    abaApv: null,
+                                    abaPayer: null,
+                                    abaPaidAmountStr: null
+                                });
+                            });
+                            await batch.commit().catch(() => {});
+                        }
+
+                        // 6. Purge from In-Memory Verifier, LocalStorage Cache, and React State
+                        if (window.SolarisPayWayVerifier) {
+                            trxIdsToDelete.forEach(id => {
+                                window.SolarisPayWayVerifier.inMemoryAbaPayments?.delete(id);
+                                window.SolarisPayWayVerifier.processedTrxIdsMemory?.delete(id);
+                            });
+                            window.SolarisPayWayVerifier.saveLocalAbaCache?.();
+                            window.SolarisPayWayVerifier.notifySubscribers?.({ type: 'ABA_BULK_DELETED', count: trxIdsToDelete.size });
+                        }
+
+                        setAbaLedgerMessages(prev => prev.filter(entry => {
+                            const id = String(entry?.parsedAba?.trxId || entry?.updateId || '').trim();
+                            return !trxIdsToDelete.has(id);
+                        }));
+
+                        setDeleteAbaConfirmModal(null);
+                        setPosSuccessToast(`🗑️ Deleted ${trxIdsToDelete.size} ABA PayWay transaction(s) for ${rangeLabel}!`);
+                        setTimeout(() => setPosSuccessToast(''), 4500);
+                    } catch (err) {
+                        console.error("Bulk delete ABA transactions failed:", err);
+                        setPosError("Failed to delete ABA transactions: " + (err.message || 'Permission or network error'));
+                        setTimeout(() => setPosError(''), 5000);
+                    } finally {
+                        setIsDeletingAbaRange(false);
+                    }
+                };
 
                 const [cart, setCart] = useState([]);
                 const [cartNotes, setCartNotes] = useState('');
@@ -21638,7 +21841,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     </div>
 
                                     {posManageSubTab === 'aba_live' && (
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-2 flex-wrap">
                                             <button
                                                 type="button"
                                                 disabled={isSyncingAbaLedger}
@@ -21657,6 +21860,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 <i className="fa-solid fa-file-csv"></i>
                                                 <span className="hidden sm:inline">Export CSV</span>
                                             </button>
+                                            {isSuper && (
+                                                <button
+                                                    type="button"
+                                                    disabled={isDeletingAbaRange}
+                                                    onClick={handleOpenDeleteAbaRangeModal}
+                                                    className="bg-red-600 hover:bg-red-700 text-white px-3.5 py-2 rounded-xl text-xs font-black shadow-sm transition flex items-center gap-1.5 active:scale-95 disabled:opacity-50"
+                                                    title="Admin Only: Delete all synced Telegram ABA transactions in the selected Date Range"
+                                                >
+                                                    <i className={`fa-solid ${isDeletingAbaRange ? 'fa-spinner fa-spin' : 'fa-trash-can'}`}></i>
+                                                    <span>Del Trans</span>
+                                                </button>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -22617,6 +22832,72 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             data={posThankYouModalData}
                             onClose={() => setPosThankYouModalData(null)}
                         />
+
+                        {/* Admin-Only Bulk Delete ABA PayWay Transactions Confirmation Modal */}
+                        {isSuper && deleteAbaConfirmModal && (
+                            <div className="fixed inset-0 bg-stone-950/75 backdrop-blur-sm z-[250] flex items-center justify-center p-4 animate-fade-in">
+                                <div className="bg-white rounded-3xl w-full max-w-md p-6 shadow-2xl border-t-4 border-red-600 text-center relative">
+                                    <button
+                                        type="button"
+                                        disabled={isDeletingAbaRange}
+                                        onClick={() => setDeleteAbaConfirmModal(null)}
+                                        className="absolute top-4 right-4 w-8 h-8 rounded-full bg-stone-100 hover:bg-stone-200 text-stone-500 flex items-center justify-center transition"
+                                    >
+                                        <i className="fa-solid fa-xmark"></i>
+                                    </button>
+
+                                    <div className="w-16 h-16 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4 shadow-inner">
+                                        <i className="fa-solid fa-trash-can text-2xl"></i>
+                                    </div>
+
+                                    <h3 className="text-xl font-black text-stone-900 mb-1">
+                                        Delete Telegram ABA Transactions?
+                                    </h3>
+                                    <p className="text-xs text-stone-500 font-medium mb-4">
+                                        This will permanently remove all Telegram-synced ABA PayWay records in the selected Date Range from Firebase (`aba_payments` & live feed).
+                                    </p>
+
+                                    <div className="bg-red-50/80 border border-red-200 rounded-2xl p-3.5 text-left text-xs space-y-1.5 mb-5">
+                                        <div className="flex justify-between">
+                                            <span className="text-stone-500 font-bold">Date Range Filter:</span>
+                                            <span className="font-black text-red-700">{deleteAbaConfirmModal.rangeLabel}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-stone-500 font-bold">Branch Scope:</span>
+                                            <span className="font-black text-stone-800">{deleteAbaConfirmModal.branchLabel}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-stone-500 font-bold">From:</span>
+                                            <span className="font-mono font-bold text-stone-700">{formatDateTime(deleteAbaConfirmModal.startMs)}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-stone-500 font-bold">To:</span>
+                                            <span className="font-mono font-bold text-stone-700">{formatDateTime(deleteAbaConfirmModal.endMs)}</span>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex gap-2.5">
+                                        <button
+                                            type="button"
+                                            disabled={isDeletingAbaRange}
+                                            onClick={() => setDeleteAbaConfirmModal(null)}
+                                            className="flex-1 bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold py-3 rounded-xl text-xs sm:text-sm transition"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            type="button"
+                                            disabled={isDeletingAbaRange}
+                                            onClick={executeDeleteAbaTransactionsByDateRange}
+                                            className="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-3 rounded-xl text-xs sm:text-sm shadow-lg shadow-red-600/25 transition flex items-center justify-center gap-2 disabled:opacity-50"
+                                        >
+                                            <i className={`fa-solid ${isDeletingAbaRange ? 'fa-spinner fa-spin' : 'fa-trash-can'}`}></i>
+                                            <span>{isDeletingAbaRange ? 'Deleting...' : 'Confirm Del Trans'}</span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </>
                 );
             }
