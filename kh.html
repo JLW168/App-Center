@@ -1866,6 +1866,15 @@
                 storage.set(CACHE_KEYS.DEVICE_ID, DEVICE_UID);
             }
 
+            // Detect friendly hardware label for Admin Device Manager
+            function detectDeviceModelLabel() {
+                var uaStr = window.navigator.userAgent || '';
+                if (/iPad/i.test(uaStr)) return 'iPad / iPad Mini (' + (window.screen ? window.screen.width + 'x' + window.screen.height : 'iOS') + ')';
+                if (/iPhone/i.test(uaStr)) return 'iPhone (' + (window.screen ? window.screen.width + 'x' + window.screen.height : 'iOS') + ')';
+                if (/Android/i.test(uaStr)) return 'Android Display (' + (window.screen ? window.screen.width + 'x' + window.screen.height : 'Android') + ')';
+                return 'Web Display (' + (window.navigator.platform || 'Browser') + ' ' + (window.screen ? window.screen.width + 'x' + window.screen.height : '') + ')';
+            }
+
             // Warm up browser CacheStorage for static CDN scripts/fonts when supported
             (function warmUpBrowserAssetCache() {
                 try {
@@ -2010,6 +2019,8 @@
                 if (DOM.connStatusText) DOM.connStatusText.textContent = 'REVOKED / LOCKED';
                 if (DOM.connDot) DOM.connDot.style.backgroundColor = '#ef4444';
 
+                reportDeviceHeartbeatToMainApp('REVOKED');
+
                 playSynthNotes([
                     { f: 440, s: 0, d: 0.18 },
                     { f: 330, s: 0.2, d: 0.28 }
@@ -2027,6 +2038,7 @@
                 lastRenderedOrderQrKey = '';
                 renderSelfOrderQrCodes();
                 showScreen('IDLE');
+                reportDeviceHeartbeatToMainApp('ONLINE');
             }
 
             function isDeviceRevokedInPayload(data) {
@@ -2518,8 +2530,11 @@
 
             function computeSessionSignature(data) {
                 if (!data || typeof data !== 'object') return '';
+                var revArr = (data.revokedDevices && data.revokedDevices.length) ? data.revokedDevices.join(',') : '';
                 return [
                     data.status || '',
+                    data.remoteLock ? '1' : '0',
+                    revArr,
                     data.sessionId || '',
                     data.invoiceNo || '',
                     data.amountKhr || 0,
@@ -2713,7 +2728,7 @@
                 if (isDeviceRevokedInPayload(data)) {
                     engageSecurityLockdown(data.lockReason || 'Stolen/unauthorized device revoked remotely by Admin.');
                     return;
-                } else if (isDeviceRevoked && !isFromCache && String(data.status || '').toUpperCase() === 'IDLE' && data.remoteLock === false) {
+                } else if (isDeviceRevoked && !isFromCache && String(data.status || '').toUpperCase() === 'IDLE' && data.remoteLock === false && !isDeviceRevokedInPayload(data)) {
                     releaseSecurityLockdown();
                 }
 
@@ -2786,14 +2801,42 @@
                 }
             }
 
-            // --- 5. Dual-Transport Firebase Engine (Cache-First + Live Continuous Sync) ---
+            // --- 5. Dual-Transport Firebase Engine (Cache-First + Live Continuous Sync + Device Registry Heartbeat) ---
             var PROJECT_ID = "solaris-40524";
             var API_KEY = "AIzaSyCThrbnG6OSGukROVphLOBx8_qwgyp1lOU";
             var firestoreDb = null;
             var displayUnsub = null;
+            var registryUnsub = null;
             var shopsUnsub = null;
             var restPollTimer = null;
+            var heartbeatTimer = null;
             var sdkConnected = false;
+
+            // Report this KHQR Display Device to Firestore so the Main POS/Admin App can query all devices & kick/block any device
+            function reportDeviceHeartbeatToMainApp(overrideState) {
+                if (!firestoreDb) return;
+                try {
+                    var shop = shopsMap[currentShopId] || {};
+                    var shopName = shop.brandingName || shop.name || currentShopId;
+                    var nowMs = new Date().getTime();
+                    var devState = overrideState || (isDeviceRevoked ? 'REVOKED' : 'ONLINE');
+                    var deviceRecord = {
+                        deviceId: DEVICE_UID,
+                        shopId: currentShopId,
+                        shopName: shopName,
+                        deviceModel: detectDeviceModelLabel(),
+                        userAgent: String(window.navigator.userAgent || '').slice(0, 180),
+                        status: devState,
+                        lastSeenAt: nowMs,
+                        appVersion: '2026.4-KHQR'
+                    };
+
+                    var patchObj = { updatedAt: nowMs, devices: {} };
+                    patchObj.devices[DEVICE_UID] = deviceRecord;
+
+                    firestoreDb.collection('system_settings').doc('khqr_devices_registry').set(patchObj, { merge: true })['catch'](function() {});
+                } catch (e) {}
+            }
 
             function parseFirestoreRestVal(valObj) {
                 if (!valObj || typeof valObj !== 'object') return null;
@@ -2935,10 +2978,12 @@
             window.addEventListener('online', function() {
                 pollBranchDisplayViaRest();
                 fetchShopsViaRest();
+                reportDeviceHeartbeatToMainApp();
             }, false);
             document.addEventListener('visibilitychange', function() {
                 if (!document.hidden) {
                     pollBranchDisplayViaRest();
+                    reportDeviceHeartbeatToMainApp();
                 }
             }, false);
 
@@ -2962,6 +3007,7 @@
                 }
 
                 pollBranchDisplayViaRest();
+                reportDeviceHeartbeatToMainApp();
 
                 if (firestoreDb) {
                     try {
@@ -3032,7 +3078,37 @@
                             }, function() {});
                         } catch (e) {}
 
+                        // Continuous listener on Central Device Registry (system_settings/khqr_devices_registry) so Main App can kick/block individual Device IDs
+                        try {
+                            if (registryUnsub) registryUnsub();
+                            registryUnsub = firestoreDb.collection('system_settings').doc('khqr_devices_registry').onSnapshot(function(snap) {
+                                if (!snap || !snap.exists) return;
+                                var regData = snap.data() || {};
+                                var myDev = regData.devices && regData.devices[DEVICE_UID];
+                                var blockedList = regData.blockedDeviceIds || [];
+                                var isInBlockedList = false;
+                                for (var i = 0; i < blockedList.length; i++) {
+                                    if (String(blockedList[i] || '').toUpperCase() === DEVICE_UID.toUpperCase() || String(blockedList[i] || '').toUpperCase() === 'ALL') {
+                                        isInBlockedList = true;
+                                        break;
+                                    }
+                                }
+                                if (isInBlockedList || (myDev && (myDev.status === 'REVOKED' || myDev.status === 'BLOCKED' || myDev.remoteLock === true))) {
+                                    if (!isDeviceRevoked) {
+                                        engageSecurityLockdown((myDev && myDev.lockReason) || 'Device blocked & kicked by Main POS Admin.');
+                                    }
+                                } else if (isDeviceRevoked && myDev && myDev.status === 'ONLINE' && myDev.remoteLock === false && !isInBlockedList) {
+                                    releaseSecurityLockdown();
+                                }
+                            }, function() {});
+                        } catch (e) {}
+
                         subscribeToBranch(currentShopId);
+                        reportDeviceHeartbeatToMainApp();
+                        if (heartbeatTimer) clearInterval(heartbeatTimer);
+                        heartbeatTimer = setInterval(function() {
+                            reportDeviceHeartbeatToMainApp();
+                        }, 45000);
                     });
                 }
             } catch (e) {}
