@@ -12358,13 +12358,41 @@
                 const activeDeliveriesCount = useMemo(() => {
                     const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
                     const allowedShops = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
+                    const validShopIds = new Set((shops || []).map(s => s.id));
+                    const now = new Date();
+                    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+
                     return orders.filter(o => {
                         if (o.orderType !== 'DELIVERY') return false;
+                        // Ignore orphaned orders from deleted/unknown branches
+                        if (validShopIds.size > 0 && o.shopId && !validShopIds.has(o.shopId)) return false;
                         if (!isSuper && allowedShops[0] !== 'All' && !allowedShops.includes(o.shopId)) return false;
-                        const dStatus = o.deliveryStatus || 'Pending';
-                        return !['Delivered', 'Cancelled', 'Failed', 'Returned'].includes(dStatus) && o.status !== 'Cancelled';
+
+                        // Resolve effective delivery status identically to DeliveryServiceView.getEffectiveDeliveryStatus
+                        let effectiveStatus = 'Pending';
+                        if (o.status === 'Cancelled' || o.deliveryStatus === 'Cancelled') {
+                            effectiveStatus = 'Cancelled';
+                        } else if (o.deliveryStatus) {
+                            effectiveStatus = o.deliveryStatus;
+                        } else if (o.status === 'Served') {
+                            effectiveStatus = 'Delivered';
+                        } else if (o.status === 'Ready') {
+                            effectiveStatus = 'Ready for Pickup';
+                        } else if (o.status === 'Preparing') {
+                            effectiveStatus = 'Preparing';
+                        }
+
+                        // Exclude completed/terminal orders (including orders marked 'Served' in KDS/POS where deliveryStatus remained 'Pending')
+                        if (['Delivered', 'Cancelled', 'Failed', 'Returned'].includes(effectiveStatus) || o.status === 'Served' || o.status === 'Cancelled') {
+                            return false;
+                        }
+
+                        // Exclude stale historical test orders from previous days that were never closed
+                        if (Number(o.createdAt || 0) < startOfToday) return false;
+
+                        return true;
                     }).length;
-                }, [orders, currentAdminRecord]);
+                }, [orders, shops, currentAdminRecord]);
 
                 // Start directly on the mobile OS Launchpad
                 const [activeTab, setActiveTab] = useState('launchpad');
@@ -12479,7 +12507,7 @@
                         <main className={`${activeTab === 'tv' ? 'p-0 overflow-hidden' : 'p-4 md:p-8 overflow-y-auto'} flex-1 relative h-full`}>
                             {activeTab === 'dashboard' && <DashboardView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} products={products} />}
                             {activeTab === 'pos' && <POSView orders={orders} products={products} categories={categories} tables={tables} shops={shops} shifts={shifts} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} admins={admins} autoOpenShopId={posAutoOpenShopId} clearAutoOpen={() => setPosAutoOpenShopId(null)} onGoToKDS={() => setActiveTab('kds')} />}
-                            {activeTab === 'kds' && <KDSView orders={orders} tables={tables} shops={shops} shifts={shifts} products={products} ingredients={ingredients} onBack={(shopId) => { setPosAutoOpenShopId(shopId); setActiveTab('pos'); }} onOpenTV={() => setActiveTab('tv')} currentAdminRecord={currentAdminRecord} />}
+                            {activeTab === 'kds' && <KDSView orders={orders} tables={tables} shops={shops} shifts={shifts} products={products} ingredients={ingredients} admins={admins} onBack={(shopId) => { setPosAutoOpenShopId(shopId); setActiveTab('pos'); }} onOpenTV={() => setActiveTab('tv')} onOpenDelivery={() => setActiveTab('delivery')} currentAdminRecord={currentAdminRecord} />}
                             {activeTab === 'tv' && <QueueTVView orders={orders} shops={shops} currentAdminRecord={currentAdminRecord} onBack={() => setActiveTab('kds')} />}
                             {activeTab === 'delivery' && <DeliveryServiceView orders={orders} shops={shops} admins={admins} shifts={shifts} currentAdminRecord={currentAdminRecord} />}
                             {activeTab === 'products' && <ProductsView products={products} categories={categories} ingredients={ingredients} sugarOptions={sugarOptions} iceOptions={iceOptions} currentAdminRecord={currentAdminRecord} shops={shops} />}
@@ -32020,7 +32048,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 );
             }
 
-            function KDSView({ orders, tables, shops, shifts, products, ingredients, onBack, onOpenTV, currentAdminRecord }) {
+            function KDSView({ orders, tables, shops, shifts, products, ingredients, admins = [], onBack, onOpenTV, onOpenDelivery, currentAdminRecord }) {
                 const isSuper = (currentAdminRecord?.role || 'Admin') === 'Admin';
                 const allowedShopIds = currentAdminRecord?.shopIds || (currentAdminRecord?.shopId ? [currentAdminRecord.shopId] : []);
                 const canSelectMultiple = isSuper || allowedShopIds.includes('All') || allowedShopIds.length > 1;
@@ -32331,6 +32359,166 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     // Fallback for customers without saved loyalty data
                     const refilledPts = customer?.refilledPoints || 0;
                     return calculateCustomerLoyalty(orders, phone, globalPoints, refilledPts);
+                };
+
+                // --- NEW: Direct KDS Driver Roster & Assignment Engine for Delivery Orders ---
+                const kdsDriversWithStats = useMemo(() => {
+                    return (admins || []).filter(a => {
+                        if (a.status === 'Inactive') return false;
+                        return a.role === 'Driver' || a.isDriver === true || (a.permissions && a.permissions.includes('delivery'));
+                    }).map(driver => {
+                        const activeTasks = orders.filter(o =>
+                            o.orderType === 'DELIVERY' &&
+                            o.assignedDriverId === driver.id &&
+                            !['Delivered', 'Cancelled', 'Failed', 'Returned'].includes(o.deliveryStatus || 'Pending') &&
+                            o.status !== 'Cancelled' &&
+                            o.status !== 'Served'
+                        );
+                        const completedToday = orders.filter(o =>
+                            o.orderType === 'DELIVERY' &&
+                            o.assignedDriverId === driver.id &&
+                            (o.deliveryStatus === 'Delivered' || o.status === 'Served')
+                        );
+
+                        let computedAvailability = driver.driverAvailability || 'Available';
+                        if (computedAvailability !== 'Offline') {
+                            if (activeTasks.some(t => ['On the Way', 'Arrived'].includes(t.deliveryStatus))) {
+                                computedAvailability = 'Delivering';
+                            } else if (activeTasks.some(t => t.deliveryStatus === 'Picked Up')) {
+                                computedAvailability = 'Picking Up';
+                            } else if (activeTasks.length > 0) {
+                                computedAvailability = 'Assigned';
+                            } else {
+                                computedAvailability = 'Available';
+                            }
+                        }
+
+                        return {
+                            ...driver,
+                            activeCount: activeTasks.length,
+                            completedCount: completedToday.length,
+                            computedAvailability
+                        };
+                    });
+                }, [admins, orders]);
+
+                const getDriversForShop = (shopId) => {
+                    return kdsDriversWithStats.filter(d => {
+                        if (!shopId || shopId === 'All' || d.role === 'Admin') return true;
+                        const staffShops = d.shopIds || (d.shopId ? [d.shopId] : []);
+                        return staffShops.includes('All') || staffShops.includes(shopId);
+                    });
+                };
+
+                const handleKdsAssignDriver = async (order, driverId, bypassConflictCheck = false) => {
+                    if (!order) return;
+                    const { doc, updateDoc } = window.FirebaseApp;
+                    const actorName = currentAdminRecord?.name || currentAdminRecord?.email || 'KDS Staff';
+                    const prevHistory = Array.isArray(order.deliveryHistory) ? order.deliveryHistory : [];
+
+                    // Unassign Driver if empty value selected
+                    if (!driverId) {
+                        try {
+                            const revertStatus = order.status === 'Ready' ? 'Ready for Pickup' : (order.status === 'Preparing' ? 'Preparing' : 'Pending');
+                            await updateDoc(doc(safeDB(), 'orders', order.id), {
+                                assignedDriverId: null,
+                                assignedDriverName: null,
+                                assignedDriverPhone: null,
+                                deliveryStatus: revertStatus,
+                                deliveryHistory: [
+                                    ...prevHistory,
+                                    {
+                                        status: revertStatus,
+                                        timestamp: Date.now(),
+                                        actor: actorName,
+                                        note: 'Driver unassigned from KDS'
+                                    }
+                                ]
+                            });
+                            showKdsPaywayToast(`Unassigned driver from ${order.queueNo}.`, 'warn');
+                        } catch (err) {
+                            showKdsPaywayToast('Failed to unassign driver: ' + err.message, 'error');
+                        }
+                        return;
+                    }
+
+                    const driverObj = kdsDriversWithStats.find(d => d.id === driverId) || admins.find(a => a.id === driverId);
+                    if (!driverObj) return;
+
+                    const shopObj = shops.find(s => s.id === order.shopId);
+                    const allowMultiBatch = !!shopObj?.deliveryChargeConfig?.allowMultiOrderDriverBatch;
+
+                    if (!bypassConflictCheck && !allowMultiBatch && driverObj.activeCount > 0 && order.assignedDriverId !== driverObj.id) {
+                        showKdsPaywayToast(`Conflict Guard: ${driverObj.name} already has ${driverObj.activeCount} active delivery task(s).`, 'warn');
+                        return;
+                    }
+
+                    const rawDelStatus = order.deliveryStatus || (order.status === 'Ready' ? 'Ready for Pickup' : (order.status === 'Preparing' ? 'Preparing' : 'Pending'));
+                    const nextDelStatus = rawDelStatus === 'Pending' ? 'Assigned' : rawDelStatus;
+
+                    try {
+                        const updates = {
+                            assignedDriverId: driverObj.id,
+                            assignedDriverName: driverObj.name || driverObj.email || 'Driver',
+                            assignedDriverPhone: driverObj.phone || '',
+                            driverAssignedAt: Date.now(),
+                            deliveryStatus: nextDelStatus,
+                            deliveryHistory: [
+                                ...prevHistory,
+                                {
+                                    status: nextDelStatus,
+                                    timestamp: Date.now(),
+                                    actor: actorName,
+                                    note: `Assigned to driver ${driverObj.name || driverObj.email} from KDS`
+                                }
+                            ]
+                        };
+                        if (!order.deliveryOtp) {
+                            updates.deliveryOtp = String(Math.floor(1000 + Math.random() * 9000));
+                        }
+                        await updateDoc(doc(safeDB(), 'orders', order.id), updates);
+
+                        // Send Telegram Alert if enabled for this branch
+                        window.SolarisTelegramNode.getEffectiveConfig(shopObj).then(cfg => {
+                            if (cfg && cfg.enabled) {
+                                const msg = `🛵 <b>DELIVERY ASSIGNED (FROM KDS)</b>\n` +
+                                    `━━━━━━━━━━━━━━━━━━━━\n` +
+                                    `🧾 <b>Invoice:</b> ${order.queueNo}\n` +
+                                    `👤 <b>Driver:</b> ${driverObj.name}\n` +
+                                    `📍 <b>Customer:</b> ${order.customerName || 'Guest'} (${order.customerPhone || 'N/A'})\n` +
+                                    `🏠 <b>Address:</b> ${order.deliveryAddress || 'GPS Pin'}\n` +
+                                    `💵 <b>Total:</b> ${(order.totalAmount || 0).toLocaleString()} ៛ (${order.paymentStatus})`;
+                                window.SolarisTelegramNode.sendMessage(shopObj, msg, cfg);
+                            }
+                        }).catch(() => {});
+
+                        showKdsPaywayToast(`🛵 Assigned ${order.queueNo} to ${driverObj.name}!`, 'success');
+                    } catch (err) {
+                        showKdsPaywayToast('Failed to assign driver: ' + err.message, 'error');
+                    }
+                };
+
+                const handleKdsAutoAssignDriver = async (order) => {
+                    if (!order) return;
+                    const shopObj = shops.find(s => s.id === order.shopId);
+                    const shopDrivers = getDriversForShop(order.shopId);
+                    const freeCandidates = shopDrivers.filter(d => d.computedAvailability === 'Available' && d.activeCount === 0);
+                    const pool = freeCandidates.length > 0 ? freeCandidates : shopDrivers.filter(d => d.computedAvailability !== 'Offline');
+
+                    if (pool.length === 0) {
+                        showKdsPaywayToast('No online drivers available for this branch.', 'error');
+                        return;
+                    }
+
+                    const scored = pool.map(d => {
+                        let distToShop = 999999;
+                        if (shopObj?.lat && shopObj?.lng && d.driverLat && d.driverLng) {
+                            distToShop = calculateDistance(Number(shopObj.lat), Number(shopObj.lng), Number(d.driverLat), Number(d.driverLng));
+                        }
+                        return { driver: d, score: (d.activeCount * 100000) + (d.completedCount * 500) + distToShop };
+                    }).sort((a, b) => a.score - b.score);
+
+                    await handleKdsAssignDriver(order, scored[0].driver.id, true);
                 };
 
                 // UPDATE: Keep 'Served' orders visible on KDS if the payment is not yet paid
@@ -33039,6 +33227,11 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         <i className="fa-solid fa-display"></i> Queue TV
                                     </button>
                                 )}
+                                {onOpenDelivery && (
+                                    <button onClick={onOpenDelivery} className="bg-teal-600 text-white px-3 py-1.5 rounded-lg text-xs sm:text-sm font-bold shadow-md hover:bg-teal-700 transition flex items-center gap-1.5 active:scale-95" title="Open Delivery Dispatch & Driver Console">
+                                        <i className="fa-solid fa-motorcycle"></i> Delivery
+                                    </button>
+                                )}
                             </h2>
                             
                             <div className="flex gap-2 items-center">
@@ -33188,6 +33381,74 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 </div>
                                             </div>
                                         </div>
+
+                                        {/* Direct Driver Assignment Control for Active Delivery Orders in KDS */}
+                                        {order.orderType === 'DELIVERY' && order.status !== 'Cancelled' && (() => {
+                                            const branchDrivers = getDriversForShop(order.shopId);
+                                            const effectiveDelStatus = order.deliveryStatus || (order.status === 'Ready' ? 'Ready for Pickup' : (order.status === 'Preparing' ? 'Preparing' : 'Pending'));
+                                            return (
+                                                <div className="mt-2 pt-2.5 border-t border-emerald-100 bg-gradient-to-br from-teal-50/80 to-emerald-50/60 -mx-2 px-2.5 py-2 rounded-xl border border-teal-200/80 space-y-1.5">
+                                                    <div className="flex items-center justify-between gap-1.5">
+                                                        <span className="text-[10px] font-black text-teal-900 uppercase tracking-wider flex items-center gap-1">
+                                                            <i className="fa-solid fa-motorcycle text-teal-600"></i>
+                                                            <span>Delivery Driver</span>
+                                                        </span>
+                                                        <div className="flex items-center gap-1">
+                                                            <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-teal-600 text-white shadow-sm">
+                                                                {effectiveDelStatus}
+                                                            </span>
+                                                            {!order.assignedDriverId && branchDrivers.length > 0 && (
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleKdsAutoAssignDriver(order)}
+                                                                    className="text-[10px] font-black text-teal-800 bg-white hover:bg-teal-100 px-2 py-0.5 rounded-lg border border-teal-300 shadow-sm transition flex items-center gap-1 active:scale-95"
+                                                                    title="Auto-Assign Nearest / Least-Loaded Available Driver"
+                                                                >
+                                                                    <i className="fa-solid fa-wand-magic-sparkles text-amber-500"></i>
+                                                                    <span>Auto</span>
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="flex items-center gap-1.5">
+                                                        <select
+                                                            className={`flex-1 border rounded-lg px-2.5 py-1.5 text-xs font-bold outline-none cursor-pointer shadow-sm transition ${
+                                                                order.assignedDriverId
+                                                                    ? 'bg-white border-teal-400 text-teal-950'
+                                                                    : 'bg-amber-50/90 border-amber-300 text-amber-900'
+                                                            }`}
+                                                            value={order.assignedDriverId || ''}
+                                                            onChange={(e) => handleKdsAssignDriver(order, e.target.value)}
+                                                        >
+                                                            <option value="">-- Assign Delivery Driver --</option>
+                                                            {branchDrivers.map(drv => (
+                                                                <option key={drv.id} value={drv.id}>
+                                                                    🛵 {drv.name || drv.email} • {drv.computedAvailability} ({drv.activeCount} active)
+                                                                </option>
+                                                            ))}
+                                                        </select>
+
+                                                        {order.assignedDriverPhone && (
+                                                            <a
+                                                                href={`tel:${String(order.assignedDriverPhone).replace(/\D/g, '')}`}
+                                                                className="w-7 h-7 rounded-lg bg-white hover:bg-teal-100 text-teal-700 border border-teal-300 flex items-center justify-center shrink-0 shadow-sm transition"
+                                                                title={`Call Driver (${order.assignedDriverName}: ${order.assignedDriverPhone})`}
+                                                            >
+                                                                <i className="fa-solid fa-phone text-[10px]"></i>
+                                                            </a>
+                                                        )}
+                                                    </div>
+
+                                                    {branchDrivers.length === 0 && (
+                                                        <div className="text-[10px] text-amber-700 font-semibold">
+                                                            <i className="fa-solid fa-circle-info mr-1"></i>
+                                                            No staff with Driver role / Delivery permission assigned to this branch yet.
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
                                     </div>
 
                                     <div className="p-4 min-h-[180px] max-h-[240px] overflow-y-auto bg-stone-50/30 relative shrink-0">
@@ -34625,9 +34886,16 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [podSignatureDataUrl, setPodSignatureDataUrl] = useState('');
                 const [podNoteInput, setPodNoteInput] = useState('');
                 const [podCollectCash, setPodCollectCash] = useState(false);
+                const [podPaymentOption, setPodPaymentOption] = useState('CASH'); // 'CASH' | 'KHQR'
                 const [isSubmittingPod, setIsSubmittingPod] = useState(false);
                 const [expandedHistoryOrderId, setExpandedHistoryOrderId] = useState(null);
                 const [reportSubView, setReportSubView] = useState('ledger'); // 'ledger' | 'by_shop' | 'by_driver' | 'cod_reconcile'
+
+                // 06 Driver App Doorstep Payment States (Cash at Door vs. Scan ABA KHQR)
+                const [driverKhqrModalOrder, setDriverKhqrModalOrder] = useState(null);
+                const [isSettlingDriverPayment, setIsSettlingDriverPayment] = useState(false);
+                const [driverPaymentModeByOrder, setDriverPaymentModeByOrder] = useState({}); // { [orderId]: 'CASH' | 'KHQR' }
+                const [driverThankYouData, setDriverThankYouData] = useState(null);
 
                 const signatureCanvasRef = useRef(null);
                 const isDrawingSignatureRef = useRef(false);
@@ -34692,12 +34960,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             o.orderType === 'DELIVERY' &&
                             o.assignedDriverId === driver.id &&
                             !['Delivered', 'Cancelled', 'Failed', 'Returned'].includes(o.deliveryStatus || 'Pending') &&
-                            o.status !== 'Cancelled'
+                            o.status !== 'Cancelled' &&
+                            o.status !== 'Served'
                         );
                         const completedToday = orders.filter(o =>
                             o.orderType === 'DELIVERY' &&
                             o.assignedDriverId === driver.id &&
-                            (o.deliveryStatus === 'Delivered' || o.status === 'Served')
+                            (o.deliveryStatus === 'Delivered' || o.status === 'Served') &&
+                            o.status !== 'Cancelled'
                         );
                         const failedToday = orders.filter(o =>
                             o.orderType === 'DELIVERY' &&
@@ -34758,9 +35028,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             if (filterPayment === 'Unpaid' && o.paymentStatus === 'Paid') return false;
 
                             if (dateRangeFilter === 'today' && o.createdAt < startOfToday) {
-                                // Always keep active uncompleted deliveries visible even if created before midnight
-                                const isStillActive = !['Delivered', 'Cancelled', 'Failed', 'Returned'].includes(o.effectiveDeliveryStatus);
-                                if (!isStillActive) return false;
+                                return false;
                             } else if (dateRangeFilter === 'week') {
                                 if (o.createdAt < now.getTime() - 7 * 86400000) return false;
                             } else if (dateRangeFilter === 'month') {
@@ -34787,6 +35055,167 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         })
                         .sort((a, b) => b.createdAt - a.createdAt);
                 }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery]);
+
+                // Helper to safely compute Product Sub-Total, Delivery Fee, and Total Bill for any Delivery Order
+                const computeOrderFinancials = React.useCallback((o) => {
+                    const rawTotal = Math.max(0, Number(o?.totalAmount) || 0);
+                    const rawFee = Math.max(0, Number(o?.deliveryFee) || 0);
+                    let prodSub = (o?.itemsSubTotal !== undefined && o?.itemsSubTotal !== null && !isNaN(Number(o.itemsSubTotal)))
+                        ? Math.max(0, Number(o.itemsSubTotal))
+                        : Math.max(0, rawTotal - rawFee);
+
+                    // Fallback to item-level sum if both totalAmount and itemsSubTotal were missing
+                    if (prodSub === 0 && rawTotal === 0 && Array.isArray(o?.items) && o.items.length > 0) {
+                        prodSub = o.items.reduce((sum, it) => {
+                            const line = it.lineTotal !== undefined ? Number(it.lineTotal) : (Number(it.price || 0) * Number(it.paidQuantity ?? it.quantity ?? 1));
+                            return sum + (isNaN(line) ? 0 : Math.max(0, line));
+                        }, 0);
+                    }
+
+                    const effectiveTotal = rawTotal > 0 ? rawTotal : (prodSub + rawFee);
+                    const isCancelledOrFailed = ['Cancelled', 'Failed', 'Returned'].includes(o?.effectiveDeliveryStatus || getEffectiveDeliveryStatus(o)) || o?.status === 'Cancelled';
+                    const isPaid = !isCancelledOrFailed && o?.paymentStatus === 'Paid';
+                    const isDelivered = (o?.effectiveDeliveryStatus || getEffectiveDeliveryStatus(o)) === 'Delivered' || o?.status === 'Served';
+
+                    return {
+                        prodSub,
+                        deliveryFee: rawFee,
+                        totalBill: effectiveTotal,
+                        isCancelledOrFailed,
+                        isPaid,
+                        isDelivered,
+                        paidAmount: isPaid ? effectiveTotal : 0,
+                        unpaidCodAmount: (!isCancelledOrFailed && !isPaid) ? effectiveTotal : 0
+                    };
+                }, []);
+
+                // Dedicated dataset for 07 Reports & Finance:
+                // Never locks out 'Delivered', 'Failed', or 'Cancelled' orders when filterStatus is 'ACTIVE' or 'UNASSIGNED'
+                const reportOrders = useMemo(() => {
+                    const now = new Date();
+                    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+                    const searchLower = searchQuery.toLowerCase().trim();
+
+                    return orders
+                        .filter(o => o.orderType === 'DELIVERY')
+                        .map(o => {
+                            const effectiveDeliveryStatus = getEffectiveDeliveryStatus(o);
+                            const fin = computeOrderFinancials({ ...o, effectiveDeliveryStatus });
+                            return {
+                                ...o,
+                                effectiveDeliveryStatus,
+                                _fin: fin
+                            };
+                        })
+                        .filter(o => {
+                            if (filterShop !== 'All' && o.shopId !== filterShop) return false;
+                            if (filterDriverId !== 'All' && o.assignedDriverId !== filterDriverId) return false;
+
+                            if (filterPayment === 'Paid' && o.paymentStatus !== 'Paid') return false;
+                            if (filterPayment === 'Unpaid' && o.paymentStatus === 'Paid') return false;
+
+                            if (dateRangeFilter === 'today' && o.createdAt < startOfToday) {
+                                return false;
+                            } else if (dateRangeFilter === 'week') {
+                                if (o.createdAt < now.getTime() - 7 * 86400000) return false;
+                            } else if (dateRangeFilter === 'month') {
+                                if (o.createdAt < new Date(now.getFullYear(), now.getMonth(), 1).getTime()) return false;
+                            }
+
+                            // Only apply specific status filter in Reports if the user explicitly chose a single lifecycle status (not 'ACTIVE' dispatch default)
+                            if (filterStatus !== 'All' && filterStatus !== 'ACTIVE') {
+                                if (filterStatus === 'UNASSIGNED') {
+                                    if (o.assignedDriverId) return false;
+                                } else if (o.effectiveDeliveryStatus !== filterStatus) {
+                                    return false;
+                                }
+                            }
+
+                            if (searchLower) {
+                                const qMatch = String(o.queueNo || '').toLowerCase().includes(searchLower);
+                                const cMatch = String(o.customerName || '').toLowerCase().includes(searchLower);
+                                const pMatch = String(o.customerPhone || '').toLowerCase().includes(searchLower);
+                                const aMatch = String(o.deliveryAddress || '').toLowerCase().includes(searchLower);
+                                const dMatch = String(o.assignedDriverName || '').toLowerCase().includes(searchLower);
+                                return qMatch || cMatch || pMatch || aMatch || dMatch;
+                            }
+                            return true;
+                        })
+                        .sort((a, b) => b.createdAt - a.createdAt);
+                }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery, computeOrderFinancials]);
+
+                // Pre-aggregated Financial & Performance Summary for 07 Reports & Finance
+                const reportFinancialSummary = useMemo(() => {
+                    let totalOrders = reportOrders.length;
+                    let deliveredCount = 0;
+                    let activeInProgressCount = 0;
+                    let failedCancelledCount = 0;
+                    let grossProductSales = 0;
+                    let totalDeliveryFees = 0;
+                    let totalValidBillVolume = 0;
+                    let totalPaidCollected = 0;
+                    let paidCashAmount = 0;
+                    let paidBankAmount = 0;
+                    let pendingCodAmount = 0;
+                    let totalDurationMinutes = 0;
+                    let durationSampleCount = 0;
+
+                    reportOrders.forEach(o => {
+                        const fin = o._fin || computeOrderFinancials(o);
+                        if (fin.isCancelledOrFailed) {
+                            failedCancelledCount++;
+                            return;
+                        }
+                        if (fin.isDelivered) {
+                            deliveredCount++;
+                            const endTs = Number(o.deliveryCompletedAt || o.completedAt || 0);
+                            const startTs = Number(o.createdAt || 0);
+                            if (endTs > startTs) {
+                                const mins = (endTs - startTs) / 60000;
+                                if (mins > 0 && mins < 720) {
+                                    totalDurationMinutes += mins;
+                                    durationSampleCount++;
+                                }
+                            }
+                        } else {
+                            activeInProgressCount++;
+                        }
+
+                        grossProductSales += fin.prodSub;
+                        totalDeliveryFees += fin.deliveryFee;
+                        totalValidBillVolume += fin.totalBill;
+
+                        if (fin.isPaid) {
+                            totalPaidCollected += fin.totalBill;
+                            if (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified) {
+                                paidBankAmount += fin.totalBill;
+                            } else {
+                                paidCashAmount += fin.totalBill;
+                            }
+                        } else {
+                            pendingCodAmount += fin.totalBill;
+                        }
+                    });
+
+                    const avgDeliveryMins = durationSampleCount > 0 ? Math.round(totalDurationMinutes / durationSampleCount) : 0;
+                    const successRatePct = totalOrders > 0 ? Math.round((deliveredCount / totalOrders) * 100) : 0;
+
+                    return {
+                        totalOrders,
+                        deliveredCount,
+                        activeInProgressCount,
+                        failedCancelledCount,
+                        grossProductSales,
+                        totalDeliveryFees,
+                        totalValidBillVolume,
+                        totalPaidCollected,
+                        paidCashAmount,
+                        paidBankAmount,
+                        pendingCodAmount,
+                        avgDeliveryMins,
+                        successRatePct
+                    };
+                }, [reportOrders, computeOrderFinancials]);
 
                 // SOW 3.1: Delivery Dashboard KPIs
                 const kpiMetrics = useMemo(() => {
@@ -34995,6 +35424,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             if (podPayload.collectedCash && order.paymentStatus !== 'Paid') {
                                 updates.paymentStatus = 'Paid';
                                 updates.paymentMethod = 'Cash';
+                                const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
+                                if (openShift && !order.shiftId) {
+                                    updates.shiftId = openShift.id;
+                                }
+                            } else if (podPayload.paidViaBank && order.paymentStatus !== 'Paid') {
+                                updates.paymentStatus = 'Paid';
+                                updates.paymentMethod = 'Bank';
                                 const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
                                 if (openShift && !order.shiftId) {
                                     updates.shiftId = openShift.id;
@@ -35334,6 +35770,148 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
+                // 06 Driver App: Doorstep Cash Collection or ABA KHQR Bank Transfer Settlement
+                const handleDriverCollectPaymentAtDoor = async (order, paymentMethodType = 'Cash', apvRef = '', verifiedAba = null) => {
+                    if (!order || isSettlingDriverPayment) return;
+                    setIsSettlingDriverPayment(true);
+                    const targetShop = shops.find(s => s.id === order.shopId);
+                    const openShift = (shifts || []).find(s => s.shopId === order.shopId && s.status === 'Open');
+                    const driverActor = currentAdminRecord?.name || order.assignedDriverName || 'Driver';
+                    const prevHistory = Array.isArray(order.deliveryHistory) ? order.deliveryHistory : [];
+
+                    try {
+                        // Path 1: Live Auto-Verified ABA PayWay Transaction
+                        if (paymentMethodType === 'Bank' && verifiedAba && verifiedAba.isValid && verifiedAba.trxId) {
+                            const res = await window.SolarisPayWayVerifier.verifyAndSettleOrder(
+                                order,
+                                verifiedAba,
+                                targetShop,
+                                shifts,
+                                null,
+                                `${driverActor} (Driver KHQR)`,
+                                orders
+                            );
+                            if (res.ok) {
+                                const { doc, updateDoc } = window.FirebaseApp;
+                                await updateDoc(doc(safeDB(), 'orders', order.id), {
+                                    deliveryHistory: [
+                                        ...prevHistory,
+                                        {
+                                            status: getEffectiveDeliveryStatus(order),
+                                            timestamp: Date.now(),
+                                            actor: driverActor,
+                                            note: `Customer paid via ABA KHQR at door (${res.amountDisplay} • APV: ${res.apv})`
+                                        }
+                                    ]
+                                }).catch(() => {});
+
+                                showToast(`✅ ABA KHQR Payment Verified for ${order.queueNo}!`, 'success');
+                                setDriverKhqrModalOrder(null);
+                                if (podModalOrder && podModalOrder.id === order.id) {
+                                    setPodModalOrder(prev => prev ? ({ ...prev, paymentStatus: 'Paid', paymentMethod: 'Bank', abaVerified: true, abaApv: res.apv, abaPayer: res.payerDisplay }) : null);
+                                    setPodCollectCash(false);
+                                }
+                                setDriverThankYouData({
+                                    invoiceNo: order.queueNo || 'PAID',
+                                    customerName: order.customerName && order.customerName !== 'Walk-in' ? order.customerName : null,
+                                    customerSex: order.customerSex || 'M',
+                                    payerDisplay: res.payerDisplay || 'ABA Customer',
+                                    amountDisplay: res.amountDisplay || `${Number(order.totalAmount || 0).toLocaleString()} ៛`,
+                                    totalKhr: Number(order.totalAmount || 0),
+                                    apv: res.apv || 'VERIFIED',
+                                    trxId: res.trxId || '',
+                                    sourceLabel: 'Driver Doorstep KHQR Verified',
+                                    shopName: targetShop?.brandingName || targetShop?.name || 'Solaris Cafe'
+                                });
+                                return;
+                            }
+                        }
+
+                        // Path 2: Driver Confirmed Bank Transfer (KHQR) or Cash on Delivery (Collect at Door)
+                        const { doc, updateDoc } = window.FirebaseApp;
+                        const isBank = paymentMethodType === 'Bank';
+                        const cleanApv = String(apvRef || '').trim();
+                        const nowTs = Date.now();
+
+                        const updates = {
+                            paymentStatus: 'Paid',
+                            paymentMethod: isBank ? 'Bank' : 'Cash',
+                            driverCollectedPaymentAt: nowTs,
+                            driverCollectedBy: driverActor,
+                            deliveryHistory: [
+                                ...prevHistory,
+                                {
+                                    status: getEffectiveDeliveryStatus(order),
+                                    timestamp: nowTs,
+                                    actor: driverActor,
+                                    note: isBank
+                                        ? `Customer paid via Bank Transfer / KHQR at door${cleanApv ? ` (Ref: ${cleanApv})` : ''}`
+                                        : `Driver collected Cash on Delivery (${(order.totalAmount || 0).toLocaleString()} ៛) at door`
+                                }
+                            ]
+                        };
+
+                        if (openShift && !order.shiftId) {
+                            updates.shiftId = openShift.id;
+                        }
+
+                        if (isBank) {
+                            updates.abaVerified = true;
+                            updates.abaApv = cleanApv || order.abaApv || 'DRIVER-QR';
+                            updates.abaPayer = order.abaPayer || `${order.customerName || 'Customer'} (Door KHQR)`;
+                            updates.abaPaidAmountStr = `៛${Number(order.totalAmount || 0).toLocaleString()}`;
+                            updates.abaVerifiedAt = nowTs;
+                            updates.abaVerifiedBy = `${driverActor} (Driver App)`;
+                            if (cleanApv) {
+                                updates.khqrCustomerRef = cleanApv;
+                            }
+                        } else {
+                            updates.proofOfDelivery = {
+                                ...(order.proofOfDelivery || {}),
+                                collectedCash: true,
+                                collectedAmount: Number(order.totalAmount || 0),
+                                verifiedByDriverId: currentAdminRecord?.id || order.assignedDriverId || null,
+                                verifiedByDriverName: driverActor,
+                                completedAt: nowTs
+                            };
+                        }
+
+                        await updateDoc(doc(safeDB(), 'orders', order.id), updates);
+
+                        showToast(
+                            isBank
+                                ? `✅ Marked ${order.queueNo} Paid via Bank Transfer (KHQR)!`
+                                : `💵 Marked ${order.queueNo} Paid via Cash at Door!`,
+                            'success'
+                        );
+
+                        setDriverKhqrModalOrder(null);
+                        if (podModalOrder && podModalOrder.id === order.id) {
+                            setPodModalOrder(prev => prev ? ({ ...prev, ...updates }) : null);
+                            setPodCollectCash(!isBank);
+                        }
+
+                        if (isBank) {
+                            setDriverThankYouData({
+                                invoiceNo: order.queueNo || 'PAID',
+                                customerName: order.customerName && order.customerName !== 'Walk-in' ? order.customerName : null,
+                                customerSex: order.customerSex || 'M',
+                                payerDisplay: updates.abaPayer,
+                                amountDisplay: `${Number(order.totalAmount || 0).toLocaleString()} ៛`,
+                                totalKhr: Number(order.totalAmount || 0),
+                                apv: updates.abaApv,
+                                trxId: order.abaTrxId || '',
+                                sourceLabel: 'Driver Doorstep KHQR Confirmed',
+                                shopName: targetShop?.brandingName || targetShop?.name || 'Solaris Cafe'
+                            });
+                        }
+                    } catch (err) {
+                        showToast('Failed to record payment: ' + err.message, 'error');
+                    } finally {
+                        setIsSettlingDriverPayment(false);
+                    }
+                };
+
                 // SOW 3.6: Proof of Delivery (POD) Photo Upload & Touch Signature Pad Helpers
                 const handlePodPhotoUpload = async (e) => {
                     const file = e.target.files?.[0];
@@ -35412,23 +35990,36 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                     setIsSubmittingPod(true);
                     try {
+                        const isOrderAlreadyPaid = podModalOrder.paymentStatus === 'Paid';
+                        const isCollectingCashNow = !isOrderAlreadyPaid && podPaymentOption === 'CASH' && !!podCollectCash;
+                        const isBankSelectedNow = !isOrderAlreadyPaid && podPaymentOption === 'KHQR';
+
                         const podPayload = {
                             method: podMethod,
                             otpVerified: podMethod === 'OTP',
                             photoDataUrl: podMethod === 'PHOTO' ? podPhotoDataUrl : null,
                             signatureDataUrl: podMethod === 'SIGNATURE' ? podSignatureDataUrl : null,
                             note: podNoteInput.trim() || null,
-                            collectedCash: !!podCollectCash,
-                            collectedAmount: podCollectCash ? Number(podModalOrder.totalAmount || 0) : 0,
+                            collectedCash: isCollectingCashNow,
+                            paidViaBank: isBankSelectedNow || (isOrderAlreadyPaid && podModalOrder.paymentMethod === 'Bank'),
+                            collectedAmount: isCollectingCashNow ? Number(podModalOrder.totalAmount || 0) : 0,
                             verifiedByDriverId: currentAdminRecord?.id || null,
                             verifiedByDriverName: currentAdminRecord?.name || 'Driver',
                             completedAt: Date.now()
                         };
 
+                        const paymentNoteLabel = isOrderAlreadyPaid
+                            ? ` • Paid (${podModalOrder.paymentMethod || 'Prepaid'})`
+                            : isCollectingCashNow
+                                ? ' • Cash Collected at Door'
+                                : isBankSelectedNow
+                                    ? ' • Paid via KHQR Bank Transfer'
+                                    : '';
+
                         await handleUpdateDeliveryStatus(
                             podModalOrder,
                             'Delivered',
-                            `Delivered (${podMethod}${podCollectCash ? ' • Cash Collected' : ''})`,
+                            `Delivered (${podMethod}${paymentNoteLabel})`,
                             podPayload
                         );
                         setPodModalOrder(null);
@@ -35437,6 +36028,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         setPodSignatureDataUrl('');
                         setPodNoteInput('');
                         setPodCollectCash(false);
+                        setPodPaymentOption('CASH');
                     } finally {
                         setIsSubmittingPod(false);
                     }
@@ -35487,13 +36079,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                 // SOW 3.8: Export Delivery Reports to CSV
                 const handleExportDeliveryCSV = () => {
-                    const headers = "Date_Time,Invoice_No,Branch,Customer_Name,Phone,Delivery_Address,Distance_m,Delivery_Fee_KHR,Order_Total_KHR,Payment_Status,Payment_Method,Assigned_Driver,Delivery_Status,Completed_At,POD_Method\n";
-                    const rows = deliveryOrders.map(o => {
+                    const sourceList = activeSubTab === 'reports' ? reportOrders : deliveryOrders;
+                    const headers = "Date_Time,Invoice_No,Branch,Customer_Name,Phone,Delivery_Address,Distance_m,Product_SubTotal_KHR,Delivery_Fee_KHR,Order_Total_KHR,Payment_Status,Payment_Method,Assigned_Driver,Delivery_Status,Completed_At,Duration_Mins,POD_Method,COD_Reconciled\n";
+                    const rows = sourceList.map(o => {
                         const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
+                        const fin = o._fin || computeOrderFinancials(o);
                         const dt = formatSolarisDateTime(o.createdAt, true);
-                        const compDt = o.deliveryCompletedAt ? formatSolarisDateTime(o.deliveryCompletedAt, true) : '';
+                        const endTs = Number(o.deliveryCompletedAt || o.completedAt || 0);
+                        const compDt = endTs ? formatSolarisDateTime(endTs, true) : '';
+                        const durMins = (endTs > o.createdAt) ? Math.round((endTs - o.createdAt) / 60000) : '';
                         const podMeth = o.proofOfDelivery?.method || '';
-                        return `"${dt}","${o.queueNo || ''}","${shopName}","${(o.customerName || 'Walk-in').replace(/"/g, '""')}","${o.customerPhone || ''}","${(o.deliveryAddress || '').replace(/"/g, '""')}",${Math.round(o.customerDistance || 0)},${o.deliveryFee || 0},${o.totalAmount || 0},"${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.assignedDriverName || 'Unassigned'}","${o.effectiveDeliveryStatus}","${compDt}","${podMeth}"`;
+                        const codRec = o.codHandoverReconciledAt ? 'Yes' : 'No';
+                        return `"${dt}","${o.queueNo || ''}","${shopName}","${(o.customerName || 'Walk-in').replace(/"/g, '""')}","${o.customerPhone || ''}","${(o.deliveryAddress || '').replace(/"/g, '""')}",${Math.round(o.customerDistance || 0)},${fin.prodSub},${fin.deliveryFee},${fin.totalBill},"${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.assignedDriverName || 'Unassigned'}","${o.effectiveDeliveryStatus}","${compDt}","${durMins}","${podMeth}","${codRec}"`;
                     }).join("\n");
 
                     const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
@@ -35891,6 +36488,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                             type="button"
                                                             onClick={() => {
                                                                 setPodModalOrder(order);
+                                                                setPodPaymentOption('CASH');
                                                                 setPodCollectCash(order.paymentStatus !== 'Paid');
                                                             }}
                                                             className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs shadow-sm transition flex items-center gap-1 shrink-0"
@@ -36150,24 +36748,135 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                     </div>
                                                 </div>
 
-                                                {/* Amount to Collect Banner */}
-                                                <div className={`p-3.5 rounded-2xl border flex items-center justify-between ${
-                                                    order.paymentStatus === 'Paid'
-                                                        ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-                                                        : 'bg-amber-50 border-amber-300 text-amber-950'
-                                                }`}>
-                                                    <div>
-                                                        <div className="text-[10px] font-black uppercase">
-                                                            {order.paymentStatus === 'Paid' ? 'Prepaid Order (Do Not Collect Cash)' : 'Cash on Delivery (Collect at Door)'}
-                                                        </div>
-                                                        <div className="text-xs font-bold opacity-80">
-                                                            Includes Delivery Fee: {(order.deliveryFee || 0).toLocaleString()} ៛
+                                                {/* Doorstep Payment Collection Card (Cash on Delivery vs. Bank Transfer KHQR) */}
+                                                {order.paymentStatus === 'Paid' ? (
+                                                    <div className="p-3.5 rounded-2xl border bg-emerald-50 border-emerald-200 text-emerald-900 space-y-2">
+                                                        <div className="flex items-center justify-between">
+                                                            <div>
+                                                                <div className="text-[10px] font-black uppercase flex items-center gap-1.5 text-emerald-700">
+                                                                    <i className="fa-solid fa-circle-check"></i>
+                                                                    <span>
+                                                                        {order.paymentMethod === 'Bank' || order.abaVerified
+                                                                            ? 'Paid via Bank Transfer (ABA KHQR)'
+                                                                            : `Paid via ${order.paymentMethod || 'Cash'} (Do Not Collect Cash)`}
+                                                                    </span>
+                                                                </div>
+                                                                <div className="text-xs font-bold opacity-80 mt-0.5">
+                                                                    Includes Delivery Fee: {(order.deliveryFee || 0).toLocaleString()} ៛
+                                                                </div>
+                                                                {order.abaVerified && (
+                                                                    <div className="text-[10px] font-mono font-bold text-emerald-800 mt-0.5">
+                                                                        {order.abaPayer ? `${order.abaPayer} • ` : ''}APV: {order.abaApv || 'VERIFIED'}
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                            <div className="text-right">
+                                                                <div className="text-xl font-black text-emerald-700">
+                                                                    {(order.totalAmount || 0).toLocaleString()} ៛
+                                                                </div>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setDriverKhqrModalOrder(order)}
+                                                                    className="text-[10px] font-bold text-stone-500 hover:text-stone-800 underline mt-0.5"
+                                                                >
+                                                                    Show KHQR
+                                                                </button>
+                                                            </div>
                                                         </div>
                                                     </div>
-                                                    <div className="text-xl font-black">
-                                                        {(order.totalAmount || 0).toLocaleString()} ៛
+                                                ) : (
+                                                    <div className="p-3.5 rounded-2xl border-2 border-amber-300 bg-amber-50/90 text-amber-950 space-y-3 shadow-sm">
+                                                        <div className="flex items-center justify-between">
+                                                            <div>
+                                                                <div className="text-[10px] font-black uppercase tracking-wider text-amber-800 flex items-center gap-1">
+                                                                    <i className="fa-solid fa-hand-holding-dollar text-amber-600"></i>
+                                                                    <span>Payment Option (Collect at Door)</span>
+                                                                </div>
+                                                                <div className="text-xs font-bold opacity-80">
+                                                                    Includes Delivery Fee: {(order.deliveryFee || 0).toLocaleString()} ៛
+                                                                </div>
+                                                            </div>
+                                                            <div className="text-right">
+                                                                <div className="text-xl font-black text-stone-900">
+                                                                    {(order.totalAmount || 0).toLocaleString()} ៛
+                                                                </div>
+                                                                <div className="text-[10px] font-mono font-bold text-emerald-700">
+                                                                    ≈ ${((Number(order.totalAmount || 0)) / Math.max(100, Number(shopObj?.khqrConfig?.exchangeRate) || 4000)).toFixed(2)} USD
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* 2-Option Payment Mode Switcher: Cash on Delivery vs Bank Transfer (KHQR) */}
+                                                        {(() => {
+                                                            const selectedMode = driverPaymentModeByOrder[order.id] || 'CASH';
+                                                            return (
+                                                                <div className="space-y-2.5">
+                                                                    <div className="grid grid-cols-2 gap-1.5 bg-white/80 p-1 rounded-xl border border-amber-200">
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => setDriverPaymentModeByOrder(prev => ({ ...prev, [order.id]: 'CASH' }))}
+                                                                            className={`py-2 px-2.5 rounded-lg font-black text-xs transition flex items-center justify-center gap-1.5 ${
+                                                                                selectedMode === 'CASH'
+                                                                                    ? 'bg-amber-500 text-stone-950 shadow-sm'
+                                                                                    : 'text-stone-600 hover:text-stone-900'
+                                                                            }`}
+                                                                        >
+                                                                            <i className="fa-solid fa-money-bill-wave"></i>
+                                                                            <span>Cash on Delivery</span>
+                                                                        </button>
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => {
+                                                                                setDriverPaymentModeByOrder(prev => ({ ...prev, [order.id]: 'KHQR' }));
+                                                                                setDriverKhqrModalOrder(order);
+                                                                            }}
+                                                                            className={`py-2 px-2.5 rounded-lg font-black text-xs transition flex items-center justify-center gap-1.5 ${
+                                                                                selectedMode === 'KHQR'
+                                                                                    ? 'bg-[#E1232E] text-white shadow-sm'
+                                                                                    : 'text-stone-600 hover:text-[#E1232E]'
+                                                                            }`}
+                                                                        >
+                                                                            <i className="fa-solid fa-qrcode"></i>
+                                                                            <span>Bank Transfer (KHQR)</span>
+                                                                        </button>
+                                                                    </div>
+
+                                                                    {selectedMode === 'CASH' ? (
+                                                                        <div className="flex items-center justify-between gap-2 bg-white p-2.5 rounded-xl border border-amber-200">
+                                                                            <div className="text-[11px] font-bold text-stone-700 leading-tight">
+                                                                                Collect <b className="text-stone-900">{(order.totalAmount || 0).toLocaleString()} ៛</b> cash from customer at the door:
+                                                                            </div>
+                                                                            <button
+                                                                                type="button"
+                                                                                disabled={isSettlingDriverPayment}
+                                                                                onClick={() => handleDriverCollectPaymentAtDoor(order, 'Cash')}
+                                                                                className="px-3 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-black text-xs shrink-0 shadow-sm active:scale-95 transition flex items-center gap-1.5 disabled:opacity-50"
+                                                                            >
+                                                                                <i className="fa-solid fa-sack-dollar"></i>
+                                                                                <span>Collect Cash</span>
+                                                                            </button>
+                                                                        </div>
+                                                                    ) : (
+                                                                        <div className="flex items-center justify-between gap-2 bg-white p-2.5 rounded-xl border border-red-200">
+                                                                            <div className="text-[11px] font-bold text-stone-700 leading-tight">
+                                                                                Show <b className="text-[#E1232E]">KHR QR Code</b> for customer to scan & pay <b className="text-stone-900">{(order.totalAmount || 0).toLocaleString()} ៛</b>:
+                                                                            </div>
+                                                                            <button
+                                                                                type="button"
+                                                                                disabled={isSettlingDriverPayment}
+                                                                                onClick={() => setDriverKhqrModalOrder(order)}
+                                                                                className="px-3.5 py-2 rounded-xl bg-[#E1232E] hover:bg-red-700 text-white font-black text-xs shrink-0 shadow-sm active:scale-95 transition flex items-center gap-1.5 disabled:opacity-50"
+                                                                            >
+                                                                                <i className="fa-solid fa-qrcode"></i>
+                                                                                <span>Show KHR QR</span>
+                                                                            </button>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            );
+                                                        })()}
                                                     </div>
-                                                </div>
+                                                )}
 
                                                 {/* SOW 3.6: Sequential 1-Tap Driver Progression Buttons (Accept / Reject / Pickup / En-Route / POD) */}
                                                 <div className="grid grid-cols-2 gap-2.5 pt-1">
@@ -36229,8 +36938,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         <button
                                                             type="button"
                                                             onClick={() => {
+                                                                const chosenMode = driverPaymentModeByOrder[order.id] || 'CASH';
                                                                 setPodModalOrder(order);
-                                                                setPodCollectCash(order.paymentStatus !== 'Paid');
+                                                                setPodPaymentOption(chosenMode);
+                                                                setPodCollectCash(order.paymentStatus !== 'Paid' && chosenMode === 'CASH');
                                                             }}
                                                             className="col-span-2 py-4 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-base shadow-lg shadow-emerald-600/30 transition active:scale-95 flex items-center justify-center gap-2"
                                                         >
@@ -36343,16 +37054,29 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             TAB 6: 07 DELIVERY REPORTS & FINANCIAL RECONCILIATION (SOW 3.8 & 5.5)
                             ===================================================================== */}
                         {activeSubTab === 'reports' && (
-                            <div className="bg-white rounded-3xl border border-stone-200 shadow-sm overflow-hidden">
+                            <div className="bg-white rounded-3xl border border-stone-200 shadow-sm overflow-hidden space-y-4">
                                 <div className="p-5 border-b border-stone-200 bg-stone-50 flex flex-wrap justify-between items-center gap-3">
                                     <div>
-                                        <h3 className="font-black text-lg text-stone-900">Delivery Financial & Performance Reports</h3>
-                                        <p className="text-xs text-stone-500">Separates Product Sub-Total from Delivery Fee & reconciles Driver COD Cash Handover.</p>
+                                        <div className="flex items-center gap-2">
+                                            <h3 className="font-black text-lg text-stone-900">Delivery Financial & Performance Reports</h3>
+                                            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-stone-900 text-amber-400">
+                                                {reportFinancialSummary.totalOrders} Orders
+                                            </span>
+                                        </div>
+                                        <p className="text-xs text-stone-500 mt-0.5">
+                                            Separates Product Sub-Total from Delivery Fee, tracks Paid vs. Pending COD, and reconciles Driver Cash Handover.
+                                        </p>
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2">
+                                        {filterStatus === 'ACTIVE' && (
+                                            <span className="text-[10px] font-bold bg-sky-50 text-sky-800 border border-sky-200 px-2.5 py-1.5 rounded-xl flex items-center gap-1">
+                                                <i className="fa-solid fa-circle-info text-sky-600"></i>
+                                                <span>Showing All Completed & Active Deliveries for Window</span>
+                                            </span>
+                                        )}
                                         <div className="flex bg-stone-200/70 p-1 rounded-xl border border-stone-300 text-xs font-black">
                                             {[
-                                                { id: 'ledger', label: 'Order Ledger' },
+                                                { id: 'ledger', label: `Order Ledger (${reportOrders.length})` },
                                                 { id: 'by_shop', label: 'By Shop' },
                                                 { id: 'by_driver', label: 'By Driver' },
                                                 { id: 'cod_reconcile', label: 'COD Cash Handover' }
@@ -36380,143 +37104,435 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     </div>
                                 </div>
 
-                                {reportSubView === 'by_shop' && (
-                                    <div className="p-4 overflow-x-auto">
-                                        <table className="w-full text-left text-xs border-collapse border border-stone-300">
-                                            <thead>
-                                                <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
-                                                    <th className="p-3 border border-stone-300">Shop / Branch</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Total Deliveries</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Delivered</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Failed / Cancelled</th>
-                                                    <th className="p-3 border border-stone-300 text-right">Product Sales (៛)</th>
-                                                    <th className="p-3 border border-stone-300 text-right">Delivery Fees (៛)</th>
-                                                    <th className="p-3 border border-stone-300 text-right">Total Collected (៛)</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {shops.map(sh => {
-                                                    const shOrders = deliveryOrders.filter(o => o.shopId === sh.id);
-                                                    const comp = shOrders.filter(o => o.effectiveDeliveryStatus === 'Delivered');
-                                                    const fail = shOrders.filter(o => ['Failed', 'Cancelled', 'Returned'].includes(o.effectiveDeliveryStatus));
-                                                    const prodRev = comp.reduce((s, o) => s + Number(o.itemsSubTotal ?? Math.max(0, (o.totalAmount || 0) - (o.deliveryFee || 0))), 0);
-                                                    const feeRev = comp.reduce((s, o) => s + Number(o.deliveryFee || 0), 0);
-                                                    return (
-                                                        <tr key={sh.id} className="hover:bg-stone-50">
-                                                            <td className="p-3 border border-stone-300 font-black text-stone-900">{sh.name}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold">{shOrders.length}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{comp.length}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{fail.length}</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-bold">{prodRev.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{feeRev.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{(prodRev + feeRev).toLocaleString()} ៛</td>
-                                                        </tr>
-                                                    );
-                                                })}
-                                            </tbody>
-                                        </table>
+                                {/* Executive Financial Summary Strip for Selected Report Window */}
+                                <div className="px-5 pt-1 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                                    <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200">
+                                        <div className="text-[10px] font-black uppercase text-stone-400">Net Product Sales</div>
+                                        <div className="text-base sm:text-lg font-black text-stone-900 mt-0.5">
+                                            {reportFinancialSummary.grossProductSales.toLocaleString()} ៛
+                                        </div>
+                                        <div className="text-[10px] font-bold text-stone-500 mt-0.5">
+                                            Excludes delivery fees
+                                        </div>
                                     </div>
-                                )}
+                                    <div className="bg-emerald-50/70 p-3 rounded-2xl border border-emerald-200">
+                                        <div className="text-[10px] font-black uppercase text-emerald-700">Total Delivery Fees</div>
+                                        <div className="text-base sm:text-lg font-black text-emerald-700 mt-0.5">
+                                            +{reportFinancialSummary.totalDeliveryFees.toLocaleString()} ៛
+                                        </div>
+                                        <div className="text-[10px] font-bold text-emerald-800/80 mt-0.5">
+                                            {reportFinancialSummary.deliveredCount} delivered
+                                        </div>
+                                    </div>
+                                    <div className="bg-amber-50/70 p-3 rounded-2xl border border-amber-200">
+                                        <div className="text-[10px] font-black uppercase text-amber-800">Total Bill Volume</div>
+                                        <div className="text-base sm:text-lg font-black text-amber-700 mt-0.5">
+                                            {reportFinancialSummary.totalValidBillVolume.toLocaleString()} ៛
+                                        </div>
+                                        <div className="text-[10px] font-bold text-amber-800/80 mt-0.5">
+                                            Products + Delivery Fees
+                                        </div>
+                                    </div>
+                                    <div className="bg-white p-3 rounded-2xl border border-emerald-300 shadow-sm">
+                                        <div className="text-[10px] font-black uppercase text-emerald-700">Paid & Collected</div>
+                                        <div className="text-base sm:text-lg font-black text-emerald-600 mt-0.5">
+                                            {reportFinancialSummary.totalPaidCollected.toLocaleString()} ៛
+                                        </div>
+                                        <div className="text-[10px] font-bold text-stone-500 mt-0.5 truncate">
+                                            💵 {reportFinancialSummary.paidCashAmount.toLocaleString()} • 🏦 {reportFinancialSummary.paidBankAmount.toLocaleString()}
+                                        </div>
+                                    </div>
+                                    <div className="bg-red-50/60 p-3 rounded-2xl border border-red-200">
+                                        <div className="text-[10px] font-black uppercase text-red-700">Unpaid / Pending COD</div>
+                                        <div className="text-base sm:text-lg font-black text-red-600 mt-0.5">
+                                            {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛
+                                        </div>
+                                        <div className="text-[10px] font-bold text-red-700/80 mt-0.5">
+                                            {reportFinancialSummary.activeInProgressCount} active in-flight
+                                        </div>
+                                    </div>
+                                    <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200">
+                                        <div className="text-[10px] font-black uppercase text-stone-500">Success & Speed</div>
+                                        <div className="text-base sm:text-lg font-black text-stone-900 mt-0.5">
+                                            {reportFinancialSummary.successRatePct}% <span className="text-xs font-bold text-stone-500">({reportFinancialSummary.avgDeliveryMins > 0 ? `${reportFinancialSummary.avgDeliveryMins}m avg` : 'N/A'})</span>
+                                        </div>
+                                        <div className="text-[10px] font-bold text-red-500 mt-0.5">
+                                            {reportFinancialSummary.failedCancelledCount} failed / cancelled
+                                        </div>
+                                    </div>
+                                </div>
 
-                                {reportSubView === 'by_driver' && (
-                                    <div className="p-4 overflow-x-auto">
-                                        <table className="w-full text-left text-xs border-collapse border border-stone-300">
-                                            <thead>
-                                                <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
-                                                    <th className="p-3 border border-stone-300">Driver Name</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Completed</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Failed</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Avg Duration</th>
-                                                    <th className="p-3 border border-stone-300 text-right">Delivery Fees Generated</th>
-                                                    <th className="p-3 border border-stone-300 text-right">COD Cash Collected</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {availableDrivers.map(drv => {
-                                                    const drvOrders = deliveryOrders.filter(o => o.assignedDriverId === drv.id);
-                                                    const comp = drvOrders.filter(o => o.effectiveDeliveryStatus === 'Delivered');
-                                                    const fail = drvOrders.filter(o => ['Failed', 'Returned'].includes(o.effectiveDeliveryStatus));
-                                                    const feesGen = comp.reduce((s, o) => s + Number(o.deliveryFee || 0), 0);
-                                                    const codCash = comp.filter(o => o.proofOfDelivery?.collectedCash).reduce((s, o) => s + Number(o.totalAmount || 0), 0);
-                                                    const durations = comp.filter(o => (o.deliveryCompletedAt || o.completedAt) > o.createdAt).map(o => ((o.deliveryCompletedAt || o.completedAt) - o.createdAt) / 60000);
-                                                    const avgMin = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
-                                                    return (
-                                                        <tr key={drv.id} className="hover:bg-stone-50">
-                                                            <td className="p-3 border border-stone-300 font-black text-stone-900">{drv.name}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{comp.length}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{fail.length}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold">{avgMin > 0 ? `${avgMin} mins` : 'N/A'}</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">{feesGen.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{codCash.toLocaleString()} ៛</td>
-                                                        </tr>
-                                                    );
-                                                })}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                )}
+                                {reportSubView === 'by_shop' && (() => {
+                                    const displayedShopsForReport = filterShop === 'All'
+                                        ? shops
+                                        : shops.filter(s => s.id === filterShop);
 
-                                {reportSubView === 'cod_reconcile' && (
-                                    <div className="p-4 overflow-x-auto">
-                                        <table className="w-full text-left text-xs border-collapse border border-stone-300">
-                                            <thead>
-                                                <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
-                                                    <th className="p-3 border border-stone-300">Invoice</th>
-                                                    <th className="p-3 border border-stone-300">Driver</th>
-                                                    <th className="p-3 border border-stone-300 text-right">COD Cash Collected</th>
-                                                    <th className="p-3 border border-stone-300 text-center">Handover Status</th>
-                                                    <th className="p-3 border border-stone-300 text-right">Reconcile to Cashier Drawer</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody>
-                                                {deliveryOrders.filter(o => o.proofOfDelivery?.collectedCash || (o.paymentMethod === 'Cash' && o.effectiveDeliveryStatus === 'Delivered')).map(o => {
-                                                    const isReconciled = !!o.codHandoverReconciledAt;
-                                                    return (
-                                                        <tr key={o.id} className="hover:bg-stone-50">
-                                                            <td className="p-3 border border-stone-300 font-mono font-black">{o.queueNo}</td>
-                                                            <td className="p-3 border border-stone-300 font-bold">{o.assignedDriverName || 'Driver'}</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{(o.totalAmount || 0).toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-center">
-                                                                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase ${isReconciled ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-900'}`}>
-                                                                    {isReconciled ? `Reconciled by ${o.codHandoverReconciledBy || 'Staff'}` : 'Pending Driver Handover'}
-                                                                </span>
+                                    const shopRows = displayedShopsForReport.map(sh => {
+                                        const shOrders = reportOrders.filter(o => o.shopId === sh.id);
+                                        const validOrders = shOrders.filter(o => !o._fin.isCancelledOrFailed);
+                                        const comp = shOrders.filter(o => o._fin.isDelivered && !o._fin.isCancelledOrFailed);
+                                        const active = shOrders.filter(o => !o._fin.isDelivered && !o._fin.isCancelledOrFailed);
+                                        const fail = shOrders.filter(o => o._fin.isCancelledOrFailed);
+
+                                        const prodRev = validOrders.reduce((s, o) => s + o._fin.prodSub, 0);
+                                        const feeRev = validOrders.reduce((s, o) => s + o._fin.deliveryFee, 0);
+                                        const totalBill = validOrders.reduce((s, o) => s + o._fin.totalBill, 0);
+                                        const paidRev = validOrders.reduce((s, o) => s + o._fin.paidAmount, 0);
+                                        const unpaidRev = validOrders.reduce((s, o) => s + o._fin.unpaidCodAmount, 0);
+
+                                        return {
+                                            shop: sh,
+                                            totalCount: shOrders.length,
+                                            deliveredCount: comp.length,
+                                            activeCount: active.length,
+                                            failCount: fail.length,
+                                            prodRev,
+                                            feeRev,
+                                            totalBill,
+                                            paidRev,
+                                            unpaidRev
+                                        };
+                                    });
+
+                                    const totals = shopRows.reduce((acc, r) => ({
+                                        totalCount: acc.totalCount + r.totalCount,
+                                        deliveredCount: acc.deliveredCount + r.deliveredCount,
+                                        activeCount: acc.activeCount + r.activeCount,
+                                        failCount: acc.failCount + r.failCount,
+                                        prodRev: acc.prodRev + r.prodRev,
+                                        feeRev: acc.feeRev + r.feeRev,
+                                        totalBill: acc.totalBill + r.totalBill,
+                                        paidRev: acc.paidRev + r.paidRev,
+                                        unpaidRev: acc.unpaidRev + r.unpaidRev
+                                    }), { totalCount: 0, deliveredCount: 0, activeCount: 0, failCount: 0, prodRev: 0, feeRev: 0, totalBill: 0, paidRev: 0, unpaidRev: 0 });
+
+                                    return (
+                                        <div className="p-4 overflow-x-auto table-wrapper">
+                                            <table className="w-full min-w-[950px] text-left text-xs border-collapse border border-stone-300">
+                                                <thead>
+                                                    <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
+                                                        <th className="p-3 border border-stone-300">Shop / Branch</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Total Orders</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Delivered</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Active</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Failed / Cancel</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Product Sub-Total (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Delivery Fees (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Total Bill (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Paid Collected (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Pending COD (៛)</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {shopRows.map(r => (
+                                                        <tr key={r.shop.id} className="hover:bg-stone-50 bg-white">
+                                                            <td className="p-3 border border-stone-300 font-black text-stone-900">{r.shop.name}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold">{r.totalCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{r.deliveredCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold text-amber-600">{r.activeCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{r.failCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-bold text-stone-800">{r.prodRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{r.feeRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{r.totalBill.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-600 bg-emerald-50/40">{r.paidRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-red-600">{r.unpaidRev.toLocaleString()} ៛</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                                <tfoot className="bg-stone-900 text-white font-black text-xs">
+                                                    <tr>
+                                                        <td className="p-3 border border-stone-700 uppercase">Grand Total</td>
+                                                        <td className="p-3 border border-stone-700 text-center">{totals.totalCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-emerald-400">{totals.deliveredCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-amber-300">{totals.activeCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-red-400">{totals.failCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-right">{totals.prodRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">+{totals.feeRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.totalBill.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">{totals.paidRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-red-300">{totals.unpaidRev.toLocaleString()} ៛</td>
+                                                    </tr>
+                                                </tfoot>
+                                            </table>
+                                        </div>
+                                    );
+                                })()}
+
+                                {reportSubView === 'by_driver' && (() => {
+                                    // Build complete driver rows + include any drivers on historical orders + an Unassigned bucket
+                                    const driverMap = new Map();
+                                    availableDrivers.forEach(drv => {
+                                        driverMap.set(drv.id, {
+                                            id: drv.id,
+                                            name: drv.name || drv.email || 'Driver',
+                                            orders: []
+                                        });
+                                    });
+
+                                    const unassignedBucket = {
+                                        id: '__UNASSIGNED__',
+                                        name: 'Unassigned / Self-Dispatched',
+                                        orders: []
+                                    };
+
+                                    reportOrders.forEach(o => {
+                                        if (o.assignedDriverId) {
+                                            if (!driverMap.has(o.assignedDriverId)) {
+                                                driverMap.set(o.assignedDriverId, {
+                                                    id: o.assignedDriverId,
+                                                    name: o.assignedDriverName || 'Assigned Driver',
+                                                    orders: []
+                                                });
+                                            }
+                                            driverMap.get(o.assignedDriverId).orders.push(o);
+                                        } else {
+                                            unassignedBucket.orders.push(o);
+                                        }
+                                    });
+
+                                    const allBuckets = [
+                                        ...Array.from(driverMap.values()),
+                                        ...(unassignedBucket.orders.length > 0 ? [unassignedBucket] : [])
+                                    ];
+
+                                    const driverRows = allBuckets.map(bucket => {
+                                        const drvOrders = bucket.orders;
+                                        const validOrders = drvOrders.filter(o => !o._fin.isCancelledOrFailed);
+                                        const comp = drvOrders.filter(o => o._fin.isDelivered && !o._fin.isCancelledOrFailed);
+                                        const active = drvOrders.filter(o => !o._fin.isDelivered && !o._fin.isCancelledOrFailed);
+                                        const fail = drvOrders.filter(o => o._fin.isCancelledOrFailed);
+
+                                        const feesGen = validOrders.reduce((s, o) => s + o._fin.deliveryFee, 0);
+                                        const totalOrderValue = validOrders.reduce((s, o) => s + o._fin.totalBill, 0);
+                                        const codCashCollected = validOrders
+                                            .filter(o => o.proofOfDelivery?.collectedCash || (o.paymentStatus === 'Paid' && o.paymentMethod === 'Cash'))
+                                            .reduce((s, o) => s + o._fin.totalBill, 0);
+                                        const khqrBankCollected = validOrders
+                                            .filter(o => o.paymentStatus === 'Paid' && (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified))
+                                            .reduce((s, o) => s + o._fin.totalBill, 0);
+
+                                        const durations = comp
+                                            .map(o => {
+                                                const endTs = Number(o.deliveryCompletedAt || o.completedAt || 0);
+                                                return endTs > o.createdAt ? (endTs - o.createdAt) / 60000 : null;
+                                            })
+                                            .filter(m => m !== null && m > 0 && m < 720);
+                                        const avgMin = durations.length > 0 ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+
+                                        return {
+                                            id: bucket.id,
+                                            name: bucket.name,
+                                            isUnassigned: bucket.id === '__UNASSIGNED__',
+                                            totalAssigned: drvOrders.length,
+                                            completedCount: comp.length,
+                                            activeCount: active.length,
+                                            failCount: fail.length,
+                                            avgMin,
+                                            feesGen,
+                                            codCashCollected,
+                                            khqrBankCollected,
+                                            totalOrderValue
+                                        };
+                                    });
+
+                                    const totals = driverRows.reduce((acc, r) => ({
+                                        totalAssigned: acc.totalAssigned + r.totalAssigned,
+                                        completedCount: acc.completedCount + r.completedCount,
+                                        activeCount: acc.activeCount + r.activeCount,
+                                        failCount: acc.failCount + r.failCount,
+                                        feesGen: acc.feesGen + r.feesGen,
+                                        codCashCollected: acc.codCashCollected + r.codCashCollected,
+                                        khqrBankCollected: acc.khqrBankCollected + r.khqrBankCollected,
+                                        totalOrderValue: acc.totalOrderValue + r.totalOrderValue
+                                    }), { totalAssigned: 0, completedCount: 0, activeCount: 0, failCount: 0, feesGen: 0, codCashCollected: 0, khqrBankCollected: 0, totalOrderValue: 0 });
+
+                                    return (
+                                        <div className="p-4 overflow-x-auto table-wrapper">
+                                            <table className="w-full min-w-[950px] text-left text-xs border-collapse border border-stone-300">
+                                                <thead>
+                                                    <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
+                                                        <th className="p-3 border border-stone-300">Driver Name</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Total Orders</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Delivered</th>
+                                                        <th className="p-3 border border-stone-300 text-center">In Progress</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Failed / Cancel</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Avg Time</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Delivery Fees (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">COD Cash Collected (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Bank / KHQR Paid (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Total Bill Value (៛)</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {driverRows.map(r => (
+                                                        <tr key={r.id} className={`hover:bg-stone-50 ${r.isUnassigned ? 'bg-amber-50/40' : 'bg-white'}`}>
+                                                            <td className="p-3 border border-stone-300 font-black text-stone-900">
+                                                                {r.isUnassigned ? <span className="text-amber-800"><i className="fa-solid fa-circle-exclamation mr-1.5 text-amber-600"></i>{r.name}</span> : r.name}
                                                             </td>
-                                                            <td className="p-3 border border-stone-300 text-right">
-                                                                {!isReconciled ? (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={async () => {
-                                                                            const { doc, updateDoc } = window.FirebaseApp;
-                                                                            const openShift = (shifts || []).find(s => s.shopId === o.shopId && s.status === 'Open');
-                                                                            const updates = {
-                                                                                codHandoverReconciledAt: Date.now(),
-                                                                                codHandoverReconciledBy: currentAdminRecord?.name || 'Cashier',
-                                                                                paymentStatus: 'Paid',
-                                                                                paymentMethod: 'Cash'
-                                                                            };
-                                                                            if (openShift && !o.shiftId) updates.shiftId = openShift.id;
-                                                                            await updateDoc(doc(safeDB(), 'orders', o.id), updates);
-                                                                            showToast(`Reconciled COD cash for ${o.queueNo}!`, 'success');
-                                                                        }}
-                                                                        className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[11px] shadow-sm"
-                                                                    >
-                                                                        Confirm Cash Handover
-                                                                    </button>
-                                                                ) : (
-                                                                    <span className="text-[10px] font-mono text-stone-400">{formatSolarisDateTime(o.codHandoverReconciledAt)}</span>
-                                                                )}
+                                                            <td className="p-3 border border-stone-300 text-center font-bold">{r.totalAssigned}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{r.completedCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold text-amber-600">{r.activeCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{r.failCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold">{r.avgMin > 0 ? `${r.avgMin} mins` : 'N/A'}</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{r.feesGen.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{r.codCashCollected.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-bold text-blue-700">{r.khqrBankCollected.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-stone-900">{r.totalOrderValue.toLocaleString()} ៛</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                                <tfoot className="bg-stone-900 text-white font-black text-xs">
+                                                    <tr>
+                                                        <td className="p-3 border border-stone-700 uppercase">Grand Total</td>
+                                                        <td className="p-3 border border-stone-700 text-center">{totals.totalAssigned}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-emerald-400">{totals.completedCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-amber-300">{totals.activeCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center text-red-400">{totals.failCount}</td>
+                                                        <td className="p-3 border border-stone-700 text-center">
+                                                            {reportFinancialSummary.avgDeliveryMins > 0 ? `${reportFinancialSummary.avgDeliveryMins} mins` : 'N/A'}
+                                                        </td>
+                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">+{totals.feesGen.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.codCashCollected.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-sky-300">{totals.khqrBankCollected.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-white">{totals.totalOrderValue.toLocaleString()} ៛</td>
+                                                    </tr>
+                                                </tfoot>
+                                            </table>
+                                        </div>
+                                    );
+                                })()}
+
+                                {reportSubView === 'cod_reconcile' && (() => {
+                                    // Include all non-cancelled orders that were collected in Cash OR are still Unpaid COD (so cashiers can see both collected and pending COD)
+                                    const codCandidateOrders = reportOrders.filter(o => {
+                                        if (o._fin.isCancelledOrFailed) return false;
+                                        const isBankPaid = o.paymentStatus === 'Paid' && (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified);
+                                        return !isBankPaid;
+                                    });
+
+                                    const totalCodAmount = codCandidateOrders.reduce((s, o) => s + o._fin.totalBill, 0);
+                                    const reconciledTotal = codCandidateOrders.filter(o => !!o.codHandoverReconciledAt).reduce((s, o) => s + o._fin.totalBill, 0);
+                                    const pendingHandoverTotal = Math.max(0, totalCodAmount - reconciledTotal);
+
+                                    return (
+                                        <div className="p-4 overflow-x-auto table-wrapper space-y-3">
+                                            <div className="flex flex-wrap items-center justify-between gap-2 bg-amber-50/80 border border-amber-200 px-4 py-2.5 rounded-2xl text-xs">
+                                                <span className="font-bold text-amber-950">
+                                                    <i className="fa-solid fa-hand-holding-dollar mr-1.5 text-amber-600"></i>
+                                                    Driver COD Cash Handover Ledger (Excludes ABA KHQR / Bank Transfers)
+                                                </span>
+                                                <div className="flex items-center gap-4 font-black">
+                                                    <span className="text-emerald-700">Reconciled: {reconciledTotal.toLocaleString()} ៛</span>
+                                                    <span className="text-red-600">Pending Handover: {pendingHandoverTotal.toLocaleString()} ៛</span>
+                                                </div>
+                                            </div>
+
+                                            <table className="w-full min-w-[900px] text-left text-xs border-collapse border border-stone-300">
+                                                <thead>
+                                                    <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
+                                                        <th className="p-3 border border-stone-300">Date & Time</th>
+                                                        <th className="p-3 border border-stone-300">Invoice & Shop</th>
+                                                        <th className="p-3 border border-stone-300">Customer</th>
+                                                        <th className="p-3 border border-stone-300">Assigned Driver</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Delivery Status</th>
+                                                        <th className="p-3 border border-stone-300 text-right">COD Amount (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Handover Status</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Reconcile to Cashier Drawer</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {codCandidateOrders.map(o => {
+                                                        const isReconciled = !!o.codHandoverReconciledAt;
+                                                        const shopName = shops.find(s => s.id === o.shopId)?.name || 'Branch';
+                                                        return (
+                                                            <tr key={o.id} className="hover:bg-stone-50 bg-white">
+                                                                <td className="p-3 border border-stone-300 font-mono whitespace-nowrap">{formatSolarisDateTime(o.createdAt)}</td>
+                                                                <td className="p-3 border border-stone-300">
+                                                                    <div className="font-mono font-black text-stone-900">{o.queueNo}</div>
+                                                                    <div className="text-[10px] text-stone-500 font-bold">{shopName}</div>
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-bold text-stone-800">
+                                                                    {o.customerName || 'Guest'} ({o.customerPhone || 'N/A'})
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-bold text-stone-800">{o.assignedDriverName || 'Unassigned'}</td>
+                                                                <td className="p-3 border border-stone-300 text-center">
+                                                                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase border ${DELIVERY_STATUS_BADGES[o.effectiveDeliveryStatus] || 'bg-stone-100'}`}>
+                                                                        {o.effectiveDeliveryStatus}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{o._fin.totalBill.toLocaleString()} ៛</td>
+                                                                <td className="p-3 border border-stone-300 text-center">
+                                                                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                                                        isReconciled
+                                                                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                                                            : o.paymentStatus === 'Paid'
+                                                                                ? 'bg-sky-100 text-sky-800 border border-sky-200'
+                                                                                : 'bg-amber-100 text-amber-900 border border-amber-200'
+                                                                    }`}>
+                                                                        {isReconciled
+                                                                            ? `Reconciled by ${o.codHandoverReconciledBy || 'Staff'}`
+                                                                            : o.paymentStatus === 'Paid'
+                                                                                ? 'Cash Collected (Awaiting Handover)'
+                                                                                : 'Unpaid COD (With Driver)'}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-right">
+                                                                    {!isReconciled ? (
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={async () => {
+                                                                                const { doc, updateDoc } = window.FirebaseApp;
+                                                                                const openShift = (shifts || []).find(s => s.shopId === o.shopId && s.status === 'Open');
+                                                                                const updates = {
+                                                                                    codHandoverReconciledAt: Date.now(),
+                                                                                    codHandoverReconciledBy: currentAdminRecord?.name || 'Cashier',
+                                                                                    paymentStatus: 'Paid',
+                                                                                    paymentMethod: 'Cash'
+                                                                                };
+                                                                                if (openShift && !o.shiftId) updates.shiftId = openShift.id;
+                                                                                await updateDoc(doc(safeDB(), 'orders', o.id), updates);
+                                                                                showToast(`Reconciled COD cash (${o._fin.totalBill.toLocaleString()} ៛) for ${o.queueNo}!`, 'success');
+                                                                            }}
+                                                                            className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[11px] shadow-sm transition active:scale-95"
+                                                                        >
+                                                                            Confirm Cash Handover
+                                                                        </button>
+                                                                    ) : (
+                                                                        <span className="text-[10px] font-mono text-stone-400">{formatSolarisDateTime(o.codHandoverReconciledAt)}</span>
+                                                                    )}
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
+                                                    {codCandidateOrders.length === 0 && (
+                                                        <tr>
+                                                            <td colSpan="8" className="p-8 text-center text-stone-400 font-bold">
+                                                                No Cash on Delivery (COD) orders found for this filter window.
                                                             </td>
                                                         </tr>
-                                                    );
-                                                })}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                )}
+                                                    )}
+                                                </tbody>
+                                                {codCandidateOrders.length > 0 && (
+                                                    <tfoot className="bg-stone-900 text-white font-black text-xs">
+                                                        <tr>
+                                                            <td colSpan="5" className="p-3 border border-stone-700 text-right uppercase">Total COD Cash Volume:</td>
+                                                            <td className="p-3 border border-stone-700 text-right text-amber-300">{totalCodAmount.toLocaleString()} ៛</td>
+                                                            <td colSpan="2" className="p-3 border border-stone-700 text-left text-[11px]">
+                                                                <span className="text-emerald-400">Reconciled: {reconciledTotal.toLocaleString()} ៛</span>
+                                                                <span className="mx-2 text-stone-500">•</span>
+                                                                <span className="text-red-300">Pending: {pendingHandoverTotal.toLocaleString()} ៛</span>
+                                                            </td>
+                                                        </tr>
+                                                    </tfoot>
+                                                )}
+                                            </table>
+                                        </div>
+                                    );
+                                })()}
 
                                 {reportSubView === 'ledger' && (
-                                <div className="overflow-x-auto p-4">
-                                    <table className="w-full min-w-[1050px] text-left text-xs border-collapse border border-stone-300">
+                                <div className="overflow-x-auto p-4 table-wrapper">
+                                    <table className="w-full min-w-[1100px] text-left text-xs border-collapse border border-stone-300">
                                         <thead>
                                             <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
                                                 <th className="p-3 border border-stone-300">Date & Time</th>
@@ -36531,12 +37547,19 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {deliveryOrders.map(o => {
+                                            {reportOrders.map(o => {
                                                 const shopName = shops.find(s => s.id === o.shopId)?.name || 'Branch';
-                                                const prodSub = Number(o.itemsSubTotal ?? Math.max(0, (o.totalAmount || 0) - (o.deliveryFee || 0)));
+                                                const fin = o._fin || computeOrderFinancials(o);
                                                 return (
-                                                    <tr key={o.id} className="hover:bg-stone-50 bg-white">
-                                                        <td className="p-3 border border-stone-300 font-mono whitespace-nowrap">{formatSolarisDateTime(o.createdAt)}</td>
+                                                    <tr key={o.id} className={`hover:bg-stone-50 ${fin.isCancelledOrFailed ? 'bg-red-50/30 text-stone-400' : 'bg-white'}`}>
+                                                        <td className="p-3 border border-stone-300 font-mono whitespace-nowrap">
+                                                            <div>{formatSolarisDateTime(o.createdAt)}</div>
+                                                            {o.deliveryCompletedAt && (
+                                                                <div className="text-[10px] text-emerald-600 font-bold mt-0.5">
+                                                                    Done: {formatSolarisDateTime(o.deliveryCompletedAt)}
+                                                                </div>
+                                                            )}
+                                                        </td>
                                                         <td className="p-3 border border-stone-300">
                                                             <div className="font-black text-stone-900 font-mono">{o.queueNo}</div>
                                                             <div className="text-[10px] text-stone-500 font-bold">{shopName}</div>
@@ -36544,14 +37567,33 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         <td className="p-3 border border-stone-300 max-w-[240px]">
                                                             <div className="font-bold text-stone-800">{o.customerName || 'Guest'} ({o.customerPhone || 'N/A'})</div>
                                                             <div className="text-[10px] text-stone-500 truncate">{o.deliveryAddress || 'GPS Pin'}</div>
+                                                            {o.customerDistance !== undefined && o.customerDistance !== null && (
+                                                                <div className="text-[10px] font-mono text-emerald-700 mt-0.5">
+                                                                    {o.customerDistance >= 1000 ? `${(o.customerDistance / 1000).toFixed(2)} km` : `${Math.round(o.customerDistance)} m`}
+                                                                </div>
+                                                            )}
                                                         </td>
-                                                        <td className="p-3 border border-stone-300 font-bold text-stone-700">{o.assignedDriverName || 'Unassigned'}</td>
-                                                        <td className="p-3 border border-stone-300 text-right font-bold">{prodSub.toLocaleString()} ៛</td>
-                                                        <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{(o.deliveryFee || 0).toLocaleString()} ៛</td>
-                                                        <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{(o.totalAmount || 0).toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-300 font-bold text-stone-700">
+                                                            {o.assignedDriverName || <span className="text-amber-600 italic">Unassigned</span>}
+                                                        </td>
+                                                        <td className={`p-3 border border-stone-300 text-right font-bold ${fin.isCancelledOrFailed ? 'line-through text-stone-400' : 'text-stone-800'}`}>
+                                                            {fin.prodSub.toLocaleString()} ៛
+                                                        </td>
+                                                        <td className={`p-3 border border-stone-300 text-right font-black ${fin.isCancelledOrFailed ? 'line-through text-stone-400' : 'text-emerald-700'}`}>
+                                                            +{fin.deliveryFee.toLocaleString()} ៛
+                                                        </td>
+                                                        <td className={`p-3 border border-stone-300 text-right font-black ${fin.isCancelledOrFailed ? 'line-through text-stone-400' : 'text-amber-700'}`}>
+                                                            {fin.totalBill.toLocaleString()} ៛
+                                                        </td>
                                                         <td className="p-3 border border-stone-300 text-center">
-                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${o.paymentStatus === 'Paid' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-700'}`}>
-                                                                {o.paymentStatus} ({o.paymentMethod || 'N/A'})
+                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
+                                                                fin.isCancelledOrFailed
+                                                                    ? 'bg-stone-100 text-stone-500'
+                                                                    : o.paymentStatus === 'Paid'
+                                                                        ? 'bg-emerald-100 text-emerald-800'
+                                                                        : 'bg-red-100 text-red-700'
+                                                            }`}>
+                                                                {o.paymentStatus || 'Unpaid'} ({o.paymentMethod || 'N/A'})
                                                             </span>
                                                         </td>
                                                         <td className="p-3 border border-stone-300 text-center">
@@ -36567,7 +37609,37 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                     </tr>
                                                 );
                                             })}
+                                            {reportOrders.length === 0 && (
+                                                <tr>
+                                                    <td colSpan="9" className="p-10 text-center text-stone-400 font-bold">
+                                                        No delivery orders found for the selected filter criteria.
+                                                    </td>
+                                                </tr>
+                                            )}
                                         </tbody>
+                                        {reportOrders.length > 0 && (
+                                            <tfoot className="bg-stone-900 text-white font-black text-xs">
+                                                <tr>
+                                                    <td colSpan="4" className="p-3 border border-stone-700 text-right uppercase">
+                                                        Valid Totals (Excludes {reportFinancialSummary.failedCancelledCount} Cancelled/Failed):
+                                                    </td>
+                                                    <td className="p-3 border border-stone-700 text-right">
+                                                        {reportFinancialSummary.grossProductSales.toLocaleString()} ៛
+                                                    </td>
+                                                    <td className="p-3 border border-stone-700 text-right text-emerald-400">
+                                                        +{reportFinancialSummary.totalDeliveryFees.toLocaleString()} ៛
+                                                    </td>
+                                                    <td className="p-3 border border-stone-700 text-right text-amber-300">
+                                                        {reportFinancialSummary.totalValidBillVolume.toLocaleString()} ៛
+                                                    </td>
+                                                    <td colSpan="2" className="p-3 border border-stone-700 text-left text-[11px]">
+                                                        <span className="text-emerald-400">Paid: {reportFinancialSummary.totalPaidCollected.toLocaleString()} ៛</span>
+                                                        <span className="mx-2 text-stone-500">•</span>
+                                                        <span className="text-red-300">Unpaid COD: {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛</span>
+                                                    </td>
+                                                </tr>
+                                            </tfoot>
+                                        )}
                                     </table>
                                 </div>
                                 )}
@@ -36693,23 +37765,101 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         />
                                     </div>
 
-                                    {podModalOrder.paymentStatus !== 'Paid' && (
-                                        <label className="flex items-center justify-between p-3.5 rounded-2xl bg-amber-50 border border-amber-300 mb-5 cursor-pointer">
+                                    {podModalOrder.paymentStatus === 'Paid' ? (
+                                        <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 mb-5 flex items-center justify-between">
                                             <div>
-                                                <div className="text-xs font-black text-amber-950">
-                                                    💵 Collected Cash at Door ({(podModalOrder.totalAmount || 0).toLocaleString()} ៛)
+                                                <div className="text-xs font-black flex items-center gap-1.5 text-emerald-700">
+                                                    <i className="fa-solid fa-circle-check"></i>
+                                                    <span>Bill Paid ({podModalOrder.paymentMethod || 'Prepaid'})</span>
                                                 </div>
-                                                <div className="text-[10px] text-amber-800 font-medium">
-                                                    Automatically marks order Paid (Cash) & links to active branch shift
-                                                </div>
+                                                {podModalOrder.abaVerified && (
+                                                    <div className="text-[10px] font-mono text-emerald-800 mt-0.5">
+                                                        APV: {podModalOrder.abaApv || 'VERIFIED'}
+                                                    </div>
+                                                )}
                                             </div>
-                                            <input
-                                                type="checkbox"
-                                                className="w-5 h-5 accent-emerald-600 rounded"
-                                                checked={podCollectCash}
-                                                onChange={e => setPodCollectCash(e.target.checked)}
-                                            />
-                                        </label>
+                                            <span className="text-sm font-black text-emerald-700">
+                                                {(podModalOrder.totalAmount || 0).toLocaleString()} ៛
+                                            </span>
+                                        </div>
+                                    ) : (
+                                        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 mb-5 space-y-3">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[11px] font-black uppercase text-amber-900">
+                                                    Doorstep Payment Option ({(podModalOrder.totalAmount || 0).toLocaleString()} ៛)
+                                                </span>
+                                                <span className="text-[10px] font-bold bg-amber-200 text-amber-950 px-2 py-0.5 rounded-full">
+                                                    Unpaid Bill
+                                                </span>
+                                            </div>
+
+                                            <div className="grid grid-cols-2 gap-1.5 bg-white p-1 rounded-xl border border-amber-200">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setPodPaymentOption('CASH');
+                                                        setPodCollectCash(true);
+                                                    }}
+                                                    className={`py-2 px-2 rounded-lg font-black text-xs transition flex items-center justify-center gap-1.5 ${
+                                                        podPaymentOption === 'CASH'
+                                                            ? 'bg-amber-500 text-stone-950 shadow-sm'
+                                                            : 'text-stone-600 hover:text-stone-900'
+                                                    }`}
+                                                >
+                                                    <i className="fa-solid fa-money-bill-wave"></i>
+                                                    <span>Cash at Door</span>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setPodPaymentOption('KHQR');
+                                                        setPodCollectCash(false);
+                                                        setDriverKhqrModalOrder(podModalOrder);
+                                                    }}
+                                                    className={`py-2 px-2 rounded-lg font-black text-xs transition flex items-center justify-center gap-1.5 ${
+                                                        podPaymentOption === 'KHQR'
+                                                            ? 'bg-[#E1232E] text-white shadow-sm'
+                                                            : 'text-stone-600 hover:text-[#E1232E]'
+                                                    }`}
+                                                >
+                                                    <i className="fa-solid fa-qrcode"></i>
+                                                    <span>Bank KHQR</span>
+                                                </button>
+                                            </div>
+
+                                            {podPaymentOption === 'CASH' ? (
+                                                <label className="flex items-center justify-between pt-1 cursor-pointer">
+                                                    <div>
+                                                        <div className="text-xs font-black text-amber-950">
+                                                            💵 Collected Cash at Door ({(podModalOrder.totalAmount || 0).toLocaleString()} ៛)
+                                                        </div>
+                                                        <div className="text-[10px] text-amber-800 font-medium">
+                                                            Marks order Paid (Cash) & links to active branch shift
+                                                        </div>
+                                                    </div>
+                                                    <input
+                                                        type="checkbox"
+                                                        className="w-5 h-5 accent-emerald-600 rounded"
+                                                        checked={podCollectCash}
+                                                        onChange={e => setPodCollectCash(e.target.checked)}
+                                                    />
+                                                </label>
+                                            ) : (
+                                                <div className="flex items-center justify-between gap-2 bg-white p-2.5 rounded-xl border border-red-200">
+                                                    <div className="text-[11px] font-bold text-stone-700 leading-tight">
+                                                        Let customer scan <b className="text-[#E1232E]">KHR QR Code</b> to pay <b className="text-stone-900">{(podModalOrder.totalAmount || 0).toLocaleString()} ៛</b>:
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setDriverKhqrModalOrder(podModalOrder)}
+                                                        className="px-3 py-1.5 rounded-lg bg-[#E1232E] hover:bg-red-700 text-white font-black text-[11px] shrink-0 shadow-sm flex items-center gap-1"
+                                                    >
+                                                        <i className="fa-solid fa-qrcode"></i>
+                                                        <span>Open KHQR</span>
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
                                     )}
 
                                     <div className="flex gap-2">
@@ -36769,6 +37919,32 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 </form>
                             </div>
                         )}
+
+                        {/* =====================================================================
+                            MODAL C: 06 DRIVER APP DOORSTEP ABA KHQR SCANNER MODAL
+                            ===================================================================== */}
+                        {driverKhqrModalOrder && (
+                            <KHQRPaymentModal
+                                shop={shops.find(s => s.id === driverKhqrModalOrder.shopId) || shops[0]}
+                                cartTotal={Number(driverKhqrModalOrder.totalAmount || 0)}
+                                previewInvoiceNo={driverKhqrModalOrder.queueNo}
+                                isSubmitting={isSettlingDriverPayment}
+                                lang="en"
+                                liveOrders={orders}
+                                confirmBtnText="Confirm Bank Paid at Door"
+                                cancelBtnText="Back to Driver Console"
+                                onClose={() => !isSettlingDriverPayment && setDriverKhqrModalOrder(null)}
+                                onConfirmPaid={(apvRef, verifiedAba = null) =>
+                                    handleDriverCollectPaymentAtDoor(driverKhqrModalOrder, 'Bank', apvRef, verifiedAba)
+                                }
+                            />
+                        )}
+
+                        {/* Celebratory "Thank You!" Moment Modal when Customer Pays Driver via KHQR */}
+                        <ThankYouPaymentModal
+                            data={driverThankYouData}
+                            onClose={() => setDriverThankYouData(null)}
+                        />
                     </div>
                 );
             }
