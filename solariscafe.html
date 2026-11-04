@@ -35194,7 +35194,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [podPaymentOption, setPodPaymentOption] = useState('CASH'); // 'CASH' | 'KHQR'
                 const [isSubmittingPod, setIsSubmittingPod] = useState(false);
                 const [expandedHistoryOrderId, setExpandedHistoryOrderId] = useState(null);
-                const [reportSubView, setReportSubView] = useState('ledger'); // 'ledger' | 'by_shop' | 'by_driver' | 'cod_reconcile'
+                const [reportSubView, setReportSubView] = useState('ledger'); // 'ledger' | 'by_shop' | 'by_driver' | 'cod_reconcile' | 'bank_audit'
+                const [isBatchReconcilingCod, setIsBatchReconcilingCod] = useState(false);
 
                 // 06 Driver App Doorstep Payment States (Cash at Door vs. Scan ABA KHQR)
                 const [driverKhqrModalOrder, setDriverKhqrModalOrder] = useState(null);
@@ -35313,6 +35314,100 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     return 'Pending';
                 };
 
+                // Helper to safely compute Product Sub-Total, Delivery Fee, Total Bill, and Explicit Bank Transfer vs. COD Clarification
+                const computeOrderFinancials = React.useCallback((o) => {
+                    const rawTotal = Math.max(0, Number(o?.totalAmount) || 0);
+                    const rawFee = Math.max(0, Number(o?.deliveryFee) || 0);
+                    let prodSub = (o?.itemsSubTotal !== undefined && o?.itemsSubTotal !== null && !isNaN(Number(o.itemsSubTotal)))
+                        ? Math.max(0, Number(o.itemsSubTotal))
+                        : Math.max(0, rawTotal - rawFee);
+
+                    // Fallback to item-level sum if both totalAmount and itemsSubTotal were missing
+                    if (prodSub === 0 && rawTotal === 0 && Array.isArray(o?.items) && o.items.length > 0) {
+                        prodSub = o.items.reduce((sum, it) => {
+                            const line = it.lineTotal !== undefined ? Number(it.lineTotal) : (Number(it.price || 0) * Number(it.paidQuantity ?? it.quantity ?? 1));
+                            return sum + (isNaN(line) ? 0 : Math.max(0, line));
+                        }, 0);
+                    }
+
+                    const effectiveTotal = rawTotal > 0 ? rawTotal : (prodSub + rawFee);
+                    const effStatus = o?.effectiveDeliveryStatus || getEffectiveDeliveryStatus(o);
+                    const isCancelledOrFailed = ['Cancelled', 'Failed', 'Returned'].includes(effStatus) || o?.status === 'Cancelled';
+                    const isPaid = !isCancelledOrFailed && o?.paymentStatus === 'Paid';
+                    const isDelivered = effStatus === 'Delivered' || o?.status === 'Served';
+
+                    // Explicit Payment Channel & COD Clarification Logic
+                    const isBankMethod = o?.paymentMethod === 'Bank' || o?.paymentMethod === 'KHQR (ABA)' || !!o?.abaVerified || !!o?.proofOfDelivery?.paidViaBank;
+                    const isPaidBankTransfer = isPaid && isBankMethod;
+                    const isPaidCodCash = isPaid && !isBankMethod;
+                    const isCodReconciled = isPaidCodCash && !!o?.codHandoverReconciledAt;
+                    const isCodWithDriver = isPaidCodCash && !o?.codHandoverReconciledAt;
+                    const isUnpaidCod = !isCancelledOrFailed && !isPaid;
+
+                    let paymentClarificationCode = 'CANCELLED';
+                    let paymentClarificationLabel = 'Cancelled / Void';
+                    let paymentChannelShort = 'Void';
+
+                    if (!isCancelledOrFailed) {
+                        if (isPaidBankTransfer) {
+                            paymentClarificationCode = 'BANK_KHQR_PAID';
+                            paymentClarificationLabel = o?.abaVerified
+                                ? `Bank Transfer (ABA KHQR • APV: ${o.abaApv || 'OK'})`
+                                : 'Bank Transfer (ABA KHQR)';
+                            paymentChannelShort = 'Bank Transfer (KHQR)';
+                        } else if (isCodReconciled) {
+                            paymentClarificationCode = 'COD_CASH_RECONCILED';
+                            paymentClarificationLabel = `COD Cash (Reconciled to Drawer by ${o?.codHandoverReconciledBy || 'Staff'})`;
+                            paymentChannelShort = 'COD Cash (In Drawer)';
+                        } else if (isCodWithDriver) {
+                            paymentClarificationCode = 'COD_CASH_WITH_DRIVER';
+                            paymentClarificationLabel = 'COD Cash (Collected • With Driver)';
+                            paymentChannelShort = 'COD Cash (With Driver)';
+                        } else {
+                            paymentClarificationCode = 'COD_UNPAID_IN_FLIGHT';
+                            paymentClarificationLabel = o?.paymentMethod === 'KHQR (ABA)'
+                                ? 'Unpaid (Pending KHQR / Collect at Door)'
+                                : 'Unpaid COD (Collect at Door)';
+                            paymentChannelShort = 'Unpaid COD (To Collect)';
+                        }
+                    }
+
+                    return {
+                        prodSub,
+                        deliveryFee: rawFee,
+                        totalBill: effectiveTotal,
+                        isCancelledOrFailed,
+                        isPaid,
+                        isDelivered,
+                        isPaidBankTransfer,
+                        isPaidCodCash,
+                        isCodReconciled,
+                        isCodWithDriver,
+                        isUnpaidCod,
+                        paymentClarificationCode,
+                        paymentClarificationLabel,
+                        paymentChannelShort,
+                        paidAmount: isPaid ? effectiveTotal : 0,
+                        paidBankAmount: isPaidBankTransfer ? effectiveTotal : 0,
+                        paidCodCashAmount: isPaidCodCash ? effectiveTotal : 0,
+                        codReconciledAmount: isCodReconciled ? effectiveTotal : 0,
+                        codWithDriverAmount: isCodWithDriver ? effectiveTotal : 0,
+                        unpaidCodAmount: isUnpaidCod ? effectiveTotal : 0
+                    };
+                }, []);
+
+                const matchesDeliveryPaymentFilter = React.useCallback((order, fin, filterVal) => {
+                    if (!filterVal || filterVal === 'All') return true;
+                    const f = fin || computeOrderFinancials(order);
+                    if (filterVal === 'Paid') return f.isPaid;
+                    if (filterVal === 'Unpaid') return f.isUnpaidCod;
+                    if (filterVal === 'BANK_KHQR') return f.isPaidBankTransfer;
+                    if (filterVal === 'COD_CASH_ALL') return f.isPaidCodCash;
+                    if (filterVal === 'COD_WITH_DRIVER') return f.isCodWithDriver;
+                    if (filterVal === 'COD_RECONCILED') return f.isCodReconciled;
+                    return true;
+                }, [computeOrderFinancials]);
+
                 // Filter all Delivery orders (`orderType === 'DELIVERY'`)
                 const deliveryOrders = useMemo(() => {
                     const now = new Date();
@@ -35321,16 +35416,20 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                     return orders
                         .filter(o => o.orderType === 'DELIVERY')
-                        .map(o => ({
-                            ...o,
-                            effectiveDeliveryStatus: getEffectiveDeliveryStatus(o)
-                        }))
+                        .map(o => {
+                            const effectiveDeliveryStatus = getEffectiveDeliveryStatus(o);
+                            const _fin = computeOrderFinancials({ ...o, effectiveDeliveryStatus });
+                            return {
+                                ...o,
+                                effectiveDeliveryStatus,
+                                _fin
+                            };
+                        })
                         .filter(o => {
                             if (filterShop !== 'All' && o.shopId !== filterShop) return false;
                             if (filterDriverId !== 'All' && o.assignedDriverId !== filterDriverId) return false;
 
-                            if (filterPayment === 'Paid' && o.paymentStatus !== 'Paid') return false;
-                            if (filterPayment === 'Unpaid' && o.paymentStatus === 'Paid') return false;
+                            if (!matchesDeliveryPaymentFilter(o, o._fin, filterPayment)) return false;
 
                             if (dateRangeFilter === 'today' && o.createdAt < startOfToday) {
                                 return false;
@@ -35354,45 +35453,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 const pMatch = String(o.customerPhone || '').toLowerCase().includes(searchLower);
                                 const aMatch = String(o.deliveryAddress || '').toLowerCase().includes(searchLower);
                                 const dMatch = String(o.assignedDriverName || '').toLowerCase().includes(searchLower);
-                                return qMatch || cMatch || pMatch || aMatch || dMatch;
+                                const apvMatch = String(o.abaApv || '').toLowerCase().includes(searchLower);
+                                const trxMatch = String(o.abaTrxId || '').toLowerCase().includes(searchLower);
+                                return qMatch || cMatch || pMatch || aMatch || dMatch || apvMatch || trxMatch;
                             }
                             return true;
                         })
                         .sort((a, b) => b.createdAt - a.createdAt);
-                }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery]);
-
-                // Helper to safely compute Product Sub-Total, Delivery Fee, and Total Bill for any Delivery Order
-                const computeOrderFinancials = React.useCallback((o) => {
-                    const rawTotal = Math.max(0, Number(o?.totalAmount) || 0);
-                    const rawFee = Math.max(0, Number(o?.deliveryFee) || 0);
-                    let prodSub = (o?.itemsSubTotal !== undefined && o?.itemsSubTotal !== null && !isNaN(Number(o.itemsSubTotal)))
-                        ? Math.max(0, Number(o.itemsSubTotal))
-                        : Math.max(0, rawTotal - rawFee);
-
-                    // Fallback to item-level sum if both totalAmount and itemsSubTotal were missing
-                    if (prodSub === 0 && rawTotal === 0 && Array.isArray(o?.items) && o.items.length > 0) {
-                        prodSub = o.items.reduce((sum, it) => {
-                            const line = it.lineTotal !== undefined ? Number(it.lineTotal) : (Number(it.price || 0) * Number(it.paidQuantity ?? it.quantity ?? 1));
-                            return sum + (isNaN(line) ? 0 : Math.max(0, line));
-                        }, 0);
-                    }
-
-                    const effectiveTotal = rawTotal > 0 ? rawTotal : (prodSub + rawFee);
-                    const isCancelledOrFailed = ['Cancelled', 'Failed', 'Returned'].includes(o?.effectiveDeliveryStatus || getEffectiveDeliveryStatus(o)) || o?.status === 'Cancelled';
-                    const isPaid = !isCancelledOrFailed && o?.paymentStatus === 'Paid';
-                    const isDelivered = (o?.effectiveDeliveryStatus || getEffectiveDeliveryStatus(o)) === 'Delivered' || o?.status === 'Served';
-
-                    return {
-                        prodSub,
-                        deliveryFee: rawFee,
-                        totalBill: effectiveTotal,
-                        isCancelledOrFailed,
-                        isPaid,
-                        isDelivered,
-                        paidAmount: isPaid ? effectiveTotal : 0,
-                        unpaidCodAmount: (!isCancelledOrFailed && !isPaid) ? effectiveTotal : 0
-                    };
-                }, []);
+                }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery, computeOrderFinancials, matchesDeliveryPaymentFilter]);
 
                 // Dedicated dataset for 07 Reports & Finance:
                 // Never locks out 'Delivered', 'Failed', or 'Cancelled' orders when filterStatus is 'ACTIVE' or 'UNASSIGNED'
@@ -35416,8 +35484,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             if (filterShop !== 'All' && o.shopId !== filterShop) return false;
                             if (filterDriverId !== 'All' && o.assignedDriverId !== filterDriverId) return false;
 
-                            if (filterPayment === 'Paid' && o.paymentStatus !== 'Paid') return false;
-                            if (filterPayment === 'Unpaid' && o.paymentStatus === 'Paid') return false;
+                            if (!matchesDeliveryPaymentFilter(o, o._fin, filterPayment)) return false;
 
                             if (dateRangeFilter === 'today' && o.createdAt < startOfToday) {
                                 return false;
@@ -35442,14 +35509,17 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 const pMatch = String(o.customerPhone || '').toLowerCase().includes(searchLower);
                                 const aMatch = String(o.deliveryAddress || '').toLowerCase().includes(searchLower);
                                 const dMatch = String(o.assignedDriverName || '').toLowerCase().includes(searchLower);
-                                return qMatch || cMatch || pMatch || aMatch || dMatch;
+                                const apvMatch = String(o.abaApv || '').toLowerCase().includes(searchLower);
+                                const trxMatch = String(o.abaTrxId || '').toLowerCase().includes(searchLower);
+                                const payerMatch = String(o.abaPayer || '').toLowerCase().includes(searchLower);
+                                return qMatch || cMatch || pMatch || aMatch || dMatch || apvMatch || trxMatch || payerMatch;
                             }
                             return true;
                         })
                         .sort((a, b) => b.createdAt - a.createdAt);
-                }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery, computeOrderFinancials]);
+                }, [orders, filterShop, filterDriverId, filterPayment, dateRangeFilter, filterStatus, searchQuery, computeOrderFinancials, matchesDeliveryPaymentFilter]);
 
-                // Pre-aggregated Financial & Performance Summary for 07 Reports & Finance
+                // Pre-aggregated Financial & Performance Summary for 07 Reports & Finance (Bank Transfer vs. COD Clarified)
                 const reportFinancialSummary = useMemo(() => {
                     let totalOrders = reportOrders.length;
                     let deliveredCount = 0;
@@ -35459,9 +35529,26 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     let totalDeliveryFees = 0;
                     let totalValidBillVolume = 0;
                     let totalPaidCollected = 0;
-                    let paidCashAmount = 0;
+
+                    // Explicit Bank Transfer vs. COD Breakdown Accumulators
                     let paidBankAmount = 0;
+                    let paidBankProductSub = 0;
+                    let paidBankDeliveryFees = 0;
+                    let paidBankCount = 0;
+
+                    let paidCashAmount = 0; // Total COD Cash Collected
+                    let paidCodProductSub = 0;
+                    let paidCodDeliveryFees = 0;
+                    let paidCodCount = 0;
+
+                    let codReconciledAmount = 0;
+                    let codReconciledCount = 0;
+                    let codWithDriverAmount = 0;
+                    let codWithDriverCount = 0;
+
                     let pendingCodAmount = 0;
+                    let pendingCodCount = 0;
+
                     let totalDurationMinutes = 0;
                     let durationSampleCount = 0;
 
@@ -35490,15 +35577,29 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         totalDeliveryFees += fin.deliveryFee;
                         totalValidBillVolume += fin.totalBill;
 
-                        if (fin.isPaid) {
+                        if (fin.isPaidBankTransfer) {
                             totalPaidCollected += fin.totalBill;
-                            if (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified) {
-                                paidBankAmount += fin.totalBill;
+                            paidBankAmount += fin.totalBill;
+                            paidBankProductSub += fin.prodSub;
+                            paidBankDeliveryFees += fin.deliveryFee;
+                            paidBankCount++;
+                        } else if (fin.isPaidCodCash) {
+                            totalPaidCollected += fin.totalBill;
+                            paidCashAmount += fin.totalBill;
+                            paidCodProductSub += fin.prodSub;
+                            paidCodDeliveryFees += fin.deliveryFee;
+                            paidCodCount++;
+
+                            if (fin.isCodReconciled) {
+                                codReconciledAmount += fin.totalBill;
+                                codReconciledCount++;
                             } else {
-                                paidCashAmount += fin.totalBill;
+                                codWithDriverAmount += fin.totalBill;
+                                codWithDriverCount++;
                             }
                         } else {
                             pendingCodAmount += fin.totalBill;
+                            pendingCodCount++;
                         }
                     });
 
@@ -35514,9 +35615,20 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         totalDeliveryFees,
                         totalValidBillVolume,
                         totalPaidCollected,
-                        paidCashAmount,
                         paidBankAmount,
+                        paidBankProductSub,
+                        paidBankDeliveryFees,
+                        paidBankCount,
+                        paidCashAmount,
+                        paidCodProductSub,
+                        paidCodDeliveryFees,
+                        paidCodCount,
+                        codReconciledAmount,
+                        codReconciledCount,
+                        codWithDriverAmount,
+                        codWithDriverCount,
                         pendingCodAmount,
+                        pendingCodCount,
                         avgDeliveryMins,
                         successRatePct
                     };
@@ -36382,10 +36494,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
-                // SOW 3.8: Export Delivery Reports to CSV
+                // SOW 3.8: Export Delivery Reports to CSV (Upgraded with Explicit Bank Transfer vs. COD Clarification Columns & Summary Footer)
                 const handleExportDeliveryCSV = () => {
                     const sourceList = activeSubTab === 'reports' ? reportOrders : deliveryOrders;
-                    const headers = "Date_Time,Invoice_No,Branch,Customer_Name,Phone,Delivery_Address,Distance_m,Product_SubTotal_KHR,Delivery_Fee_KHR,Order_Total_KHR,Payment_Status,Payment_Method,Assigned_Driver,Delivery_Status,Completed_At,Duration_Mins,POD_Method,COD_Reconciled\n";
+                    const headers = "Date_Time,Invoice_No,Branch,Customer_Name,Phone,Delivery_Address,Distance_m,Product_SubTotal_KHR,Delivery_Fee_KHR,Order_Total_KHR,Payment_Status,Payment_Channel_Clarified,Bank_Transfer_Paid_KHR,COD_Cash_Collected_KHR,COD_Reconciled_In_Drawer_KHR,COD_Held_By_Driver_KHR,Unpaid_COD_In_Flight_KHR,ABA_Payer,ABA_APV,ABA_Trx_ID,Assigned_Driver,Delivery_Status,Completed_At,Duration_Mins,POD_Method,COD_Reconciled,COD_Reconciled_By\n";
                     const rows = sourceList.map(o => {
                         const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
                         const fin = o._fin || computeOrderFinancials(o);
@@ -36395,14 +36507,66 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const durMins = (endTs > o.createdAt) ? Math.round((endTs - o.createdAt) / 60000) : '';
                         const podMeth = o.proofOfDelivery?.method || '';
                         const codRec = o.codHandoverReconciledAt ? 'Yes' : 'No';
-                        return `"${dt}","${o.queueNo || ''}","${shopName}","${(o.customerName || 'Walk-in').replace(/"/g, '""')}","${o.customerPhone || ''}","${(o.deliveryAddress || '').replace(/"/g, '""')}",${Math.round(o.customerDistance || 0)},${fin.prodSub},${fin.deliveryFee},${fin.totalBill},"${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.assignedDriverName || 'Unassigned'}","${o.effectiveDeliveryStatus}","${compDt}","${durMins}","${podMeth}","${codRec}"`;
+                        const codRecBy = o.codHandoverReconciledBy || '';
+                        return `"${dt}","${o.queueNo || ''}","${shopName}","${(o.customerName || 'Walk-in').replace(/"/g, '""')}","${o.customerPhone || ''}","${(o.deliveryAddress || '').replace(/"/g, '""')}",${Math.round(o.customerDistance || 0)},${fin.prodSub},${fin.deliveryFee},${fin.totalBill},"${o.paymentStatus || 'Unpaid'}","${(fin.paymentChannelShort || '').replace(/"/g, '""')}",${fin.paidBankAmount},${fin.paidCodCashAmount},${fin.codReconciledAmount},${fin.codWithDriverAmount},${fin.unpaidCodAmount},"${(o.abaPayer || '').replace(/"/g, '""')}","${o.abaApv || ''}","${o.abaTrxId || ''}","${o.assignedDriverName || 'Unassigned'}","${o.effectiveDeliveryStatus}","${compDt}","${durMins}","${podMeth}","${codRec}","${codRecBy}"`;
                     }).join("\n");
 
-                    const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
+                    const sumFooter = [
+                        "",
+                        `"DELIVERY FINANCIAL & PAYMENT CLARIFICATION SUMMARY (${getTodayString()})"`,
+                        `"Total Orders",${reportFinancialSummary.totalOrders}`,
+                        `"Delivered Orders",${reportFinancialSummary.deliveredCount}`,
+                        `"Net Product Sales (KHR)",${reportFinancialSummary.grossProductSales}`,
+                        `"Total Delivery Fees (KHR)",${reportFinancialSummary.totalDeliveryFees}`,
+                        `"Total Valid Bill Volume (KHR)",${reportFinancialSummary.totalValidBillVolume}`,
+                        `"Paid by Bank Transfer / ABA KHQR (KHR)",${reportFinancialSummary.paidBankAmount},"(${reportFinancialSummary.paidBankCount} orders)"`,
+                        `"Total COD Cash Collected (KHR)",${reportFinancialSummary.paidCashAmount},"(${reportFinancialSummary.paidCodCount} orders)"`,
+                        `"COD Cash Reconciled to Drawer (KHR)",${reportFinancialSummary.codReconciledAmount},"(${reportFinancialSummary.codReconciledCount} orders)"`,
+                        `"COD Cash Held by Driver - Pending Handover (KHR)",${reportFinancialSummary.codWithDriverAmount},"(${reportFinancialSummary.codWithDriverCount} orders)"`,
+                        `"Unpaid COD In-Flight - To Collect (KHR)",${reportFinancialSummary.pendingCodAmount},"(${reportFinancialSummary.pendingCodCount} orders)"`
+                    ].join("\n");
+
+                    const blob = new Blob([headers + rows + "\n" + sumFooter], { type: 'text/csv;charset=utf-8;' });
                     const link = document.createElement("a");
                     link.href = URL.createObjectURL(blob);
-                    link.download = `Solaris_Delivery_Report_${getTodayString()}.csv`;
+                    link.download = `Solaris_Delivery_Financial_Clarification_${getTodayString()}.csv`;
                     link.click();
+                };
+
+                // Batch Reconcile All Collected COD Cash Currently Held by Drivers
+                const handleBatchReconcileDriverCod = async (ordersToReconcile) => {
+                    if (!Array.isArray(ordersToReconcile) || ordersToReconcile.length === 0 || isBatchReconcilingCod) return;
+                    setIsBatchReconcilingCod(true);
+                    try {
+                        const { doc, writeBatch } = window.FirebaseApp;
+                        const database = safeDB();
+                        const nowTs = Date.now();
+                        const actorName = currentAdminRecord?.name || 'Cashier';
+
+                        for (let i = 0; i < ordersToReconcile.length; i += 400) {
+                            const chunk = ordersToReconcile.slice(i, i + 400);
+                            const batch = writeBatch(database);
+                            chunk.forEach(o => {
+                                const openShift = (shifts || []).find(s => s.shopId === o.shopId && s.status === 'Open');
+                                const updates = {
+                                    codHandoverReconciledAt: nowTs,
+                                    codHandoverReconciledBy: actorName,
+                                    paymentStatus: 'Paid',
+                                    paymentMethod: 'Cash'
+                                };
+                                if (openShift && !o.shiftId) updates.shiftId = openShift.id;
+                                batch.update(doc(database, 'orders', o.id), updates);
+                            });
+                            await batch.commit();
+                        }
+
+                        const totalAmt = ordersToReconcile.reduce((s, o) => s + (o._fin?.totalBill || Number(o.totalAmount || 0)), 0);
+                        showToast(`✅ Batch reconciled ${ordersToReconcile.length} COD order(s) (${totalAmt.toLocaleString()} ៛) to Cashier Drawer!`, 'success');
+                    } catch (err) {
+                        showToast('Batch COD reconciliation failed: ' + err.message, 'error');
+                    } finally {
+                        setIsBatchReconcilingCod(false);
+                    }
                 };
 
                 return (
@@ -36542,11 +36706,15 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             </div>
 
                             <div>
-                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Payment Status</label>
+                                <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1">Payment & COD Filter</label>
                                 <select className="w-full border border-stone-300 rounded-xl px-3 py-2 text-xs font-bold bg-stone-50 outline-none" value={filterPayment} onChange={e => setFilterPayment(e.target.value)}>
-                                    <option value="All">All Payments</option>
-                                    <option value="Paid">Paid (Prepaid / ABA / Cash)</option>
-                                    <option value="Unpaid">Unpaid (COD Collect)</option>
+                                    <option value="All">All Payment Channels</option>
+                                    <option value="BANK_KHQR">🏦 Bank Transfer / ABA KHQR (Paid)</option>
+                                    <option value="COD_CASH_ALL">💵 COD Cash — All Collected</option>
+                                    <option value="COD_WITH_DRIVER">🛵 COD Cash — With Driver (Pending Handover)</option>
+                                    <option value="COD_RECONCILED">✅ COD Cash — Reconciled in Drawer</option>
+                                    <option value="Unpaid">⏳ Unpaid COD (In-Flight / To Collect)</option>
+                                    <option value="Paid">All Paid (Bank + COD Cash)</option>
                                 </select>
                             </div>
 
@@ -37362,14 +37530,17 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             <div className="bg-white rounded-3xl border border-stone-200 shadow-sm overflow-hidden space-y-4">
                                 <div className="p-5 border-b border-stone-200 bg-stone-50 flex flex-wrap justify-between items-center gap-3">
                                     <div>
-                                        <div className="flex items-center gap-2">
+                                        <div className="flex items-center gap-2 flex-wrap">
                                             <h3 className="font-black text-lg text-stone-900">Delivery Financial & Performance Reports</h3>
                                             <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-stone-900 text-amber-400">
                                                 {reportFinancialSummary.totalOrders} Orders
                                             </span>
+                                            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-blue-100 text-blue-800 border border-blue-200">
+                                                🏦 Bank KHQR & 💵 COD Clarified
+                                            </span>
                                         </div>
                                         <p className="text-xs text-stone-500 mt-0.5">
-                                            Separates Product Sub-Total from Delivery Fee, tracks Paid vs. Pending COD, and reconciles Driver Cash Handover.
+                                            Separates Product Sub-Total from Delivery Fee, clarifies <b>Payment by Bank Transfer (ABA KHQR)</b> vs. <b>COD (Cash on Delivery)</b>, and tracks Driver Cash Handover.
                                         </p>
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2">
@@ -37379,12 +37550,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 <span>Showing All Completed & Active Deliveries for Window</span>
                                             </span>
                                         )}
-                                        <div className="flex bg-stone-200/70 p-1 rounded-xl border border-stone-300 text-xs font-black">
+                                        <div className="flex flex-wrap bg-stone-200/70 p-1 rounded-xl border border-stone-300 text-xs font-black gap-0.5">
                                             {[
                                                 { id: 'ledger', label: `Order Ledger (${reportOrders.length})` },
                                                 { id: 'by_shop', label: 'By Shop' },
                                                 { id: 'by_driver', label: 'By Driver' },
-                                                { id: 'cod_reconcile', label: 'COD Cash Handover' }
+                                                { id: 'bank_audit', label: `🏦 Bank Transfer (${reportFinancialSummary.paidBankCount})` },
+                                                { id: 'cod_reconcile', label: `💵 COD Clarify (${reportFinancialSummary.paidCodCount + reportFinancialSummary.pendingCodCount})` }
                                             ].map(vw => (
                                                 <button
                                                     key={vw.id}
@@ -37409,60 +37581,163 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     </div>
                                 </div>
 
-                                {/* Executive Financial Summary Strip for Selected Report Window */}
-                                <div className="px-5 pt-1 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-                                    <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200">
-                                        <div className="text-[10px] font-black uppercase text-stone-400">Net Product Sales</div>
-                                        <div className="text-base sm:text-lg font-black text-stone-900 mt-0.5">
-                                            {reportFinancialSummary.grossProductSales.toLocaleString()} ៛
+                                {/* Executive Financial & Payment Clarification Strip (8 Cards: Revenue + Bank Transfer vs. COD Breakdown) */}
+                                <div className="px-5 pt-1 space-y-3">
+                                    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-3">
+                                        {/* 1. Net Product Sales */}
+                                        <div className="bg-stone-50 p-3.5 rounded-2xl border border-stone-200">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase text-stone-400">1. Net Product Sales</span>
+                                                <i className="fa-solid fa-mug-hot text-stone-400 text-xs"></i>
+                                            </div>
+                                            <div className="text-lg sm:text-xl font-black text-stone-900 mt-1">
+                                                {reportFinancialSummary.grossProductSales.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-stone-500 mt-0.5">
+                                                Excludes delivery fees • {reportFinancialSummary.deliveredCount} delivered
+                                            </div>
                                         </div>
-                                        <div className="text-[10px] font-bold text-stone-500 mt-0.5">
-                                            Excludes delivery fees
+
+                                        {/* 2. Delivery Fee Revenue */}
+                                        <div className="bg-emerald-50/70 p-3.5 rounded-2xl border border-emerald-200">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase text-emerald-700">2. Delivery Fee Revenue</span>
+                                                <i className="fa-solid fa-motorcycle text-emerald-600 text-xs"></i>
+                                            </div>
+                                            <div className="text-lg sm:text-xl font-black text-emerald-700 mt-1">
+                                                +{reportFinancialSummary.totalDeliveryFees.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-emerald-800/80 mt-0.5">
+                                                🏦 Bank: {reportFinancialSummary.paidBankDeliveryFees.toLocaleString()} ៛ • 💵 COD: {reportFinancialSummary.paidCodDeliveryFees.toLocaleString()} ៛
+                                            </div>
+                                        </div>
+
+                                        {/* 3. Total Valid Bill Volume */}
+                                        <div className="bg-amber-50/70 p-3.5 rounded-2xl border border-amber-200">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase text-amber-800">3. Total Valid Bill Volume</span>
+                                                <i className="fa-solid fa-file-invoice-dollar text-amber-600 text-xs"></i>
+                                            </div>
+                                            <div className="text-lg sm:text-xl font-black text-amber-700 mt-1">
+                                                {reportFinancialSummary.totalValidBillVolume.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-amber-800/80 mt-0.5">
+                                                Paid: {reportFinancialSummary.totalPaidCollected.toLocaleString()} ៛ • Unpaid: {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛
+                                            </div>
+                                        </div>
+
+                                        {/* 4. Delivery Performance & Speed */}
+                                        <div className="bg-stone-50 p-3.5 rounded-2xl border border-stone-200">
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase text-stone-500">4. Success & Avg Speed</span>
+                                                <i className="fa-solid fa-gauge-high text-teal-600 text-xs"></i>
+                                            </div>
+                                            <div className="text-lg sm:text-xl font-black text-stone-900 mt-1">
+                                                {reportFinancialSummary.successRatePct}% <span className="text-xs font-bold text-stone-500">({reportFinancialSummary.avgDeliveryMins > 0 ? `${reportFinancialSummary.avgDeliveryMins}m avg` : 'N/A'})</span>
+                                            </div>
+                                            <div className="text-[10px] font-bold text-red-500 mt-0.5">
+                                                {reportFinancialSummary.failedCancelledCount} failed / cancelled
+                                            </div>
                                         </div>
                                     </div>
-                                    <div className="bg-emerald-50/70 p-3 rounded-2xl border border-emerald-200">
-                                        <div className="text-[10px] font-black uppercase text-emerald-700">Total Delivery Fees</div>
-                                        <div className="text-base sm:text-lg font-black text-emerald-700 mt-0.5">
-                                            +{reportFinancialSummary.totalDeliveryFees.toLocaleString()} ៛
+
+                                    {/* Row 2: Dedicated Payment by Bank Transfer (ABA KHQR) vs. COD Clarification Strip */}
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                                        {/* 5. Paid by Bank Transfer (ABA KHQR) */}
+                                        <div
+                                            onClick={() => setReportSubView('bank_audit')}
+                                            className="bg-gradient-to-br from-blue-600 to-indigo-700 text-white p-3.5 rounded-2xl shadow-sm cursor-pointer hover:brightness-105 transition"
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase tracking-wider text-blue-100">
+                                                    🏦 Paid by Bank Transfer (KHQR)
+                                                </span>
+                                                <span className="text-[10px] font-black bg-white/20 px-2 py-0.5 rounded-full">
+                                                    {reportFinancialSummary.paidBankCount} Orders
+                                                </span>
+                                            </div>
+                                            <div className="text-xl sm:text-2xl font-black mt-1">
+                                                {reportFinancialSummary.paidBankAmount.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-blue-100 mt-1 flex items-center justify-between">
+                                                <span>Items: {reportFinancialSummary.paidBankProductSub.toLocaleString()} ៛ • Fee: +{reportFinancialSummary.paidBankDeliveryFees.toLocaleString()} ៛</span>
+                                                <span className="underline">Audit →</span>
+                                            </div>
                                         </div>
-                                        <div className="text-[10px] font-bold text-emerald-800/80 mt-0.5">
-                                            {reportFinancialSummary.deliveredCount} delivered
+
+                                        {/* 6. Total COD Cash Collected (At Door) */}
+                                        <div
+                                            onClick={() => setReportSubView('cod_reconcile')}
+                                            className="bg-white p-3.5 rounded-2xl border-2 border-amber-300 shadow-sm cursor-pointer hover:bg-amber-50/30 transition"
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase tracking-wider text-amber-900">
+                                                    💵 Total COD Cash Collected
+                                                </span>
+                                                <span className="text-[10px] font-black bg-amber-100 text-amber-900 px-2 py-0.5 rounded-full border border-amber-200">
+                                                    {reportFinancialSummary.paidCodCount} Orders
+                                                </span>
+                                            </div>
+                                            <div className="text-xl sm:text-2xl font-black text-stone-900 mt-1">
+                                                {reportFinancialSummary.paidCashAmount.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-stone-500 mt-1 flex items-center justify-between">
+                                                <span>Items: {reportFinancialSummary.paidCodProductSub.toLocaleString()} ៛ • Fee: +{reportFinancialSummary.paidCodDeliveryFees.toLocaleString()} ៛</span>
+                                                <span className="text-amber-700 underline">Clarify →</span>
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div className="bg-amber-50/70 p-3 rounded-2xl border border-amber-200">
-                                        <div className="text-[10px] font-black uppercase text-amber-800">Total Bill Volume</div>
-                                        <div className="text-base sm:text-lg font-black text-amber-700 mt-0.5">
-                                            {reportFinancialSummary.totalValidBillVolume.toLocaleString()} ៛
+
+                                        {/* 7. COD Cash Clarification: In Drawer vs. Held by Driver */}
+                                        <div
+                                            onClick={() => setReportSubView('cod_reconcile')}
+                                            className="bg-emerald-50/80 p-3.5 rounded-2xl border border-emerald-300 shadow-sm cursor-pointer hover:bg-emerald-100/50 transition"
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase tracking-wider text-emerald-900">
+                                                    ✅ COD Reconciled vs. 🛵 With Driver
+                                                </span>
+                                                <i className="fa-solid fa-scale-balanced text-emerald-600 text-xs"></i>
+                                            </div>
+                                            <div className="flex items-baseline justify-between mt-1">
+                                                <div>
+                                                    <div className="text-[9px] font-bold uppercase text-emerald-700">In Shop Drawer ({reportFinancialSummary.codReconciledCount})</div>
+                                                    <div className="text-base sm:text-lg font-black text-emerald-700">
+                                                        {reportFinancialSummary.codReconciledAmount.toLocaleString()} ៛
+                                                    </div>
+                                                </div>
+                                                <div className="text-right">
+                                                    <div className="text-[9px] font-bold uppercase text-amber-800">Held by Driver ({reportFinancialSummary.codWithDriverCount})</div>
+                                                    <div className="text-base sm:text-lg font-black text-amber-700">
+                                                        {reportFinancialSummary.codWithDriverAmount.toLocaleString()} ៛
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div className="text-[10px] font-bold text-emerald-800 mt-1">
+                                                {reportFinancialSummary.codWithDriverCount > 0
+                                                    ? `⚠️ ${reportFinancialSummary.codWithDriverCount} order(s) awaiting driver cash handover`
+                                                    : 'All collected COD cash is reconciled in drawer'}
+                                            </div>
                                         </div>
-                                        <div className="text-[10px] font-bold text-amber-800/80 mt-0.5">
-                                            Products + Delivery Fees
-                                        </div>
-                                    </div>
-                                    <div className="bg-white p-3 rounded-2xl border border-emerald-300 shadow-sm">
-                                        <div className="text-[10px] font-black uppercase text-emerald-700">Paid & Collected</div>
-                                        <div className="text-base sm:text-lg font-black text-emerald-600 mt-0.5">
-                                            {reportFinancialSummary.totalPaidCollected.toLocaleString()} ៛
-                                        </div>
-                                        <div className="text-[10px] font-bold text-stone-500 mt-0.5 truncate">
-                                            💵 {reportFinancialSummary.paidCashAmount.toLocaleString()} • 🏦 {reportFinancialSummary.paidBankAmount.toLocaleString()}
-                                        </div>
-                                    </div>
-                                    <div className="bg-red-50/60 p-3 rounded-2xl border border-red-200">
-                                        <div className="text-[10px] font-black uppercase text-red-700">Unpaid / Pending COD</div>
-                                        <div className="text-base sm:text-lg font-black text-red-600 mt-0.5">
-                                            {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛
-                                        </div>
-                                        <div className="text-[10px] font-bold text-red-700/80 mt-0.5">
-                                            {reportFinancialSummary.activeInProgressCount} active in-flight
-                                        </div>
-                                    </div>
-                                    <div className="bg-stone-50 p-3 rounded-2xl border border-stone-200">
-                                        <div className="text-[10px] font-black uppercase text-stone-500">Success & Speed</div>
-                                        <div className="text-base sm:text-lg font-black text-stone-900 mt-0.5">
-                                            {reportFinancialSummary.successRatePct}% <span className="text-xs font-bold text-stone-500">({reportFinancialSummary.avgDeliveryMins > 0 ? `${reportFinancialSummary.avgDeliveryMins}m avg` : 'N/A'})</span>
-                                        </div>
-                                        <div className="text-[10px] font-bold text-red-500 mt-0.5">
-                                            {reportFinancialSummary.failedCancelledCount} failed / cancelled
+
+                                        {/* 8. Unpaid COD In-Flight (To Collect at Door) */}
+                                        <div
+                                            onClick={() => setReportSubView('cod_reconcile')}
+                                            className="bg-red-50/70 p-3.5 rounded-2xl border border-red-200 shadow-sm cursor-pointer hover:bg-red-100/50 transition"
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-[10px] font-black uppercase tracking-wider text-red-800">
+                                                    ⏳ Unpaid COD (To Collect at Door)
+                                                </span>
+                                                <span className="text-[10px] font-black bg-red-100 text-red-800 px-2 py-0.5 rounded-full border border-red-200">
+                                                    {reportFinancialSummary.pendingCodCount} Orders
+                                                </span>
+                                            </div>
+                                            <div className="text-xl sm:text-2xl font-black text-red-600 mt-1">
+                                                {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛
+                                            </div>
+                                            <div className="text-[10px] font-bold text-red-700/80 mt-1">
+                                                {reportFinancialSummary.activeInProgressCount} active delivery order(s) in-flight
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -37482,7 +37757,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         const prodRev = validOrders.reduce((s, o) => s + o._fin.prodSub, 0);
                                         const feeRev = validOrders.reduce((s, o) => s + o._fin.deliveryFee, 0);
                                         const totalBill = validOrders.reduce((s, o) => s + o._fin.totalBill, 0);
-                                        const paidRev = validOrders.reduce((s, o) => s + o._fin.paidAmount, 0);
+                                        const bankPaidRev = validOrders.reduce((s, o) => s + o._fin.paidBankAmount, 0);
+                                        const codCollectedRev = validOrders.reduce((s, o) => s + o._fin.paidCodCashAmount, 0);
+                                        const codReconciledRev = validOrders.reduce((s, o) => s + o._fin.codReconciledAmount, 0);
+                                        const codWithDriverRev = validOrders.reduce((s, o) => s + o._fin.codWithDriverAmount, 0);
                                         const unpaidRev = validOrders.reduce((s, o) => s + o._fin.unpaidCodAmount, 0);
 
                                         return {
@@ -37494,7 +37772,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             prodRev,
                                             feeRev,
                                             totalBill,
-                                            paidRev,
+                                            bankPaidRev,
+                                            codCollectedRev,
+                                            codReconciledRev,
+                                            codWithDriverRev,
                                             unpaidRev
                                         };
                                     });
@@ -37507,40 +37788,48 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         prodRev: acc.prodRev + r.prodRev,
                                         feeRev: acc.feeRev + r.feeRev,
                                         totalBill: acc.totalBill + r.totalBill,
-                                        paidRev: acc.paidRev + r.paidRev,
+                                        bankPaidRev: acc.bankPaidRev + r.bankPaidRev,
+                                        codCollectedRev: acc.codCollectedRev + r.codCollectedRev,
+                                        codReconciledRev: acc.codReconciledRev + r.codReconciledRev,
+                                        codWithDriverRev: acc.codWithDriverRev + r.codWithDriverRev,
                                         unpaidRev: acc.unpaidRev + r.unpaidRev
-                                    }), { totalCount: 0, deliveredCount: 0, activeCount: 0, failCount: 0, prodRev: 0, feeRev: 0, totalBill: 0, paidRev: 0, unpaidRev: 0 });
+                                    }), { totalCount: 0, deliveredCount: 0, activeCount: 0, failCount: 0, prodRev: 0, feeRev: 0, totalBill: 0, bankPaidRev: 0, codCollectedRev: 0, codReconciledRev: 0, codWithDriverRev: 0, unpaidRev: 0 });
 
                                     return (
                                         <div className="p-4 overflow-x-auto table-wrapper">
-                                            <table className="w-full min-w-[950px] text-left text-xs border-collapse border border-stone-300">
+                                            <table className="w-full min-w-[1150px] text-left text-xs border-collapse border border-stone-300">
                                                 <thead>
                                                     <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
                                                         <th className="p-3 border border-stone-300">Shop / Branch</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Total Orders</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Orders</th>
                                                         <th className="p-3 border border-stone-300 text-center">Delivered</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Active</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Failed / Cancel</th>
                                                         <th className="p-3 border border-stone-300 text-right">Product Sub-Total (៛)</th>
                                                         <th className="p-3 border border-stone-300 text-right">Delivery Fees (៛)</th>
                                                         <th className="p-3 border border-stone-300 text-right">Total Bill (៛)</th>
-                                                        <th className="p-3 border border-stone-300 text-right">Paid Collected (៛)</th>
-                                                        <th className="p-3 border border-stone-300 text-right">Pending COD (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-blue-50 text-blue-900">🏦 Bank Transfer / KHQR (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-amber-50 text-amber-900">💵 COD Cash Collected (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-emerald-50 text-emerald-900">✅ COD In Drawer (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-orange-50 text-orange-900">🛵 COD With Driver (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-red-50 text-red-900">⏳ Unpaid COD (៛)</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
                                                     {shopRows.map(r => (
                                                         <tr key={r.shop.id} className="hover:bg-stone-50 bg-white">
                                                             <td className="p-3 border border-stone-300 font-black text-stone-900">{r.shop.name}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold">{r.totalCount}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold">
+                                                                {r.totalCount}
+                                                                {r.failCount > 0 && <span className="text-[10px] text-red-500 ml-1">({r.failCount} void)</span>}
+                                                            </td>
                                                             <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{r.deliveredCount}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-amber-600">{r.activeCount}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{r.failCount}</td>
                                                             <td className="p-3 border border-stone-300 text-right font-bold text-stone-800">{r.prodRev.toLocaleString()} ៛</td>
                                                             <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{r.feeRev.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{r.totalBill.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-600 bg-emerald-50/40">{r.paidRev.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-red-600">{r.unpaidRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-stone-900">{r.totalBill.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-blue-700 bg-blue-50/30">{r.bankPaidRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-800 bg-amber-50/30">{r.codCollectedRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700 bg-emerald-50/30">{r.codReconciledRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-orange-700 bg-orange-50/30">{r.codWithDriverRev.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-red-600 bg-red-50/20">{r.unpaidRev.toLocaleString()} ៛</td>
                                                         </tr>
                                                     ))}
                                                 </tbody>
@@ -37549,12 +37838,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         <td className="p-3 border border-stone-700 uppercase">Grand Total</td>
                                                         <td className="p-3 border border-stone-700 text-center">{totals.totalCount}</td>
                                                         <td className="p-3 border border-stone-700 text-center text-emerald-400">{totals.deliveredCount}</td>
-                                                        <td className="p-3 border border-stone-700 text-center text-amber-300">{totals.activeCount}</td>
-                                                        <td className="p-3 border border-stone-700 text-center text-red-400">{totals.failCount}</td>
                                                         <td className="p-3 border border-stone-700 text-right">{totals.prodRev.toLocaleString()} ៛</td>
                                                         <td className="p-3 border border-stone-700 text-right text-emerald-400">+{totals.feeRev.toLocaleString()} ៛</td>
-                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.totalBill.toLocaleString()} ៛</td>
-                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">{totals.paidRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-white">{totals.totalBill.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-sky-300">{totals.bankPaidRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.codCollectedRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">{totals.codReconciledRev.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-orange-300">{totals.codWithDriverRev.toLocaleString()} ៛</td>
                                                         <td className="p-3 border border-stone-700 text-right text-red-300">{totals.unpaidRev.toLocaleString()} ៛</td>
                                                     </tr>
                                                 </tfoot>
@@ -37609,12 +37899,11 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                                         const feesGen = validOrders.reduce((s, o) => s + o._fin.deliveryFee, 0);
                                         const totalOrderValue = validOrders.reduce((s, o) => s + o._fin.totalBill, 0);
-                                        const codCashCollected = validOrders
-                                            .filter(o => o.proofOfDelivery?.collectedCash || (o.paymentStatus === 'Paid' && o.paymentMethod === 'Cash'))
-                                            .reduce((s, o) => s + o._fin.totalBill, 0);
-                                        const khqrBankCollected = validOrders
-                                            .filter(o => o.paymentStatus === 'Paid' && (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified))
-                                            .reduce((s, o) => s + o._fin.totalBill, 0);
+                                        const khqrBankCollected = validOrders.reduce((s, o) => s + o._fin.paidBankAmount, 0);
+                                        const codCashCollected = validOrders.reduce((s, o) => s + o._fin.paidCodCashAmount, 0);
+                                        const codReconciled = validOrders.reduce((s, o) => s + o._fin.codReconciledAmount, 0);
+                                        const codHeldByDriver = validOrders.reduce((s, o) => s + o._fin.codWithDriverAmount, 0);
+                                        const unpaidCodInFlight = validOrders.reduce((s, o) => s + o._fin.unpaidCodAmount, 0);
 
                                         const durations = comp
                                             .map(o => {
@@ -37634,8 +37923,11 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             failCount: fail.length,
                                             avgMin,
                                             feesGen,
-                                            codCashCollected,
                                             khqrBankCollected,
+                                            codCashCollected,
+                                            codReconciled,
+                                            codHeldByDriver,
+                                            unpaidCodInFlight,
                                             totalOrderValue
                                         };
                                     });
@@ -37646,25 +37938,29 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         activeCount: acc.activeCount + r.activeCount,
                                         failCount: acc.failCount + r.failCount,
                                         feesGen: acc.feesGen + r.feesGen,
-                                        codCashCollected: acc.codCashCollected + r.codCashCollected,
                                         khqrBankCollected: acc.khqrBankCollected + r.khqrBankCollected,
+                                        codCashCollected: acc.codCashCollected + r.codCashCollected,
+                                        codReconciled: acc.codReconciled + r.codReconciled,
+                                        codHeldByDriver: acc.codHeldByDriver + r.codHeldByDriver,
+                                        unpaidCodInFlight: acc.unpaidCodInFlight + r.unpaidCodInFlight,
                                         totalOrderValue: acc.totalOrderValue + r.totalOrderValue
-                                    }), { totalAssigned: 0, completedCount: 0, activeCount: 0, failCount: 0, feesGen: 0, codCashCollected: 0, khqrBankCollected: 0, totalOrderValue: 0 });
+                                    }), { totalAssigned: 0, completedCount: 0, activeCount: 0, failCount: 0, feesGen: 0, khqrBankCollected: 0, codCashCollected: 0, codReconciled: 0, codHeldByDriver: 0, unpaidCodInFlight: 0, totalOrderValue: 0 });
 
                                     return (
                                         <div className="p-4 overflow-x-auto table-wrapper">
-                                            <table className="w-full min-w-[950px] text-left text-xs border-collapse border border-stone-300">
+                                            <table className="w-full min-w-[1180px] text-left text-xs border-collapse border border-stone-300">
                                                 <thead>
                                                     <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
                                                         <th className="p-3 border border-stone-300">Driver Name</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Total Orders</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Orders</th>
                                                         <th className="p-3 border border-stone-300 text-center">Delivered</th>
-                                                        <th className="p-3 border border-stone-300 text-center">In Progress</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Failed / Cancel</th>
                                                         <th className="p-3 border border-stone-300 text-center">Avg Time</th>
                                                         <th className="p-3 border border-stone-300 text-right">Delivery Fees (៛)</th>
-                                                        <th className="p-3 border border-stone-300 text-right">COD Cash Collected (៛)</th>
-                                                        <th className="p-3 border border-stone-300 text-right">Bank / KHQR Paid (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-blue-50 text-blue-900">🏦 Bank / KHQR Paid (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-amber-50 text-amber-900">💵 COD Cash Collected (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-emerald-50 text-emerald-900">✅ COD Handed Over (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-orange-50 text-orange-900">🛵 COD With Driver (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-red-50 text-red-900">⏳ Unpaid COD (៛)</th>
                                                         <th className="p-3 border border-stone-300 text-right">Total Bill Value (៛)</th>
                                                     </tr>
                                                 </thead>
@@ -37674,14 +37970,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                             <td className="p-3 border border-stone-300 font-black text-stone-900">
                                                                 {r.isUnassigned ? <span className="text-amber-800"><i className="fa-solid fa-circle-exclamation mr-1.5 text-amber-600"></i>{r.name}</span> : r.name}
                                                             </td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold">{r.totalAssigned}</td>
+                                                            <td className="p-3 border border-stone-300 text-center font-bold">
+                                                                {r.totalAssigned}
+                                                                {r.failCount > 0 && <span className="text-[10px] text-red-500 ml-1">({r.failCount} fail)</span>}
+                                                            </td>
                                                             <td className="p-3 border border-stone-300 text-center font-black text-emerald-600">{r.completedCount}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-amber-600">{r.activeCount}</td>
-                                                            <td className="p-3 border border-stone-300 text-center font-bold text-red-600">{r.failCount}</td>
                                                             <td className="p-3 border border-stone-300 text-center font-bold">{r.avgMin > 0 ? `${r.avgMin} mins` : 'N/A'}</td>
                                                             <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{r.feesGen.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{r.codCashCollected.toLocaleString()} ៛</td>
-                                                            <td className="p-3 border border-stone-300 text-right font-bold text-blue-700">{r.khqrBankCollected.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-blue-700 bg-blue-50/30">{r.khqrBankCollected.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-amber-800 bg-amber-50/30">{r.codCashCollected.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-emerald-700 bg-emerald-50/30">{r.codReconciled.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-orange-700 bg-orange-50/30">{r.codHeldByDriver.toLocaleString()} ៛</td>
+                                                            <td className="p-3 border border-stone-300 text-right font-black text-red-600 bg-red-50/20">{r.unpaidCodInFlight.toLocaleString()} ៛</td>
                                                             <td className="p-3 border border-stone-300 text-right font-black text-stone-900">{r.totalOrderValue.toLocaleString()} ៛</td>
                                                         </tr>
                                                     ))}
@@ -37691,14 +37991,15 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         <td className="p-3 border border-stone-700 uppercase">Grand Total</td>
                                                         <td className="p-3 border border-stone-700 text-center">{totals.totalAssigned}</td>
                                                         <td className="p-3 border border-stone-700 text-center text-emerald-400">{totals.completedCount}</td>
-                                                        <td className="p-3 border border-stone-700 text-center text-amber-300">{totals.activeCount}</td>
-                                                        <td className="p-3 border border-stone-700 text-center text-red-400">{totals.failCount}</td>
                                                         <td className="p-3 border border-stone-700 text-center">
                                                             {reportFinancialSummary.avgDeliveryMins > 0 ? `${reportFinancialSummary.avgDeliveryMins} mins` : 'N/A'}
                                                         </td>
                                                         <td className="p-3 border border-stone-700 text-right text-emerald-400">+{totals.feesGen.toLocaleString()} ៛</td>
-                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.codCashCollected.toLocaleString()} ៛</td>
                                                         <td className="p-3 border border-stone-700 text-right text-sky-300">{totals.khqrBankCollected.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-amber-300">{totals.codCashCollected.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-emerald-400">{totals.codReconciled.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-orange-300">{totals.codHeldByDriver.toLocaleString()} ៛</td>
+                                                        <td className="p-3 border border-stone-700 text-right text-red-300">{totals.unpaidCodInFlight.toLocaleString()} ៛</td>
                                                         <td className="p-3 border border-stone-700 text-right text-white">{totals.totalOrderValue.toLocaleString()} ៛</td>
                                                     </tr>
                                                 </tfoot>
@@ -37707,32 +38008,187 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     );
                                 })()}
 
-                                {reportSubView === 'cod_reconcile' && (() => {
-                                    // Include all non-cancelled orders that were collected in Cash OR are still Unpaid COD (so cashiers can see both collected and pending COD)
-                                    const codCandidateOrders = reportOrders.filter(o => {
-                                        if (o._fin.isCancelledOrFailed) return false;
-                                        const isBankPaid = o.paymentStatus === 'Paid' && (o.paymentMethod === 'Bank' || o.paymentMethod === 'KHQR (ABA)' || o.abaVerified);
-                                        return !isBankPaid;
-                                    });
-
-                                    const totalCodAmount = codCandidateOrders.reduce((s, o) => s + o._fin.totalBill, 0);
-                                    const reconciledTotal = codCandidateOrders.filter(o => !!o.codHandoverReconciledAt).reduce((s, o) => s + o._fin.totalBill, 0);
-                                    const pendingHandoverTotal = Math.max(0, totalCodAmount - reconciledTotal);
+                                {/* NEW SUB-VIEW: 🏦 BANK TRANSFER (ABA KHQR) CLARIFICATION & AUDIT LEDGER */}
+                                {reportSubView === 'bank_audit' && (() => {
+                                    const bankTransferOrders = reportOrders.filter(o => o._fin?.isPaidBankTransfer);
+                                    const totalBankProdSub = bankTransferOrders.reduce((s, o) => s + o._fin.prodSub, 0);
+                                    const totalBankFees = bankTransferOrders.reduce((s, o) => s + o._fin.deliveryFee, 0);
+                                    const totalBankPaid = bankTransferOrders.reduce((s, o) => s + o._fin.totalBill, 0);
 
                                     return (
                                         <div className="p-4 overflow-x-auto table-wrapper space-y-3">
-                                            <div className="flex flex-wrap items-center justify-between gap-2 bg-amber-50/80 border border-amber-200 px-4 py-2.5 rounded-2xl text-xs">
-                                                <span className="font-bold text-amber-950">
-                                                    <i className="fa-solid fa-hand-holding-dollar mr-1.5 text-amber-600"></i>
-                                                    Driver COD Cash Handover Ledger (Excludes ABA KHQR / Bank Transfers)
-                                                </span>
+                                            <div className="flex flex-wrap items-center justify-between gap-2 bg-blue-50/90 border border-blue-200 px-4 py-3 rounded-2xl text-xs">
+                                                <div className="font-black text-blue-950 flex items-center gap-2">
+                                                    <i className="fa-solid fa-building-columns text-blue-600 text-sm"></i>
+                                                    <span>Payment by Bank Transfer (ABA KHQR) Clarification Ledger — Settled Directly to Bank Account (Driver Does Not Collect Cash)</span>
+                                                </div>
                                                 <div className="flex items-center gap-4 font-black">
-                                                    <span className="text-emerald-700">Reconciled: {reconciledTotal.toLocaleString()} ៛</span>
-                                                    <span className="text-red-600">Pending Handover: {pendingHandoverTotal.toLocaleString()} ៛</span>
+                                                    <span className="text-stone-700">Products: {totalBankProdSub.toLocaleString()} ៛</span>
+                                                    <span className="text-emerald-700">Delivery Fees: +{totalBankFees.toLocaleString()} ៛</span>
+                                                    <span className="text-blue-700 bg-white px-2.5 py-1 rounded-lg border border-blue-200 shadow-sm">
+                                                        Total Bank Paid: {totalBankPaid.toLocaleString()} ៛
+                                                    </span>
                                                 </div>
                                             </div>
 
-                                            <table className="w-full min-w-[900px] text-left text-xs border-collapse border border-stone-300">
+                                            <table className="w-full min-w-[1050px] text-left text-xs border-collapse border border-stone-300">
+                                                <thead>
+                                                    <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
+                                                        <th className="p-3 border border-stone-300">Date & Time</th>
+                                                        <th className="p-3 border border-stone-300">Invoice & Shop</th>
+                                                        <th className="p-3 border border-stone-300">Customer</th>
+                                                        <th className="p-3 border border-stone-300">Assigned Driver</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Product Sub-Total (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Delivery Fee (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-right bg-blue-50 text-blue-900">Bank Paid Total (៛)</th>
+                                                        <th className="p-3 border border-stone-300">ABA Payer & Account</th>
+                                                        <th className="p-3 border border-stone-300">APV / Trx. ID</th>
+                                                        <th className="p-3 border border-stone-300 text-center">Verification Source</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {bankTransferOrders.map(o => {
+                                                        const shopName = shops.find(s => s.id === o.shopId)?.name || 'Branch';
+                                                        const isDoorKhqr = String(o.abaVerifiedBy || '').toLowerCase().includes('driver') || String(o.abaPayer || '').toLowerCase().includes('door');
+                                                        return (
+                                                            <tr key={o.id} className="hover:bg-stone-50 bg-white">
+                                                                <td className="p-3 border border-stone-300 font-mono whitespace-nowrap">
+                                                                    <div>{formatSolarisDateTime(o.createdAt)}</div>
+                                                                    {o.abaVerifiedAt && (
+                                                                        <div className="text-[10px] text-blue-600 font-bold mt-0.5">
+                                                                            Paid: {formatSolarisDateTime(o.abaVerifiedAt)}
+                                                                        </div>
+                                                                    )}
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300">
+                                                                    <div className="font-mono font-black text-stone-900">{o.queueNo}</div>
+                                                                    <div className="text-[10px] text-stone-500 font-bold">{shopName}</div>
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-bold text-stone-800">
+                                                                    {o.customerName || 'Guest'} ({o.customerPhone || 'N/A'})
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-bold text-stone-700">
+                                                                    {o.assignedDriverName || 'Unassigned'}
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-right font-bold text-stone-800">
+                                                                    {o._fin.prodSub.toLocaleString()} ៛
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">
+                                                                    +{o._fin.deliveryFee.toLocaleString()} ៛
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-right font-black text-blue-700 bg-blue-50/30">
+                                                                    {o._fin.totalBill.toLocaleString()} ៛
+                                                                    {o.abaPaidAmountStr && (
+                                                                        <div className="text-[10px] font-mono text-emerald-700 font-bold">
+                                                                            ({o.abaPaidAmountStr})
+                                                                        </div>
+                                                                    )}
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-bold text-stone-800">
+                                                                    {o.abaPayer || <span className="text-stone-400 italic">ABA KHQR Payer</span>}
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 font-mono text-[11px]">
+                                                                    <span className="bg-amber-100 text-amber-900 font-black px-2 py-0.5 rounded border border-amber-200">
+                                                                        APV: {o.abaApv || 'VERIFIED'}
+                                                                    </span>
+                                                                    {o.abaTrxId && (
+                                                                        <div className="text-[10px] text-stone-400 mt-0.5 truncate max-w-[140px]">
+                                                                            Trx: {o.abaTrxId}
+                                                                        </div>
+                                                                    )}
+                                                                </td>
+                                                                <td className="p-3 border border-stone-300 text-center">
+                                                                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase border ${
+                                                                        isDoorKhqr
+                                                                            ? 'bg-purple-100 text-purple-800 border-purple-200'
+                                                                            : 'bg-blue-100 text-blue-800 border-blue-200'
+                                                                    }`}>
+                                                                        {isDoorKhqr ? '🛵 Driver Doorstep KHQR' : '⚡ Online / POS KHQR'}
+                                                                    </span>
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
+                                                    {bankTransferOrders.length === 0 && (
+                                                        <tr>
+                                                            <td colSpan="10" className="p-10 text-center text-stone-400 font-bold">
+                                                                No Delivery orders paid via Bank Transfer (ABA KHQR) found for this filter window.
+                                                            </td>
+                                                        </tr>
+                                                    )}
+                                                </tbody>
+                                                {bankTransferOrders.length > 0 && (
+                                                    <tfoot className="bg-stone-900 text-white font-black text-xs">
+                                                        <tr>
+                                                            <td colSpan="4" className="p-3 border border-stone-700 text-right uppercase">
+                                                                Total Bank Transfer / ABA KHQR ({bankTransferOrders.length} Orders):
+                                                            </td>
+                                                            <td className="p-3 border border-stone-700 text-right">
+                                                                {totalBankProdSub.toLocaleString()} ៛
+                                                            </td>
+                                                            <td className="p-3 border border-stone-700 text-right text-emerald-400">
+                                                                +{totalBankFees.toLocaleString()} ៛
+                                                            </td>
+                                                            <td className="p-3 border border-stone-700 text-right text-sky-300">
+                                                                {totalBankPaid.toLocaleString()} ៛
+                                                            </td>
+                                                            <td colSpan="3" className="p-3 border border-stone-700 text-left text-[11px] text-stone-300">
+                                                                100% Settled in Bank — Excluded from Driver COD Cash Handover
+                                                            </td>
+                                                        </tr>
+                                                    </tfoot>
+                                                )}
+                                            </table>
+                                        </div>
+                                    );
+                                })()}
+
+                                {reportSubView === 'cod_reconcile' && (() => {
+                                    // Include all non-cancelled orders that were collected in Cash OR are still Unpaid COD
+                                    const codCandidateOrders = reportOrders.filter(o => {
+                                        if (o._fin.isCancelledOrFailed) return false;
+                                        return !o._fin.isPaidBankTransfer;
+                                    });
+
+                                    const totalCodAmount = codCandidateOrders.reduce((s, o) => s + o._fin.totalBill, 0);
+                                    const reconciledTotal = codCandidateOrders.reduce((s, o) => s + o._fin.codReconciledAmount, 0);
+                                    const withDriverOrders = codCandidateOrders.filter(o => o._fin.isCodWithDriver);
+                                    const withDriverTotal = withDriverOrders.reduce((s, o) => s + o._fin.codWithDriverAmount, 0);
+                                    const unpaidInFlightTotal = codCandidateOrders.reduce((s, o) => s + o._fin.unpaidCodAmount, 0);
+
+                                    return (
+                                        <div className="p-4 overflow-x-auto table-wrapper space-y-3">
+                                            <div className="flex flex-wrap items-center justify-between gap-3 bg-amber-50/90 border border-amber-200 px-4 py-3 rounded-2xl text-xs">
+                                                <div className="space-y-0.5">
+                                                    <div className="font-black text-amber-950 flex items-center gap-1.5">
+                                                        <i className="fa-solid fa-hand-holding-dollar text-amber-600 text-sm"></i>
+                                                        <span>COD (Cash on Delivery) Clarification & Driver Handover Ledger (Excludes Bank Transfers)</span>
+                                                    </div>
+                                                    <div className="flex flex-wrap items-center gap-4 text-[11px] font-bold">
+                                                        <span className="text-emerald-700">✅ Reconciled in Drawer: <b>{reconciledTotal.toLocaleString()} ៛</b></span>
+                                                        <span className="text-orange-700">🛵 Collected & Held by Driver: <b>{withDriverTotal.toLocaleString()} ៛</b> ({withDriverOrders.length})</span>
+                                                        <span className="text-red-600">⏳ Unpaid COD (In-Flight): <b>{unpaidInFlightTotal.toLocaleString()} ៛</b></span>
+                                                    </div>
+                                                </div>
+
+                                                {withDriverOrders.length > 0 && (
+                                                    <button
+                                                        type="button"
+                                                        disabled={isBatchReconcilingCod}
+                                                        onClick={() => handleBatchReconcileDriverCod(withDriverOrders)}
+                                                        className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs shadow-md transition flex items-center gap-2 active:scale-95 disabled:opacity-50"
+                                                    >
+                                                        <i className={`fa-solid ${isBatchReconcilingCod ? 'fa-spinner fa-spin' : 'fa-check-double'}`}></i>
+                                                        <span>
+                                                            {isBatchReconcilingCod
+                                                                ? 'Reconciling...'
+                                                                : `Batch Reconcile Collected COD (${withDriverOrders.length} • ${withDriverTotal.toLocaleString()} ៛)`}
+                                                        </span>
+                                                    </button>
+                                                )}
+                                            </div>
+
+                                            <table className="w-full min-w-[1000px] text-left text-xs border-collapse border border-stone-300">
                                                 <thead>
                                                     <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
                                                         <th className="p-3 border border-stone-300">Date & Time</th>
@@ -37740,8 +38196,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         <th className="p-3 border border-stone-300">Customer</th>
                                                         <th className="p-3 border border-stone-300">Assigned Driver</th>
                                                         <th className="p-3 border border-stone-300 text-center">Delivery Status</th>
-                                                        <th className="p-3 border border-stone-300 text-right">COD Amount (៛)</th>
-                                                        <th className="p-3 border border-stone-300 text-center">Handover Status</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Product Sub-Total</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Delivery Fee</th>
+                                                        <th className="p-3 border border-stone-300 text-right">Total COD Bill (៛)</th>
+                                                        <th className="p-3 border border-stone-300 text-center">COD Clarification Stage</th>
                                                         <th className="p-3 border border-stone-300 text-right">Reconcile to Cashier Drawer</th>
                                                     </tr>
                                                 </thead>
@@ -37765,20 +38223,22 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                                         {o.effectiveDeliveryStatus}
                                                                     </span>
                                                                 </td>
+                                                                <td className="p-3 border border-stone-300 text-right font-bold text-stone-700">{o._fin.prodSub.toLocaleString()} ៛</td>
+                                                                <td className="p-3 border border-stone-300 text-right font-black text-emerald-700">+{o._fin.deliveryFee.toLocaleString()} ៛</td>
                                                                 <td className="p-3 border border-stone-300 text-right font-black text-amber-700">{o._fin.totalBill.toLocaleString()} ៛</td>
                                                                 <td className="p-3 border border-stone-300 text-center">
-                                                                    <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                                                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase ${
                                                                         isReconciled
                                                                             ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                                                                             : o.paymentStatus === 'Paid'
-                                                                                ? 'bg-sky-100 text-sky-800 border border-sky-200'
-                                                                                : 'bg-amber-100 text-amber-900 border border-amber-200'
+                                                                                ? 'bg-orange-100 text-orange-900 border border-orange-300'
+                                                                                : 'bg-red-100 text-red-800 border border-red-200'
                                                                     }`}>
                                                                         {isReconciled
-                                                                            ? `Reconciled by ${o.codHandoverReconciledBy || 'Staff'}`
+                                                                            ? `✅ In Drawer (${o.codHandoverReconciledBy || 'Staff'})`
                                                                             : o.paymentStatus === 'Paid'
-                                                                                ? 'Cash Collected (Awaiting Handover)'
-                                                                                : 'Unpaid COD (With Driver)'}
+                                                                                ? '🛵 Cash With Driver (Awaiting Handover)'
+                                                                                : '⏳ Unpaid COD (To Collect at Door)'}
                                                                     </span>
                                                                 </td>
                                                                 <td className="p-3 border border-stone-300 text-right">
@@ -37811,7 +38271,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                     })}
                                                     {codCandidateOrders.length === 0 && (
                                                         <tr>
-                                                            <td colSpan="8" className="p-8 text-center text-stone-400 font-bold">
+                                                            <td colSpan="10" className="p-8 text-center text-stone-400 font-bold">
                                                                 No Cash on Delivery (COD) orders found for this filter window.
                                                             </td>
                                                         </tr>
@@ -37820,12 +38280,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 {codCandidateOrders.length > 0 && (
                                                     <tfoot className="bg-stone-900 text-white font-black text-xs">
                                                         <tr>
-                                                            <td colSpan="5" className="p-3 border border-stone-700 text-right uppercase">Total COD Cash Volume:</td>
+                                                            <td colSpan="7" className="p-3 border border-stone-700 text-right uppercase">Total COD Cash Volume:</td>
                                                             <td className="p-3 border border-stone-700 text-right text-amber-300">{totalCodAmount.toLocaleString()} ៛</td>
                                                             <td colSpan="2" className="p-3 border border-stone-700 text-left text-[11px]">
-                                                                <span className="text-emerald-400">Reconciled: {reconciledTotal.toLocaleString()} ៛</span>
+                                                                <span className="text-emerald-400">In Drawer: {reconciledTotal.toLocaleString()} ៛</span>
                                                                 <span className="mx-2 text-stone-500">•</span>
-                                                                <span className="text-red-300">Pending: {pendingHandoverTotal.toLocaleString()} ៛</span>
+                                                                <span className="text-orange-300">With Driver: {withDriverTotal.toLocaleString()} ៛</span>
+                                                                <span className="mx-2 text-stone-500">•</span>
+                                                                <span className="text-red-300">Unpaid: {unpaidInFlightTotal.toLocaleString()} ៛</span>
                                                             </td>
                                                         </tr>
                                                     </tfoot>
@@ -37837,7 +38299,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                                 {reportSubView === 'ledger' && (
                                 <div className="overflow-x-auto p-4 table-wrapper">
-                                    <table className="w-full min-w-[1100px] text-left text-xs border-collapse border border-stone-300">
+                                    <table className="w-full min-w-[1180px] text-left text-xs border-collapse border border-stone-300">
                                         <thead>
                                             <tr className="bg-stone-100 text-stone-700 uppercase text-[10px]">
                                                 <th className="p-3 border border-stone-300">Date & Time</th>
@@ -37847,7 +38309,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 <th className="p-3 border border-stone-300 text-right">Product SubTotal</th>
                                                 <th className="p-3 border border-stone-300 text-right">Delivery Fee</th>
                                                 <th className="p-3 border border-stone-300 text-right">Total Bill</th>
-                                                <th className="p-3 border border-stone-300 text-center">Payment</th>
+                                                <th className="p-3 border border-stone-300 text-center">Payment & COD Clarification</th>
                                                 <th className="p-3 border border-stone-300 text-center">Delivery Status & POD</th>
                                             </tr>
                                         </thead>
@@ -37891,15 +38353,35 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                             {fin.totalBill.toLocaleString()} ៛
                                                         </td>
                                                         <td className="p-3 border border-stone-300 text-center">
-                                                            <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${
-                                                                fin.isCancelledOrFailed
-                                                                    ? 'bg-stone-100 text-stone-500'
-                                                                    : o.paymentStatus === 'Paid'
-                                                                        ? 'bg-emerald-100 text-emerald-800'
-                                                                        : 'bg-red-100 text-red-700'
-                                                            }`}>
-                                                                {o.paymentStatus || 'Unpaid'} ({o.paymentMethod || 'N/A'})
-                                                            </span>
+                                                            <div className="flex flex-col items-center gap-1">
+                                                                <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase border ${
+                                                                    fin.isCancelledOrFailed
+                                                                        ? 'bg-stone-100 text-stone-500 border-stone-200'
+                                                                        : fin.isPaidBankTransfer
+                                                                            ? 'bg-blue-100 text-blue-800 border-blue-200'
+                                                                            : fin.isCodReconciled
+                                                                                ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                                                                                : fin.isCodWithDriver
+                                                                                    ? 'bg-orange-100 text-orange-900 border-orange-300'
+                                                                                    : 'bg-red-100 text-red-700 border-red-200'
+                                                                }`}>
+                                                                    {fin.isPaidBankTransfer && '🏦 '}
+                                                                    {fin.isCodReconciled && '✅ '}
+                                                                    {fin.isCodWithDriver && '🛵 '}
+                                                                    {fin.isUnpaidCod && '⏳ '}
+                                                                    {fin.paymentChannelShort}
+                                                                </span>
+                                                                {fin.isPaidBankTransfer && (o.abaApv || o.abaPayer) && (
+                                                                    <span className="text-[9px] font-mono text-blue-700 font-bold">
+                                                                        {o.abaPayer ? `${o.abaPayer} • ` : ''}APV: {o.abaApv || 'OK'}
+                                                                    </span>
+                                                                )}
+                                                                {fin.isCodWithDriver && (
+                                                                    <span className="text-[9px] font-bold text-orange-700">
+                                                                        Awaiting Handover to Drawer
+                                                                    </span>
+                                                                )}
+                                                            </div>
                                                         </td>
                                                         <td className="p-3 border border-stone-300 text-center">
                                                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase border ${DELIVERY_STATUS_BADGES[o.effectiveDeliveryStatus] || 'bg-stone-100'}`}>
@@ -37938,9 +38420,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         {reportFinancialSummary.totalValidBillVolume.toLocaleString()} ៛
                                                     </td>
                                                     <td colSpan="2" className="p-3 border border-stone-700 text-left text-[11px]">
-                                                        <span className="text-emerald-400">Paid: {reportFinancialSummary.totalPaidCollected.toLocaleString()} ៛</span>
-                                                        <span className="mx-2 text-stone-500">•</span>
-                                                        <span className="text-red-300">Unpaid COD: {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛</span>
+                                                        <span className="text-sky-300">🏦 Bank: {reportFinancialSummary.paidBankAmount.toLocaleString()} ៛</span>
+                                                        <span className="mx-1.5 text-stone-500">•</span>
+                                                        <span className="text-emerald-400">✅ COD Drawer: {reportFinancialSummary.codReconciledAmount.toLocaleString()} ៛</span>
+                                                        <span className="mx-1.5 text-stone-500">•</span>
+                                                        <span className="text-orange-300">🛵 COD Driver: {reportFinancialSummary.codWithDriverAmount.toLocaleString()} ៛</span>
+                                                        <span className="mx-1.5 text-stone-500">•</span>
+                                                        <span className="text-red-300">⏳ Unpaid: {reportFinancialSummary.pendingCodAmount.toLocaleString()} ៛</span>
                                                     </td>
                                                 </tr>
                                             </tfoot>
