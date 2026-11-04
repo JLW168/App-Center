@@ -1090,27 +1090,29 @@
                 if (!rawChargeStatus || rawChargeStatus === 'Normal' || rawChargeStatus === 'Normal Price') return null;
 
                 // Evaluate Branch Eligibility (All / Global vs Specific Branches)
-                const scope = profile.chargeStatusScope || 'All';
+                const rawScope = String(profile.chargeStatusScope || 'All').trim().toLowerCase();
                 const allowedShops = Array.isArray(profile.chargeStatusShopIds) ? profile.chargeStatusShopIds : [];
-                const isGlobalScope = scope === 'All' || scope === 'Global' || allowedShops.length === 0;
-                const isShopEligible = isGlobalScope || !currentShopId || allowedShops.includes(currentShopId);
+                const isGlobalScope = rawScope === 'all' || rawScope === 'global' || allowedShops.length === 0;
+                const isShopEligible = isGlobalScope || !currentShopId || currentShopId === 'All' || allowedShops.includes(currentShopId);
                 if (!isShopEligible) return null;
 
-                const tierLabel = (profile.customerType && profile.customerType !== 'Normal') ? profile.customerType : 'Member';
+                const tierLabel = (profile.customerType && profile.customerType !== 'Normal') ? profile.customerType : 'VIP Member';
                 const statusUpper = rawChargeStatus.toUpperCase();
-                const basePrice = Number(item.price) || 0;
+                const basePrice = Number(item.originalPrice !== undefined ? item.originalPrice : item.price) || 0;
                 const paidQty = Math.max(0, (Number(item.quantity) || 0) - (Number(item.redeemedQty) || 0));
+                if (paidQty <= 0 || basePrice <= 0) return null;
 
-                if (statusUpper.includes('FOC')) {
+                if (statusUpper.includes('FOC') || statusUpper.includes('FREE')) {
                     return {
                         name: 'VIP',
                         effectiveUnitPrice: 0,
                         lineTotal: 0,
                         savings: basePrice * paidQty,
+                        effectivePct: 100,
                         totalQtyForKDS: item.quantity,
                         freeQuantity: 0,
                         badgeLabel: `${tierLabel} (FOC)`,
-                        promoNames: [`${tierLabel} (FOC)`]
+                        promoNames: [`👑 ${tierLabel} (FOC)`]
                     };
                 }
 
@@ -1127,39 +1129,84 @@
                     }
                     const effectiveUnitPrice = Math.min(basePrice, Math.max(0, unitCost));
                     const lineTotal = effectiveUnitPrice * paidQty;
+                    const savings = Math.max(0, (basePrice * paidQty) - lineTotal);
+                    const effectivePct = basePrice > 0 ? ((basePrice - effectiveUnitPrice) / basePrice) * 100 : 0;
                     return {
                         name: 'VIP',
                         effectiveUnitPrice,
                         lineTotal,
-                        savings: Math.max(0, (basePrice * paidQty) - lineTotal),
+                        savings,
+                        effectivePct,
                         totalQtyForKDS: item.quantity,
                         freeQuantity: 0,
                         badgeLabel: `${tierLabel} (COG)`,
-                        promoNames: [`${tierLabel} (COG)`]
+                        promoNames: [`👑 ${tierLabel} (COG)`]
                     };
                 }
 
-                // Custom Discount Percentage (Supports "10%", "15% Dis", "12.5%", or plain numeric "20")
+                // Custom Discount Percentage (Supports "60%", "60% Off", "40% Dis", "12.5%", or plain numeric "60")
                 const pctMatch = statusUpper.match(/(\d+(?:\.\d+)?)/);
                 if (pctMatch) {
                     const pct = Math.min(100, Math.max(0, parseFloat(pctMatch[1])));
                     if (pct > 0) {
-                        const effectiveUnitPrice = Math.max(0, Math.round(basePrice * (1 - pct / 100)));
+                        const unitDiscount = Math.round(basePrice * (pct / 100));
+                        const effectiveUnitPrice = Math.max(0, basePrice - unitDiscount);
                         const lineTotal = effectiveUnitPrice * paidQty;
+                        const savings = Math.max(0, (basePrice * paidQty) - lineTotal);
                         return {
                             name: 'VIP',
                             effectiveUnitPrice,
                             lineTotal,
-                            savings: Math.max(0, (basePrice * paidQty) - lineTotal),
+                            savings,
+                            effectivePct: pct,
                             totalQtyForKDS: item.quantity,
                             freeQuantity: 0,
                             badgeLabel: `${tierLabel} (-${pct}%)`,
-                            promoNames: [`${tierLabel} ${pct}% Off`]
+                            promoNames: [`👑 ${tierLabel} (-${pct}%)`]
                         };
                     }
                 }
 
                 return null;
+            };
+
+            // Centralized Best-Value Discount Scenario Comparator (Used by both Customer Portal & POSView)
+            // Guarantees that the highest customer discount (e.g. 60% VIP vs 40% Happy Hour) ALWAYS wins,
+            // with strict tie-breaking priority: VIP > Combo > Welcome > Happy Hour > Branch Promo.
+            const selectBestDiscountScenario = (currentBest, candidate) => {
+                if (!candidate) return currentBest;
+                if (!currentBest || currentBest.name === 'None') {
+                    return (Number(candidate.savings) > 0 || Number(candidate.effectivePct) > 0) ? candidate : currentBest;
+                }
+
+                const getPriority = (name = '') => {
+                    const n = String(name);
+                    if (n.includes('VIP')) return 5;
+                    if (n.includes('Combo')) return 4;
+                    if (n.includes('Welcome')) return 3;
+                    if (n.includes('Happy')) return 2;
+                    return 1;
+                };
+
+                const candSavings = Number(candidate.savings) || 0;
+                const bestSavings = Number(currentBest.savings) || 0;
+
+                // 1. Primary comparison: Exact KHR savings on the line item
+                if (candSavings > bestSavings) return candidate;
+                if (candSavings < bestSavings) return currentBest;
+
+                // 2. Secondary comparison: Effective discount percentage (handles rounding ties on small unit prices)
+                const candPct = Number(candidate.effectivePct) || 0;
+                const bestPct = Number(currentBest.effectivePct) || 0;
+                if (candPct > bestPct) return candidate;
+                if (candPct < bestPct) return currentBest;
+
+                // 3. Tertiary comparison: Explicit hierarchy tie-breaker (VIP > Combo > Welcome > Happy > Promo)
+                if (candSavings > 0 && getPriority(candidate.name) > getPriority(currentBest.name)) {
+                    return candidate;
+                }
+
+                return currentBest;
             };
 
             // OPTIMIZATION: Moved from client-side render loop to transaction calculation
@@ -6194,6 +6241,10 @@
                         hasWelcomeDiscount,
                         systemCustomerId,
                         docId,
+                        customerType: syncedCustomerProfile?.customerType || 'Normal',
+                        chargeStatus: syncedCustomerProfile?.chargeStatus || 'Normal',
+                        chargeStatusScope: syncedCustomerProfile?.chargeStatusScope || 'All',
+                        chargeStatusShopIds: syncedCustomerProfile?.chargeStatusShopIds || [],
                         fullData: syncedCustomerProfile
                     });
                 } catch (err) {
@@ -9020,14 +9071,42 @@
                     
                     const unsubCust = onSnapshot(qCust, snap => {
                         if (!snap.empty) {
-                            // Prefer the document that has a non-Normal chargeStatus or Member customerType if duplicates exist
-                            const bestDoc = snap.docs.find(d => d.data()?.chargeStatus && d.data()?.chargeStatus !== 'Normal') || snap.docs[0];
+                            // If duplicate customer docs exist for the same phone, pick the one with the highest discount benefit
+                            const scoreCustomerDoc = (d) => {
+                                const data = d.data() || {};
+                                const cs = String(data.chargeStatus || 'Normal').toUpperCase();
+                                if (cs.includes('FOC') || cs.includes('FREE')) return 1000;
+                                if (cs.includes('COG')) return 900;
+                                const m = cs.match(/(\d+(?:\.\d+)?)/);
+                                if (m) return parseFloat(m[1]);
+                                if (data.customerType && data.customerType !== 'Normal') return 1;
+                                return 0;
+                            };
+                            const sortedDocs = [...snap.docs].sort((a, b) => scoreCustomerDoc(b) - scoreCustomerDoc(a));
+                            const bestDoc = sortedDocs[0];
                             const data = bestDoc.data();
                             setLiveRefilledPoints(data.refilledPoints || 0);
                             
                             // Lock the profile state if the target matches the actively logged-in session
                             if (targetPhone === sessionInfo.customerPhone && sessionInfo.isSetup) {
                                 setCustomerProfile(prev => ({ ...(prev || {}), id: bestDoc.id, ...data }));
+                                setSessionInfo(prev => {
+                                    if (
+                                        prev.chargeStatus === (data.chargeStatus || 'Normal') &&
+                                        prev.customerType === (data.customerType || 'Normal') &&
+                                        prev.chargeStatusScope === (data.chargeStatusScope || 'All')
+                                    ) {
+                                        return prev;
+                                    }
+                                    return {
+                                        ...prev,
+                                        customerDocId: bestDoc.id,
+                                        customerType: data.customerType || 'Normal',
+                                        chargeStatus: data.chargeStatus || 'Normal',
+                                        chargeStatusScope: data.chargeStatusScope || 'All',
+                                        chargeStatusShopIds: data.chargeStatusShopIds || []
+                                    };
+                                });
                             }
                         } else {
                             setLiveRefilledPoints(0);
@@ -9488,6 +9567,10 @@
                         hasWelcomeDiscount: data.hasWelcomeDiscount,
                         customerId: data.systemCustomerId || prev.customerId,
                         customerDocId: data.docId || prev.customerDocId,
+                        customerType: data.customerType || data.fullData?.customerType || prev.customerType || 'Normal',
+                        chargeStatus: data.chargeStatus || data.fullData?.chargeStatus || prev.chargeStatus || 'Normal',
+                        chargeStatusScope: data.chargeStatusScope || data.fullData?.chargeStatusScope || prev.chargeStatusScope || 'All',
+                        chargeStatusShopIds: data.chargeStatusShopIds || data.fullData?.chargeStatusShopIds || prev.chargeStatusShopIds || [],
                         mode: prev.mode || 'TAKEAWAY',
                         shopId: prev.shopId || nearestShopInfo?.shop?.id || (shops.length > 0 ? shops[0].id : ''),
                         sessionTimestamp: Date.now()
@@ -10085,9 +10168,16 @@
                         const targetShop = shops?.find(s => s.id === effectivePortalShopId);
                         if (!targetShop || !targetShop.happyHourEnabled) return null;
                         const now = new Date();
+                        const daysMap = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                        const currentDay = daysMap[now.getDay()];
+                        const activeDays = targetShop.happyHourDays || ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+                        if (!activeDays.includes(currentDay)) return null;
+
                         const currentMins = now.getHours() * 60 + now.getMinutes();
                         const slots = targetShop.happyHourSlots || (targetShop.happyHourStart ? [{start: targetShop.happyHourStart, end: targetShop.happyHourEnd, type: targetShop.happyHourType, value: targetShop.happyHourValue}] : []);
                         
+                        // Evaluate all currently active time slots and pick the one with the highest value
+                        let bestActiveSlot = null;
                         for (const slot of slots) {
                             if (!slot.start || !slot.end) continue;
                             const [startH, startM] = slot.start.split(':').map(Number);
@@ -10096,16 +10186,28 @@
                             const endMins = endH * 60 + endM;
                             
                             const type = slot.type || targetShop.happyHourType || 'DISCOUNT_PCT';
-                            const value = slot.value !== undefined ? slot.value : (targetShop.happyHourValue || 0);
+                            const value = Number(slot.value !== undefined ? slot.value : (targetShop.happyHourValue || 0)) || 0;
 
-                            if (startMins <= endMins) {
-                                if (currentMins >= startMins && currentMins <= endMins) return { type, value };
-                            } else {
-                                if (currentMins >= startMins || currentMins <= endMins) return { type, value };
+                            const isTimeMatch = startMins <= endMins
+                                ? (currentMins >= startMins && currentMins <= endMins)
+                                : (currentMins >= startMins || currentMins <= endMins);
+
+                            if (isTimeMatch && value > 0) {
+                                if (!bestActiveSlot || value > bestActiveSlot.value) {
+                                    bestActiveSlot = { type, value };
+                                }
                             }
                         }
-                        return null;
+                        return bestActiveSlot;
                     })();
+
+                    // Build resilient Customer Profile for discount evaluation (falls back to persisted sessionInfo if Firestore snapshot is still loading after page refresh)
+                    const effectiveCustomerProfile = customerProfile || (sessionInfo.isSetup && sessionInfo.chargeStatus && sessionInfo.chargeStatus !== 'Normal' ? {
+                        customerType: sessionInfo.customerType || 'Member',
+                        chargeStatus: sessionInfo.chargeStatus,
+                        chargeStatusScope: sessionInfo.chargeStatusScope || 'All',
+                        chargeStatusShopIds: sessionInfo.chargeStatusShopIds || []
+                    } : null);
 
                     // PHASE 3.3: Pre-scan cart for Trigger Products that have a linked `upsellProductIds` + `comboDiscountAmount > 0`
                     // Build a pool of available Combo Bundle discounts that companion items in the cart can claim (1-to-1 per trigger unit)
@@ -10139,70 +10241,66 @@
                             effectiveUnitPrice: item.price,
                             lineTotal: item.price * paidQty,
                             savings: 0,
+                            effectivePct: 0,
                             totalQtyForKDS: item.quantity,
                             freeQuantity: 0,
                             promoNames: []
                         };
 
-                        // Best Value Evaluator Function
+                        // Best Value Evaluator Function (Compares exact KHR savings, effective %, and strict priority hierarchy)
                         const addScenario = (scenario) => {
-                            // Tie-breaker priority: VIP/Member > Combo Deal > Welcome > Happy Hour > General Promo
-                            const getPriority = (name) => {
-                                if (name.includes('VIP')) return 5;
-                                if (name.includes('Combo')) return 4;
-                                if (name.includes('Welcome')) return 3;
-                                if (name.includes('Happy')) return 2;
-                                return 1;
-                            };
-
-                            if (scenario.savings > bestScenario.savings) {
-                                bestScenario = scenario;
-                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
-                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
-                                    bestScenario = scenario;
-                                }
-                            }
+                            bestScenario = selectBestDiscountScenario(bestScenario, scenario);
                         };
 
                         if (paidQty > 0) {
                             // Scenario 1: Happy Hour
                             if (activeHappyHour) {
+                                const hhVal = Number(activeHappyHour.value) || 0;
                                 let effPrice = item.price;
                                 if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    effPrice = Math.round(item.price - (item.price * (activeHappyHour.value / 100)));
+                                    effPrice = Math.max(0, item.price - Math.round(item.price * (hhVal / 100)));
                                 } else {
-                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                    effPrice = Math.max(0, item.price - hhVal);
                                 }
-                                let lTotal = effPrice * paidQty;
+                                const lTotal = effPrice * paidQty;
+                                const savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                const effPct = activeHappyHour.type === 'DISCOUNT_PCT'
+                                    ? hhVal
+                                    : (item.price > 0 ? ((item.price - effPrice) / item.price) * 100 : 0);
                                 addScenario({
                                     name: 'Happy',
                                     effectiveUnitPrice: effPrice,
                                     lineTotal: lTotal,
-                                    savings: (item.price * paidQty) - lTotal,
+                                    savings,
+                                    effectivePct: effPct,
                                     totalQtyForKDS: item.quantity,
                                     freeQuantity: 0,
-                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? hhVal + '%' : hhVal.toLocaleString() + '៛'})`]
                                 });
                             }
 
-                            // Scenario 2: Standard Promo (Percentage, Fixed, BOGO, Free Item)
-                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                            if (promo) {
+                            // Scenario 2: Standard Branch Promotions (Evaluate ALL matching active promos so the best promo is considered)
+                            const matchingPromos = activePromos.filter(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            matchingPromos.forEach(promo => {
                                 let effPrice = item.price;
                                 let lTotal = item.price * paidQty;
                                 let fQty = 0;
                                 let tQty = item.quantity;
                                 let pName = promo.name;
                                 let savings = 0;
+                                let effPct = 0;
+                                const discVal = Number(promo.discountValue || 0);
 
                                 if (promo.type === 'DISCOUNT_PCT') {
-                                    effPrice = Math.round(item.price - (item.price * (Number(promo.discountValue || 0) / 100)));
+                                    effPrice = Math.max(0, item.price - Math.round(item.price * (discVal / 100)));
                                     lTotal = effPrice * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
+                                    savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                    effPct = discVal;
                                 } else if (promo.type === 'DISCOUNT_FIXED') {
-                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    effPrice = Math.max(0, item.price - discVal);
                                     lTotal = effPrice * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
+                                    savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                    effPct = item.price > 0 ? ((item.price - effPrice) / item.price) * 100 : 0;
                                 } else if (promo.type === 'BOGO') {
                                     const reqQty = Math.max(1, Number(promo.requiredQty || 1));
                                     const rewQty = Math.max(1, Number(promo.rewardQty || 1));
@@ -10210,11 +10308,13 @@
                                     tQty = item.quantity + fQty;
                                     lTotal = effPrice * paidQty;
                                     savings = fQty * item.price; // Savings derived from the value of free items given
+                                    effPct = (paidQty + fQty) > 0 ? (fQty / (paidQty + fQty)) * 100 : 0;
                                     if (fQty > 0) pName += ` (+${fQty} Free)`;
                                 } else if (promo.type === 'FREE_ITEM') {
                                     effPrice = 0;
                                     lTotal = 0;
                                     savings = item.price * paidQty;
+                                    effPct = 100;
                                 }
 
                                 if (savings > 0) {
@@ -10222,32 +10322,34 @@
                                         name: 'Promo',
                                         effectiveUnitPrice: effPrice,
                                         lineTotal: lTotal,
-                                        savings: savings,
+                                        savings,
+                                        effectivePct: effPct,
                                         totalQtyForKDS: tQty,
                                         freeQuantity: fQty,
                                         promoNames: [pName]
                                     });
                                 }
-                            }
+                            });
 
                             // Scenario 3: Welcome Discount
-                            if (sessionInfo.hasWelcomeDiscount && globalPoints?.welcomeDiscountEnabled && globalPoints?.welcomeDiscountPct > 0) {
-                                const welcomePct = Number(globalPoints.welcomeDiscountPct) / 100;
-                                const effPrice = Math.round(item.price - (item.price * welcomePct));
+                            if (sessionInfo.hasWelcomeDiscount && globalPoints?.welcomeDiscountEnabled && Number(globalPoints?.welcomeDiscountPct) > 0) {
+                                const welcomePctVal = Number(globalPoints.welcomeDiscountPct);
+                                const effPrice = Math.max(0, item.price - Math.round(item.price * (welcomePctVal / 100)));
                                 const lTotal = effPrice * paidQty;
                                 addScenario({
                                     name: 'Welcome',
                                     effectiveUnitPrice: effPrice,
                                     lineTotal: lTotal,
-                                    savings: (item.price * paidQty) - lTotal,
+                                    savings: Math.max(0, (item.price * paidQty) - lTotal),
+                                    effectivePct: welcomePctVal,
                                     totalQtyForKDS: item.quantity,
                                     freeQuantity: 0,
-                                    promoNames: [`🎉 New Member ${globalPoints.welcomeDiscountPct}%`]
+                                    promoNames: [`🎉 New Member (-${welcomePctVal}%)`]
                                 });
                             }
 
-                            // Scenario 4: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount %)
-                            const memberScenario = evaluateCustomerChargeStatus(customerProfile, effectivePortalShopId, item, product);
+                            // Scenario 4: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount % e.g. 60%)
+                            const memberScenario = evaluateCustomerChargeStatus(effectiveCustomerProfile, effectivePortalShopId, item, product);
                             if (memberScenario) {
                                 addScenario(memberScenario);
                             }
@@ -10265,11 +10367,13 @@
                                 if (totalComboSavings > 0) {
                                     const lTotal = Math.max(0, (item.price * paidQty) - totalComboSavings);
                                     const effPrice = Math.round(lTotal / paidQty);
+                                    const effPct = (item.price * paidQty) > 0 ? (totalComboSavings / (item.price * paidQty)) * 100 : 0;
                                     addScenario({
                                         name: 'Combo',
                                         effectiveUnitPrice: effPrice,
                                         lineTotal: lTotal,
                                         savings: totalComboSavings,
+                                        effectivePct: effPct,
                                         totalQtyForKDS: item.quantity,
                                         freeQuantity: 0,
                                         promoNames: [`Combo Deal (-${totalComboSavings.toLocaleString()} ៛)`],
@@ -10319,7 +10423,7 @@
                     });
 
                     return { processedCart: processed, itemsSubTotal: Math.max(0, total), cartItemCount: count };
-                }, [cart, activeBranchPromos, sessionInfo.shopId, sessionInfo.hasWelcomeDiscount, customerProfile, products, globalPoints, shops]);
+                }, [cart, activeBranchPromos, sessionInfo.shopId, sessionInfo.hasWelcomeDiscount, sessionInfo.chargeStatus, sessionInfo.customerType, sessionInfo.chargeStatusScope, sessionInfo.chargeStatusShopIds, detectedShop, nearestShopInfo?.shop?.id, customerProfile, products, globalPoints, shops]);
 
                 // LIVE DISTANCE & TERRITORY CHECK (Synchronized instantly with Firestore)
                 const liveLocationStatus = useMemo(() => {
@@ -23520,7 +23624,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             const snapCust = await getDocs(qCust);
                             
                             if (!snapCust.empty) {
-                                const bestDoc = snapCust.docs.find(d => d.data()?.chargeStatus && d.data()?.chargeStatus !== 'Normal') || snapCust.docs[0];
+                                const scoreCustomerDoc = (d) => {
+                                    const data = d.data() || {};
+                                    const cs = String(data.chargeStatus || 'Normal').toUpperCase();
+                                    if (cs.includes('FOC') || cs.includes('FREE')) return 1000;
+                                    if (cs.includes('COG')) return 900;
+                                    const m = cs.match(/(\d+(?:\.\d+)?)/);
+                                    if (m) return parseFloat(m[1]);
+                                    if (data.customerType && data.customerType !== 'Normal') return 1;
+                                    return 0;
+                                };
+                                const sortedDocs = [...snapCust.docs].sort((a, b) => scoreCustomerDoc(b) - scoreCustomerDoc(a));
+                                const bestDoc = sortedDocs[0];
                                 const data = bestDoc.data();
                                 
                                 if (data.status === 'Inactive') {
@@ -23709,6 +23824,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const currentMins = now.getHours() * 60 + now.getMinutes();
                         const slots = targetShop.happyHourSlots || (targetShop.happyHourStart ? [{start: targetShop.happyHourStart, end: targetShop.happyHourEnd, type: targetShop.happyHourType, value: targetShop.happyHourValue}] : []);
                         
+                        let bestActiveSlot = null;
                         for (const slot of slots) {
                             if (!slot.start || !slot.end) continue;
                             const [startH, startM] = slot.start.split(':').map(Number);
@@ -23717,15 +23833,19 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             const endMins = endH * 60 + endM;
                             
                             const type = slot.type || targetShop.happyHourType || 'DISCOUNT_PCT';
-                            const value = slot.value !== undefined ? slot.value : (targetShop.happyHourValue || 0);
+                            const value = Number(slot.value !== undefined ? slot.value : (targetShop.happyHourValue || 0)) || 0;
 
-                            if (startMins <= endMins) {
-                                if (currentMins >= startMins && currentMins <= endMins) return { type, value };
-                            } else {
-                                if (currentMins >= startMins || currentMins <= endMins) return { type, value };
+                            const isTimeMatch = startMins <= endMins
+                                ? (currentMins >= startMins && currentMins <= endMins)
+                                : (currentMins >= startMins || currentMins <= endMins);
+
+                            if (isTimeMatch && value > 0) {
+                                if (!bestActiveSlot || value > bestActiveSlot.value) {
+                                    bestActiveSlot = { type, value };
+                                }
                             }
                         }
-                        return null;
+                        return bestActiveSlot;
                     })();
 
                     const effectivePosShopId = cartShopId || (posShopId !== 'All' ? posShopId : '');
@@ -23762,69 +23882,66 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             effectiveUnitPrice: item.price,
                             lineTotal: item.price * paidQty,
                             savings: 0,
+                            effectivePct: 0,
                             totalQtyForKDS: item.quantity,
                             freeQuantity: 0,
                             promoNames: []
                         };
 
-                        // Best Value Evaluator Function
+                        // Best Value Evaluator Function (Uses centralized comparator for KHR savings, effective %, and priority)
                         const addScenario = (scenario) => {
-                            // Priority: VIP > Combo > Happy Hour > Promo
-                            const getPriority = (name) => {
-                                if (name.includes('VIP')) return 5;
-                                if (name.includes('Combo')) return 4;
-                                if (name.includes('Happy')) return 2;
-                                return 1;
-                            };
-
-                            if (scenario.savings > bestScenario.savings) {
-                                bestScenario = scenario;
-                            } else if (scenario.savings === bestScenario.savings && scenario.savings > 0) {
-                                if (getPriority(scenario.name) > getPriority(bestScenario.name)) {
-                                    bestScenario = scenario;
-                                }
-                            }
+                            bestScenario = selectBestDiscountScenario(bestScenario, scenario);
                         };
 
                         if (paidQty > 0) {
                             // Scenario 1: Happy Hour
                             if (activeHappyHour) {
+                                const hhVal = Number(activeHappyHour.value) || 0;
                                 let effPrice = item.price;
                                 if (activeHappyHour.type === 'DISCOUNT_PCT') {
-                                    effPrice = Math.round(item.price - (item.price * (activeHappyHour.value / 100)));
+                                    effPrice = Math.max(0, item.price - Math.round(item.price * (hhVal / 100)));
                                 } else {
-                                    effPrice = Math.max(0, item.price - activeHappyHour.value);
+                                    effPrice = Math.max(0, item.price - hhVal);
                                 }
-                                let lTotal = effPrice * paidQty;
+                                const lTotal = effPrice * paidQty;
+                                const savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                const effPct = activeHappyHour.type === 'DISCOUNT_PCT'
+                                    ? hhVal
+                                    : (item.price > 0 ? ((item.price - effPrice) / item.price) * 100 : 0);
                                 addScenario({
                                     name: 'Happy',
                                     effectiveUnitPrice: effPrice,
                                     lineTotal: lTotal,
-                                    savings: (item.price * paidQty) - lTotal,
+                                    savings,
+                                    effectivePct: effPct,
                                     totalQtyForKDS: item.quantity,
                                     freeQuantity: 0,
-                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? activeHappyHour.value + '%' : activeHappyHour.value + '៛'})`]
+                                    promoNames: [`Happy Hour (-${activeHappyHour.type === 'DISCOUNT_PCT' ? hhVal + '%' : hhVal.toLocaleString() + '៛'})`]
                                 });
                             }
 
-                            // Scenario 2: Standard Promo
-                            const promo = activePromos.find(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
-                            if (promo) {
+                            // Scenario 2: Standard Branch Promotions (Evaluate ALL matching active promos)
+                            const matchingPromos = activePromos.filter(p => !p.applicableProductIds || p.applicableProductIds.length === 0 || p.applicableProductIds.includes(item.productId));
+                            matchingPromos.forEach(promo => {
                                 let effPrice = item.price;
                                 let lTotal = item.price * paidQty;
                                 let fQty = 0;
                                 let tQty = item.quantity;
                                 let pName = promo.name;
                                 let savings = 0;
+                                let effPct = 0;
+                                const discVal = Number(promo.discountValue || 0);
 
                                 if (promo.type === 'DISCOUNT_PCT') {
-                                    effPrice = Math.round(item.price - (item.price * (Number(promo.discountValue || 0) / 100)));
+                                    effPrice = Math.max(0, item.price - Math.round(item.price * (discVal / 100)));
                                     lTotal = effPrice * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
+                                    savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                    effPct = discVal;
                                 } else if (promo.type === 'DISCOUNT_FIXED') {
-                                    effPrice = Math.max(0, item.price - Number(promo.discountValue || 0));
+                                    effPrice = Math.max(0, item.price - discVal);
                                     lTotal = effPrice * paidQty;
-                                    savings = (item.price * paidQty) - lTotal;
+                                    savings = Math.max(0, (item.price * paidQty) - lTotal);
+                                    effPct = item.price > 0 ? ((item.price - effPrice) / item.price) * 100 : 0;
                                 } else if (promo.type === 'BOGO') {
                                     const reqQty = Math.max(1, Number(promo.requiredQty || 1));
                                     const rewQty = Math.max(1, Number(promo.rewardQty || 1));
@@ -23832,11 +23949,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     tQty = item.quantity + fQty;
                                     lTotal = effPrice * paidQty;
                                     savings = fQty * item.price;
+                                    effPct = (paidQty + fQty) > 0 ? (fQty / (paidQty + fQty)) * 100 : 0;
                                     if (fQty > 0) pName += ` (+${fQty} Free)`;
                                 } else if (promo.type === 'FREE_ITEM') {
                                     effPrice = 0;
                                     lTotal = 0;
                                     savings = item.price * paidQty;
+                                    effPct = 100;
                                 }
 
                                 if (savings > 0) {
@@ -23844,15 +23963,16 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         name: 'Promo',
                                         effectiveUnitPrice: effPrice,
                                         lineTotal: lTotal,
-                                        savings: savings,
+                                        savings,
+                                        effectivePct: effPct,
                                         totalQtyForKDS: tQty,
                                         freeQuantity: fQty,
                                         promoNames: [pName]
                                     });
                                 }
-                            }
+                            });
 
-                            // Scenario 3: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount %)
+                            // Scenario 3: CRM Member / Charge Status (Normal Price, FOC, COG, or Custom Discount % e.g. 60%)
                             const memberScenario = evaluateCustomerChargeStatus(customerData, effectivePosShopId, item, product);
                             if (memberScenario) {
                                 addScenario(memberScenario);
@@ -23871,11 +23991,13 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 if (totalComboSavings > 0) {
                                     const lTotal = Math.max(0, (item.price * paidQty) - totalComboSavings);
                                     const effPrice = Math.round(lTotal / paidQty);
+                                    const effPct = (item.price * paidQty) > 0 ? (totalComboSavings / (item.price * paidQty)) * 100 : 0;
                                     addScenario({
                                         name: 'Combo',
                                         effectiveUnitPrice: effPrice,
                                         lineTotal: lTotal,
                                         savings: totalComboSavings,
+                                        effectivePct: effPct,
                                         totalQtyForKDS: item.quantity,
                                         freeQuantity: 0,
                                         promoNames: [`Combo Deal (-${totalComboSavings.toLocaleString()} ៛)`],
@@ -26227,6 +26349,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     phone: data.phone,
                                     name: data.name,
                                     sex: data.sex,
+                                    customerType: data.customerType || data.fullData?.customerType || prev?.customerType || 'Normal',
+                                    chargeStatus: data.chargeStatus || data.fullData?.chargeStatus || prev?.chargeStatus || 'Normal',
+                                    chargeStatusScope: data.chargeStatusScope || data.fullData?.chargeStatusScope || prev?.chargeStatusScope || 'All',
+                                    chargeStatusShopIds: data.chargeStatusShopIds || data.fullData?.chargeStatusShopIds || prev?.chargeStatusShopIds || [],
                                     hasWelcomeDiscount: data.hasWelcomeDiscount
                                 }));
                                 setTimeout(() => {
