@@ -771,6 +771,49 @@
             };
 
             // ============================================================================
+            // CENTRALIZED ORDER SOURCE & HANDLER RESOLVER
+            // Accurately distinguishes Customer Self-Orders (which carry an anonymous customer
+            // `userId` and may later gain a `staffId` when staff settle payment in POS/KDS)
+            // from POS Counter Orders created directly by staff.
+            // ============================================================================
+            window.SolarisOrderUtils = {
+                isCustomerSelfOrder(order, admins = []) {
+                    if (!order) return false;
+                    if (order.orderSource === 'SELF_ORDER') return true;
+                    if (order.orderSource === 'POS') return false;
+
+                    const adminIds = new Set((admins || []).map(a => a.id));
+                    // Customer Portal orders always have a `userId` (anonymous customer auth UID)
+                    // that does NOT belong to any staff account in the `admins` collection.
+                    if (order.userId && adminIds.size > 0 && !adminIds.has(order.userId)) {
+                        return true;
+                    }
+                    // If neither staffId nor a known admin userId is present
+                    if (!order.staffId && (!order.userId || !adminIds.has(order.userId))) {
+                        return true;
+                    }
+                    return false;
+                },
+
+                getOrderSourceAndHandler(order, admins = []) {
+                    const isSelfOrder = this.isCustomerSelfOrder(order, admins);
+                    const staffByStaffId = order?.staffId ? (admins || []).find(a => a.id === order.staffId) : null;
+                    const staffByUserId = (!isSelfOrder && order?.userId) ? (admins || []).find(a => a.id === order.userId) : null;
+                    const resolvedStaff = staffByStaffId || staffByUserId || null;
+                    const handlerName = resolvedStaff?.name || order?.handlerUserId || (isSelfOrder ? null : 'Staff');
+
+                    return {
+                        isSelfOrder,
+                        sourceCode: isSelfOrder ? 'SELF_ORDER' : 'POS',
+                        sourceLabel: isSelfOrder ? 'Self-Order' : 'POS Counter',
+                        displayStaffOrSource: isSelfOrder ? 'Self-Order' : (handlerName || 'POS Staff'),
+                        settledByStaffName: isSelfOrder ? (resolvedStaff?.name || order?.handlerUserId || null) : null,
+                        handlerStaffId: resolvedStaff?.id || order?.staffId || (!isSelfOrder ? order?.userId : null) || null
+                    };
+                }
+            };
+
+            // ============================================================================
             // UNIFIED SEQUENTIAL INVOICE NUMBER ENGINE (Customer Self-Order + POSView)
             // Guarantees strict sequential numbering (e.g. SLR-000000001, SLR-000000002...)
             // across both Customer Portal (where global orders[] is empty) and Staff POS!
@@ -12000,6 +12043,7 @@
                     const orderData = {
                         id: preAllocatedOrderRef.id,
                         userId: currentUser ? currentUser.uid : null,
+                        orderSource: 'SELF_ORDER',
                         orderType: actualOrderType,
                         tableId: actualOrderType === 'DELIVERY' ? 'DELIVERY' : (snapTableId || 'TAKEAWAY'),
                         tableName: actualOrderType === 'DELIVERY' ? 'Delivery' : (snapTableName || 'Take Away'),
@@ -14260,19 +14304,24 @@
                     try { return localStorage.getItem('solaris_tv_voice_lang') || 'both'; } catch (e) { return 'both'; }
                 }); // 'en' | 'km' | 'both'
                 const [recentlyReady, setRecentlyReady] = useState(null);
+                const [recentlyPreparing, setRecentlyPreparing] = useState(null);
                 const [isFullscreen, setIsFullscreen] = useState(false);
                 const [audioUnlocked, setAudioUnlocked] = useState(false);
 
                 const announcedReadyIds = useRef(new Set());
+                const announcedPreparingIds = useRef(new Set());
                 const isInitialMount = useRef(true);
+                const isInitialPrepMount = useRef(true);
                 const audioCtxRef = useRef(null);
                 const availableVoicesRef = useRef([]);
                 const activeUtteranceRef = useRef(null);
                 const ttsAudioRef = useRef(null);
                 const speechQueueTimerRef = useRef(null);
+                const announcementQueueRef = useRef([]);
+                const isProcessingQueueRef = useRef(false);
                 const isAudioUnlockedRef = useRef(false);
 
-                // Preload and cache English voices, and unlock WebAudio + HTML5 Audio + SpeechSynthesis on user gesture
+                // Preload and cache English/Khmer voices, and unlock WebAudio + HTML5 Audio + SpeechSynthesis on user gesture
                 useEffect(() => {
                     const loadVoices = () => {
                         try {
@@ -14289,7 +14338,7 @@
                         window.speechSynthesis.onvoiceschanged = loadVoices;
                     }
 
-                    // Create a persistent HTML5 Audio element for Cloud TTS fallback (works on Smart TVs/Android WebViews without local TTS voices)
+                    // Create a persistent HTML5 Audio element for Cloud TTS fallback
                     if (!ttsAudioRef.current) {
                         try {
                             const audioEl = new Audio();
@@ -14297,7 +14346,6 @@
                             audioEl.playsInline = true;
                             audioEl.setAttribute('playsinline', '');
                             audioEl.setAttribute('webkit-playsinline', '');
-                            audioEl.referrerPolicy = 'no-referrer';
                             ttsAudioRef.current = audioEl;
                         } catch (e) {}
                     }
@@ -14309,13 +14357,6 @@
                     };
 
                     const unlockAudioAndSpeech = () => {
-                        if (isAudioUnlockedRef.current) {
-                            removeUnlockListeners();
-                            return;
-                        }
-                        isAudioUnlockedRef.current = true;
-                        removeUnlockListeners();
-
                         try {
                             const AudioContext = window.AudioContext || window.webkitAudioContext;
                             if (!audioCtxRef.current && AudioContext) {
@@ -14324,24 +14365,33 @@
                             if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
                                 Promise.resolve(audioCtxRef.current.resume()).catch(() => {});
                             }
-                            if (ttsAudioRef.current) {
-                                const silentWav = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-                                ttsAudioRef.current.src = silentWav;
-                                const p = ttsAudioRef.current.play();
-                                if (p !== undefined) {
-                                    p.then(() => {
-                                        if (ttsAudioRef.current) {
-                                            ttsAudioRef.current.pause();
-                                            ttsAudioRef.current.currentTime = 0;
-                                        }
-                                    }).catch(() => {});
+                            if (!isAudioUnlockedRef.current) {
+                                isAudioUnlockedRef.current = true;
+                                removeUnlockListeners();
+
+                                if (ttsAudioRef.current) {
+                                    const silentWav = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+                                    ttsAudioRef.current.src = silentWav;
+                                    const p = ttsAudioRef.current.play();
+                                    if (p !== undefined) {
+                                        p.then(() => {
+                                            if (ttsAudioRef.current) {
+                                                ttsAudioRef.current.pause();
+                                                ttsAudioRef.current.currentTime = 0;
+                                            }
+                                        }).catch(() => {});
+                                    }
                                 }
+                                if ('speechSynthesis' in window) {
+                                    window.speechSynthesis.cancel();
+                                    const silentUtter = new SpeechSynthesisUtterance(' ');
+                                    silentUtter.volume = 0.01;
+                                    silentUtter.rate = 2.0;
+                                    window.speechSynthesis.speak(silentUtter);
+                                    window.speechSynthesis.resume();
+                                }
+                                setAudioUnlocked(true);
                             }
-                            if ('speechSynthesis' in window) {
-                                window.speechSynthesis.cancel();
-                                window.speechSynthesis.resume();
-                            }
-                            setAudioUnlocked(true);
                         } catch (e) {}
                     };
 
@@ -14355,6 +14405,8 @@
                             clearTimeout(speechQueueTimerRef.current);
                             speechQueueTimerRef.current = null;
                         }
+                        announcementQueueRef.current = [];
+                        isProcessingQueueRef.current = false;
                         try {
                             if ('speechSynthesis' in window) {
                                 window.speechSynthesis.onvoiceschanged = null;
@@ -14416,29 +14468,60 @@
                     return queueNo;
                 };
 
-                const formatSpokenInvoice = (queueNo) => {
+                // Extracts only the trailing invoice number after all leading zeros (e.g. "SLR-000000015" -> "15")
+                const extractSpokenQueueNumber = (queueNo) => {
                     if (!queueNo) return '';
-                    const parts = String(queueNo).split('-');
-                    if (parts.length > 1) {
-                        const prefix = parts[0].split('').join(' ');
-                        const num = parseInt(parts[1], 10);
-                        const numStr = isNaN(num) ? parts[1] : String(num);
-                        return `${prefix}, ${numStr}`;
+                    const str = String(queueNo).trim();
+                    const trailingMatch = str.match(/(\d+)\s*$/);
+                    if (trailingMatch && trailingMatch[1]) {
+                        const stripped = trailingMatch[1].replace(/^0+/, '');
+                        return stripped || '0';
                     }
-                    return String(queueNo);
+                    const parts = str.split('-');
+                    const rawPart = parts.length > 1 ? parts[parts.length - 1] : parts[0];
+                    const cleanDigits = String(rawPart).replace(/\D/g, '').replace(/^0+/, '');
+                    return cleanDigits || String(rawPart).trim();
+                };
+
+                // Converts an integer into natural spoken Khmer words (e.g. 5 -> "ប្រាំ", 15 -> "ដប់ប្រាំ", 25 -> "ម្ភៃប្រាំ")
+                const numberToKhmerWords = (numValue) => {
+                    const n = parseInt(numValue, 10);
+                    const khmerDigits = ['សូន្យ', 'មួយ', 'ពីរ', 'បី', 'បួន', 'ប្រាំ', 'ប្រាំមួយ', 'ប្រាំពីរ', 'ប្រាំបី', 'ប្រាំបួន'];
+                    const khmerTens = ['', 'ដប់', 'ម្ភៃ', 'សាមសិប', 'សែសិប', 'ហាសិប', 'ហុកសិប', 'ចិតសិប', 'ប៉ែតសិប', 'កៅសិប'];
+
+                    if (isNaN(n) || n < 0) {
+                        return String(numValue || '')
+                            .split('')
+                            .map(ch => (ch >= '0' && ch <= '9' ? khmerDigits[Number(ch)] : ch))
+                            .join(' ');
+                    }
+                    if (n < 10) return khmerDigits[n];
+                    if (n < 100) {
+                        const ten = Math.floor(n / 10);
+                        const rem = n % 10;
+                        return rem === 0 ? khmerTens[ten] : `${khmerTens[ten]}${khmerDigits[rem]}`;
+                    }
+                    if (n < 1000) {
+                        const hundred = Math.floor(n / 100);
+                        const rem = n % 100;
+                        return rem === 0 ? `${khmerDigits[hundred]}រយ` : `${khmerDigits[hundred]}រយ ${numberToKhmerWords(rem)}`;
+                    }
+                    if (n < 10000) {
+                        const thousand = Math.floor(n / 1000);
+                        const rem = n % 1000;
+                        return rem === 0 ? `${khmerDigits[thousand]}ពាន់` : `${khmerDigits[thousand]}ពាន់ ${numberToKhmerWords(rem)}`;
+                    }
+                    return String(n).split('').map(ch => khmerDigits[Number(ch)] || ch).join(' ');
+                };
+
+                const formatSpokenInvoice = (queueNo) => {
+                    return extractSpokenQueueNumber(queueNo);
                 };
 
                 const formatKhmerSpokenInvoice = (queueNo) => {
-                    if (!queueNo) return '';
-                    const khmerDigits = {
-                        '0': 'សូន្យ', '1': 'មួយ', '2': 'ពីរ', '3': 'បី', '4': 'បួន',
-                        '5': 'ប្រាំ', '6': 'ប្រាំមួយ', '7': 'ប្រាំពីរ', '8': 'ប្រាំបី', '9': 'ប្រាំបួន'
-                    };
-                    const parts = String(queueNo).split('-');
-                    const rawNum = parts.length > 1 ? parts[1] : parts[0];
-                    const parsedNum = parseInt(rawNum, 10);
-                    const cleanDigits = isNaN(parsedNum) ? String(rawNum) : String(parsedNum);
-                    return cleanDigits.split('').map(ch => khmerDigits[ch] || ch).join(' ');
+                    const cleanNumber = extractSpokenQueueNumber(queueNo);
+                    if (!cleanNumber) return '';
+                    return numberToKhmerWords(cleanNumber);
                 };
 
                 const buildAnnouncementSegments = (order, langMode = voiceLang) => {
@@ -14466,6 +14549,24 @@
                     return [{ lang: 'en-US', tl: 'en', text: enText }];
                 };
 
+                const buildPreparingAnnouncementSegments = (order, langMode = voiceLang) => {
+                    const spokenInvoice = formatSpokenInvoice(order.queueNo);
+                    const kmSpokenInvoice = formatKhmerSpokenInvoice(order.queueNo);
+                    const totalCups = (order.items || []).reduce((s, i) => s + (Number(i.quantity) || 1), 0) || 1;
+                    const modeEn = order.orderType === 'TAKEAWAY' ? 'Takeaway' : order.orderType === 'DELIVERY' ? 'Delivery' : `Table ${order.tableName || ''}`;
+                    const modeKm = order.orderType === 'TAKEAWAY' ? 'ខ្ចប់យកទៅក្រៅ' : order.orderType === 'DELIVERY' ? 'ដឹកជញ្ជូន' : `តុលេខ ${order.tableName || ''}`;
+
+                    const enText = `Staff attention please. New ${modeEn} order received. Invoice number ${spokenInvoice}, ${totalCups} ${totalCups === 1 ? 'item' : 'items'}. Please start preparing.`;
+                    const kmText = `សូមជូនដំណឹងដល់បុគ្គលិក មានការកម្ម៉ង់ថ្មី ${modeKm} វិក្កយបត្រលេខ ${kmSpokenInvoice} ចំនួន ${totalCups} មុខ សូមចាប់ផ្តើមរៀបចំ`;
+
+                    if (langMode === 'km') return [{ lang: 'km-KH', tl: 'km', text: kmText }];
+                    if (langMode === 'both') return [
+                        { lang: 'km-KH', tl: 'km', text: kmText },
+                        { lang: 'en-US', tl: 'en', text: enText }
+                    ];
+                    return [{ lang: 'en-US', tl: 'en', text: enText }];
+                };
+
                 const splitTextIntoTTSChunks = (text, maxLen = 90) => {
                     const words = String(text).trim().split(/\s+/);
                     const chunks = [];
@@ -14482,8 +14583,86 @@
                     return chunks.length > 0 ? chunks : [text];
                 };
 
+                // Plays audio bytes directly via WebAudio API (immune to HTML5 <audio> autoplay blocks once AudioContext is running)
+                const playBufferViaWebAudio = async (arrayBuffer, playbackRate = 1.0) => {
+                    try {
+                        const AudioContext = window.AudioContext || window.webkitAudioContext;
+                        if (!audioCtxRef.current && AudioContext) {
+                            audioCtxRef.current = new AudioContext();
+                        }
+                        const ctx = audioCtxRef.current;
+                        if (!ctx) return false;
+                        if (ctx.state === 'suspended') {
+                            await ctx.resume().catch(() => {});
+                        }
+                        const audioBuffer = await new Promise((resolve, reject) => {
+                            ctx.decodeAudioData(arrayBuffer.slice(0), resolve, reject);
+                        });
+                        return await new Promise((resolve) => {
+                            const source = ctx.createBufferSource();
+                            source.buffer = audioBuffer;
+                            source.playbackRate.value = playbackRate;
+                            const gainNode = ctx.createGain();
+                            gainNode.gain.value = 1.0;
+                            source.connect(gainNode);
+                            gainNode.connect(ctx.destination);
+                            source.onended = () => resolve(true);
+                            source.start(0);
+                        });
+                    } catch (e) {
+                        return false;
+                    }
+                };
+
                 const playSingleCloudTTSUrl = (url, tl) => {
-                    return new Promise((resolve) => {
+                    return new Promise(async (resolve) => {
+                        // Strategy 1: Fetch binary audio and decode through WebAudio API (bypasses <audio> tag restrictions & hotlink blocks)
+                        try {
+                            const controller = new AbortController();
+                            const fetchTimer = setTimeout(() => controller.abort(), 5000);
+                            const res = await fetch(url, { signal: controller.signal, credentials: 'omit' });
+                            clearTimeout(fetchTimer);
+                            if (res.ok) {
+                                const buf = await res.arrayBuffer();
+                                if (buf && buf.byteLength > 256) {
+                                    const playedViaWebAudio = await playBufferViaWebAudio(buf, tl === 'km' ? 1.0 : 0.96);
+                                    if (playedViaWebAudio) {
+                                        resolve(true);
+                                        return;
+                                    }
+                                    // Secondary blob URL playback on the pre-unlocked <audio> element
+                                    const blob = new Blob([buf], { type: 'audio/mpeg' });
+                                    const blobUrl = URL.createObjectURL(blob);
+                                    const blobOk = await new Promise((resBlob) => {
+                                        const audio = ttsAudioRef.current || new Audio();
+                                        ttsAudioRef.current = audio;
+                                        let done = false;
+                                        const finishBlob = (val) => {
+                                            if (done) return;
+                                            done = true;
+                                            URL.revokeObjectURL(blobUrl);
+                                            clearTimeout(tId);
+                                            audio.onended = null;
+                                            audio.onerror = null;
+                                            resBlob(val);
+                                        };
+                                        const tId = setTimeout(() => finishBlob(false), 8000);
+                                        audio.onended = () => finishBlob(true);
+                                        audio.onerror = () => finishBlob(false);
+                                        audio.src = blobUrl;
+                                        audio.volume = 1.0;
+                                        const p = audio.play();
+                                        if (p !== undefined) p.catch(() => finishBlob(false));
+                                    });
+                                    if (blobOk) {
+                                        resolve(true);
+                                        return;
+                                    }
+                                }
+                            }
+                        } catch (fetchErr) {}
+
+                        // Strategy 2: Direct <audio src="..."> stream fallback (with no-referrer to avoid 403)
                         try {
                             const audio = ttsAudioRef.current || new Audio();
                             ttsAudioRef.current = audio;
@@ -14502,7 +14681,7 @@
                                 resolve(ok);
                             };
 
-                            const safetyTimer = setTimeout(() => finish(false), 8000);
+                            const safetyTimer = setTimeout(() => finish(false), 7500);
                             audio.onended = () => finish(true);
                             audio.onerror = () => finish(false);
                             audio.src = url;
@@ -14520,16 +14699,20 @@
                 };
 
                 const playCloudTTSFallback = async (speechText, tl = 'en') => {
-                    const chunks = splitTextIntoTTSChunks(speechText, tl === 'km' ? 75 : 140);
+                    const chunks = splitTextIntoTTSChunks(speechText, tl === 'km' ? 75 : 130);
                     const langParam = tl === 'km' ? 'km' : 'en';
                     let allSucceeded = true;
 
                     for (const chunk of chunks) {
                         const encoded = encodeURIComponent(chunk);
+                        const rawGoogleTtsUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${langParam}&q=${encoded}`;
+                        const rawGoogleTwObUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${langParam}&q=${encoded}`;
                         const endpoints = [
-                            `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${langParam}&q=${encoded}`,
-                            `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${langParam}&q=${encoded}`,
-                            `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${langParam}&q=${encoded}`
+                            `https://corsproxy.io/?${encodeURIComponent(rawGoogleTtsUrl)}`,
+                            `https://api.allorigins.win/raw?url=${encodeURIComponent(rawGoogleTtsUrl)}`,
+                            rawGoogleTtsUrl,
+                            rawGoogleTwObUrl,
+                            `https://dict.youdao.com/dictvoice?audio=${encoded}&le=${langParam === 'km' ? 'km' : 'eng'}`
                         ];
 
                         let chunkPlayed = false;
@@ -14548,102 +14731,175 @@
                     return allSucceeded;
                 };
 
-                const speakSingleSegment = (segment) => {
+                const speakViaBrowserSpeechSynthesis = (speechText, lang, tl) => {
                     return new Promise((resolve) => {
-                        const { lang, tl, text: speechText } = segment;
-
-                        // CRITICAL MOBILE FIX: Mobile browsers (iOS Safari & Android Chrome) frequently report
-                        // dummy/default voices for speechSynthesis or silently drop `km-KH` utterances without firing `onerror`.
-                        // For Khmer ('km'), always prioritize the pre-unlocked Cloud TTS audio stream first, then fall back to native speechSynthesis.
-                        if (tl === 'km') {
-                            playCloudTTSFallback(speechText, 'km').then((ok) => {
-                                if (ok) {
-                                    resolve(true);
-                                    return;
-                                }
-                                // Fallback to device speechSynthesis if offline or Cloud TTS blocked
-                                if ('speechSynthesis' in window) {
-                                    try {
-                                        const voices = availableVoicesRef.current.length > 0
-                                            ? availableVoicesRef.current
-                                            : window.speechSynthesis.getVoices();
-                                        const matchedVoice = voices.find(v => (v.lang && v.lang.toLowerCase().includes('km')) || (v.name && v.name.toLowerCase().includes('khmer')));
-                                        window.speechSynthesis.cancel();
-                                        const utter = new SpeechSynthesisUtterance(speechText);
-                                        utter.lang = 'km-KH';
-                                        if (matchedVoice) utter.voice = matchedVoice;
-                                        const timer = setTimeout(() => resolve(false), 6000);
-                                        utter.onend = () => { clearTimeout(timer); resolve(true); };
-                                        utter.onerror = () => { clearTimeout(timer); resolve(false); };
-                                        window.speechSynthesis.speak(utter);
-                                        return;
-                                    } catch (e) {}
-                                }
-                                resolve(false);
-                            });
+                        if (!('speechSynthesis' in window)) {
+                            resolve(false);
                             return;
                         }
+                        try {
+                            const voices = availableVoicesRef.current.length > 0
+                                ? availableVoicesRef.current
+                                : window.speechSynthesis.getVoices();
 
-                        if ('speechSynthesis' in window) {
-                            try {
-                                const voices = availableVoicesRef.current.length > 0
-                                    ? availableVoicesRef.current
-                                    : window.speechSynthesis.getVoices();
-
-                                const matchedVoice = voices.find(v => v.lang === 'en-US' && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Samantha') || v.name.includes('Microsoft')))
+                            let matchedVoice = null;
+                            if (tl === 'km') {
+                                matchedVoice = voices.find(v => (v.lang && v.lang.toLowerCase().includes('km')) || (v.name && v.name.toLowerCase().includes('khmer')));
+                                // If device has zero native Khmer voices installed, return false immediately so Cloud TTS handles Khmer
+                                if (!matchedVoice) {
+                                    resolve(false);
+                                    return;
+                                }
+                            } else {
+                                matchedVoice = voices.find(v => v.lang === 'en-US' && (v.name.includes('Google') || v.name.includes('Natural') || v.name.includes('Samantha') || v.name.includes('Microsoft')))
                                     || voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en-us'))
                                     || voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en'));
+                            }
 
-                                if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
-                                    window.speechSynthesis.cancel();
+                            window.speechSynthesis.cancel();
+                            window.speechSynthesis.resume();
+
+                            const utter = new SpeechSynthesisUtterance(speechText);
+                            utter.lang = lang;
+                            utter.rate = tl === 'km' ? 0.95 : 0.92;
+                            utter.pitch = 1.0;
+                            utter.volume = 1.0;
+                            if (matchedVoice) utter.voice = matchedVoice;
+
+                            let settled = false;
+                            let hasStarted = false;
+                            activeUtteranceRef.current = utter;
+
+                            // Chrome/Android keep-alive ping to prevent speechSynthesis from freezing mid-sentence
+                            const resumePing = setInterval(() => {
+                                if ('speechSynthesis' in window && window.speechSynthesis.paused) {
+                                    window.speechSynthesis.resume();
                                 }
-                                window.speechSynthesis.resume();
+                            }, 350);
 
-                                const utter = new SpeechSynthesisUtterance(speechText);
-                                utter.lang = lang;
-                                utter.rate = 0.92;
-                                utter.pitch = 1.0;
-                                utter.volume = 1.0;
-                                if (matchedVoice) utter.voice = matchedVoice;
+                            const finish = (ok) => {
+                                if (settled) return;
+                                settled = true;
+                                clearInterval(resumePing);
+                                clearTimeout(startWatchdog);
+                                clearTimeout(maxDurationTimer);
+                                activeUtteranceRef.current = null;
+                                resolve(ok);
+                            };
 
-                                let hasStartedSpeaking = false;
-                                activeUtteranceRef.current = utter;
+                            const startWatchdog = setTimeout(() => {
+                                if (!hasStarted) {
+                                    window.speechSynthesis.cancel();
+                                    finish(false);
+                                }
+                            }, 1400);
 
-                                const watchdogTimer = setTimeout(() => {
-                                    if (!hasStartedSpeaking) {
-                                        playCloudTTSFallback(speechText, tl).then(resolve);
-                                    }
-                                }, 800);
+                            const maxDurationTimer = setTimeout(() => finish(hasStarted), 12000);
 
-                                utter.onstart = () => {
-                                    hasStartedSpeaking = true;
-                                    clearTimeout(watchdogTimer);
-                                };
-                                utter.onend = () => {
-                                    clearTimeout(watchdogTimer);
-                                    activeUtteranceRef.current = null;
-                                    resolve(true);
-                                };
-                                utter.onerror = () => {
-                                    clearTimeout(watchdogTimer);
-                                    activeUtteranceRef.current = null;
-                                    if (!hasStartedSpeaking) {
-                                        playCloudTTSFallback(speechText, tl).then(resolve);
-                                    } else {
-                                        resolve(false);
-                                    }
-                                };
+                            utter.onstart = () => {
+                                hasStarted = true;
+                                clearTimeout(startWatchdog);
+                            };
+                            utter.onend = () => finish(true);
+                            utter.onerror = () => finish(false);
 
-                                window.speechSynthesis.speak(utter);
-                                window.speechSynthesis.resume();
+                            setTimeout(() => {
+                                try {
+                                    window.speechSynthesis.speak(utter);
+                                    window.speechSynthesis.resume();
+                                } catch (err) {
+                                    finish(false);
+                                }
+                            }, 40);
+                        } catch (e) {
+                            resolve(false);
+                        }
+                    });
+                };
+
+                const speakSingleSegment = async (segment) => {
+                    const { lang, tl, text: speechText } = segment;
+
+                    if (tl === 'km') {
+                        // For Khmer: Try Cloud TTS (WebAudio/Proxy) first since most devices lack a local Khmer voice pack, then fallback to native speechSynthesis
+                        const cloudOk = await playCloudTTSFallback(speechText, 'km');
+                        if (cloudOk) return true;
+                        return await speakViaBrowserSpeechSynthesis(speechText, lang, 'km');
+                    } else {
+                        // For English: Try native SpeechSynthesis first, and if blocked or silent, fallback to Cloud TTS (WebAudio/Proxy)
+                        const nativeOk = await speakViaBrowserSpeechSynthesis(speechText, lang, 'en');
+                        if (nativeOk) return true;
+                        return await playCloudTTSFallback(speechText, 'en');
+                    }
+                };
+
+                const playChimeNotes = (type = 'READY') => {
+                    return new Promise((resolve) => {
+                        if (!isSoundEnabled) {
+                            resolve();
+                            return;
+                        }
+                        try {
+                            const AudioContext = window.AudioContext || window.webkitAudioContext;
+                            if (!audioCtxRef.current && AudioContext) audioCtxRef.current = new AudioContext();
+                            const ctx = audioCtxRef.current;
+                            if (!ctx) {
+                                resolve();
                                 return;
-                            } catch (e) {
-                                console.warn("Native SpeechSynthesis exception, using Cloud TTS fallback:", e);
+                            }
+                            if (ctx.state === 'suspended') {
+                                ctx.resume().catch(() => {});
+                            }
+
+                            const playTone = (freq, start, duration, vol = 0.35, wave = 'sine') => {
+                                const osc = ctx.createOscillator();
+                                const gain = ctx.createGain();
+                                osc.type = wave;
+                                osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+                                gain.gain.setValueAtTime(0.001, ctx.currentTime + start);
+                                gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.03);
+                                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+                                osc.connect(gain);
+                                gain.connect(ctx.destination);
+                                osc.start(ctx.currentTime + start);
+                                osc.stop(ctx.currentTime + start + duration);
+                            };
+
+                            if (type === 'PREPARING') {
+                                // Staff Attention 3-Note Ascending Chime: C5 -> E5 -> G5
+                                playTone(523.25, 0, 0.25, 0.35, 'triangle');
+                                playTone(659.25, 0.18, 0.25, 0.35, 'triangle');
+                                playTone(783.99, 0.36, 0.55, 0.40, 'triangle');
+                                setTimeout(resolve, 900);
+                            } else {
+                                // Pleasant two-tone airport chime for Ready pickup: E5 -> C5
+                                playTone(659.25, 0, 0.55, 0.38, 'sine');
+                                playTone(523.25, 0.40, 0.85, 0.38, 'sine');
+                                setTimeout(resolve, 1150);
+                            }
+                        } catch (e) {
+                            resolve();
+                        }
+                    });
+                };
+
+                const processAnnouncementQueue = async () => {
+                    if (isProcessingQueueRef.current) return;
+                    isProcessingQueueRef.current = true;
+                    try {
+                        while (announcementQueueRef.current.length > 0) {
+                            const task = announcementQueueRef.current.shift();
+                            if (!task) continue;
+                            await playChimeNotes(task.type);
+                            if (task.shouldPlayVoice && Array.isArray(task.segments)) {
+                                for (const seg of task.segments) {
+                                    await speakSingleSegment(seg);
+                                }
                             }
                         }
-
-                        playCloudTTSFallback(speechText, tl).then(resolve);
-                    });
+                    } finally {
+                        isProcessingQueueRef.current = false;
+                    }
                 };
 
                 const speakOrderAnnouncement = async (order, overrideLang = null) => {
@@ -14653,56 +14909,32 @@
                     }
                 };
 
-                // Play Airport-style Ding-Dong Chime + Voice Announcement
+                // Enqueue Ready for Pickup Announcement (Customer Pickup)
                 const triggerReadyAnnouncement = (order, forceVoice = null, overrideLang = null) => {
                     const shouldPlayVoice = forceVoice !== null ? forceVoice : isVoiceEnabled;
-
                     if (!isSoundEnabled && !shouldPlayVoice) return;
 
-                    if (speechQueueTimerRef.current) {
-                        clearTimeout(speechQueueTimerRef.current);
-                        speechQueueTimerRef.current = null;
-                    }
+                    const segments = buildAnnouncementSegments(order, overrideLang || voiceLang);
+                    announcementQueueRef.current.push({
+                        type: 'READY',
+                        shouldPlayVoice,
+                        segments
+                    });
+                    processAnnouncementQueue();
+                };
 
-                    try {
-                        if (isSoundEnabled) {
-                            const AudioContext = window.AudioContext || window.webkitAudioContext;
-                            if (!audioCtxRef.current && AudioContext) audioCtxRef.current = new AudioContext();
-                            const ctx = audioCtxRef.current;
-                            if (ctx) {
-                                if (ctx.state === 'suspended') ctx.resume();
+                // Enqueue Preparing Side Announcement (Staff Attention for Incoming New Active Order)
+                const triggerPreparingAnnouncement = (order, forceVoice = null, overrideLang = null) => {
+                    const shouldPlayVoice = forceVoice !== null ? forceVoice : isVoiceEnabled;
+                    if (!isSoundEnabled && !shouldPlayVoice) return;
 
-                                const playTone = (freq, start, duration, vol = 0.35) => {
-                                    const osc = ctx.createOscillator();
-                                    const gain = ctx.createGain();
-                                    osc.type = 'sine';
-                                    osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
-                                    gain.gain.setValueAtTime(0, ctx.currentTime + start);
-                                    gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.03);
-                                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
-                                    osc.connect(gain);
-                                    gain.connect(ctx.destination);
-                                    osc.start(ctx.currentTime + start);
-                                    osc.stop(ctx.currentTime + start + duration);
-                                };
-
-                                // Pleasant two-tone airport chime: E5 -> C5
-                                playTone(659.25, 0, 0.65);
-                                playTone(523.25, 0.45, 0.95);
-                            }
-                        }
-
-                        // Trigger voice announcement after chime finishes
-                        if (shouldPlayVoice) {
-                            const delayMs = isSoundEnabled ? 1250 : 50;
-                            speechQueueTimerRef.current = setTimeout(() => {
-                                speakOrderAnnouncement(order, overrideLang);
-                            }, delayMs);
-                        }
-                    } catch (err) {
-                        console.warn("TV Audio error:", err);
-                        if (shouldPlayVoice) speakOrderAnnouncement(order, overrideLang);
-                    }
+                    const segments = buildPreparingAnnouncementSegments(order, overrideLang || voiceLang);
+                    announcementQueueRef.current.push({
+                        type: 'PREPARING',
+                        shouldPlayVoice,
+                        segments
+                    });
+                    processAnnouncementQueue();
                 };
 
                 // Filter Preparing & Ready orders for the selected branch
@@ -14722,7 +14954,41 @@
                     return { preparingOrders: prep, readyOrders: ready };
                 }, [orders, filterShop]);
 
-                // Detect newly Ready orders and trigger visual flash + chime + English voice
+                // Detect newly incoming Active Orders on the Preparing Side and trigger Staff Attention Voice Announcement
+                useEffect(() => {
+                    if (isInitialPrepMount.current) {
+                        preparingOrders.forEach(o => announcedPreparingIds.current.add(o.id));
+                        isInitialPrepMount.current = false;
+                        return;
+                    }
+
+                    const currentPrepSet = new Set(preparingOrders.map(o => o.id));
+                    announcedPreparingIds.current.forEach(id => {
+                        if (!currentPrepSet.has(id)) {
+                            announcedPreparingIds.current.delete(id);
+                        }
+                    });
+
+                    const newPrepOrders = [];
+                    preparingOrders.forEach(o => {
+                        if (!announcedPreparingIds.current.has(o.id)) {
+                            announcedPreparingIds.current.add(o.id);
+                            newPrepOrders.push(o);
+                        }
+                    });
+
+                    if (newPrepOrders.length > 0) {
+                        const latestPrepOrder = newPrepOrders[newPrepOrders.length - 1];
+                        setRecentlyPreparing(latestPrepOrder);
+                        newPrepOrders.forEach(ord => triggerPreparingAnnouncement(ord));
+                        const timer = setTimeout(() => {
+                            setRecentlyPreparing(prev => (prev?.id === latestPrepOrder.id ? null : prev));
+                        }, 8000);
+                        return () => clearTimeout(timer);
+                    }
+                }, [preparingOrders, isSoundEnabled, isVoiceEnabled, voiceLang]);
+
+                // Detect newly Ready orders and trigger visual flash + chime + English/Khmer voice
                 useEffect(() => {
                     if (isInitialMount.current) {
                         readyOrders.forEach(o => announcedReadyIds.current.add(o.id));
@@ -14821,7 +15087,9 @@
                                         onChange={e => {
                                             setFilterShop(e.target.value);
                                             announcedReadyIds.current.clear();
+                                            announcedPreparingIds.current.clear();
                                             isInitialMount.current = true;
+                                            isInitialPrepMount.current = true;
                                         }}
                                     >
                                         {(isSuper || allowedShopIds.includes('All')) && <option value="All">All Branches</option>}
@@ -14914,6 +15182,40 @@
                             </div>
                         </div>
 
+                        {/* Non-Blocking Top Notification Banner for Incoming New Active Orders on Preparing Side (Staff Attention) */}
+                        {recentlyPreparing && (
+                            <div
+                                onClick={() => setRecentlyPreparing(null)}
+                                className="bg-amber-500 text-stone-950 px-4 py-2.5 sm:px-6 sm:py-3 border-b-2 border-white shadow-[0_10px_30px_rgba(245,158,11,0.4)] flex items-center justify-between gap-3 shrink-0 z-30 cursor-pointer animate-fade-in"
+                            >
+                                <div className="flex items-center gap-3 min-w-0">
+                                    <div className="w-9 h-9 sm:w-11 sm:h-11 rounded-xl bg-stone-950 text-amber-400 flex items-center justify-center text-lg sm:text-xl shrink-0 shadow-inner">
+                                        <i className="fa-solid fa-fire-burner animate-bounce"></i>
+                                    </div>
+                                    <div className="min-w-0">
+                                        <div className="text-[10px] font-black uppercase tracking-widest text-stone-900 leading-tight">
+                                            Staff Attention • New Active Order Received
+                                        </div>
+                                        <div className="text-lg sm:text-2xl font-black tracking-tight font-mono leading-tight truncate">
+                                            {formatShortQueue(recentlyPreparing.queueNo)}
+                                            <span className="text-xs sm:text-sm font-bold ml-2 opacity-80">({recentlyPreparing.queueNo})</span>
+                                            <span className="font-sans text-xs sm:text-base font-black ml-2 bg-stone-950 text-amber-400 px-2 py-0.5 rounded-lg">
+                                                {recentlyPreparing.orderType === 'TAKEAWAY' ? 'Takeaway' : recentlyPreparing.orderType === 'DELIVERY' ? 'Delivery' : `Table ${recentlyPreparing.tableName}`}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={(e) => { e.stopPropagation(); setRecentlyPreparing(null); }}
+                                    className="w-7 h-7 sm:w-8 sm:h-8 rounded-full bg-stone-950/15 hover:bg-stone-950/25 text-stone-950 flex items-center justify-center shrink-0 transition"
+                                    title="Dismiss"
+                                >
+                                    <i className="fa-solid fa-xmark text-sm"></i>
+                                </button>
+                            </div>
+                        )}
+
                         {/* Non-Blocking Top Notification Banner for Newly Ready Orders (Never overlaps Ready Cards on Mobile) */}
                         {recentlyReady && (
                             <div 
@@ -14983,9 +15285,10 @@
                                                 const doneItems = order.items?.reduce((s, i) => s + (i.done ? (i.quantity || 1) : 0), 0) || 0;
                                                 const progressPct = Math.round((doneItems / totalItems) * 100);
                                                 const isPaid = order.paymentStatus === 'Paid';
+                                                const isJustArrivedPrep = recentlyPreparing?.id === order.id;
 
                                                 return (
-                                                    <div key={order.id} className="bg-stone-900/95 border border-stone-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                                                    <div key={order.id} className={`bg-stone-900/95 border rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden transition-all duration-500 ${isJustArrivedPrep ? 'border-amber-400 ring-4 ring-amber-500/40' : 'border-stone-800'}`}>
                                                         <div>
                                                             {/* Header: Queue No, Invoice No, Timestamp & Order Type */}
                                                             <div className="flex justify-between items-start gap-2 mb-2">
@@ -15006,9 +15309,23 @@
                                                                     </div>
                                                                 </div>
                                                                 <div className="flex flex-col items-end gap-1 shrink-0">
-                                                                    <span className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded border ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-stone-300 border-stone-700' : order.orderType === 'DELIVERY' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-amber-500/20 text-amber-300 border-amber-500/30'}`}>
-                                                                        {order.orderType === 'TAKEAWAY' ? 'Takeaway' : order.orderType === 'DELIVERY' ? 'Delivery' : `Table ${order.tableName}`}
-                                                                    </span>
+                                                                    <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                setRecentlyPreparing(order);
+                                                                                triggerPreparingAnnouncement(order, true);
+                                                                            }}
+                                                                            className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition flex items-center gap-1"
+                                                                            title="Announce Order to Staff Again"
+                                                                        >
+                                                                            <i className="fa-solid fa-bullhorn"></i> Alert Staff
+                                                                        </button>
+                                                                        <span className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded border ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-stone-300 border-stone-700' : order.orderType === 'DELIVERY' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : 'bg-amber-500/20 text-amber-300 border-amber-500/30'}`}>
+                                                                            {order.orderType === 'TAKEAWAY' ? 'Takeaway' : order.orderType === 'DELIVERY' ? 'Delivery' : `Table ${order.tableName}`}
+                                                                        </span>
+                                                                    </div>
                                                                     <span className="text-xs font-bold text-stone-300 truncate max-w-[140px]">
                                                                         {order.customerName && order.customerName !== 'Walk-in' 
                                                                             ? `${order.customerSex === 'F' ? 'Ms. ' : 'Mr. '}${order.customerName}`
@@ -24883,9 +25200,9 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             if (o.paymentStatus !== 'Paid') return false;
                             if (o.shiftId) return false;
 
-                            // NEW: Claim it if we made it, OR if it's a Customer Self-Order (no staffId) that was auto-paid
+                            // Claim it if we made/settled it, OR if it's a Customer Self-Order that was auto-paid
                             const isMyOrder = o.staffId === currentShift.openedByUserId || o.userId === currentShift.openedByUserId;
-                            const isSelfOrder = !o.staffId; 
+                            const isSelfOrder = window.SolarisOrderUtils ? window.SolarisOrderUtils.isCustomerSelfOrder(o, admins) : !o.staffId;
                             
                             return isMyOrder || isSelfOrder;
                         });
@@ -26955,6 +27272,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             userId: currentAdminRecord ? currentAdminRecord.id : null,
                             staffId: currentAdminRecord ? currentAdminRecord.id : null,
                             handlerUserId: currentAdminRecord?.staffId || currentAdminRecord?.name || 'Staff',
+                            orderSource: 'POS',
                             orderType: actualOrderType,
                             tableId: actualOrderType === 'DELIVERY' ? 'DELIVERY' : (snapTableId || 'TAKEAWAY'),
                             tableName: actualOrderType === 'DELIVERY' ? 'Delivery' : (snapTableName || 'Take Away'),
@@ -28094,7 +28412,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         <thead className="sticky top-0 z-20 shadow-md">
                                             <tr className="text-stone-700 uppercase tracking-wider bg-stone-100 text-[11px]">
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Date & Time</th>
-                                                <th className="p-3 font-bold border border-stone-300 bg-stone-100">Staff Name</th>
+                                                <th className="p-3 font-bold border border-stone-300 bg-stone-100">Staff / Source</th>
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Shop Name</th>
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Table Name</th>
                                                 <th className="p-3 font-bold border border-stone-300 bg-stone-100">Invoice No.</th>
@@ -28108,7 +28426,9 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </thead>
                                         <tbody>
                                             {displayedOrders.map(order => {
-                                                const staffName = admins?.find(a => a.id === (order.staffId || order.userId))?.name || 'Self-Order';
+                                                const sourceMeta = window.SolarisOrderUtils
+                                                    ? window.SolarisOrderUtils.getOrderSourceAndHandler(order, admins)
+                                                    : { isSelfOrder: !order.staffId, displayStaffOrSource: admins?.find(a => a.id === (order.staffId || order.userId))?.name || 'Self-Order', settledByStaffName: null };
                                                 const shopName = shops.find(s => s.id === order.shopId)?.name || 'Unknown';
                                                 return (
                                                 <tr key={order.id} className="hover:bg-stone-50 bg-white">
@@ -28121,7 +28441,25 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         </div>
                                                     </td>
                                                     <td className="p-3 border border-stone-300 align-top font-medium text-stone-800">
-                                                        {staffName}
+                                                        {sourceMeta.isSelfOrder ? (
+                                                            <div className="flex flex-col items-start gap-1">
+                                                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300 whitespace-nowrap shadow-sm">
+                                                                    <i className="fa-solid fa-mobile-screen-button text-emerald-600"></i> Self-Order
+                                                                </span>
+                                                                {sourceMeta.settledByStaffName && (
+                                                                    <span className="text-[10px] text-stone-500 font-bold whitespace-nowrap">
+                                                                        Handled: {sourceMeta.settledByStaffName}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        ) : (
+                                                            <div className="flex flex-col items-start gap-1">
+                                                                <span className="font-bold text-stone-800 text-xs">{sourceMeta.displayStaffOrSource}</span>
+                                                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-stone-100 text-stone-600 border border-stone-200 whitespace-nowrap">
+                                                                    <i className="fa-solid fa-cash-register text-stone-400"></i> POS Counter
+                                                                </span>
+                                                            </div>
+                                                        )}
                                                     </td>
                                                     <td className="p-3 border border-stone-300 align-top font-medium text-stone-800">
                                                         {shopName}
@@ -28134,9 +28472,19 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         {order.queueNo}
                                                     </td>
                                                     <td className="p-3 border border-stone-300 align-top">
-                                                        <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded whitespace-nowrap ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-white' : order.orderType === 'DELIVERY' ? 'bg-emerald-600 text-white' : 'bg-amber-600 text-white'}`}>
-                                                            {order.orderType === 'TAKEAWAY' ? 'Take Away' : order.orderType === 'DELIVERY' ? 'Delivery' : 'Dine-In'}
-                                                        </span>
+                                                        <div className="flex flex-col items-start gap-1">
+                                                            <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded whitespace-nowrap inline-flex items-center gap-1 ${order.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-white' : order.orderType === 'DELIVERY' ? 'bg-emerald-600 text-white' : 'bg-amber-600 text-white'}`}>
+                                                                <i className={`fa-solid ${order.orderType === 'TAKEAWAY' ? 'fa-bag-shopping' : order.orderType === 'DELIVERY' ? 'fa-motorcycle' : 'fa-utensils'} text-[9px]`}></i>
+                                                                <span>{order.orderType === 'TAKEAWAY' ? 'Take Away' : order.orderType === 'DELIVERY' ? 'Delivery' : `Dine-In (${order.tableName || 'Table'})`}</span>
+                                                            </span>
+                                                            <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded border whitespace-nowrap ${
+                                                                sourceMeta.isSelfOrder
+                                                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                                    : 'bg-blue-50 text-blue-700 border-blue-200'
+                                                            }`}>
+                                                                {sourceMeta.isSelfOrder ? '📱 Self-Order' : '🖥️ POS Counter'}
+                                                            </span>
+                                                        </div>
                                                         {order.orderType === 'TAKEAWAY' && order.pickupTime && (
                                                             <div className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded font-bold mt-1 w-fit whitespace-nowrap">
                                                                 <i className="fa-regular fa-clock mr-1 text-amber-600"></i>{order.pickupTime}
@@ -29109,6 +29457,18 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [purchaseInvoice, setPurchaseInvoice] = useState({ supplier: '', reference: '', items: [] });
                 const [selectedIngToAdd, setSelectedIngToAdd] = useState('');
 
+                // Stock Internal Transfer State (Branch-to-Branch Workflow)
+                const [transferModalOpen, setTransferModalOpen] = useState(false);
+                const [transferForm, setTransferForm] = useState({
+                    fromShopId: '',
+                    toShopId: '',
+                    reference: '',
+                    note: '',
+                    items: [] // [{ ingredientId, name, unit, conversionUnit, conversionRate, availableBaseQty, qtyBase }]
+                });
+                const [selectedTransferIngId, setSelectedTransferIngId] = useState('');
+                const [isSubmittingTransfer, setIsSubmittingTransfer] = useState(false);
+
                 // PHASE 2: Waste & Spoilage State
                 const [wasteModalOpen, setWasteModalOpen] = useState(false);
                 const [wasteData, setWasteData] = useState({ id: null, name: '', qty: '', reason: 'Expired', unit: '', conversionUnit: '', conversionRate: 1 });
@@ -29456,6 +29816,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             // Support legacy types for backwards compatibility
                             if (logsTypeFilter === 'Delivery') return l.type === 'Delivery' || l.type === 'Restock';
                             if (logsTypeFilter === 'Audit') return l.type === 'Audit' || l.type === 'Adjustment';
+                            if (logsTypeFilter === 'Transfer') return l.type === 'Transfer Out' || l.type === 'Transfer In';
                             return l.type === logsTypeFilter;
                         });
                     }
@@ -29653,6 +30014,160 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }
                 };
 
+                // Open Stock Internal Transfer Modal (Supports global multi-item or pre-selected single ingredient from row)
+                const openInternalTransferModal = (preselectedIngredient = null) => {
+                    const sourceShopId = (filterShop && filterShop !== 'All') ? filterShop : (shops[0]?.id || '');
+                    const defaultDestShop = shops.find(s => s.id !== sourceShopId);
+                    const autoRef = `TRF-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${String(Date.now()).slice(-4)}`;
+
+                    let initialItems = [];
+                    if (preselectedIngredient) {
+                        const convRate = Number(preselectedIngredient.conversionRate) || 1;
+                        const currentRecipeStock = Number(preselectedIngredient.stockByShop?.[sourceShopId] || 0);
+                        const availBase = currentRecipeStock / convRate;
+                        initialItems = [{
+                            ingredientId: preselectedIngredient.id,
+                            name: preselectedIngredient.name,
+                            code: preselectedIngredient.ingredientCode || '',
+                            unit: preselectedIngredient.unit || preselectedIngredient.conversionUnit || 'Unit',
+                            conversionUnit: preselectedIngredient.conversionUnit || preselectedIngredient.unit || 'Unit',
+                            conversionRate: convRate,
+                            availableBaseQty: availBase,
+                            qtyBase: ''
+                        }];
+                    }
+
+                    setTransferForm({
+                        fromShopId: sourceShopId,
+                        toShopId: defaultDestShop ? defaultDestShop.id : '',
+                        reference: autoRef,
+                        note: '',
+                        items: initialItems
+                    });
+                    setSelectedTransferIngId('');
+                    setTransferModalOpen(true);
+                };
+
+                // Execute Atomic Branch-to-Branch Stock Internal Transfer
+                const handleInternalTransferSubmit = async (e) => {
+                    e.preventDefault();
+                    if (isSubmittingTransfer) return;
+
+                    const { fromShopId, toShopId, reference, note, items } = transferForm;
+                    if (!fromShopId || !toShopId) {
+                        showInventoryToast("Please select both Source and Destination branches.", "error");
+                        return;
+                    }
+                    if (fromShopId === toShopId) {
+                        showInventoryToast("Source and Destination branches must be different.", "error");
+                        return;
+                    }
+                    if (!items || items.length === 0) {
+                        showInventoryToast("Please add at least one ingredient to transfer.", "error");
+                        return;
+                    }
+
+                    const fromShopObj = shops.find(s => s.id === fromShopId);
+                    const toShopObj = shops.find(s => s.id === toShopId);
+                    const fromShopName = fromShopObj?.name || 'Source Branch';
+                    const toShopName = toShopObj?.name || 'Destination Branch';
+                    const staffActor = currentAdminRecord?.name || currentAdminRecord?.email || 'Staff';
+
+                    const { doc, collection, writeBatch, increment } = window.FirebaseApp;
+                    const database = safeDB();
+                    const batch = writeBatch(database);
+
+                    const outEntries = [];
+                    const inEntries = [];
+                    let totalTransferValue = 0;
+
+                    for (const item of items) {
+                        const ing = ingredients.find(i => i.id === item.ingredientId);
+                        if (!ing) continue;
+
+                        const qtyBase = Number(item.qtyBase);
+                        if (isNaN(qtyBase) || qtyBase <= 0) {
+                            showInventoryToast(`Please enter a valid transfer quantity for "${item.name}".`, "error");
+                            return;
+                        }
+
+                        const rate = Number(ing.conversionRate) || 1;
+                        const currentRecipeStock = Number(ing.stockByShop?.[fromShopId] || 0);
+                        const availableBase = currentRecipeStock / rate;
+
+                        if (qtyBase > availableBase + 0.0001) {
+                            showInventoryToast(`Insufficient stock for "${ing.name}" at ${fromShopName} (Available: ${availableBase.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${ing.unit || ''}).`, "error");
+                            return;
+                        }
+
+                        const stockDeltaRecipeUnits = qtyBase * rate;
+                        const itemEstimatedCost = qtyBase * Number(ing.costPerUnit || 0);
+                        totalTransferValue += itemEstimatedCost;
+
+                        // Atomically deduct from Source Branch and increment Destination Branch on the same ingredient doc
+                        batch.update(doc(database, 'ingredients', ing.id), {
+                            [`stockByShop.${fromShopId}`]: increment(-stockDeltaRecipeUnits),
+                            [`stockByShop.${toShopId}`]: increment(stockDeltaRecipeUnits),
+                            updatedAt: Date.now()
+                        });
+
+                        outEntries.push({
+                            ingredientId: ing.id,
+                            amount: -stockDeltaRecipeUnits,
+                            cost: itemEstimatedCost
+                        });
+
+                        inEntries.push({
+                            ingredientId: ing.id,
+                            amount: stockDeltaRecipeUnits,
+                            cost: itemEstimatedCost
+                        });
+                    }
+
+                    if (outEntries.length === 0) return;
+
+                    setIsSubmittingTransfer(true);
+                    try {
+                        const nowTs = Date.now();
+                        const refClean = (reference || `TRF-${String(nowTs).slice(-6)}`).trim();
+                        const noteSuffix = note && note.trim() ? ` (${note.trim()})` : '';
+
+                        // 1. Create Transfer Out Log for Source Branch
+                        const outLogRef = doc(collection(database, 'inventory_logs'));
+                        batch.set(outLogRef, {
+                            shopId: fromShopId,
+                            targetShopId: toShopId,
+                            type: 'Transfer Out',
+                            reference: `${refClean} → To ${toShopName}${noteSuffix} • By ${staffActor}`,
+                            timestamp: nowTs,
+                            entries: outEntries,
+                            totalCost: totalTransferValue
+                        });
+
+                        // 2. Create Transfer In Log for Destination Branch
+                        const inLogRef = doc(collection(database, 'inventory_logs'));
+                        batch.set(inLogRef, {
+                            shopId: toShopId,
+                            sourceShopId: fromShopId,
+                            type: 'Transfer In',
+                            reference: `${refClean} ← From ${fromShopName}${noteSuffix} • By ${staffActor}`,
+                            timestamp: nowTs,
+                            entries: inEntries,
+                            totalCost: totalTransferValue
+                        });
+
+                        await batch.commit();
+                        setTransferModalOpen(false);
+                        setTransferForm({ fromShopId: '', toShopId: '', reference: '', note: '', items: [] });
+                        showInventoryToast(`Transferred ${outEntries.length} item(s) from ${fromShopName} to ${toShopName}!`, "success");
+                    } catch (err) {
+                        console.error("Stock Internal Transfer failed:", err);
+                        showInventoryToast("Failed to process transfer: " + err.message, "error");
+                    } finally {
+                        setIsSubmittingTransfer(false);
+                    }
+                };
+
                 // PHASE 2: Waste Submission Handler
                 const handleWasteSubmit = async (e) => {
                     e.preventDefault();
@@ -29781,6 +30296,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                     <select className="border border-stone-300 rounded-xl px-4 py-2 outline-none focus:border-amber-600 bg-white font-medium text-stone-600 shadow-sm text-sm" value={logsTypeFilter} onChange={e=>setLogsTypeFilter(e.target.value)}>
                                         <option value="All">All Types</option>
                                         <option value="Delivery">Delivery (In)</option>
+                                        <option value="Transfer">Internal Transfer (In/Out)</option>
                                         <option value="Usage">Usage (Out)</option>
                                         <option value="Waste">Waste (Out)</option>
                                         <option value="Audit">Audit (Adj)</option>
@@ -29842,6 +30358,9 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         <div className="flex flex-wrap gap-2 w-full sm:w-auto mt-2 sm:mt-0">
                                             <button onClick={() => setPurchaseModalOpen(true)} className="bg-green-600 text-white px-3 py-2 rounded-xl font-bold shadow-md hover:bg-green-700 transition flex items-center text-sm whitespace-nowrap">
                                                 <i className="fa-solid fa-truck-ramp-box mr-1.5"></i> Receive Delivery
+                                            </button>
+                                            <button onClick={() => openInternalTransferModal(null)} className="bg-blue-600 text-white px-3 py-2 rounded-xl font-bold shadow-md hover:bg-blue-700 transition flex items-center text-sm whitespace-nowrap">
+                                                <i className="fa-solid fa-right-left mr-1.5"></i> Stock Internal Transfer
                                             </button>
                                             <button onClick={() => setIsStocktakeMode(true)} className="bg-purple-600 text-white px-3 py-2 rounded-xl font-bold shadow-md hover:bg-purple-700 transition flex items-center text-sm whitespace-nowrap">
                                                 <i className="fa-solid fa-clipboard-list mr-1.5"></i> Bulk Stocktake
@@ -30028,6 +30547,21 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                                             <i className={`fa-solid ${resettingStockId === ing.id ? 'fa-spinner fa-spin' : 'fa-rotate-left'} text-xs`}></i>
                                                                         </button>
                                                                     )}
+                                                                    {hasFullInventoryAccess && shops.length > 1 && (
+                                                                        <button
+                                                                            type="button"
+                                                                            disabled={currentStock <= 0}
+                                                                            onClick={() => openInternalTransferModal(ing)}
+                                                                            className={`px-2.5 py-1.5 text-xs font-bold rounded-lg shadow-sm border transition flex items-center justify-center gap-1.5 ${
+                                                                                currentStock <= 0
+                                                                                    ? 'bg-stone-50 text-stone-300 border-stone-200 cursor-not-allowed'
+                                                                                    : 'bg-blue-50 text-blue-700 hover:bg-blue-600 hover:text-white border-blue-200'
+                                                                            }`}
+                                                                            title={currentStock <= 0 ? 'No stock available to transfer' : `Transfer "${ing.name}" to another branch`}
+                                                                        >
+                                                                            <i className="fa-solid fa-right-left"></i> Transfer
+                                                                        </button>
+                                                                    )}
                                                                     <button 
                                                                         onClick={() => {
                                                                             setWasteData({
@@ -30206,6 +30740,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                 let icon = 'fa-file-lines';
                                                 
                                                 if (log.type === 'Restock' || log.type === 'Delivery') { typeColor = 'bg-green-50 text-green-700 border-green-200'; amtColor = 'text-green-600'; icon = 'fa-truck-ramp-box'; }
+                                                if (log.type === 'Transfer In') { typeColor = 'bg-blue-50 text-blue-700 border-blue-200'; amtColor = 'text-blue-600'; icon = 'fa-right-to-bracket'; }
+                                                if (log.type === 'Transfer Out') { typeColor = 'bg-sky-50 text-sky-800 border-sky-200'; amtColor = 'text-sky-700'; icon = 'fa-right-from-bracket'; }
                                                 if (log.type === 'Usage') { typeColor = 'bg-red-50 text-red-700 border-red-200'; amtColor = 'text-red-500'; icon = 'fa-fire-burner'; }
                                                 if (log.type === 'Adjustment') { typeColor = 'bg-amber-50 text-amber-700 border-amber-200'; amtColor = 'text-amber-600'; icon = 'fa-scale-balanced'; }
                                                 if (log.type === 'Audit') { typeColor = 'bg-purple-50 text-purple-700 border-purple-200'; amtColor = 'text-purple-600'; icon = 'fa-clipboard-list'; }
@@ -30232,6 +30768,17 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                         </td>
                                                         <td className="p-3 border border-stone-300 text-right whitespace-nowrap">
                                                             {log.type === 'Delivery' && log.cost && <div className="text-xs text-stone-700 font-bold">Cost: <span className="text-stone-900">{log.cost.toLocaleString()} ៛</span></div>}
+                                                            {(log.type === 'Transfer In' || log.type === 'Transfer Out') && (
+                                                                <div className="text-xs text-blue-700 font-bold">
+                                                                    Val: <span className="text-stone-900">
+                                                                        {Math.round(log.cost !== undefined ? Number(log.cost) : (() => {
+                                                                            const rate = ing ? (Number(ing.conversionRate) || 1) : 1;
+                                                                            const cUnit = ing ? ((ing.conversionUnit && rate > 0) ? (Number(ing.costPerUnit || 0) / rate) : Number(ing.costPerUnit || 0)) : 0;
+                                                                            return Math.abs(Number(log.amount || 0)) * cUnit;
+                                                                        })()).toLocaleString()} ៛
+                                                                    </span>
+                                                                </div>
+                                                            )}
                                                             {log.type === 'Usage' && (() => {
                                                                 const rate = ing ? (Number(ing.conversionRate) || 1) : 1;
                                                                 const costPerRecipeUnit = ing ? ((ing.conversionUnit && rate > 0) ? (Number(ing.costPerUnit || 0) / rate) : Number(ing.costPerUnit || 0)) : 0;
@@ -30406,6 +30953,314 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             <button type="button" onClick={() => setPurchaseModalOpen(false)} className="px-5 py-3 rounded-xl font-semibold text-stone-600 bg-stone-100 hover:bg-stone-200 transition">Cancel</button>
                                             <button type="submit" className="px-5 py-3 rounded-xl font-bold bg-green-600 text-white hover:bg-green-700 shadow-md transition flex items-center">
                                                 <i className="fa-solid fa-check-double mr-2"></i> Submit Invoice
+                                            </button>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {/* Stock Internal Transfer (Branch-to-Branch) Modal */}
+                        {transferModalOpen && (
+                            <div className="fixed inset-0 bg-stone-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <form onSubmit={handleInternalTransferSubmit} className="bg-white rounded-3xl w-full max-w-3xl p-6 shadow-2xl animate-fade-in relative flex flex-col max-h-[90vh]">
+                                    <button
+                                        type="button"
+                                        onClick={() => setTransferModalOpen(false)}
+                                        className="absolute top-4 right-4 text-stone-400 hover:text-stone-700 w-8 h-8 flex items-center justify-center bg-stone-100 hover:bg-stone-200 rounded-full transition z-10"
+                                    >
+                                        <i className="fa-solid fa-xmark"></i>
+                                    </button>
+
+                                    <div className="flex items-center gap-3 mb-5 shrink-0">
+                                        <div className="w-12 h-12 bg-blue-100 text-blue-600 rounded-2xl flex items-center justify-center shadow-inner shrink-0">
+                                            <i className="fa-solid fa-right-left text-xl"></i>
+                                        </div>
+                                        <div>
+                                            <h3 className="text-xl font-black text-stone-900 leading-tight">Stock Internal Transfer</h3>
+                                            <p className="text-xs font-bold text-stone-500">
+                                                Move ingredient stock between branches with real-time on-hand validation & dual audit logging.
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    {/* Source & Destination Branch Selector + Transfer Reference */}
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4 shrink-0 bg-blue-50/60 p-4 rounded-2xl border border-blue-200/80">
+                                        <div>
+                                            <label className="block text-[10px] font-black text-blue-900 uppercase tracking-wider mb-1">
+                                                <i className="fa-solid fa-store mr-1 text-red-500"></i>From Branch (Source) *
+                                            </label>
+                                            <select
+                                                required
+                                                className="w-full border border-blue-300 rounded-xl px-3 py-2.5 outline-none focus:border-blue-600 bg-white text-xs sm:text-sm font-black text-stone-800 shadow-sm cursor-pointer"
+                                                value={transferForm.fromShopId}
+                                                onChange={e => {
+                                                    const newFromId = e.target.value;
+                                                    setTransferForm(prev => {
+                                                        const nextToId = prev.toShopId === newFromId
+                                                            ? (shops.find(s => s.id !== newFromId)?.id || '')
+                                                            : prev.toShopId;
+                                                        // Recalculate availableBaseQty for existing items when source branch changes
+                                                        const updatedItems = prev.items.map(it => {
+                                                            const ing = ingredients.find(i => i.id === it.ingredientId);
+                                                            const rate = Number(ing?.conversionRate) || 1;
+                                                            const curStock = Number(ing?.stockByShop?.[newFromId] || 0);
+                                                            return {
+                                                                ...it,
+                                                                availableBaseQty: curStock / rate
+                                                            };
+                                                        });
+                                                        return { ...prev, fromShopId: newFromId, toShopId: nextToId, items: updatedItems };
+                                                    });
+                                                }}
+                                            >
+                                                <option value="" disabled>Select Source Branch...</option>
+                                                {shops.filter(s => isSuper || currentAdminRecord?.shopIds?.includes(s.id) || s.id === filterShop).map(s => (
+                                                    <option key={s.id} value={s.id}>{s.name}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-[10px] font-black text-blue-900 uppercase tracking-wider mb-1">
+                                                <i className="fa-solid fa-truck-arrow-right mr-1 text-emerald-600"></i>To Branch (Destination) *
+                                            </label>
+                                            <select
+                                                required
+                                                className="w-full border border-blue-300 rounded-xl px-3 py-2.5 outline-none focus:border-blue-600 bg-white text-xs sm:text-sm font-black text-stone-800 shadow-sm cursor-pointer"
+                                                value={transferForm.toShopId}
+                                                onChange={e => setTransferForm(prev => ({ ...prev, toShopId: e.target.value }))}
+                                            >
+                                                <option value="" disabled>Select Destination Branch...</option>
+                                                {shops.filter(s => s.id !== transferForm.fromShopId).map(s => (
+                                                    <option key={s.id} value={s.id}>{s.name}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-[10px] font-black text-blue-900 uppercase tracking-wider mb-1">
+                                                <i className="fa-solid fa-hashtag mr-1 text-blue-600"></i>Transfer Ref / Slip No.
+                                            </label>
+                                            <input
+                                                type="text"
+                                                placeholder="e.g. TRF-261106-01"
+                                                className="w-full border border-blue-300 rounded-xl px-3 py-2.5 outline-none focus:border-blue-600 bg-white text-xs sm:text-sm font-mono font-bold text-stone-800 shadow-sm"
+                                                value={transferForm.reference}
+                                                onChange={e => setTransferForm(prev => ({ ...prev, reference: e.target.value }))}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {/* Ingredient Picker & Transfer Line Items */}
+                                    <div className="flex-1 overflow-y-auto min-h-[220px] border border-stone-200 rounded-2xl bg-stone-50 p-4 mb-4">
+                                        <div className="flex gap-2 mb-4">
+                                            <select
+                                                className="flex-1 border border-stone-300 rounded-xl px-3 py-2.5 outline-none focus:border-blue-500 bg-white font-bold text-xs sm:text-sm shadow-sm cursor-pointer"
+                                                value={selectedTransferIngId}
+                                                onChange={e => setSelectedTransferIngId(e.target.value)}
+                                            >
+                                                <option value="" disabled>Select Ingredient to Transfer from {shops.find(s => s.id === transferForm.fromShopId)?.name || 'Source'}...</option>
+                                                {sortedIngredients
+                                                    .filter(ing => !transferForm.items.some(i => i.ingredientId === ing.id))
+                                                    .map(ing => {
+                                                        const rate = Number(ing.conversionRate) || 1;
+                                                        const availBase = (Number(ing.stockByShop?.[transferForm.fromShopId] || 0)) / rate;
+                                                        const unitLabel = ing.unit || ing.conversionUnit || 'Unit';
+                                                        return (
+                                                            <option key={ing.id} value={ing.id} disabled={availBase <= 0}>
+                                                                {ing.ingredientCode ? `[${ing.ingredientCode}] ` : ''}{ing.name} — Avail: {availBase.toLocaleString(undefined, { maximumFractionDigits: 2 })} {unitLabel}
+                                                            </option>
+                                                        );
+                                                    })}
+                                            </select>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    if (!selectedTransferIngId) return;
+                                                    const ing = ingredients.find(i => i.id === selectedTransferIngId);
+                                                    if (!ing) return;
+                                                    const rate = Number(ing.conversionRate) || 1;
+                                                    const availBase = (Number(ing.stockByShop?.[transferForm.fromShopId] || 0)) / rate;
+                                                    if (availBase <= 0) {
+                                                        showInventoryToast(`"${ing.name}" has 0 on-hand stock at the source branch.`, "error");
+                                                        return;
+                                                    }
+                                                    setTransferForm(prev => ({
+                                                        ...prev,
+                                                        items: [
+                                                            ...prev.items,
+                                                            {
+                                                                ingredientId: ing.id,
+                                                                name: ing.name,
+                                                                code: ing.ingredientCode || '',
+                                                                unit: ing.unit || ing.conversionUnit || 'Unit',
+                                                                conversionUnit: ing.conversionUnit || ing.unit || 'Unit',
+                                                                conversionRate: rate,
+                                                                availableBaseQty: availBase,
+                                                                qtyBase: ''
+                                                            }
+                                                        ]
+                                                    }));
+                                                    setSelectedTransferIngId('');
+                                                }}
+                                                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-xl font-bold text-xs sm:text-sm shadow-md transition whitespace-nowrap flex items-center gap-1.5"
+                                            >
+                                                <i className="fa-solid fa-plus"></i> Add Item
+                                            </button>
+                                        </div>
+
+                                        {transferForm.items.length === 0 ? (
+                                            <div className="text-center py-8 text-stone-400 font-medium">
+                                                <i className="fa-solid fa-people-carry-box text-3xl mb-2 opacity-40 block"></i>
+                                                Select one or more ingredients above to transfer between branches.
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-2.5">
+                                                {transferForm.items.map((item, idx) => {
+                                                    const ingObj = ingredients.find(i => i.id === item.ingredientId);
+                                                    const rate = Number(ingObj?.conversionRate || item.conversionRate) || 1;
+                                                    const liveAvailBase = (Number(ingObj?.stockByShop?.[transferForm.fromShopId] || 0)) / rate;
+                                                    const destCurrentBase = (Number(ingObj?.stockByShop?.[transferForm.toShopId] || 0)) / rate;
+                                                    const enteredQty = Number(item.qtyBase) || 0;
+                                                    const isOverLimit = enteredQty > liveAvailBase + 0.0001;
+                                                    const estLineVal = enteredQty * Number(ingObj?.costPerUnit || 0);
+
+                                                    return (
+                                                        <div key={item.ingredientId} className={`flex flex-col sm:flex-row gap-3 bg-white p-3.5 rounded-2xl border shadow-sm items-center transition ${isOverLimit ? 'border-red-400 bg-red-50/30' : 'border-stone-200'}`}>
+                                                            <div className="flex-1 w-full min-w-0">
+                                                                <div className="flex items-center gap-2">
+                                                                    <span className="font-bold text-stone-800 text-sm truncate">{idx + 1}. {item.name}</span>
+                                                                    {item.code && <span className="text-[10px] font-bold bg-stone-100 text-stone-600 px-1.5 py-0.5 rounded border border-stone-200 uppercase">{item.code}</span>}
+                                                                </div>
+                                                                <div className="flex flex-wrap items-center gap-3 mt-1 text-[11px] font-bold">
+                                                                    <span className="text-stone-500">
+                                                                        Source Avail: <strong className="text-blue-700">{liveAvailBase.toLocaleString(undefined, { maximumFractionDigits: 2 })} {item.unit}</strong>
+                                                                    </span>
+                                                                    {transferForm.toShopId && (
+                                                                        <span className="text-stone-400">
+                                                                            Dest Current: <strong className="text-emerald-700">{destCurrentBase.toLocaleString(undefined, { maximumFractionDigits: 2 })} {item.unit}</strong>
+                                                                        </span>
+                                                                    )}
+                                                                    {enteredQty > 0 && rate > 1 && (
+                                                                        <span className="text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 text-[10px]">
+                                                                            = {(enteredQty * rate).toLocaleString(undefined, { maximumFractionDigits: 0 })} {item.conversionUnit}
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                                {isOverLimit && (
+                                                                    <div className="text-[10px] font-black text-red-600 mt-1">
+                                                                        <i className="fa-solid fa-triangle-exclamation mr-1"></i> Exceeds available stock at source branch!
+                                                                    </div>
+                                                                )}
+                                                            </div>
+
+                                                            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                                                                <div className="relative flex-1 sm:w-40">
+                                                                    <label className="absolute -top-2 left-2.5 bg-white px-1 text-[9px] font-black text-blue-700 uppercase">Transfer Qty *</label>
+                                                                    <input
+                                                                        type="number"
+                                                                        step="any"
+                                                                        min="0.0001"
+                                                                        max={liveAvailBase > 0 ? liveAvailBase : undefined}
+                                                                        required
+                                                                        placeholder="0.00"
+                                                                        className={`w-full border rounded-xl pl-3 pr-12 py-2 text-sm outline-none font-black text-stone-900 ${isOverLimit ? 'border-red-500 bg-red-50' : 'border-stone-300 focus:border-blue-600 bg-white'}`}
+                                                                        value={item.qtyBase}
+                                                                        onChange={e => {
+                                                                            const val = e.target.value;
+                                                                            setTransferForm(prev => {
+                                                                                const next = [...prev.items];
+                                                                                next[idx] = { ...next[idx], qtyBase: val };
+                                                                                return { ...prev, items: next };
+                                                                            });
+                                                                        }}
+                                                                    />
+                                                                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-stone-400">{item.unit}</span>
+                                                                </div>
+
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => {
+                                                                        setTransferForm(prev => {
+                                                                            const next = [...prev.items];
+                                                                            next[idx] = { ...next[idx], qtyBase: String(Number(liveAvailBase.toFixed(4))) };
+                                                                            return { ...prev, items: next };
+                                                                        });
+                                                                    }}
+                                                                    className="px-2.5 py-2 rounded-xl bg-stone-100 hover:bg-blue-50 text-stone-600 hover:text-blue-700 font-black text-[10px] uppercase border border-stone-200 transition shrink-0"
+                                                                    title="Transfer Max Available Stock"
+                                                                >
+                                                                    Max
+                                                                </button>
+
+                                                                {estLineVal > 0 && (
+                                                                    <div className="hidden md:flex flex-col items-end min-w-[75px] text-right">
+                                                                        <span className="text-[9px] font-bold text-stone-400 uppercase">Est. Value</span>
+                                                                        <span className="text-xs font-black text-stone-700">{Math.round(estLineVal).toLocaleString()} ៛</span>
+                                                                    </div>
+                                                                )}
+
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => {
+                                                                        setTransferForm(prev => ({
+                                                                            ...prev,
+                                                                            items: prev.items.filter((_, i) => i !== idx)
+                                                                        }));
+                                                                    }}
+                                                                    className="w-9 h-9 shrink-0 bg-red-50 text-red-500 hover:bg-red-100 hover:text-red-700 rounded-xl flex items-center justify-center transition"
+                                                                    title="Remove Item"
+                                                                >
+                                                                    <i className="fa-solid fa-trash text-xs"></i>
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Optional Transfer Reason / Driver Note */}
+                                    <div className="mb-4 shrink-0">
+                                        <input
+                                            type="text"
+                                            placeholder="Optional transfer note (e.g. Urgent milk & beans restock carried by Driver Dara)..."
+                                            className="w-full border border-stone-300 rounded-xl px-4 py-2.5 text-xs sm:text-sm font-medium outline-none focus:border-blue-600 bg-stone-50 focus:bg-white"
+                                            value={transferForm.note}
+                                            onChange={e => setTransferForm(prev => ({ ...prev, note: e.target.value }))}
+                                        />
+                                    </div>
+
+                                    {/* Footer Summary & Submit */}
+                                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 pt-4 border-t border-stone-100 shrink-0">
+                                        <div className="text-xs sm:text-sm font-bold text-stone-500">
+                                            Est. Transfer Stock Value:{' '}
+                                            <span className="text-lg font-black text-blue-700 ml-1">
+                                                {Math.round(
+                                                    transferForm.items.reduce((sum, it) => {
+                                                        const ing = ingredients.find(i => i.id === it.ingredientId);
+                                                        return sum + ((Number(it.qtyBase) || 0) * Number(ing?.costPerUnit || 0));
+                                                    }, 0)
+                                                ).toLocaleString()} ៛
+                                            </span>
+                                        </div>
+                                        <div className="flex gap-2 w-full sm:w-auto">
+                                            <button
+                                                type="button"
+                                                onClick={() => setTransferModalOpen(false)}
+                                                className="flex-1 sm:flex-none px-5 py-3 rounded-xl font-semibold text-stone-600 bg-stone-100 hover:bg-stone-200 transition text-sm"
+                                            >
+                                                Cancel
+                                            </button>
+                                            <button
+                                                type="submit"
+                                                disabled={isSubmittingTransfer || transferForm.items.length === 0 || !transferForm.fromShopId || !transferForm.toShopId || transferForm.fromShopId === transferForm.toShopId}
+                                                className="flex-1 sm:flex-none px-6 py-3 rounded-xl font-bold bg-blue-600 text-white hover:bg-blue-700 shadow-md transition flex items-center justify-center gap-2 text-sm disabled:opacity-50"
+                                            >
+                                                {isSubmittingTransfer ? <i className="fa-solid fa-spinner fa-spin"></i> : <i className="fa-solid fa-right-left"></i>}
+                                                <span>{isSubmittingTransfer ? 'Transferring...' : 'Confirm Stock Transfer'}</span>
                                             </button>
                                         </div>
                                     </div>
@@ -32027,8 +32882,15 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const matchShop = filterShopId === 'All' || o.shopId === filterShopId;
                         if (!matchShop) return false;
                         
+                        const isSelfOrder = window.SolarisOrderUtils
+                            ? window.SolarisOrderUtils.isCustomerSelfOrder(o, admins)
+                            : !(o.staffId || o.userId);
                         const matchStaff = filterStaff === 'All' || 
-                                        (filterStaff === 'Self-Order' ? !(o.staffId || o.userId) : (o.staffId === filterStaff || o.userId === filterStaff));
+                                        (filterStaff === 'Self-Order'
+                                            ? isSelfOrder
+                                            : (filterStaff === 'POS-Only'
+                                                ? !isSelfOrder
+                                                : (o.staffId === filterStaff || (!isSelfOrder && o.userId === filterStaff))));
                         if (!matchStaff) return false;
 
                         // Smart Filter: Shift Name Match
@@ -32250,15 +33112,21 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const formatSalesDateTime = (timestamp) => formatSolarisDateTime(timestamp, true);
 
                 const exportCSV = () => {
-                    const headers = "Date_Time,Shop_Name,Staff_Name,Invoice,Table,Customer,Phone,Items,Total,Redeemed_Points,Promotions,Payment_Status,Payment_Method,Order_Status\n";
+                    const headers = "Date_Time,Shop_Name,Order_Source,Staff_Name,Invoice,Order_Mode,Table,Customer,Phone,Items,Total,Redeemed_Points,Promotions,Payment_Status,Payment_Method,Order_Status\n";
                     const rows = filteredOrders.map(o => {
                         const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
-                        const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                        const sourceMeta = window.SolarisOrderUtils
+                            ? window.SolarisOrderUtils.getOrderSourceAndHandler(o, admins)
+                            : { isSelfOrder: !o.staffId, sourceLabel: !o.staffId ? 'Self-Order' : 'POS Counter', displayStaffOrSource: admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order', settledByStaffName: null };
+                        const staffLabel = sourceMeta.isSelfOrder
+                            ? (sourceMeta.settledByStaffName ? `Self-Order (Handled: ${sourceMeta.settledByStaffName})` : 'Self-Order')
+                            : sourceMeta.displayStaffOrSource;
+                        const modeLabel = o.orderType === 'TAKEAWAY' ? 'Take Away' : o.orderType === 'DELIVERY' ? 'Delivery' : 'Dine-In';
                         const promoSet = new Set(o.items?.map(i => i.promoName).filter(Boolean));
                         if (o.appliedScpName) promoSet.add(`SCP: ${o.appliedScpName}`);
                         const promos = [...promoSet].join('; ');
                         const itemsList = o.items?.map(i => `${i.quantity}x ${i.name} (${i.size}${i.gradeName && i.gradeName !== 'Default' ? `, ${i.gradeName}` : ''})`).join(' | ') || '';
-                        return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${staffName}","${o.queueNo}","${o.tableName}","${o.customerName || 'Walk-in'}","${o.customerPhone || 'N/A'}","${itemsList}",${o.totalAmount},${o.redeemedPoints || 0},"${promos}","${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.status}"`;
+                        return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${sourceMeta.sourceLabel}","${staffLabel}","${o.queueNo}","${modeLabel}","${o.tableName}","${o.customerName || 'Walk-in'}","${o.customerPhone || 'N/A'}","${itemsList}",${o.totalAmount},${o.redeemedPoints || 0},"${promos}","${o.paymentStatus || 'Unpaid'}","${o.paymentMethod || 'N/A'}","${o.status}"`;
                     }).join("\n");
                     const blob = new Blob([headers + rows], { type: 'text/csv;charset=utf-8;' });
                     const link = document.createElement("a");
@@ -32271,7 +33139,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     const headers = "Date_Time,Shop_Name,Staff_Name,Invoice_No,Partner_Name,Promo_Name,Item_Name,Discount,Order_Net\n";
                     const rows = scpReportData.usages.map(o => {
                         const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
-                        const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                        const sourceMeta = window.SolarisOrderUtils
+                            ? window.SolarisOrderUtils.getOrderSourceAndHandler(o, admins)
+                            : { displayStaffOrSource: admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order' };
+                        const staffName = sourceMeta.displayStaffOrSource;
                         const partnerName = partnersList.find(p=>p.id === o.appliedScpPartnerId)?.name || 'Unknown Partner';
                         const itemsList = o.items?.map(i => `${i.quantity}x ${i.name}`).join(' | ') || '';
                         return `"${formatSalesDateTime(o.createdAt)}","${shopName}","${staffName}","${o.queueNo}","${partnerName}","${o.appliedScpName}","${itemsList}","-${(o.scpDiscountAmount || 0)}","${o.totalAmount}"`;
@@ -32691,9 +33562,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 <div className="flex-1 min-w-[130px]">
                                     <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Staff / Source</label>
                                     <select className="w-full border border-stone-300 rounded-lg px-2.5 py-2 text-xs sm:text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filterStaff} onChange={e => setFilterStaff(e.target.value)}>
-                                        <option value="All">All Staff / Handlers</option>
-                                        <option value="Self-Order">Self-Order (Customer Portal)</option>
-                                        {filteredAdminsForDropdown.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                                        <option value="All">All Staff / Sources</option>
+                                        <option value="Self-Order">📱 Self-Order (Customer Portal)</option>
+                                        <option value="POS-Only">🖥️ POS Counter Only (All Staff)</option>
+                                        {filteredAdminsForDropdown.map(a => <option key={a.id} value={a.id}>👤 {a.name}</option>)}
                                     </select>
                                 </div>
 
@@ -32749,14 +33621,15 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         </div>
 
                         <div className="-mx-4 md:mx-0 bg-white border-y md:border md:rounded-2xl border-stone-200 shadow-sm overflow-x-auto table-wrapper pb-2">
-                            <table className="w-full min-w-[1400px] text-left text-sm border-collapse border border-stone-300">
+                            <table className="w-full min-w-[1550px] text-left text-sm border-collapse border border-stone-300">
                                 <thead>
                                     <tr className="text-stone-700 uppercase tracking-wider bg-stone-100">
                                         <th className="p-3 font-bold border border-stone-300">Date & Time</th>
                                         <th className="p-3 font-bold border border-stone-300">Shop Name</th>
-                                        <th className="p-3 font-bold border border-stone-300">Staff Name</th>
+                                        <th className="p-3 font-bold border border-stone-300">Staff / Source</th>
                                         <th className="p-3 font-bold border border-stone-300">Invoice</th>
-                                        <th className="p-3 font-bold border border-stone-300">Table</th>
+                                        <th className="p-3 font-bold border border-stone-300">Order Mode / Table</th>
+                                        <th className="p-3 font-bold border border-stone-300">Customer</th>
                                         <th className="p-3 font-bold border border-stone-300">Items</th>
                                         <th className="p-3 font-bold border border-stone-300">Total</th>
                                         <th className="p-3 font-bold border border-stone-300">Payment Method</th>
@@ -32768,7 +33641,9 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                 <tbody>
                                     {filteredOrders.map(o => {
                                         const shopName = shops.find(s => s.id === o.shopId)?.name || 'Unknown';
-                                        const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                                        const sourceMeta = window.SolarisOrderUtils
+                                            ? window.SolarisOrderUtils.getOrderSourceAndHandler(o, admins)
+                                            : { isSelfOrder: !o.staffId, displayStaffOrSource: admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order', settledByStaffName: null };
                                         return (
                                             <tr key={o.id} className="hover:bg-stone-50 bg-white">
                                                 <td className="p-3 border border-stone-300 align-top whitespace-nowrap text-stone-600 font-medium">
@@ -32780,9 +33655,46 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                                     </div>
                                                 </td>
                                                 <td className="p-3 border border-stone-300 align-top font-bold text-stone-800">{shopName}</td>
-                                                <td className="p-3 border border-stone-300 align-top font-medium text-stone-700">{staffName}</td>
+                                                <td className="p-3 border border-stone-300 align-top font-medium text-stone-700">
+                                                    {sourceMeta.isSelfOrder ? (
+                                                        <div className="flex flex-col items-start gap-1">
+                                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300 whitespace-nowrap shadow-sm">
+                                                                <i className="fa-solid fa-mobile-screen-button text-emerald-600"></i> Self-Order
+                                                            </span>
+                                                            {sourceMeta.settledByStaffName && (
+                                                                <span className="text-[10px] text-stone-500 font-bold whitespace-nowrap">
+                                                                    Handled: {sourceMeta.settledByStaffName}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    ) : (
+                                                        <div className="flex flex-col items-start gap-1">
+                                                            <span className="font-bold text-stone-800 text-xs">{sourceMeta.displayStaffOrSource}</span>
+                                                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-stone-100 text-stone-600 border border-stone-200 whitespace-nowrap">
+                                                                <i className="fa-solid fa-cash-register text-stone-400"></i> POS Counter
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                </td>
                                                 <td className="p-3 border border-stone-300 align-top font-bold text-stone-900">{o.queueNo}</td>
-                                            <td className="p-3 border border-stone-300 align-top font-medium">{o.tableName}</td>
+                                            <td className="p-3 border border-stone-300 align-top font-medium">
+                                                <div className="flex flex-col items-start gap-1">
+                                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded whitespace-nowrap inline-flex items-center gap-1 ${o.orderType === 'TAKEAWAY' ? 'bg-stone-800 text-white' : o.orderType === 'DELIVERY' ? 'bg-emerald-600 text-white' : 'bg-amber-600 text-white'}`}>
+                                                        <i className={`fa-solid ${o.orderType === 'TAKEAWAY' ? 'fa-bag-shopping' : o.orderType === 'DELIVERY' ? 'fa-motorcycle' : 'fa-utensils'} text-[9px]`}></i>
+                                                        <span>{o.orderType === 'TAKEAWAY' ? 'Take Away' : o.orderType === 'DELIVERY' ? 'Delivery' : `Dine-In (${o.tableName || 'Table'})`}</span>
+                                                    </span>
+                                                    {o.orderType === 'TAKEAWAY' && o.pickupTime && (
+                                                        <div className="text-[10px] text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded font-bold w-fit whitespace-nowrap">
+                                                            <i className="fa-regular fa-clock mr-1 text-amber-600"></i>{o.pickupTime}
+                                                        </div>
+                                                    )}
+                                                    {o.orderType === 'DELIVERY' && o.deliveryAddress && (
+                                                        <div className="text-[10px] text-emerald-800 font-bold max-w-[150px] break-words">
+                                                            <i className="fa-solid fa-location-dot mr-1 text-emerald-600"></i>{o.deliveryAddress}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </td>
                                             <td className="p-3 border border-stone-300 align-top">
                                                 <span className="font-semibold">
                                                     {!o.customerName || o.customerName === 'Walk-in' ? 'Walk-in' :
@@ -32893,7 +33805,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </tr>
                                     );
                                 })}
-                                        {filteredOrders.length === 0 && <tr><td colSpan={isSuper ? "11" : "10"} className="text-center py-8 text-stone-400 border border-stone-300">No matching orders found.</td></tr>}
+                                        {filteredOrders.length === 0 && <tr><td colSpan={isSuper ? "12" : "11"} className="text-center py-8 text-stone-400 border border-stone-300">No matching orders found.</td></tr>}
                                     </tbody>
                                 </table>
                             </div>
@@ -33216,11 +34128,12 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                                         {/* Staff Filter */}
                                         <div className="flex-1 min-w-[130px]">
-                                            <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Staff Member</label>
+                                            <label className="block text-[10px] font-bold text-stone-500 uppercase mb-1 ml-1">Staff / Source</label>
                                             <select className="w-full border border-stone-300 rounded-lg px-2.5 py-2 text-xs sm:text-sm outline-none focus:border-amber-500 bg-stone-50 font-bold text-stone-700 shadow-sm cursor-pointer" value={filterStaff} onChange={e => setFilterStaff(e.target.value)}>
-                                                <option value="All">All Staff</option>
-                                                <option value="Self-Order">Self-Order</option>
-                                                {filteredAdminsForDropdown.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+                                                <option value="All">All Staff / Sources</option>
+                                                <option value="Self-Order">📱 Self-Order</option>
+                                                <option value="POS-Only">🖥️ POS Counter Only</option>
+                                                {filteredAdminsForDropdown.map(a => <option key={a.id} value={a.id}>👤 {a.name}</option>)}
                                             </select>
                                         </div>
 
@@ -33295,7 +34208,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                         </thead>
                                         <tbody>
                                             {scpReportData.usages.map(o => {
-                                                const staffName = admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order';
+                                                const sourceMeta = window.SolarisOrderUtils
+                                                    ? window.SolarisOrderUtils.getOrderSourceAndHandler(o, admins)
+                                                    : { displayStaffOrSource: admins?.find(a => a.id === (o.staffId || o.userId))?.name || 'Self-Order' };
+                                                const staffName = sourceMeta.displayStaffOrSource;
                                                 return (
                                                 <tr key={o.id} className="hover:bg-stone-50 bg-white">
                                                     <td className="p-3 border border-stone-300 font-medium text-stone-600">{formatSalesDateTime(o.createdAt)}</td>
