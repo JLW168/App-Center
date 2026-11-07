@@ -962,13 +962,9 @@
             
             const isLeavePenaltyVoided = (es) => {
                 if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return true;
-                const coveringLeave = monthLeave.find(lr => {
-                    const numDays = parseFloat(lr.numberOfDays) || 0;
-                    if (numDays <= 1) return es.date === lr.leaveDate;
-                    return es.date >= lr.leaveDate && es.date < lr.returnDate;
-                });
+                const coveringLeave = monthLeave.find(lr => Utils.getLeaveDayCoverage(lr, es.date) !== null);
                 if (!coveringLeave) return false;
-                const session = (coveringLeave.leaveSession || 'Full Day').trim();
+                const session = (Utils.getLeaveDayCoverage(coveringLeave, es.date) || 'Full Day').trim();
                 if (session === 'Full Day') return true;
                 
                 const empShift = (shifts || []).find(s => s.name === employee.shift && s.shopName === es.shop) ||
@@ -1176,8 +1172,9 @@
                 } else {
                     // ONLY if it's not a holiday do we penalize for absence
                     if (!attendedDays.has(dayKey)) {
-                        // FIX: Check for specific leave record to handle half-days and same-day return dates precisely
-                        const todayLeaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && (dayKey < lr.returnDate || dayKey === lr.leaveDate));
+                        // Check for specific leave record and day coverage to handle half-days and multi-day half-day leaves (e.g., 1.5 days) precisely
+                        const todayLeaveRecord = monthLeave.find(lr => Utils.getLeaveDayCoverage(lr, dayKey) !== null);
+                        const dayCoverage = todayLeaveRecord ? Utils.getLeaveDayCoverage(todayLeaveRecord, dayKey) : null;
                         
                         if (!todayLeaveRecord) {
                             absentDays++; // Full absence
@@ -1186,14 +1183,14 @@
                             const hadRejectedLeave = (leaveRequests || []).some(
                                 lr => lr.staffId === employee.id &&
                                       lr.status === 'Rejected' &&
-                                      dayKey >= lr.leaveDate && (dayKey < lr.returnDate || dayKey === lr.leaveDate) 
+                                      Utils.getLeaveDayCoverage({ ...lr, status: 'Approved' }, dayKey) !== null
                             );
                             
                             if (hadRejectedLeave) {
                                 rejectedLeavePenaltyAmount += (salaryPerDay * 2);
                             }
-                        } else if (todayLeaveRecord.leaveSession !== 'Full Day') {
-                            // UX FIX: If they had a half-day leave but didn't show up at all, they are absent for 0.5 days.
+                        } else if (dayCoverage !== 'Full Day') {
+                            // UX FIX: If they had a half-day leave on this specific day but didn't show up at all, they are absent for 0.5 days.
                             absentDays += 0.5;
                         }
                     }
@@ -1540,6 +1537,44 @@
                 const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
                 const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
                 return R * c; // Distance in metres
+            },
+
+            // Helper: Determine the specific leave session ('Full Day', 'AM', 'PM', or null) for a target date (YYYY-MM-DD)
+            // Supports single-day (0.5 / 1.0) and multi-day with half-day (e.g., 1.5, 2.5 days) leave requests
+            getLeaveDayCoverage: (lr, targetDate) => {
+                if (!lr || lr.status !== 'Approved' || !lr.leaveDate) return null;
+                const numDays = parseFloat(lr.numberOfDays) || 0;
+                const session = (lr.leaveSession || 'Full Day').trim();
+                const returnDate = lr.returnDate || lr.leaveDate;
+
+                if (numDays <= 1) {
+                    if (targetDate === lr.leaveDate) return session;
+                    return null;
+                }
+
+                // Multi-day leave (> 1 day, e.g., 1.5, 2.0, 2.5 days)
+                if (targetDate < lr.leaveDate || targetDate >= returnDate) return null;
+
+                if (session === 'Full Day') {
+                    return 'Full Day';
+                }
+
+                // Multi-day + AM Leave (e.g., 1.5 days: Full Day(s) first, then AM Leave on the last covered day before returning in PM)
+                if (session === 'AM' || session.includes('First Half')) {
+                    const retD = new Date(returnDate);
+                    retD.setDate(retD.getDate() - 1);
+                    const lastCoveredDay = retD.toISOString().slice(0, 10);
+                    if (targetDate === lastCoveredDay) return 'AM';
+                    return 'Full Day';
+                }
+
+                // Multi-day + PM Leave (e.g., 1.5 days: PM Leave on the first day afternoon, followed by Full Day(s))
+                if (session === 'PM' || session.includes('Second Half')) {
+                    if (targetDate === lr.leaveDate) return 'PM';
+                    return 'Full Day';
+                }
+
+                return 'Full Day';
             },
 
             // --- NEW FUNCTION FOR SALARY SAVING PROGRAM (STEP 1) ---
@@ -7707,7 +7742,7 @@
                         }
                         if (userProfile.role === 'Shop Manager') {
                             const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                            return myShops.includes(t.shopName) && assigneeRole === 'Shop Supervisor';
+                            return myShops.includes(t.shopName) && (assigneeRole === 'Shop Supervisor' || assigneeRole === 'Staff');
                         }
                         if (userProfile.role === 'Shop Supervisor') {
                             const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
@@ -9961,19 +9996,12 @@
                         const checkInMins = parseTimeToMinutes(currentLocalTime);
                         const checkInHour = Math.floor(checkInMins / 60);
 
-                        const isLeaveCoveringDate = (lr, targetDate) => {
-                            if (!lr || lr.status !== 'Approved') return false;
-                            const numDays = parseFloat(lr.numberOfDays) || 0;
-                            if (numDays <= 1) return targetDate === lr.leaveDate;
-                            return targetDate >= lr.leaveDate && targetDate < lr.returnDate;
-                        };
-
                         const todayOT = (allData.otRequests || []).find(ot => 
                             ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
                         );
                         
                         let todayLeave = (allData.leaveRequests || []).find(lr => 
-                            lr.staffId === userProfile.id && isLeaveCoveringDate(lr, todayStr)
+                            lr.staffId === userProfile.id && Utils.getLeaveDayCoverage(lr, todayStr) !== null
                         );
 
                         if (!todayLeave) {
@@ -9984,11 +10012,13 @@
                                     where('staffId', '==', userProfile.id),
                                     where('status', '==', 'Approved')
                                 ));
-                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => isLeaveCoveringDate(lr, todayStr));
+                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => Utils.getLeaveDayCoverage(lr, todayStr) !== null);
                             } catch (err) {
                                 console.warn("Direct leave verification fallback error:", err);
                             }
                         }
+
+                        const todayLeaveCoverage = todayLeave ? Utils.getLeaveDayCoverage(todayLeave, todayStr) : null;
 
                         const isHoliday = (allData.publicHolidays || []).some(h => {
                             if (h.isGrouped) {
@@ -10013,7 +10043,7 @@
                         });
 
                         let effectiveShiftName = userProfile.shift;
-                        const hasMorningLeave = todayLeave && (todayLeave.leaveSession === 'Full Day' || todayLeave.leaveSession === 'AM' || (todayLeave.leaveSession || '').includes('First Half'));
+                        const hasMorningLeave = todayLeaveCoverage && (todayLeaveCoverage === 'Full Day' || todayLeaveCoverage === 'AM' || todayLeaveCoverage.includes('First Half'));
                         if (!hasMorningLeave && todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
                             effectiveShiftName = 'AM';
                         }
@@ -10030,8 +10060,8 @@
                             let isAfternoonLeaveShift = false;
                             let standardGraceMins = Math.max(0, lateLimitMins - startMins);
 
-                            if (!isExcused && todayLeave) {
-                                const session = (todayLeave.leaveSession || 'Full Day').trim();
+                            if (!isExcused && todayLeaveCoverage) {
+                                const session = todayLeaveCoverage.trim();
                                 if (session === 'Full Day') {
                                     isExcused = true;
                                 } else if (session === 'AM' || session.includes('First Half')) {
@@ -10202,19 +10232,12 @@
                         const checkInMins = parseTimeToMinutes(currentLocalTime);
                         const checkInHour = Math.floor(checkInMins / 60);
 
-                        const isLeaveCoveringDate = (lr, targetDate) => {
-                            if (!lr || lr.status !== 'Approved') return false;
-                            const numDays = parseFloat(lr.numberOfDays) || 0;
-                            if (numDays <= 1) return targetDate === lr.leaveDate;
-                            return targetDate >= lr.leaveDate && targetDate < lr.returnDate;
-                        };
-
                         const todayOT = (allData.otRequests || []).find(ot => 
                             ot.staffId === userProfile.id && ot.status === 'Approved' && ot.reqDate === todayStr
                         );
                         
                         let todayLeave = (allData.leaveRequests || []).find(lr => 
-                            lr.staffId === userProfile.id && isLeaveCoveringDate(lr, todayStr)
+                            lr.staffId === userProfile.id && Utils.getLeaveDayCoverage(lr, todayStr) !== null
                         );
 
                         if (!todayLeave) {
@@ -10225,11 +10248,13 @@
                                     where('staffId', '==', userProfile.id),
                                     where('status', '==', 'Approved')
                                 ));
-                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => isLeaveCoveringDate(lr, todayStr));
+                                todayLeave = leaveSnap.docs.map(d => d.data()).find(lr => Utils.getLeaveDayCoverage(lr, todayStr) !== null);
                             } catch (err) {
                                 console.warn("Direct leave verification fallback error:", err);
                             }
                         }
+
+                        const todayLeaveCoverage = todayLeave ? Utils.getLeaveDayCoverage(todayLeave, todayStr) : null;
 
                         const isHoliday = (allData.publicHolidays || []).some(h => {
                             if (h.isGrouped) {
@@ -10254,7 +10279,7 @@
                         });
 
                         let effectiveShiftName = userProfile.shift;
-                        const hasMorningLeave = todayLeave && (todayLeave.leaveSession === 'Full Day' || todayLeave.leaveSession === 'AM' || (todayLeave.leaveSession || '').includes('First Half'));
+                        const hasMorningLeave = todayLeaveCoverage && (todayLeaveCoverage === 'Full Day' || todayLeaveCoverage === 'AM' || todayLeaveCoverage.includes('First Half'));
                         if (!hasMorningLeave && todayOT && (todayOT.session === 'AM' || todayOT.session === 'Full Day') && checkInHour < 11) {
                             effectiveShiftName = 'AM';
                         }
@@ -10271,8 +10296,8 @@
                             let isAfternoonLeaveShift = false;
                             let standardGraceMins = Math.max(0, lateLimitMins - startMins);
 
-                            if (!isExcused && todayLeave) {
-                                const session = (todayLeave.leaveSession || 'Full Day').trim();
+                            if (!isExcused && todayLeaveCoverage) {
+                                const session = todayLeaveCoverage.trim();
                                 if (session === 'Full Day') {
                                     isExcused = true;
                                 } else if (session === 'AM' || session.includes('First Half')) {
@@ -10686,9 +10711,12 @@
                                 newFormData.numberOfDays = 0.5; 
                             }
                         } else {
-                            // Multi-day leave
-                            newFormData.numberOfDays = diffDays;
-                            newFormData.leaveSession = 'Full Day'; // Force full day for multi-day leaves
+                            // Multi-day leave: Support full days (e.g., 2, 3) OR multi-day with half-day session (e.g., 1.5, 2.5 days)
+                            if (newFormData.leaveSession === 'Full Day') {
+                                newFormData.numberOfDays = diffDays;
+                            } else {
+                                newFormData.numberOfDays = diffDays - 0.5;
+                            }
                         }
                     }
                 } else {
@@ -10736,11 +10764,18 @@
                                 
                                 <div>
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-sun mr-2 text-yellow-400"></i>Session</label>
-                                    <select name="leaveSession" value={formData.leaveSession || 'Full Day'} onChange={handleChange} className="select" disabled={isMultiDayLeave}>
-                                        <option value="Full Day">Full Day</option>
-                                        <option value="AM">First Half (AM Leave)</option>
-                                        <option value="PM">Second Half (PM Leave)</option>
+                                    <select name="leaveSession" value={formData.leaveSession || 'Full Day'} onChange={handleChange} className="select">
+                                        <option value="Full Day">{isMultiDayLeave ? `Full Days (${dateDiffInDays} Days)` : 'Full Day'}</option>
+                                        <option value="AM">{isMultiDayLeave ? `Full Day(s) + AM Leave (${dateDiffInDays - 0.5} Days)` : 'First Half (AM Leave)'}</option>
+                                        <option value="PM">{isMultiDayLeave ? `PM Leave + Full Day(s) (${dateDiffInDays - 0.5} Days)` : 'Second Half (PM Leave)'}</option>
                                     </select>
+                                    {isMultiDayLeave && formData.leaveSession !== 'Full Day' && (
+                                        <p className="text-[10px] text-blue-400 mt-1">
+                                            {formData.leaveSession === 'AM' 
+                                                ? `Covers Full Day(s) first + AM Leave on last day (Return afternoon).` 
+                                                : `Covers PM Leave on ${Utils.formatISOToDisplay(formData.leaveDate)} + Full Day(s) after.`}
+                                        </p>
+                                    )}
                                 </div>
                                 <div>
                                     <label className="text-sm font-medium text-slate-400"><i className="fas fa-calculator mr-2 text-blue-400"></i>No. Day(s)</label>
@@ -11290,9 +11325,7 @@
                     if (collectionName === 'leaveRequests' && status === 'Approved') {
                         const leaveReq = requests.find(r => r.id === id);
                         if (leaveReq) {
-                            const { staffId, leaveDate, returnDate, leaveSession } = leaveReq;
-                            const session = (leaveSession || 'Full Day').trim();
-                            const numDays = parseFloat(leaveReq.numberOfDays) || 0;
+                            const { staffId, leaveDate, returnDate } = leaveReq;
                             
                             const statesQ = query(
                                 collection(db, 'employeeStates'),
@@ -11307,8 +11340,9 @@
                                 const stateData = stateDoc.data();
                                 // Target the late check-in penalties within the leave range
                                 if (stateData.statusState === 'Deduction' && stateData.note?.includes('CheckIn Late')) {
-                                    const isCoveredDate = numDays <= 1 ? (stateData.date === leaveDate) : (stateData.date >= leaveDate && stateData.date < returnDate);
-                                    if (isCoveredDate) {
+                                    const dayCoverage = Utils.getLeaveDayCoverage({ ...leaveReq, status: 'Approved' }, stateData.date);
+                                    if (dayCoverage) {
+                                        const session = dayCoverage.trim();
                                         if (session === 'Full Day') {
                                             batch.delete(stateDoc.ref);
                                             penaltiesVoided++;
@@ -13047,11 +13081,8 @@
 
                     // --- OPTIMIZATION: Use Lookup Map instead of .find() ---
                     const employeeLeaves = leaveLookup.get(employee.id) || [];
-                    const approvedLeave = employeeLeaves.find(lr => {
-                        const numDays = parseFloat(lr.numberOfDays) || 0;
-                        if (numDays <= 1) return entry.date === lr.leaveDate;
-                        return entry.date >= lr.leaveDate && entry.date < lr.returnDate;
-                    });
+                    const approvedLeave = employeeLeaves.find(lr => Utils.getLeaveDayCoverage(lr, entry.date) !== null);
+                    const approvedLeaveCoverage = approvedLeave ? Utils.getLeaveDayCoverage(approvedLeave, entry.date) : null;
                     // --- END OPTIMIZATION ---
 
                     let isLate = false;
@@ -13085,8 +13116,8 @@
                             let isExcused = isHoliday;
 
                             // Apply Half-Day Leave Offset Logic exactly like the scanner engine
-                            if (!isExcused && approvedLeave) {
-                                const session = (approvedLeave.leaveSession || 'Full Day').trim();
+                            if (!isExcused && approvedLeaveCoverage) {
+                                const session = approvedLeaveCoverage.trim();
                                 if (session === 'Full Day') {
                                     isExcused = true;
                                 } else if (session === 'AM' || session.includes('First Half')) {
@@ -13136,8 +13167,8 @@
                     if (isHoliday) {
                         // If they checked in/out on a holiday, explicitly note it, otherwise mark as Holiday
                         isOnLeave = (checkIn || checkOut) ? 'Worked (Holiday)' : 'Holiday';
-                    } else if (approvedLeave) {
-                        isOnLeave = approvedLeave.leaveSession === 'Full Day' ? 'Y-Full Day' : `Y-${approvedLeave.leaveSession}`;
+                    } else if (approvedLeaveCoverage) {
+                        isOnLeave = approvedLeaveCoverage === 'Full Day' ? 'Y-Full Day' : `Y-${approvedLeaveCoverage}`;
                     } else if (checkIn || checkOut) {
                         isOnLeave = 'N';
                     } else {
@@ -13676,13 +13707,9 @@
                     // FIX: Read-Model Reconciliation - Exclude late days covered by Full Day or on-time AM approved leave
                     const totalLate = monthStates.filter(es => {
                         if (!(es.statusState === 'Deduction' && es.note?.includes('CheckIn Late'))) return false;
-                        const coveringLeave = monthLeave.find(lr => {
-                            const numDays = parseFloat(lr.numberOfDays) || 0;
-                            if (numDays <= 1) return es.date === lr.leaveDate;
-                            return es.date >= lr.leaveDate && es.date < lr.returnDate;
-                        });
+                        const coveringLeave = monthLeave.find(lr => Utils.getLeaveDayCoverage(lr, es.date) !== null);
                         if (!coveringLeave) return true;
-                        const session = (coveringLeave.leaveSession || 'Full Day').trim();
+                        const session = (Utils.getLeaveDayCoverage(coveringLeave, es.date) || 'Full Day').trim();
                         if (session === 'Full Day') return false;
                         if (session === 'AM' || session.includes('First Half')) {
                             const empShift = (shifts || []).find(s => s.name === employee.shift && s.shopName === es.shop) ||
@@ -13816,11 +13843,12 @@
 
                         } else {
                             if (!attendedDays.has(dayKey)) {
-                                // FIX: Check for specific leave record to handle half-days precisely
-                                const leaveRecord = monthLeave.find(lr => dayKey >= lr.leaveDate && dayKey < lr.returnDate);
+                                // FIX: Check for specific leave record and day coverage to handle half-days and 1.5-day leaves precisely
+                                const leaveRecord = monthLeave.find(lr => Utils.getLeaveDayCoverage(lr, dayKey) !== null);
+                                const dayCoverage = leaveRecord ? Utils.getLeaveDayCoverage(leaveRecord, dayKey) : null;
                                 if (!leaveRecord) {
                                     noAbsentCount++;
-                                } else if (leaveRecord.leaveSession !== 'Full Day') {
+                                } else if (dayCoverage !== 'Full Day') {
                                     noAbsentCount += 0.5;
                                 }
                             }
@@ -19729,7 +19757,7 @@ service cloud.firestore {
             
             // Determine task assignee's role for hierarchical auditing:
             // Admin/CEO -> audits Shop Manager
-            // Shop Manager -> audits Shop Supervisor
+            // Shop Manager -> audits Shop Supervisor & Staff
             // Shop Supervisor -> audits Staff
             const assignee = useMemo(() => {
                 if (!employees || !task.staffId) return null;
@@ -19749,7 +19777,7 @@ service cloud.firestore {
                     return viewerRole === 'Shop Manager';
                 }
                 if (assigneeRole === 'Staff') {
-                    return viewerRole === 'Shop Supervisor';
+                    return viewerRole === 'Shop Supervisor' || viewerRole === 'Shop Manager';
                 }
                 // Fallback for Admin/CEO tasks
                 return viewerRole === 'Admin' || viewerRole === 'CEO';
@@ -19758,7 +19786,7 @@ service cloud.firestore {
             const requiredAuditorLabel = useMemo(() => {
                 if (assigneeRole === 'Shop Manager') return 'Admin / CEO';
                 if (assigneeRole === 'Shop Supervisor') return 'Shop Manager';
-                if (assigneeRole === 'Staff') return 'Shop Supervisor';
+                if (assigneeRole === 'Staff') return 'Shop Supervisor / Shop Manager';
                 return 'Admin / CEO';
             }, [assigneeRole]);
             
@@ -23462,7 +23490,7 @@ service cloud.firestore {
                     
                     // Filter by shop and hierarchical auditing role:
                     // Admin/CEO -> Shop Manager tasks
-                    // Shop Manager -> Shop Supervisor tasks
+                    // Shop Manager -> Shop Supervisor & Staff tasks
                     // Shop Supervisor -> Staff tasks
                     items = items.filter(t => {
                         const assignee = (employees || []).find(e => e.id === t.staffId);
@@ -23473,7 +23501,7 @@ service cloud.firestore {
                         }
                         if (userProfile.role === 'Shop Manager') {
                             const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
-                            return myShops.includes(t.shopName) && assigneeRole === 'Shop Supervisor';
+                            return myShops.includes(t.shopName) && (assigneeRole === 'Shop Supervisor' || assigneeRole === 'Staff');
                         }
                         if (userProfile.role === 'Shop Supervisor') {
                             const myShops = Array.isArray(userProfile.shop) ? userProfile.shop : [userProfile.shop];
