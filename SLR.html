@@ -573,15 +573,25 @@
             // ============================================================================
             window.SolarisDataCache = {
                 CACHE_PREFIX: 'solaris_fast_boot_v1_',
+                PERSIST_PREFIX: 'solaris_fast_persist_v2_',
                 _inFlightPromises: {},
                 _memoryDocs: {},
 
                 readSession(key, fallback = []) {
                     try {
-                        const raw = sessionStorage.getItem(this.CACHE_PREFIX + key);
-                        if (!raw) return fallback;
-                        const parsed = JSON.parse(raw);
-                        return Array.isArray(parsed) ? parsed : (parsed || fallback);
+                        const rawSession = sessionStorage.getItem(this.CACHE_PREFIX + key);
+                        if (rawSession) {
+                            const parsed = JSON.parse(rawSession);
+                            if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+                            if (parsed && !Array.isArray(parsed)) return parsed;
+                        }
+                        // Fallback to persistent localStorage cache so cold starts also render in 0ms
+                        const rawPersist = localStorage.getItem(this.PERSIST_PREFIX + key);
+                        if (rawPersist) {
+                            const parsedPersist = JSON.parse(rawPersist);
+                            return Array.isArray(parsedPersist) ? parsedPersist : (parsedPersist || fallback);
+                        }
+                        return fallback;
                     } catch (e) {
                         return fallback;
                     }
@@ -599,6 +609,20 @@
                             } catch (innerErr) {}
                         }
                     }
+
+                    // Also persist lightweight storefront metadata in localStorage for instant cold-boot rendering
+                    try {
+                        if (key === 'products' && Array.isArray(data)) {
+                            // Keep external URLs, strip heavy base64 strings from localStorage to protect quota
+                            const lightProducts = data.map(p => ({
+                                ...p,
+                                image: (p.image && !String(p.image).startsWith('data:')) ? p.image : ''
+                            }));
+                            localStorage.setItem(this.PERSIST_PREFIX + key, JSON.stringify(lightProducts));
+                        } else if (['shops', 'categories', 'sugar', 'ice'].includes(key)) {
+                            localStorage.setItem(this.PERSIST_PREFIX + key, JSON.stringify(data));
+                        }
+                    } catch (persistErr) {}
                 },
 
                 // Deduplicates concurrent or repeated getDoc calls (e.g. loyalty_settings/global_points or loyalty_settings/{shopId})
@@ -5598,20 +5622,22 @@
                         clearTimeout(window.solarisLoadTimer);
                     }
 
-                    const initAndClearSession = async () => {
+                    const initAndClearSession = () => {
                         initializeFirebase();
-                        // Clear any previous admin login session on app boot to prevent zombie states
+                        // Instant non-blocking Customer-First boot: render the Customer Front Store immediately
+                        // without waiting for network signOut round-trips.
+                        setIsReady(true);
+
                         try {
                             localStorage.removeItem('solaris_last_view');
                             localStorage.removeItem('solaris_admin_profile');
                             localStorage.removeItem('solaris_last_heal');
                             if (auth && auth.currentUser && !auth.currentUser.isAnonymous) {
-                                await window.FirebaseApp.signOut(auth);
+                                window.FirebaseApp.signOut(auth).catch(e => console.warn("Background signOut warning:", e));
                             }
                         } catch (e) {
                             console.warn("Session cleanup warning:", e);
                         }
-                        setIsReady(true);
                     };
 
                     if (!window.FirebaseApp) {
@@ -5835,9 +5861,20 @@
                 const [loadingShops, setLoadingShops] = useState(() => window.SolarisDataCache.readSession('shops', []).length === 0);
                 const [loadingTables, setLoadingTables] = useState(false);
                 const tablesLoadedRef = useRef(window.SolarisDataCache.readSession('tables', []).length > 0);
+                const [isCustomerFrontStoreReady, setIsCustomerFrontStoreReady] = useState(() => {
+                    return window.SolarisDataCache.readSession('products', []).length > 0 &&
+                           window.SolarisDataCache.readSession('categories', []).length > 0;
+                });
                 
                 const isMenuLoading = loadingProducts || loadingCategories;
                 const isSetupLoading = loadingShops; 
+
+                // Mark Customer Front Store as completely loaded once critical storefront data (Products, Categories, Shops) is ready
+                useEffect(() => {
+                    if (!loadingProducts && !loadingCategories && !loadingShops) {
+                        setIsCustomerFrontStoreReady(true);
+                    }
+                }, [loadingProducts, loadingCategories, loadingShops]);
 
                 // Fetch Admin Profile in memory only when an admin explicitly logs in during the current session
                 const [adminProfile, setAdminProfile] = useState(null);
@@ -5861,11 +5898,13 @@
                     }
                 }, []);
 
-                // PHASE 2: On-Demand Back Office Entry Handler
+                // PHASE 2: On-Demand Back Office Entry Handler (Triggered ONLY when user clicks the Login Panel button)
                 const handleEnterBackOffice = async () => {
                     if (isBackOfficeLoading) return;
                     setBackOfficeLoadError('');
-                    const targetView = (user && !user.isAnonymous) ? 'admin_dashboard' : 'admin_login';
+                    const targetView = (user && !user.isAnonymous && adminProfile && adminProfile.status !== 'Inactive')
+                        ? 'admin_dashboard'
+                        : 'admin_login';
 
                     if (window.SolarisBackOffice && window.SolarisBackOfficeLoader?.isLoaded) {
                         setView(targetView);
@@ -5885,7 +5924,8 @@
                 
                 useEffect(() => {
                     initializeFirebase();
-                    if (user && !user.isAnonymous && window.FirebaseApp) {
+                    // Strictly fetch Admin Profile ONLY when the user has requested the Back Office view
+                    if (view !== 'customer' && user && !user.isAnonymous && window.FirebaseApp) {
                         try {
                             const { doc, getDoc } = window.FirebaseApp;
                             const database = safeDB();
@@ -5900,10 +5940,10 @@
                         } catch (err) {
                             console.error("Failed to fetch admin profile", err);
                         }
-                    } else if (!user || user.isAnonymous) {
+                    } else if (!user || user.isAnonymous || view === 'customer') {
                         setAdminProfile(null);
                     }
-                }, [user]);
+                }, [user, view]);
 
                 // SECURITY FIX: Active Background Session Monitor
                 useEffect(() => {
@@ -5966,25 +6006,7 @@
                     };
 
                     const unsubscribers = [];
-
-                    // Listen for global Application Name, System Logo & Global Default Banner changes in system_settings/security
-                    try {
-                        const { doc } = window.FirebaseApp;
-                        unsubscribers.push(onSnapshot(doc(safeDB(), 'system_settings', 'security'), snap => {
-                            if (snap.exists()) {
-                                const secData = snap.data() || {};
-                                if (secData.appName) {
-                                    handleUpdateAppName(secData.appName);
-                                }
-                                if (secData.appLogo !== undefined) {
-                                    handleUpdateAppLogo(secData.appLogo);
-                                }
-                                if (secData.defaultPortalBanner !== undefined) {
-                                    handleUpdateDefaultBanner(secData.defaultPortalBanner);
-                                }
-                            }
-                        }, () => {}));
-                    } catch (e) {}
+                    let isCancelled = false;
 
                     // PHASE 4A: Strict 5-Gate Back Office Verification
                     // Back Office listeners ONLY connect when:
@@ -6002,14 +6024,24 @@
                         }
                     };
 
-                    // PRIORITY 3 & 4: Live Listener ONLY for Products (catches real-time "Sold Out" status & pricing updates)
-                    unsubscribers.push(onSnapshot(getColRef('products'), snap => {
-                        const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
-                        syncToState('products', freshProducts, setProducts, setLoadingProducts);
-                    }, handleGlobalSnapError));
-
                     if (isVerifiedBackOfficeActive) {
-                        // Gate 5 Passed: Authorized Back Office Dashboard gets live WebSockets
+                        // Gate 5 Passed: Authorized Back Office Dashboard gets live real-time WebSockets
+                        try {
+                            const { doc } = window.FirebaseApp;
+                            unsubscribers.push(onSnapshot(doc(safeDB(), 'system_settings', 'security'), snap => {
+                                if (snap.exists()) {
+                                    const secData = snap.data() || {};
+                                    if (secData.appName) handleUpdateAppName(secData.appName);
+                                    if (secData.appLogo !== undefined) handleUpdateAppLogo(secData.appLogo);
+                                    if (secData.defaultPortalBanner !== undefined) handleUpdateDefaultBanner(secData.defaultPortalBanner);
+                                }
+                            }, () => {}));
+                        } catch (e) {}
+
+                        unsubscribers.push(onSnapshot(getColRef('products'), snap => {
+                            const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
+                            syncToState('products', freshProducts, setProducts, setLoadingProducts);
+                        }, handleGlobalSnapError));
                         unsubscribers.push(onSnapshot(getColRef('categories'), snap => {
                             syncToState('categories', snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
                         }, handleGlobalSnapError));
@@ -6033,36 +6065,68 @@
                         setIngredients([]);
                         setShifts([]);
 
-                        // PHASE 3A: Parallel Priority 1–3 Fetch for Customer Portal (Shops first, then Categories & Modifiers)
-                        // Note: `tables` is intentionally excluded from startup and loaded lazily only if ?table= is in URL or DINE_IN is selected!
-                        const fetchCustomerPriorityConfig = async () => {
+                        // CUSTOMER-FIRST STAGED DATA FETCHING STRATEGY:
+                        // Stage 1: Fetch ONLY Critical Above-the-Fold Customer Storefront Data (Shops + Categories + Products)
+                        // Stage 2: Once Customer Storefront is displayed, load secondary modifiers (Sugar/Ice) & Branding in the background
+                        const loadCustomerFrontStoreFirst = async () => {
                             try {
                                 const hasTableParam = new URLSearchParams(window.location.search).has('table');
-                                const [shopsSnap, catsSnap, sugarSnap, iceSnap] = await Promise.all([
+
+                                // STAGE 1: Critical Above-the-Fold Storefront Data (Shops + Categories + Live Products)
+                                const [shopsSnap, catsSnap] = await Promise.all([
                                     getDocs(getColRef('shops')),
-                                    getDocs(getColRef('categories')),
-                                    getDocs(getColRef('sugar_options')),
-                                    getDocs(getColRef('ice_options'))
+                                    getDocs(getColRef('categories'))
                                 ]);
-                                
+
+                                if (isCancelled) return;
                                 syncToState('shops', shopsSnap.docs.map(d => ({ id: d.id, ...d.data() })), setShops, setLoadingShops);
                                 syncToState('categories', catsSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setCategories, setLoadingCategories);
-                                syncToState('sugar', sugarSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
-                                syncToState('ice', iceSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
+
+                                // Attach real-time listener for Products so Customer Storefront renders immediately and stays in sync
+                                unsubscribers.push(onSnapshot(getColRef('products'), snap => {
+                                    if (isCancelled) return;
+                                    const freshProducts = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>b.updatedAt-a.updatedAt);
+                                    syncToState('products', freshProducts, setProducts, setLoadingProducts);
+                                }, handleGlobalSnapError));
 
                                 if (hasTableParam) {
                                     ensureTablesLoaded();
                                 }
+
+                                // STAGE 2: Secondary Customer Modifiers & Branding (Deferred until after Stage 1 completes)
+                                const [sugarSnap, iceSnap] = await Promise.all([
+                                    getDocs(getColRef('sugar_options')),
+                                    getDocs(getColRef('ice_options'))
+                                ]);
+
+                                if (isCancelled) return;
+                                syncToState('sugar', sugarSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setSugarOptions, null);
+                                syncToState('ice', iceSnap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b)=>a.order-b.order), setIceOptions, null);
+
+                                // Lightweight 1-time branding check for Customer Portal (avoids holding an open WebSocket)
+                                try {
+                                    const secData = await window.SolarisDataCache.fetchDocDeduplicated('system_settings', 'security', 120000);
+                                    if (!isCancelled && secData) {
+                                        if (secData.appName) handleUpdateAppName(secData.appName);
+                                        if (secData.appLogo !== undefined) handleUpdateAppLogo(secData.appLogo);
+                                        if (secData.defaultPortalBanner !== undefined) handleUpdateDefaultBanner(secData.defaultPortalBanner);
+                                    }
+                                } catch (secErr) {}
                             } catch (err) {
                                 console.warn("Failed to fetch customer priority config", err);
                                 setLoadingShops(false);
                                 setLoadingCategories(false);
+                                setLoadingProducts(false);
                             }
                         };
-                        fetchCustomerPriorityConfig();
+
+                        loadCustomerFrontStoreFirst();
                     }
 
-                    return () => unsubscribers.forEach(unsub => { if(typeof unsub === 'function') unsub(); });
+                    return () => {
+                        isCancelled = true;
+                        unsubscribers.forEach(unsub => { if(typeof unsub === 'function') unsub(); });
+                    };
                 }, [view, user, adminProfile, ensureTablesLoaded]);
 
                 // PHASE 4A: Strict Back Office Isolation for Global Orders Listener
@@ -6206,8 +6270,8 @@
                                     <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center mx-auto mb-4 shadow-inner">
                                         <i className="fa-solid fa-spinner fa-spin text-2xl"></i>
                                     </div>
-                                    <h3 className="text-lg font-black text-stone-900">Loading Back Office...</h3>
-                                    <p className="text-xs text-stone-500 font-medium mt-1">Initializing management & POS modules on-demand.</p>
+                                    <h3 className="text-lg font-black text-stone-900">Loading Login Panel...</h3>
+                                    <p className="text-xs text-stone-500 font-medium mt-1">Customer Storefront ready • Initializing Back Office on-demand.</p>
                                 </div>
                             </div>
                         )}
