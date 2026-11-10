@@ -33,6 +33,8 @@
         <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2"></script>
         <!-- NEW: Chart.js for Reports -->
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <!-- NEW: HTML5-QRCode for Mobile Camera Barcode & QR Scanning -->
+        <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 
         <!-- Custom Styles -->
         <style>
@@ -223,11 +225,16 @@
 
         const { data: vendors, loading: vendorsLoading } = useCollection('vendors');
         const { data: shops, loading: shopsLoading } = useCollection('shops');
-        // --- HIGH PRIORITY FETCHING ---
-        // These collections are fetched first to unblock the UI quickly.
-        const { data: allPOs, loading: posLoading } = useCollection('purchaseOrders');
-        const { data: allTransfers, loading: transfersLoading } = useCollection('internalTransfers');
-        const { data: users, loading: usersLoading } = useCollection('users');
+        // --- QUOTA OPTIMIZATION: Lazy-load heavy Inventory/Admin collections ---
+        // Do not attach listeners to allPOs, allTransfers, or users while in POS Terminal until Inventory/Settings is opened
+        const [enableHeavyCollections, setEnableHeavyCollections] = useState(false);
+        const activateHeavyCollections = useCallback(() => {
+            setEnableHeavyCollections(prev => (prev ? prev : true));
+        }, []);
+
+        const { data: allPOs, loading: posLoading } = useCollection('purchaseOrders', { enabled: enableHeavyCollections });
+        const { data: allTransfers, loading: transfersLoading } = useCollection('internalTransfers', { enabled: enableHeavyCollections });
+        const { data: users, loading: usersLoading } = useCollection('users', { enabled: enableHeavyCollections });
         // --- PHASE 1 ADDITION: Fetch Customers ---
         const { data: customers, loading: customersLoading } = useCollection('customers');
 
@@ -244,10 +251,18 @@
             return () => unsubscribe();
         }, []);
 
-        // STEP 2: Implement Phased Fetching Logic
+        // STEP 2: Implement Phased Fetching Logic (Optimized: Only re-subscribe if vendor IDs or priorities actually change)
+        const vendorPrioritySignature = useMemo(() => {
+            if (vendorsLoading || !vendors) return null;
+            return vendors
+                .map(v => `${v.id}:${v.priority || 'Low'}`)
+                .sort()
+                .join('|');
+        }, [vendors, vendorsLoading]);
+
         useEffect(() => {
             // Wait until vendors have been loaded.
-            if (vendorsLoading || !vendors) {
+            if (vendorPrioritySignature === null || !vendors) {
                 return;
             }
 
@@ -293,9 +308,9 @@
                         const query = db.collection('products').where('vendorId', 'in', chunk);
                         
                         const unsub = query.onSnapshot(snapshot => {
-                            // --- FIX START ---
-                            // Use docChanges() to correctly handle additions, modifications, AND removals.
+                            let hasChanges = false;
                             snapshot.docChanges().forEach((change) => {
+                                hasChanges = true;
                                 if (change.type === "added" || change.type === "modified") {
                                     allProductsForPriority.set(change.doc.id, { id: change.doc.id, ...change.doc.data() });
                                 }
@@ -303,11 +318,11 @@
                                     allProductsForPriority.delete(change.doc.id);
                                 }
                             });
-                            // --- FIX END ---
 
-                            // Update state with the combined results from all chunks for this priority level.
-                            setDataCallback(Array.from(allProductsForPriority.values()));
-                            if(setLoadedCallback) setLoadedCallback(true); // Signal that at least one chunk has loaded.
+                            if (hasChanges || snapshot.empty) {
+                                setDataCallback(Array.from(allProductsForPriority.values()));
+                            }
+                            if(setLoadedCallback) setLoadedCallback(true);
                         }, (error) => console.error("Error fetching product chunk:", error));
                         
                         allUnsubscribes.push(unsub);
@@ -320,17 +335,13 @@
             fetchProductsInChunks(highPriorityVendorIds, setHighPriorityProducts, setHighPriorityLoaded);
             fetchProductsInChunks(mediumPriorityVendorIds, setMediumPriorityProducts, setMediumPriorityLoaded);
             fetchProductsInChunks(lowPriorityVendorIds, setLowPriorityProducts, setLowPriorityLoaded);
-            
-            // Set loading to false immediately, allowing the UI to become interactive.
-            // All products will now stream in in the background.
-            
 
-            // Cleanup function to detach all listeners when the component unmounts or vendors change.
+            // Cleanup function to detach all listeners when the component unmounts or vendor priorities change.
             return () => {
                 allUnsubscribes.forEach(unsub => unsub());
             };
 
-        }, [vendors, vendorsLoading]);
+        }, [vendorPrioritySignature]);
 
         // This effect ensures the app is "ready" for product searches once high-priority items are loaded.
         useEffect(() => {
@@ -348,7 +359,7 @@
         ], [highPriorityProducts, mediumPriorityProducts, lowPriorityProducts]);
 
 
-        const isLoading = vendorsLoading || shopsLoading || posLoading || transfersLoading || usersLoading;
+        const isLoading = vendorsLoading || shopsLoading || (enableHeavyCollections && (posLoading || transfersLoading || usersLoading));
         const backgroundLoadComplete = highPriorityLoaded && mediumPriorityLoaded && lowPriorityLoaded;
 
         const value = { 
@@ -359,7 +370,8 @@
             productsLoading,
             posLoading, transfersLoading, usersLoading, customersLoading,
             backgroundFetchInitiated, backgroundLoadComplete,
-            systemConfig // <-- Expose config
+            systemConfig, // <-- Expose config
+            activateHeavyCollections // <-- Lazy-load trigger for Inventory / Admin tabs
         };
 
         return (
@@ -396,12 +408,18 @@
 
     // --- 3. CUSTOM HOOKS (Reusable Logic) ---
 
-    // Fetches a Firestore collection with real-time updates
+    // Fetches a Firestore collection with real-time updates (supports lazy loading via options.enabled)
     const useCollection = (collectionName, options = {}) => {
         const [data, setData] = useState([]);
-        const [loading, setLoading] = useState(true);
+        const [loading, setLoading] = useState(options.enabled !== false);
+        const isEnabled = options.enabled !== false;
 
         useEffect(() => {
+            if (!isEnabled) {
+                setLoading(false);
+                return;
+            }
+            setLoading(true);
             let query = db.collection(collectionName);
             if (options.query) {
                 options.query.forEach(q => {
@@ -419,7 +437,7 @@
             });
 
             return () => unsubscribe();
-        }, [collectionName, JSON.stringify(options.query)]);
+        }, [collectionName, JSON.stringify(options.query), isEnabled]);
 
         return { data, loading };
     };
@@ -484,6 +502,75 @@
     // Formatters for currency
     const khrFormatter = new Intl.NumberFormat('en-US');
     const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+
+    // --- NEW: Dynamic KHQR (EMVCo / Bakong Standard CRC-16/CCITT-FALSE) Generator ---
+    const computeCRC16CCITT = (str) => {
+        let crc = 0xFFFF;
+        for (let i = 0; i < str.length; i++) {
+            crc ^= (str.charCodeAt(i) << 8);
+            for (let j = 0; j < 8; j++) {
+                if ((crc & 0x8000) !== 0) {
+                    crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+                } else {
+                    crc = (crc << 1) & 0xFFFF;
+                }
+            }
+        }
+        return crc.toString(16).toUpperCase().padStart(4, '0');
+    };
+
+    const formatEMVTag = (id, value) => {
+        const strVal = String(value ?? '');
+        const len = String(strVal.length).padStart(2, '0');
+        return `${id}${len}${strVal}`;
+    };
+
+    const buildDynamicKHQRPayload = ({
+        bakongAccountId = 'merchant@aba',
+        merchantName = 'PO SYSTEM POS',
+        merchantCity = 'Phnom Penh',
+        currency = 'KHR', // 'KHR' (116) or 'USD' (840)
+        amount = 0,
+        billNumber = ''
+    }) => {
+        const cleanAccount = (bakongAccountId || 'merchant@aba').trim();
+        const cleanName = (merchantName || 'PO SYSTEM POS').replace(/[^a-zA-Z0-9 .-]/g, '').slice(0, 25).trim() || 'MERCHANT';
+        const cleanCity = (merchantCity || 'Phnom Penh').replace(/[^a-zA-Z0-9 .-]/g, '').slice(0, 15).trim() || 'Phnom Penh';
+
+        // Tag 00: Payload Format Indicator ("01")
+        const tag00 = formatEMVTag('00', '01');
+        // Tag 01: Point of Initiation Method ("12" = Dynamic QR)
+        const tag01 = formatEMVTag('01', '12');
+        // Tag 29: Merchant Account Information (Bakong Account ID under sub-tag 00)
+        const tag29 = formatEMVTag('29', formatEMVTag('00', cleanAccount));
+        // Tag 52: Merchant Category Code ("5999" Miscellaneous Retail)
+        const tag52 = formatEMVTag('52', '5999');
+        // Tag 53: Transaction Currency ("116" = KHR, "840" = USD)
+        const isUSD = currency === 'USD';
+        const tag53 = formatEMVTag('53', isUSD ? '840' : '116');
+        // Tag 54: Transaction Amount
+        const formattedAmt = isUSD ? Number(amount || 0).toFixed(2) : String(Math.round(Number(amount || 0)));
+        const tag54 = formatEMVTag('54', formattedAmt);
+        // Tag 58: Country Code ("KH")
+        const tag58 = formatEMVTag('58', 'KH');
+        // Tag 59: Merchant Name
+        const tag59 = formatEMVTag('59', cleanName);
+        // Tag 60: Merchant City
+        const tag60 = formatEMVTag('60', cleanCity);
+
+        // Tag 62: Additional Data Field Template (Sub-tag 01: Bill Number)
+        const refBill = (billNumber || `POS${Date.now().toString().slice(-6)}`).slice(0, 20);
+        const tag62 = formatEMVTag('62', formatEMVTag('01', refBill));
+
+        // Tag 99: Timestamp template (Sub-tag 00: creation ms, Sub-tag 01: expiration ms)
+        const nowMs = Date.now();
+        const expMs = nowMs + 10 * 60 * 1000; // 10 minutes validity
+        const tag99 = formatEMVTag('99', formatEMVTag('00', String(nowMs)) + formatEMVTag('01', String(expMs)));
+
+        const payloadWithoutCRC = `${tag00}${tag01}${tag29}${tag52}${tag53}${tag54}${tag58}${tag59}${tag60}${tag62}${tag99}6304`;
+        const crcHex = computeCRC16CCITT(payloadWithoutCRC);
+        return `${payloadWithoutCRC}${crcHex}`;
+    };
 
     // --- 5. REUSABLE UI COMPONENTS ---
 
@@ -946,11 +1033,18 @@
         // --- NEW: Add Customer State ---
         const [showAddCustomerModal, setShowAddCustomerModal] = useState(false);
         
-        // --- NEW: Hold/Recall State ---
+        // --- NEW: Hold/Recall State (Shared single listener for Badge + Modal) ---
         const [showHeldTicketsModal, setShowHeldTicketsModal] = useState(false);
-        const [showSaveTicketModal, setShowSaveTicketModal] = useState(false); // <-- NEW
-        const [heldTicketsCount, setHeldTicketsCount] = useState(0); // <-- LIVE HELD BILLS BADGE COUNT
+        const [showSaveTicketModal, setShowSaveTicketModal] = useState(false);
+        const [heldTickets, setHeldTickets] = useState([]); // <-- SHARED HELD TICKETS CACHE
+        const [heldTicketsLoading, setHeldTicketsLoading] = useState(true);
+        const heldTicketsCount = heldTickets.length;
         const [editingCartItem, setEditingCartItem] = useState(null); // <-- TOUCH NUMPAD & LINE-ITEM OVERRIDE MODAL
+        const [showCameraScanner, setShowCameraScanner] = useState(false); // <-- MOBILE CAMERA BARCODE/QR SCANNER
+
+        // --- SHARED TODAY'S SALES CACHE (Eliminates 3 duplicate listeners on 'sales') ---
+        const [todaySales, setTodaySales] = useState([]);
+        const [todaySalesLoading, setTodaySalesLoading] = useState(true);
 
         // --- NON-BLOCKING POS DIALOG STATE ---
         const [posMessage, setPosMessage] = useState({ show: false, title: '', message: '', isError: false });
@@ -972,7 +1066,7 @@
         const stockWarningTimerRef = useRef(null);
         const scannerBufferRef = useRef({ chars: '', lastKeyTime: 0, isRapidBurst: false, preBurstSearchTerm: '' });
 
-        // --- OFFLINE QUEUE & NETWORK RESILIENCE STATE ---
+        // --- OFFLINE QUEUE & NETWORK RESILIENCE STATE (Zero-Read Local Counter) ---
         const [isOnline, setIsOnline] = useState(() => navigator.onLine);
         const [pendingSyncCount, setPendingSyncCount] = useState(0);
         const [isSyncing, setIsSyncing] = useState(false);
@@ -982,6 +1076,7 @@
                 setIsOnline(true);
                 setIsSyncing(true);
                 db.waitForPendingWrites().then(() => {
+                    setPendingSyncCount(0);
                     setIsSyncing(false);
                 }).catch(() => setIsSyncing(false));
             };
@@ -996,40 +1091,52 @@
             };
         }, []);
 
-        // Track unsynced offline sales in real-time via Firestore metadata
+        // --- SINGLE SHARED TODAY'S SALES LISTENER (Lazy-loaded only when History or Daily Report modal is opened) ---
         useEffect(() => {
-            if (!selectedShopId) return;
+            if (!selectedShopId || (!showSalesHistory && !showDailyReport)) return;
+
+            setTodaySalesLoading(true);
             const startOfDay = new Date();
             startOfDay.setHours(0, 0, 0, 0);
 
             const unsubscribe = db.collection('sales')
                 .where('shopId', '==', selectedShopId)
                 .where('timestamp', '>=', startOfDay)
-                .onSnapshot({ includeMetadataChanges: true }, (snapshot) => {
-                    const pendingDocs = snapshot.docs.filter(doc => doc.metadata.hasPendingWrites);
-                    setPendingSyncCount(pendingDocs.length);
-                    if (pendingDocs.length === 0) {
-                        setIsSyncing(false);
-                    }
+                .orderBy('timestamp', 'desc')
+                .onSnapshot((snapshot) => {
+                    const salesList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setTodaySales(salesList);
+                    setTodaySalesLoading(false);
                 }, (err) => {
-                    console.warn("Offline queue monitor warning:", err);
+                    console.warn("Today's sales listener error:", err);
+                    setTodaySalesLoading(false);
                 });
 
             return () => unsubscribe();
-        }, [selectedShopId]);
+        }, [selectedShopId, showSalesHistory, showDailyReport]);
 
-        // --- LIVE HELD TICKETS COUNT LISTENER ---
+        // --- SINGLE SHARED HELD TICKETS LISTENER (Powers both badge count and HeldTicketsModal) ---
         useEffect(() => {
             if (!selectedShopId) {
-                setHeldTicketsCount(0);
+                setHeldTickets([]);
+                setHeldTicketsLoading(false);
                 return;
             }
+            setHeldTicketsLoading(true);
             const unsubscribe = db.collection('heldTickets')
                 .where('shopId', '==', selectedShopId)
                 .onSnapshot((snapshot) => {
-                    setHeldTicketsCount(snapshot.size);
+                    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    data.sort((a, b) => {
+                        const dateA = safeToDate(a.savedAt) || new Date(0);
+                        const dateB = safeToDate(b.savedAt) || new Date(0);
+                        return dateB - dateA;
+                    });
+                    setHeldTickets(data);
+                    setHeldTicketsLoading(false);
                 }, (err) => {
-                    console.warn("Held tickets count listener error:", err);
+                    console.warn("Held tickets listener error:", err);
+                    setHeldTicketsLoading(false);
                 });
             return () => unsubscribe();
         }, [selectedShopId]);
@@ -1064,11 +1171,34 @@
 
         const currentShopObj = useMemo(() => shops.find(s => s.id === selectedShopId), [shops, selectedShopId]);
 
+        // O(1) Product Map & Barcode Lookup Map (Eliminates O(N) .find() scans across cart, search, and barcode scanner)
+        const productByIdMap = useMemo(() => {
+            const map = new Map();
+            if (products) {
+                for (let i = 0; i < products.length; i++) {
+                    map.set(products[i].id, products[i]);
+                }
+            }
+            return map;
+        }, [products]);
+
+        const productByCodeOrBarcodeMap = useMemo(() => {
+            const map = new Map();
+            if (products) {
+                for (let i = 0; i < products.length; i++) {
+                    const p = products[i];
+                    if (p.code) map.set(String(p.code).toLowerCase(), p);
+                    if (p.barcode) map.set(String(p.barcode).toLowerCase(), p);
+                }
+            }
+            return map;
+        }, [products]);
+
         const getAvailableStock = useCallback((productId) => {
-            const prod = products?.find(p => p.id === productId);
+            const prod = productByIdMap.get(productId);
             if (!prod) return 0;
             return prod.stockByShop?.[selectedShopId] || 0;
-        }, [products, selectedShopId]);
+        }, [productByIdMap, selectedShopId]);
 
         // Setup initial shop (Enforce Device Shop if set)
         useEffect(() => {
@@ -1131,6 +1261,9 @@
             return ['All', ...sortedVendors];
         }, [products]);
 
+        // Debounce search term slightly for large catalogs while keeping instant barcode Enter response
+        const debouncedPosSearchTerm = useDebounce(searchTerm, 80);
+
         // Filter Products for Grid
         const filteredProducts = useMemo(() => {
             if (!products) return [];
@@ -1146,21 +1279,21 @@
             }
 
             // 2. Filter by Search
-            if (searchTerm) {
-                const lower = searchTerm.toLowerCase();
+            if (debouncedPosSearchTerm) {
+                const lower = debouncedPosSearchTerm.toLowerCase();
                 res = res.filter(p => 
                     p.name.toLowerCase().includes(lower) || 
                     p.code.toLowerCase().includes(lower) || 
-                    (p.barcode && p.barcode.includes(lower))
+                    (p.barcode && String(p.barcode).toLowerCase().includes(lower))
                 );
             }
             return res;
-        }, [products, selectedTab, searchTerm]);
+        }, [products, selectedTab, debouncedPosSearchTerm]);
 
         // Reset highlight when search changes
         useEffect(() => {
             setHighlightedIndex(0);
-        }, [searchTerm, selectedTab]);
+        }, [debouncedPosSearchTerm, selectedTab]);
 
         // Cart Actions
         const addToCart = useCallback((product) => {
@@ -1276,8 +1409,50 @@
             refocusSearchInput();
         };
 
+        // --- SEARCH INPUT KEYBOARD NAVIGATION & BARCODE ENTER HANDLER ---
+        const handleSearchKeyDown = (e) => {
+            const visibleCount = Math.min(filteredProducts.length, RENDER_LIMIT);
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (visibleCount > 0) {
+                    setHighlightedIndex(prev => (prev + 1) % visibleCount);
+                }
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (visibleCount > 0) {
+                    setHighlightedIndex(prev => (prev - 1 + visibleCount) % visibleCount);
+                }
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                const trimmed = searchTerm.trim();
+                if (trimmed) {
+                    // 1. O(1) check for exact barcode or product code match first
+                    const exactMatch = productByCodeOrBarcodeMap.get(trimmed.toLowerCase());
+                    if (exactMatch) {
+                        addToCart(exactMatch);
+                        setSearchTerm('');
+                        setHighlightedIndex(0);
+                        return;
+                    }
+                }
+                // 2. Otherwise add currently highlighted product from filtered list
+                if (visibleCount > 0) {
+                    const targetProduct = filteredProducts[highlightedIndex] || filteredProducts[0];
+                    if (targetProduct) {
+                        addToCart(targetProduct);
+                        setSearchTerm('');
+                        setHighlightedIndex(0);
+                    }
+                }
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                setSearchTerm('');
+                setHighlightedIndex(0);
+            }
+        };
+
         // --- GLOBAL BARCODE SCANNER LISTENER (<35ms burst detection) & DESKTOP HOTKEYS ---
-        const isAnyPosModalOpen = showPaymentModal || showReceiptModal || showSalesHistory || showDailyReport || showShiftModal || showAddCustomerModal || showSaveTicketModal || showHeldTicketsModal || posMessage.show || !!pendingRestoreTicket || !!editingCartItem;
+        const isAnyPosModalOpen = showPaymentModal || showReceiptModal || showSalesHistory || showDailyReport || showShiftModal || showAddCustomerModal || showSaveTicketModal || showHeldTicketsModal || posMessage.show || !!pendingRestoreTicket || !!editingCartItem || showCameraScanner;
 
         useEffect(() => {
             const handleGlobalKeyDown = (e) => {
@@ -1372,10 +1547,7 @@
                         const scannedCode = chars.trim();
                         scannerBufferRef.current = { chars: '', lastKeyTime: 0, isRapidBurst: false, preBurstSearchTerm: '' };
 
-                        const exactMatch = products?.find(p =>
-                            (p.barcode && String(p.barcode).toLowerCase() === scannedCode.toLowerCase()) ||
-                            (p.code && String(p.code).toLowerCase() === scannedCode.toLowerCase())
-                        );
+                        const exactMatch = productByCodeOrBarcodeMap.get(scannedCode.toLowerCase());
                         if (exactMatch) {
                             addToCart(exactMatch);
                             // Restore previous search term if the scan happened while search input was focused
@@ -1393,7 +1565,7 @@
 
             window.addEventListener('keydown', handleGlobalKeyDown, true);
             return () => window.removeEventListener('keydown', handleGlobalKeyDown, true);
-        }, [isAnyPosModalOpen, products, addToCart, cart.length, selectedShopId, searchTerm, showPosAlert, triggerStockWarning]);
+        }, [isAnyPosModalOpen, productByCodeOrBarcodeMap, addToCart, cart.length, selectedShopId, searchTerm, showPosAlert, triggerStockWarning]);
 
         const cartTotal = cart.reduce((sum, item) => sum + (item.price * (Number(item.quantity) || 0)), 0);
         const cartTotalCost = cart.reduce((sum, item) => sum + (item.cost * (Number(item.quantity) || 0)), 0);
@@ -1450,70 +1622,54 @@
             }
         };
 
-        // --- NEW: Handle Restore Ticket ---
+        // --- NEW: Restore Held Ticket Logic ---
         const executeRestoreTicket = async (ticket) => {
-            setCart(ticket.items);
-            setSelectedCustomerId(ticket.customerId || '');
-            setShowHeldTicketsModal(false);
-            setPendingRestoreTicket(null);
+            if (!ticket) return;
             try {
+                setCart(ticket.items || []);
+                setSelectedCustomerId(ticket.customerId || '');
                 await db.collection('heldTickets').doc(ticket.id).delete();
+                setPendingRestoreTicket(null);
+                setShowHeldTicketsModal(false);
+                setTimeout(() => searchInputRef.current?.focus(), 50);
             } catch (err) {
-                console.error("Error clearing held ticket after restore:", err);
+                console.error("Error restoring ticket:", err);
+                showPosAlert("Restore Error", "Failed to restore saved bill.", true);
             }
-            setTimeout(() => searchInputRef.current?.focus(), 50);
         };
 
         const handleRestoreTicket = (ticket) => {
+            if (!ticket) return;
             if (cart.length > 0) {
+                setShowHeldTicketsModal(false);
                 setPendingRestoreTicket(ticket);
-                return;
+            } else {
+                executeRestoreTicket(ticket);
             }
-            executeRestoreTicket(ticket);
         };
 
-        // --- NEW: Handle Scanner/Keyboard Input ---
-        const handleSearchKeyDown = (e) => {
-            // Block if no shift
-            if (e.key === 'Enter' && !currentShift && searchTerm.trim()) {
+        // --- NEW: Handle Mobile Camera Barcode / QR Scan Result ---
+        const handleCameraScanSuccess = useCallback((decodedText) => {
+            if (!decodedText) return false;
+            const trimmed = decodedText.trim();
+            if (!trimmed) return false;
+
+            if (!currentShift) {
+                setShowCameraScanner(false);
                 setShowShiftModal(true);
-                return;
+                return false;
             }
 
-            // Calculate effective limit for navigation
-            const effectiveLimit = Math.min(filteredProducts.length, RENDER_LIMIT);
+            const exactMatch = productByCodeOrBarcodeMap.get(trimmed.toLowerCase());
 
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                // Clamp navigation to visible items only
-                setHighlightedIndex(prev => Math.min(prev + 1, effectiveLimit - 1));
-            } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                setHighlightedIndex(prev => Math.max(prev - 1, 0));
-            } else if (e.key === 'Enter') {
-                e.preventDefault();
-                const trimmed = searchTerm.trim();
-                if (trimmed && products) {
-                    // Prioritize exact barcode or product code match regardless of active Vendor tab
-                    const exactMatch = products.find(p =>
-                        (p.barcode && String(p.barcode).toLowerCase() === trimmed.toLowerCase()) ||
-                        (p.code && String(p.code).toLowerCase() === trimmed.toLowerCase())
-                    );
-                    if (exactMatch) {
-                        addToCart(exactMatch);
-                        setSearchTerm('');
-                        setHighlightedIndex(0);
-                        return;
-                    }
-                }
-                // Fallback to highlighted item in filtered list
-                if (filteredProducts.length > 0 && highlightedIndex >= 0 && highlightedIndex < effectiveLimit) {
-                    addToCart(filteredProducts[highlightedIndex]);
-                    setSearchTerm('');
-                    setHighlightedIndex(0);
-                }
+            if (exactMatch) {
+                addToCart(exactMatch);
+                return { found: true, product: exactMatch };
+            } else {
+                triggerStockWarning(`Scanned code "${trimmed}" not found in product catalog.`);
+                return { found: false, code: trimmed };
             }
-        };
+        }, [productByCodeOrBarcodeMap, currentShift, addToCart, triggerStockWarning]);
 
         // --- PHASE 2: Transaction Logic (Optimized for Quota & Speed) ---
         const handleProcessSale = async (paymentDetails) => {
@@ -1552,41 +1708,13 @@
                 const shopNameStr = shop?.name || 'X';
                 const lastLetter = shopNameStr.trim().slice(-1).toUpperCase() || 'X';
 
-                // 1. RECEIPT NUMBER GENERATION (Online Transaction with Offline Fallback)
-                let receiptNo = '';
-                if (navigator.onLine) {
-                    try {
-                        const nextSeq = await db.runTransaction(async (transaction) => {
-                            const counterRef = db.collection('system').doc(`counter_${selectedShopId}_${dateStr}`);
-                            const counterDoc = await transaction.get(counterRef);
-                            
-                            let seq = 1;
-                            if (counterDoc.exists) {
-                                seq = (counterDoc.data().seq || 0) + 1;
-                                transaction.update(counterRef, { seq: seq });
-                            } else {
-                                transaction.set(counterRef, { seq: seq });
-                            }
-                            return seq;
-                        });
-                        const paddedSeq = String(nextSeq).padStart(4, '0');
-                        receiptNo = `${lastLetter}N-${dateStr}-${paddedSeq}`;
-                    } catch (txError) {
-                        // Fallback if connection dropped mid-request
-                        const localSeqKey = `offline_seq_${selectedShopId}_${dateStr}`;
-                        const localSeq = (parseInt(localStorage.getItem(localSeqKey) || '0', 10) + 1);
-                        localStorage.setItem(localSeqKey, String(localSeq));
-                        const timeSuffix = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
-                        receiptNo = `${lastLetter}F-${dateStr}-${timeSuffix}-${localSeq}`;
-                    }
-                } else {
-                    // Offline Receipt Number Generation (No network required)
-                    const localSeqKey = `offline_seq_${selectedShopId}_${dateStr}`;
-                    const localSeq = (parseInt(localStorage.getItem(localSeqKey) || '0', 10) + 1);
-                    localStorage.setItem(localSeqKey, String(localSeq));
-                    const timeSuffix = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
-                    receiptNo = `${lastLetter}F-${dateStr}-${timeSuffix}-${localSeq}`;
-                }
+                // 1. ZERO-READ RECEIPT NUMBER GENERATION (Eliminates 1 Read + 1 Write per sale to save Quota)
+                const localSeqKey = `pos_seq_${selectedShopId}_${dateStr}`;
+                const nextSeq = parseInt(localStorage.getItem(localSeqKey) || '0', 10) + 1;
+                localStorage.setItem(localSeqKey, String(nextSeq));
+                const deviceTag = (currentDevice?.name || currentDeviceId || 'T1').replace(/[^a-zA-Z0-9]/g, '').slice(-2).toUpperCase() || 'T1';
+                const paddedSeq = String(nextSeq).padStart(4, '0');
+                const receiptNo = `${lastLetter}${deviceTag}-${dateStr}-${paddedSeq}`;
 
                 // 2. BATCH WRITE: Save everything else efficiently in one go (Queues in IndexedDB if offline)
                 const batch = db.batch();
@@ -1632,29 +1760,15 @@
 
                 batch.set(saleRef, saleData);
 
-                // Inventory Deduction & Movement Logs
-                sanitizedCart.forEach(item => {
-                    const productRef = db.collection("products").doc(item.productId);
-                    
-                    // Decrement Stock
-                    batch.update(productRef, {
-                        [`stockByShop.${selectedShopId}`]: firebase.firestore.FieldValue.increment(-item.quantity)
+                // Inventory Deduction (Only decrement stock if shop manages stock; skip redundant per-item movement docs on regular POS sales to cut writes by 50%)
+                if (shop?.manageStock !== false) {
+                    sanitizedCart.forEach(item => {
+                        const productRef = db.collection("products").doc(item.productId);
+                        batch.update(productRef, {
+                            [`stockByShop.${selectedShopId}`]: firebase.firestore.FieldValue.increment(-item.quantity)
+                        });
                     });
-
-                    // Log Movement
-                    const moveRef = db.collection("productMovement").doc();
-                    batch.set(moveRef, {
-                        productId: item.productId,
-                        productCode: item.code,
-                        productName: item.name,
-                        type: 'Sale',
-                        quantityChange: -item.quantity,
-                        from: shop?.name,
-                        to: 'Customer',
-                        referenceNo: receiptNo,
-                        timestamp: firebase.firestore.FieldValue.serverTimestamp()
-                    });
-                });
+                }
 
                 // Customer Points Update (Earn & Redeem)
                 if (selectedCustomerId) {
@@ -1686,18 +1800,22 @@
                 });
 
                 // Execute all database writes at once
-                // When offline, batch.commit() resolves once queued in local IndexedDB or we race a brief timeout so UI never hangs
                 if (navigator.onLine) {
                     await Promise.race([
                         batch.commit(),
                         new Promise((resolve) => setTimeout(resolve, 2500))
                     ]);
                 } else {
-                    batch.commit().catch(err => console.error("Offline batch sync error:", err));
+                    setPendingSyncCount(prev => prev + 1);
+                    batch.commit()
+                        .then(() => setPendingSyncCount(prev => Math.max(0, prev - 1)))
+                        .catch(err => console.error("Offline batch sync error:", err));
                 }
 
-                // 3. Success State
-                setLastSaleData({ ...saleData, id: saleRef.id, queuedOffline: !navigator.onLine }); 
+                // 3. Success State (Also optimistic-update todaySales cache if loaded)
+                const completedSale = { ...saleData, id: saleRef.id, queuedOffline: !navigator.onLine };
+                setLastSaleData(completedSale);
+                setTodaySales(prev => prev.some(s => s.id === completedSale.id) ? prev : [completedSale, ...prev]);
                 setCart([]);
                 setSearchTerm('');
                 setSelectedCustomerId('');
@@ -1773,6 +1891,8 @@
                     <PaymentModal 
                         total={cartTotal} 
                         customer={selectedCustomerObj}
+                        shop={currentShopObj}
+                        systemConfig={systemConfig}
                         onConfirm={handleProcessSale} 
                         onCancel={() => setShowPaymentModal(false)}
                         isProcessing={isProcessing}
@@ -1789,6 +1909,8 @@
                 {showSalesHistory && (
                     <SalesHistoryModal 
                         shopId={selectedShopId} 
+                        sales={todaySales}
+                        loading={todaySalesLoading}
                         onClose={() => setShowSalesHistory(false)}
                         onReprint={(sale) => { setLastSaleData(sale); setShowReceiptModal(true); }}
                         userProfile={userProfile}
@@ -1797,6 +1919,8 @@
                 {showDailyReport && (
                     <DailyReportModal 
                         shopId={selectedShopId} 
+                        sales={todaySales}
+                        loading={todaySalesLoading}
                         onClose={() => setShowDailyReport(false)} 
                     />
                 )}
@@ -1829,10 +1953,11 @@
                     />
                 )}
 
-                {/* NEW: Held Tickets Modal */}
+                {/* NEW: Held Tickets Modal (Reuses parent heldTickets state - 0 extra reads) */}
                 {showHeldTicketsModal && (
                     <HeldTicketsModal 
-                        shopId={selectedShopId}
+                        tickets={heldTickets}
+                        loading={heldTicketsLoading}
                         onClose={() => setShowHeldTicketsModal(false)}
                         onRestore={handleRestoreTicket}
                         onError={(msg) => showPosAlert("Error", msg, true)}
@@ -1850,6 +1975,23 @@
                         onClose={() => {
                             setEditingCartItem(null);
                             refocusSearchInput();
+                        }}
+                    />
+                )}
+
+                {/* NEW: Mobile Camera Barcode & QR Scanner Modal */}
+                {showCameraScanner && (
+                    <MobileCameraScannerModal
+                        onScan={handleCameraScanSuccess}
+                        onClose={() => {
+                            setShowCameraScanner(false);
+                            refocusSearchInput();
+                        }}
+                        cartItemCount={cartItemCount}
+                        cartTotal={cartTotal}
+                        onViewCart={() => {
+                            setShowCameraScanner(false);
+                            setActiveMobileTab('cart');
                         }}
                     />
                 )}
@@ -1872,8 +2014,8 @@
                     <div className={`flex-1 flex flex-col bg-slate-800 rounded-lg border border-slate-700 overflow-hidden ${activeMobileTab === 'products' ? 'flex' : 'hidden md:flex'}`}>
                         {/* Top Bar: Search & Shop */}
                         <div className="p-3 md:p-4 bg-slate-900/50 border-b border-slate-700 flex flex-col md:flex-row gap-3 md:gap-4 justify-between">
-                            <div className="flex gap-2 md:gap-4 flex-1">
-                                <div className="flex-1 relative">
+                            <div className="flex gap-2 md:gap-3 flex-1">
+                                <div className="flex-1 relative flex items-center">
                                     <input 
                                         ref={searchInputRef}
                                         type="text" 
@@ -1881,12 +2023,40 @@
                                         value={searchTerm}
                                         onChange={(e) => setSearchTerm(e.target.value)}
                                         onKeyDown={handleSearchKeyDown}
-                                        className="w-full bg-slate-700 text-white pl-9 pr-14 py-2 md:py-3 rounded-lg border border-slate-600 focus:ring-2 focus:ring-blue-500 outline-none text-sm md:text-base"
+                                        className="w-full bg-slate-700 text-white pl-9 pr-12 md:pr-14 py-2 md:py-3 rounded-lg border border-slate-600 focus:ring-2 focus:ring-blue-500 outline-none text-sm md:text-base"
                                         autoFocus
                                     />
-                                    <i className="fas fa-barcode absolute left-3 top-3 md:top-4 text-slate-400"></i>
-                                    <span className="hidden lg:inline-block absolute right-2.5 top-2.5 px-1.5 py-0.5 text-[10px] font-mono font-bold bg-slate-800 text-slate-400 rounded border border-slate-600 pointer-events-none">F2</span>
+                                    <i className="fas fa-barcode absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                                    {searchTerm && (
+                                        <button
+                                            type="button"
+                                            onClick={() => { setSearchTerm(''); searchInputRef.current?.focus(); }}
+                                            className="absolute right-2.5 lg:right-11 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1"
+                                            title="Clear search"
+                                        >
+                                            <i className="fas fa-times-circle"></i>
+                                        </button>
+                                    )}
+                                    <span className="hidden lg:inline-block absolute right-2.5 top-1/2 -translate-y-1/2 px-1.5 py-0.5 text-[10px] font-mono font-bold bg-slate-800 text-slate-400 rounded border border-slate-600 pointer-events-none">F2</span>
                                 </div>
+
+                                {/* Mobile / Tablet Camera Barcode & QR Scan Button */}
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        if (!currentShift) {
+                                            setShowShiftModal(true);
+                                        } else {
+                                            setShowCameraScanner(true);
+                                        }
+                                    }}
+                                    className="bg-blue-600 hover:bg-blue-500 active:scale-95 text-white px-3.5 py-2 rounded-lg font-bold flex items-center justify-center gap-2 shadow-lg shadow-blue-600/30 border border-blue-400/30 transition shrink-0"
+                                    title="Scan Barcode / QR Code with Camera"
+                                >
+                                    <i className="fas fa-camera text-base"></i>
+                                    <span className="text-xs font-bold sm:inline hidden md:hidden">Scan</span>
+                                </button>
+
                                 {/* LOCKED SHOP SELECTOR */}
                                 <div className="relative">
                                     <select 
@@ -2315,20 +2485,32 @@
                 </div>
 
                 {/* MOBILE BOTTOM NAVIGATION */}
-                <div className="md:hidden mt-2 grid grid-cols-2 gap-2 shrink-0">
+                <div className="md:hidden mt-2 grid grid-cols-3 gap-2 shrink-0">
                     <button
                         onClick={() => setActiveMobileTab('products')}
-                        className={`py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${activeMobileTab === 'products' ? 'bg-slate-700 text-white border border-slate-600' : 'bg-slate-800 text-slate-400 border border-transparent'}`}
+                        className={`py-3 rounded-lg font-bold flex items-center justify-center gap-1.5 transition-all text-sm ${activeMobileTab === 'products' ? 'bg-slate-700 text-white border border-slate-600' : 'bg-slate-800 text-slate-400 border border-transparent'}`}
                     >
-                        <i className="fas fa-boxes"></i> Products
+                        <i className="fas fa-boxes"></i> <span>Products</span>
+                    </button>
+                    <button
+                        onClick={() => {
+                            if (!currentShift) {
+                                setShowShiftModal(true);
+                            } else {
+                                setShowCameraScanner(true);
+                            }
+                        }}
+                        className="py-3 rounded-lg font-bold flex items-center justify-center gap-1.5 bg-gradient-to-r from-indigo-600 to-blue-600 text-white shadow-lg shadow-blue-900/40 active:scale-95 transition-all text-sm border border-blue-400/30"
+                    >
+                        <i className="fas fa-qrcode"></i> <span>Scan</span>
                     </button>
                     <button
                         onClick={() => setActiveMobileTab('cart')}
-                        className={`py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all relative ${activeMobileTab === 'cart' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}
+                        className={`py-3 rounded-lg font-bold flex items-center justify-center gap-1.5 transition-all relative text-sm ${activeMobileTab === 'cart' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}
                     >
                         <i className="fas fa-shopping-cart"></i> 
                         <span>Cart</span>
-                        {cartTotal > 0 && <span className="text-xs bg-white/20 px-2 py-0.5 rounded ml-1">៛{new Intl.NumberFormat('en-US', { notation: "compact" }).format(cartTotal)}</span>}
+                        {cartTotal > 0 && <span className="text-[11px] bg-white/20 px-1.5 py-0.5 rounded">៛{new Intl.NumberFormat('en-US', { notation: "compact" }).format(cartTotal)}</span>}
                         {cartItemCount > 0 && (
                             <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[10px] w-5 h-5 flex items-center justify-center rounded-full border-2 border-slate-900">
                                 {cartItemCount}
@@ -2337,6 +2519,359 @@
                     </button>
                 </div>
             </div>
+        );
+    };
+
+    // --- NEW: Mobile Camera Barcode & QR Code Scanner Modal ---
+    const MobileCameraScannerModal = ({ onScan, onClose, cartItemCount, cartTotal, onViewCart }) => {
+        const [continuousMode, setContinuousMode] = useState(true);
+        const [cameraFacing, setCameraFacing] = useState('environment'); // 'environment' (back) or 'user' (front)
+        const [torchOn, setTorchOn] = useState(false);
+        const [torchSupported, setTorchSupported] = useState(false);
+        const [scanFeedback, setScanFeedback] = useState(null);
+        const [cameraError, setCameraError] = useState('');
+        const [isStarting, setIsStarting] = useState(true);
+        const [manualCode, setManualCode] = useState('');
+
+        const scannerRef = useRef(null);
+        const lastScanRef = useRef({ code: '', time: 0 });
+        const onScanRef = useRef(onScan);
+        const continuousModeRef = useRef(continuousMode);
+
+        useEffect(() => {
+            onScanRef.current = onScan;
+        }, [onScan]);
+
+        useEffect(() => {
+            continuousModeRef.current = continuousMode;
+        }, [continuousMode]);
+
+        // Web Audio API Beep for tactile POS scanner feedback
+        const playBeep = useCallback((isSuccess = true) => {
+            try {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                const ctx = new AudioCtx();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+
+                osc.type = isSuccess ? 'sine' : 'sawtooth';
+                osc.frequency.setValueAtTime(isSuccess ? 1480 : 320, ctx.currentTime);
+                gain.gain.setValueAtTime(0.15, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + (isSuccess ? 0.12 : 0.25));
+
+                osc.start();
+                osc.stop(ctx.currentTime + (isSuccess ? 0.12 : 0.25));
+            } catch (e) {
+                // Ignore audio context restriction errors
+            }
+        }, []);
+
+        useEffect(() => {
+            let html5QrCode = null;
+            let isMounted = true;
+
+            const startScanner = async () => {
+                setIsStarting(true);
+                setCameraError('');
+                setTorchSupported(false);
+                setTorchOn(false);
+
+                try {
+                    if (typeof Html5Qrcode === 'undefined') {
+                        throw new Error("Scanner library failed to load. Please check your internet connection.");
+                    }
+
+                    html5QrCode = new Html5Qrcode("pos-camera-reader");
+                    scannerRef.current = html5QrCode;
+
+                    const config = {
+                        fps: 15,
+                        qrbox: { width: 250, height: 170 },
+                        aspectRatio: 1.0,
+                        disableFlip: false
+                    };
+
+                    await html5QrCode.start(
+                        { facingMode: cameraFacing },
+                        config,
+                        (decodedText) => {
+                            if (!isMounted) return;
+                            const now = Date.now();
+                            // Prevent duplicate rapid scans of the same barcode within 1.5 seconds
+                            if (
+                                lastScanRef.current.code === decodedText &&
+                                now - lastScanRef.current.time < 1500
+                            ) {
+                                return;
+                            }
+                            lastScanRef.current = { code: decodedText, time: now };
+
+                            if (navigator.vibrate) {
+                                navigator.vibrate(60);
+                            }
+
+                            const result = onScanRef.current(decodedText);
+                            if (result && result.found) {
+                                playBeep(true);
+                                setScanFeedback({
+                                    type: 'success',
+                                    title: result.product.name,
+                                    subtitle: `Added • ៛${new Intl.NumberFormat('en-US').format(result.product.price)}`
+                                });
+                                if (!continuousModeRef.current) {
+                                    setTimeout(() => {
+                                        if (isMounted) onClose();
+                                    }, 350);
+                                }
+                            } else {
+                                playBeep(false);
+                                setScanFeedback({
+                                    type: 'error',
+                                    title: 'Product Not Found',
+                                    subtitle: `Code: ${decodedText}`
+                                });
+                            }
+                        },
+                        () => {
+                            // Frame scan error (normal when no barcode in view)
+                        }
+                    );
+
+                    if (isMounted) {
+                        setIsStarting(false);
+                        // Check if camera supports flashlight/torch
+                        try {
+                            const capabilities = html5QrCode.getRunningTrackCameraCapabilities();
+                            if (capabilities && capabilities.torchFeature && capabilities.torchFeature().isSupported()) {
+                                setTorchSupported(true);
+                            }
+                        } catch (capErr) {
+                            setTorchSupported(false);
+                        }
+                    }
+                } catch (err) {
+                    console.error("Camera Scanner Error:", err);
+                    if (isMounted) {
+                        setIsStarting(false);
+                        setCameraError(
+                            typeof err === 'string'
+                                ? err
+                                : err?.message || "Unable to access camera. Please grant camera permission in your browser settings."
+                        );
+                    }
+                }
+            };
+
+            startScanner();
+
+            return () => {
+                isMounted = false;
+                if (html5QrCode) {
+                    try {
+                        if (html5QrCode.isScanning) {
+                            html5QrCode.stop().then(() => html5QrCode.clear()).catch(() => {});
+                        } else {
+                            html5QrCode.clear();
+                        }
+                    } catch (e) {}
+                }
+            };
+        }, [cameraFacing, playBeep]);
+
+        const toggleTorch = async () => {
+            if (!scannerRef.current || !torchSupported) return;
+            try {
+                const nextState = !torchOn;
+                await scannerRef.current.applyVideoConstraints({
+                    advanced: [{ torch: nextState }]
+                });
+                setTorchOn(nextState);
+            } catch (err) {
+                console.warn("Torch toggle failed:", err);
+            }
+        };
+
+        const handleManualSubmit = (e) => {
+            e.preventDefault();
+            if (!manualCode.trim()) return;
+            const res = onScan(manualCode.trim());
+            if (res && res.found) {
+                playBeep(true);
+                setScanFeedback({
+                    type: 'success',
+                    title: res.product.name,
+                    subtitle: `Added • ៛${new Intl.NumberFormat('en-US').format(res.product.price)}`
+                });
+                setManualCode('');
+                if (!continuousMode) {
+                    onClose();
+                }
+            } else {
+                playBeep(false);
+                setScanFeedback({
+                    type: 'error',
+                    title: 'Product Not Found',
+                    subtitle: `Code: ${manualCode.trim()}`
+                });
+            }
+        };
+
+        return (
+            <Modal show={true} onClose={onClose} maxWidth="max-w-md">
+                <ModalHeader title="Camera Barcode / QR Scanner" onClose={onClose} />
+                <ModalBody>
+                    <div className="space-y-4">
+                        {/* Mode & Camera Controls Bar */}
+                        <div className="flex items-center justify-between gap-2 bg-slate-900/80 p-2.5 rounded-xl border border-slate-700">
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setContinuousMode(!continuousMode)}
+                                    className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition ${
+                                        continuousMode
+                                            ? 'bg-emerald-600 text-white shadow-sm'
+                                            : 'bg-slate-800 text-slate-300 border border-slate-600'
+                                    }`}
+                                >
+                                    <i className={`fas ${continuousMode ? 'fa-sync-alt' : 'fa-bullseye'}`}></i>
+                                    <span>{continuousMode ? 'Continuous Scan' : 'Single Scan'}</span>
+                                </button>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                                {torchSupported && (
+                                    <button
+                                        type="button"
+                                        onClick={toggleTorch}
+                                        className={`w-9 h-9 rounded-lg flex items-center justify-center transition border ${
+                                            torchOn
+                                                ? 'bg-yellow-500 text-slate-950 border-yellow-400 shadow-lg shadow-yellow-500/30'
+                                                : 'bg-slate-800 text-slate-300 border-slate-600 hover:text-white'
+                                        }`}
+                                        title="Toggle Flashlight"
+                                    >
+                                        <i className="fas fa-bolt"></i>
+                                    </button>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => setCameraFacing(prev => (prev === 'environment' ? 'user' : 'environment'))}
+                                    className="px-3 h-9 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 text-xs font-bold flex items-center gap-1.5 transition"
+                                    title="Switch Front/Back Camera"
+                                >
+                                    <i className="fas fa-camera-rotate"></i>
+                                    <span>Flip</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Live Camera Viewport */}
+                        <div className="relative bg-black rounded-2xl overflow-hidden border-2 border-slate-700 min-h-[260px] flex items-center justify-center shadow-inner">
+                            <div id="pos-camera-reader" className="w-full"></div>
+
+                            {isStarting && !cameraError && (
+                                <div className="absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center text-slate-300 gap-3 z-10">
+                                    <div className="loader w-8 h-8"></div>
+                                    <span className="text-xs font-medium">Starting camera...</span>
+                                </div>
+                            )}
+
+                            {cameraError && (
+                                <div className="p-6 text-center space-y-3 z-10">
+                                    <div className="w-12 h-12 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center mx-auto">
+                                        <i className="fas fa-video-slash text-xl"></i>
+                                    </div>
+                                    <p className="text-xs text-red-300 leading-relaxed">{cameraError}</p>
+                                    <button
+                                        type="button"
+                                        onClick={() => setCameraFacing(prev => prev)}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-xs font-bold"
+                                    >
+                                        Retry Camera
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Live Scan Feedback Toast */}
+                        {scanFeedback ? (
+                            <div
+                                className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition-all ${
+                                    scanFeedback.type === 'success'
+                                        ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-200'
+                                        : 'bg-red-950/60 border-red-500/50 text-red-200'
+                                }`}
+                            >
+                                <div className="flex items-center gap-3 min-w-0">
+                                    <div
+                                        className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
+                                            scanFeedback.type === 'success' ? 'bg-emerald-500 text-slate-950' : 'bg-red-500 text-white'
+                                        }`}
+                                    >
+                                        <i className={`fas ${scanFeedback.type === 'success' ? 'fa-check' : 'fa-exclamation'}`}></i>
+                                    </div>
+                                    <div className="min-w-0">
+                                        <div className="font-bold text-sm truncate text-white">{scanFeedback.title}</div>
+                                        <div className="text-xs opacity-90 truncate">{scanFeedback.subtitle}</div>
+                                    </div>
+                                </div>
+                                <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-black/30 shrink-0">
+                                    Just Scanned
+                                </span>
+                            </div>
+                        ) : (
+                            <div className="text-center text-xs text-slate-400 py-1">
+                                <i className="fas fa-crosshairs mr-1.5 text-blue-400"></i>
+                                Point camera at any 1D Barcode or 2D QR Code
+                            </div>
+                        )}
+
+                        {/* Manual Fallback Code Input */}
+                        <form onSubmit={handleManualSubmit} className="flex gap-2">
+                            <input
+                                type="text"
+                                value={manualCode}
+                                onChange={(e) => setManualCode(e.target.value)}
+                                placeholder="Or type barcode / code manually..."
+                                className="flex-1 bg-slate-900 text-white px-3 py-2 rounded-lg border border-slate-700 focus:border-blue-500 outline-none text-xs"
+                            />
+                            <button
+                                type="submit"
+                                className="px-4 py-2 bg-slate-700 hover:bg-blue-600 text-white text-xs font-bold rounded-lg transition"
+                            >
+                                Add
+                            </button>
+                        </form>
+                    </div>
+                </ModalBody>
+                <ModalFooter>
+                    <div className="w-full flex items-center justify-between gap-3">
+                        <button
+                            type="button"
+                            onClick={onViewCart}
+                            className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-lg shadow-blue-600/30 text-sm"
+                        >
+                            <i className="fas fa-shopping-cart"></i>
+                            <span>View Cart ({cartItemCount})</span>
+                            {cartTotal > 0 && (
+                                <span className="bg-black/20 px-2 py-0.5 rounded text-xs">
+                                    ៛{new Intl.NumberFormat('en-US', { notation: 'compact' }).format(cartTotal)}
+                                </span>
+                            )}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={onClose}
+                            className="bg-slate-600 hover:bg-slate-500 text-white font-bold py-2.5 px-5 rounded-lg text-sm"
+                        >
+                            Done
+                        </button>
+                    </div>
+                </ModalFooter>
+            </Modal>
         );
     };
 
@@ -2628,33 +3163,9 @@
         );
     };
 
-    // --- NEW: Held Tickets Modal ---
-    const HeldTicketsModal = ({ shopId, onClose, onRestore, onError }) => {
-        const [tickets, setTickets] = useState([]);
-        const [loading, setLoading] = useState(true);
+    // --- NEW: Held Tickets Modal (Zero-Read Presentation Component using shared parent listener) ---
+    const HeldTicketsModal = ({ tickets = [], loading = false, onClose, onRestore, onError }) => {
         const [deleteId, setDeleteId] = useState(null); // New state for custom confirmation
-
-        useEffect(() => {
-            // Client-side sorting maintained to prevent index errors
-            const unsubscribe = db.collection('heldTickets')
-                .where('shopId', '==', shopId)
-                .onSnapshot(snapshot => {
-                    const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    
-                    data.sort((a, b) => {
-                        const dateA = safeToDate(a.savedAt) || new Date(0);
-                        const dateB = safeToDate(b.savedAt) || new Date(0);
-                        return dateB - dateA;
-                    });
-
-                    setTickets(data);
-                    setLoading(false);
-                }, err => {
-                    console.error("Error fetching held tickets:", err);
-                    setLoading(false);
-                });
-            return () => unsubscribe();
-        }, [shopId]);
 
         const requestDelete = (id) => {
             setDeleteId(id); // Trigger custom modal instead of window.confirm
@@ -3331,7 +3842,7 @@
     };
 
     // --- NEW: Payment Modal ---
-    const PaymentModal = ({ total, customer, onConfirm, onCancel, isProcessing }) => {
+    const PaymentModal = ({ total, customer, shop, systemConfig, onConfirm, onCancel, isProcessing }) => {
         const [method, setMethod] = useState('Cash');
         const [tenderedKHR, setTenderedKHR] = useState('');
         const [tenderedUSD, setTenderedUSD] = useState('');
@@ -3339,6 +3850,13 @@
         const [redeemPoints, setRedeemPoints] = useState('');
         const [manualDiscount, setManualDiscount] = useState('');
         const [changeMode, setChangeMode] = useState('dual'); // 'dual' ($ + ៛) or 'khr' (All ៛)
+        const [khqrCurrency, setKhqrCurrency] = useState('KHR'); // 'KHR' or 'USD'
+        const [showFullscreenQR, setShowFullscreenQR] = useState(false);
+        const [qrCopied, setQrCopied] = useState(false);
+
+        const khqrContainerRef = useRef(null);
+        const fullscreenQrContainerRef = useRef(null);
+        const [billRef] = useState(() => `INV-${Date.now().toString().slice(-6)}`);
         
         const availablePoints = customer?.points || 0;
         const parsedManualDiscount = Math.max(0, Math.min(total, parseInt(manualDiscount) || 0));
@@ -3353,10 +3871,60 @@
         const usdAmount = parseFloat(tenderedUSD) || 0;
         const validRate = exchangeRate > 0 ? exchangeRate : 4000;
         const totalTendered = khrAmount + (usdAmount * validRate);
+        const netTotalUSD = netTotal / validRate;
         
         const change = method === 'Cash' ? Math.max(0, totalTendered - netTotal) : 0;
         const shortage = method === 'Cash' ? Math.max(0, netTotal - totalTendered) : 0;
         const canPay = method !== 'Cash' || totalTendered >= netTotal;
+
+        // Merchant Info for Dynamic KHQR
+        const merchantName = systemConfig?.khqrMerchantName || shop?.name || systemConfig?.appName || 'PO SYSTEM POS';
+        const bakongAccountId = systemConfig?.khqrAccountId || 'merchant@aba';
+        const merchantCity = shop?.location || 'Phnom Penh';
+
+        // Generate Dynamic KHQR EMVCo String whenever amount or currency changes
+        const dynamicKhqrString = useMemo(() => {
+            const targetAmount = khqrCurrency === 'USD' ? netTotalUSD : netTotal;
+            return buildDynamicKHQRPayload({
+                bakongAccountId,
+                merchantName,
+                merchantCity,
+                currency: khqrCurrency,
+                amount: targetAmount,
+                billNumber: billRef
+            });
+        }, [bakongAccountId, merchantName, merchantCity, khqrCurrency, netTotal, netTotalUSD, billRef]);
+
+        // Render QR Code SVG/IMG inside Payment Modal and Fullscreen Customer Display
+        useEffect(() => {
+            if (method !== 'KHQR' || typeof qrcode === 'undefined') return;
+            try {
+                const qr = qrcode(0, 'M');
+                qr.addData(dynamicKhqrString);
+                qr.make();
+                if (khqrContainerRef.current) {
+                    khqrContainerRef.current.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+                }
+                if (showFullscreenQR && fullscreenQrContainerRef.current) {
+                    fullscreenQrContainerRef.current.innerHTML = qr.createSvgTag({ cellSize: 7, margin: 2, scalable: true });
+                }
+            } catch (err) {
+                console.error("KHQR generation error:", err);
+            }
+        }, [method, dynamicKhqrString, showFullscreenQR]);
+
+        const handleCopyKhqrPayload = () => {
+            try {
+                const tempInput = document.createElement('textarea');
+                tempInput.value = dynamicKhqrString;
+                document.body.appendChild(tempInput);
+                tempInput.select();
+                document.execCommand('copy');
+                document.body.removeChild(tempInput);
+                setQrCopied(true);
+                setTimeout(() => setQrCopied(false), 2000);
+            } catch (e) {}
+        };
 
         // Smart Dual-Currency Change Breakdown (Cambodia Retail Standard: Whole USD notes + KHR remainder)
         const smartChange = useMemo(() => {
@@ -3489,13 +4057,225 @@
                                 <button
                                     key={m}
                                     onClick={() => setMethod(m)}
-                                    className={`py-2.5 rounded-lg font-bold transition flex flex-col items-center justify-center gap-1 ${method === m ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}
+                                    className={`py-2.5 rounded-lg font-bold transition flex flex-col items-center justify-center gap-1 ${method === m ? (m === 'KHQR' ? 'bg-[#E1232E] text-white shadow-lg shadow-red-900/40' : 'bg-blue-600 text-white') : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}
                                 >
                                     <i className={`fas ${m === 'Cash' ? 'fa-money-bill-wave' : 'fa-qrcode'}`}></i>
                                     {m}
                                 </button>
                             ))}
                         </div>
+
+                        {/* Dynamic KHQR Code Generator Card */}
+                        {method === 'KHQR' && (
+                            <div className="space-y-3 animate-fade-in-up">
+                                {/* Currency & Exchange Rate Control Bar */}
+                                <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-900/70 p-2.5 rounded-xl border border-slate-700">
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-[11px] font-bold text-slate-400 uppercase mr-1">QR Currency:</span>
+                                        <button
+                                            type="button"
+                                            onClick={() => setKhqrCurrency('KHR')}
+                                            className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition ${
+                                                khqrCurrency === 'KHR'
+                                                    ? 'bg-[#E1232E] text-white shadow'
+                                                    : 'bg-slate-800 text-slate-400 hover:text-white border border-slate-700'
+                                            }`}
+                                        >
+                                            ៛ KHR
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setKhqrCurrency('USD')}
+                                            className={`px-2.5 py-1 rounded-lg text-xs font-extrabold transition ${
+                                                khqrCurrency === 'USD'
+                                                    ? 'bg-[#E1232E] text-white shadow'
+                                                    : 'bg-slate-800 text-slate-400 hover:text-white border border-slate-700'
+                                            }`}
+                                        >
+                                            $ USD
+                                        </button>
+                                    </div>
+                                    <div className="flex items-center gap-1 text-xs text-slate-400">
+                                        <span>1$=៛</span>
+                                        <input
+                                            type="number"
+                                            value={exchangeRate}
+                                            onChange={e => setExchangeRate(parseFloat(e.target.value) || 0)}
+                                            className="w-16 bg-slate-800 border border-slate-600 rounded px-1.5 py-0.5 text-right text-white font-bold focus:border-red-500 outline-none"
+                                        />
+                                    </div>
+                                </div>
+
+                                {/* Official Bakong KHQR Styled Standee Card */}
+                                <div className="bg-white rounded-2xl overflow-hidden shadow-2xl border-2 border-[#E1232E] max-w-[300px] mx-auto text-slate-900">
+                                    {/* Top Red KHQR Banner */}
+                                    <div className="bg-[#E1232E] px-4 py-2.5 flex items-center justify-between text-white relative">
+                                        <div className="flex items-center gap-2">
+                                            <i className="fas fa-qrcode text-lg"></i>
+                                            <span className="font-black tracking-widest text-base">KHQR</span>
+                                        </div>
+                                        <span className="text-[10px] font-bold uppercase bg-white/20 px-2 py-0.5 rounded-full">
+                                            Dynamic • {billRef}
+                                        </span>
+                                    </div>
+
+                                    {/* Merchant & Exact Dual-Currency Amount Header */}
+                                    <div className="px-5 pt-3.5 pb-2.5 border-b border-dashed border-slate-300 text-left bg-slate-50">
+                                        <div className="text-xs font-bold text-slate-500 uppercase tracking-wider truncate" title={merchantName}>
+                                            {merchantName}
+                                        </div>
+                                        {khqrCurrency === 'KHR' ? (
+                                            <div className="mt-1">
+                                                <div className="text-2xl font-black text-slate-900 leading-none">
+                                                    {new Intl.NumberFormat('en-US').format(netTotal)} <span className="text-sm font-bold text-[#E1232E]">KHR</span>
+                                                </div>
+                                                <div className="text-xs font-bold text-slate-500 mt-1">
+                                                    ≈ ${new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(netTotalUSD)} USD
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="mt-1">
+                                                <div className="text-2xl font-black text-slate-900 leading-none">
+                                                    ${new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(netTotalUSD)} <span className="text-sm font-bold text-[#E1232E]">USD</span>
+                                                </div>
+                                                <div className="text-xs font-bold text-slate-500 mt-1">
+                                                    ≈ ៛{new Intl.NumberFormat('en-US').format(netTotal)} KHR
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Dynamic QR Code Graphic with Center Currency Badge */}
+                                    <div className="p-4 flex flex-col items-center justify-center bg-white relative">
+                                        <div className="relative w-48 h-48 flex items-center justify-center p-1 bg-white rounded-xl border border-slate-200 shadow-inner">
+                                            <div ref={khqrContainerRef} className="w-full h-full flex items-center justify-center [&>svg]:w-full [&>svg]:h-full"></div>
+                                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                                <div className="w-9 h-9 rounded-full bg-[#E1232E] text-white font-black text-sm flex items-center justify-center border-2 border-white shadow-md">
+                                                    {khqrCurrency === 'KHR' ? '៛' : '$'}
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-2.5 text-center">
+                                            <p className="text-[11px] font-bold text-slate-700">
+                                                Scan with Bakong, ABA, ACLEDA, Wing or any KHQR Bank App
+                                            </p>
+                                            <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                                                ID: {bakongAccountId}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Customer Display & Payload Utility Actions */}
+                                <div className="flex items-center justify-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowFullscreenQR(true)}
+                                        className="flex-1 py-2 px-3 bg-slate-700 hover:bg-slate-600 text-white text-xs font-bold rounded-lg border border-slate-600 flex items-center justify-center gap-1.5 transition"
+                                    >
+                                        <i className="fas fa-expand"></i>
+                                        <span>Full-Screen Customer View</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={handleCopyKhqrPayload}
+                                        className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-lg border border-slate-700 flex items-center gap-1.5 transition"
+                                        title="Copy EMVCo KHQR String"
+                                    >
+                                        <i className={`fas ${qrCopied ? 'fa-check text-emerald-400' : 'fa-copy'}`}></i>
+                                        <span>{qrCopied ? 'Copied' : 'Copy QR'}</span>
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Full-Screen Customer-Facing KHQR Display Overlay */}
+                        {showFullscreenQR && method === 'KHQR' && (
+                            <div
+                                className="fixed inset-0 z-[80] bg-slate-950/95 backdrop-blur-md flex flex-col items-center justify-center p-4 animate-fade-in-up"
+                                onClick={() => setShowFullscreenQR(false)}
+                            >
+                                <div
+                                    className="bg-white rounded-3xl overflow-hidden shadow-2xl border-4 border-[#E1232E] w-full max-w-sm text-slate-900"
+                                    onClick={(e) => e.stopPropagation()}
+                                >
+                                    <div className="bg-[#E1232E] px-6 py-4 flex items-center justify-between text-white">
+                                        <div className="flex items-center gap-2.5">
+                                            <i className="fas fa-qrcode text-2xl"></i>
+                                            <span className="font-black tracking-widest text-2xl">KHQR</span>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowFullscreenQR(false)}
+                                            className="w-8 h-8 rounded-full bg-black/20 hover:bg-black/40 text-white flex items-center justify-center"
+                                        >
+                                            <i className="fas fa-times"></i>
+                                        </button>
+                                    </div>
+
+                                    <div className="px-6 py-4 bg-slate-50 border-b border-dashed border-slate-300 text-center">
+                                        <div className="text-sm font-extrabold text-slate-500 uppercase tracking-wider">
+                                            {merchantName}
+                                        </div>
+                                        <div className="mt-2 flex flex-col items-center">
+                                            <div className="text-3xl font-black text-slate-900">
+                                                ៛{new Intl.NumberFormat('en-US').format(netTotal)} <span className="text-base font-bold text-[#E1232E]">KHR</span>
+                                            </div>
+                                            <div className="text-lg font-extrabold text-emerald-600 mt-0.5">
+                                                ${new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(netTotalUSD)} USD
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="p-6 flex flex-col items-center bg-white">
+                                        <div className="relative w-64 h-64 flex items-center justify-center p-2 bg-white rounded-2xl border-2 border-slate-200 shadow-inner">
+                                            <div ref={fullscreenQrContainerRef} className="w-full h-full flex items-center justify-center [&>svg]:w-full [&>svg]:h-full"></div>
+                                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                                <div className="w-12 h-12 rounded-full bg-[#E1232E] text-white font-black text-lg flex items-center justify-center border-4 border-white shadow-lg">
+                                                    {khqrCurrency === 'KHR' ? '៛' : '$'}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <p className="text-xs font-bold text-slate-600 mt-4 text-center">
+                                            Please scan to pay exact amount • {billRef}
+                                        </p>
+                                    </div>
+
+                                    <div className="p-4 bg-slate-100 border-t border-slate-200 flex gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowFullscreenQR(false)}
+                                            className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl text-sm"
+                                        >
+                                            Back to Cashier
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setShowFullscreenQR(false);
+                                                onConfirm({
+                                                    method,
+                                                    tendered: netTotal,
+                                                    tenderedUSD: 0,
+                                                    tenderedKHR: 0,
+                                                    exchangeRate: validRate,
+                                                    change: 0,
+                                                    changeBreakdown: null,
+                                                    discount: totalDiscount,
+                                                    redemptionAmount: parsedRedemption,
+                                                    manualDiscount: parsedManualDiscount
+                                                });
+                                            }}
+                                            disabled={isProcessing}
+                                            className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-sm flex items-center justify-center gap-1.5"
+                                        >
+                                            <i className="fas fa-check-circle"></i> Payment Received
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
 
                         {/* Cash Input Section */}
                         {method === 'Cash' && (
@@ -3871,32 +4651,12 @@
         );
     };
 
-    // --- PHASE 3: Sales History & Void Logic ---
-    const SalesHistoryModal = ({ shopId, onClose, onReprint, userProfile }) => {
-        const [sales, setSales] = useState([]);
-        const [loading, setLoading] = useState(true);
+    // --- PHASE 3: Sales History & Void Logic (Reuses shared todaySales state from POSTerminal) ---
+    const SalesHistoryModal = ({ shopId, sales = [], loading = false, onClose, onReprint, userProfile }) => {
         const [voidingId, setVoidingId] = useState(null);
         const [expandedSaleId, setExpandedSaleId] = useState(null); // New state for row expansion
         const [saleToVoid, setSaleToVoid] = useState(null);
         const [errorModal, setErrorModal] = useState({ show: false, message: '' });
-
-        // Fetch today's sales for this shop
-        useEffect(() => {
-            const startOfDay = new Date();
-            startOfDay.setHours(0,0,0,0);
-            
-            const unsubscribe = db.collection('sales')
-                .where('shopId', '==', shopId)
-                .where('timestamp', '>=', startOfDay)
-                .orderBy('timestamp', 'desc')
-                .limit(50)
-                .onSnapshot(snapshot => {
-                    const salesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    setSales(salesData);
-                    setLoading(false);
-                });
-            return () => unsubscribe();
-        }, [shopId]);
 
         const toggleExpand = (saleId) => {
             setExpandedSaleId(prev => prev === saleId ? null : saleId);
@@ -4117,44 +4877,30 @@
         );
     };
 
-    // --- PHASE 3: Daily Report ---
-    const DailyReportModal = ({ shopId, onClose }) => {
-        const [stats, setStats] = useState(null);
-        const [loading, setLoading] = useState(true);
+    // --- PHASE 3: Daily Report (Zero-Read Computed Summary from shared todaySales state) ---
+    const DailyReportModal = ({ shopId, sales = [], loading = false, onClose }) => {
+        const stats = useMemo(() => {
+            let totalSales = 0;
+            let totalCash = 0;
+            let totalQR = 0;
+            let totalCard = 0;
+            let count = 0;
+            let itemsSold = 0;
 
-        useEffect(() => {
-            const startOfDay = new Date();
-            startOfDay.setHours(0,0,0,0);
-            
-            const unsubscribe = db.collection('sales')
-                .where('shopId', '==', shopId)
-                .where('timestamp', '>=', startOfDay)
-                .onSnapshot(snapshot => {
-                    let totalSales = 0;
-                    let totalCash = 0;
-                    let totalQR = 0;
-                    let totalCard = 0;
-                    let count = 0;
-                    let itemsSold = 0;
+            (sales || []).forEach(data => {
+                if (data.status === 'void') return; // Skip voided
 
-                    snapshot.docs.forEach(doc => {
-                        const data = doc.data();
-                        if (data.status === 'void') return; // Skip voided
+                totalSales += (data.grandTotal || 0);
+                count++;
+                itemsSold += (data.items || []).reduce((acc, item) => acc + (Number(item.quantity) || 0), 0);
 
-                        totalSales += data.grandTotal;
-                        count++;
-                        itemsSold += data.items.reduce((acc, item) => acc + item.quantity, 0);
+                if (data.paymentMethod === 'Cash') totalCash += (data.grandTotal || 0);
+                else if (data.paymentMethod === 'KHQR') totalQR += (data.grandTotal || 0);
+                else totalCard += (data.grandTotal || 0);
+            });
 
-                        if (data.paymentMethod === 'Cash') totalCash += data.grandTotal;
-                        else if (data.paymentMethod === 'KHQR') totalQR += data.grandTotal;
-                        else totalCard += data.grandTotal;
-                    });
-
-                    setStats({ totalSales, totalCash, totalQR, totalCard, count, itemsSold });
-                    setLoading(false);
-                });
-            return () => unsubscribe();
-        }, [shopId]);
+            return { totalSales, totalCash, totalQR, totalCard, count, itemsSold };
+        }, [sales]);
 
         return (
             <Modal show={true} onClose={onClose} maxWidth="max-w-md">
@@ -11308,12 +12054,16 @@
     const GeneralSettings = () => {
         const { systemConfig } = useData();
         const [appName, setAppName] = useState('');
+        const [khqrMerchantName, setKhqrMerchantName] = useState('');
+        const [khqrAccountId, setKhqrAccountId] = useState('');
         const [loading, setLoading] = useState(false);
         const [modal, setModal] = useState({ type: null, data: null });
 
         useEffect(() => {
             if (systemConfig) {
                 setAppName(systemConfig.appName || '');
+                setKhqrMerchantName(systemConfig.khqrMerchantName || '');
+                setKhqrAccountId(systemConfig.khqrAccountId || '');
             }
         }, [systemConfig]);
 
@@ -11322,11 +12072,13 @@
             setLoading(true);
             try {
                 await db.collection('system').doc('config').set({
-                    appName: appName
+                    appName: appName,
+                    khqrMerchantName: khqrMerchantName.trim(),
+                    khqrAccountId: khqrAccountId.trim()
                 }, { merge: true });
                 
                 document.title = appName; 
-                setModal({ type: 'message', data: { title: 'Success', message: 'Application settings updated.' } });
+                setModal({ type: 'message', data: { title: 'Success', message: 'Application & KHQR settings updated.' } });
             } catch (error) {
                 console.error("Settings save error:", error);
                 setModal({ type: 'message', data: { title: 'Error', message: 'Failed to save settings.', isError: true } });
@@ -11357,6 +12109,46 @@
                             <p className="text-xs text-slate-500 mt-2">
                                 This name will appear on the Login screen, Sidebar, and Browser Tab.
                             </p>
+                        </div>
+
+                        {/* Dynamic KHQR / Bakong Merchant Configuration */}
+                        <div className="space-y-4">
+                            <h4 className="text-base font-bold text-slate-200 flex items-center gap-2">
+                                <span className="bg-[#E1232E] text-white text-xs font-black px-2 py-0.5 rounded">KHQR</span>
+                                Dynamic KHQR Payment Configuration
+                            </h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-300 mb-1">
+                                        Bakong / Bank Account ID
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={khqrAccountId}
+                                        onChange={(e) => setKhqrAccountId(e.target.value)}
+                                        className="w-full bg-slate-700 text-white px-3 py-2.5 rounded-lg border border-slate-600 focus:ring-2 focus:ring-red-500 outline-none font-mono text-sm"
+                                        placeholder="e.g. merchant@aba or username@aclb"
+                                    />
+                                    <p className="text-[11px] text-slate-500 mt-1">
+                                        Your Bakong ID (e.g., <code>shop@aba</code>, <code>shop@aclb</code>, <code>shop@wing</code>).
+                                    </p>
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-300 mb-1">
+                                        KHQR Merchant Display Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={khqrMerchantName}
+                                        onChange={(e) => setKhqrMerchantName(e.target.value)}
+                                        className="w-full bg-slate-700 text-white px-3 py-2.5 rounded-lg border border-slate-600 focus:ring-2 focus:ring-red-500 outline-none text-sm"
+                                        placeholder="Defaults to Shop Name"
+                                    />
+                                    <p className="text-[11px] text-slate-500 mt-1">
+                                        Shown at the top of the KHQR card on the POS payment screen.
+                                    </p>
+                                </div>
+                            </div>
                         </div>
                         
                         <div className="pt-4 border-t border-slate-700 flex justify-end">
@@ -12233,13 +13025,15 @@
 
     const ShopManagement = () => {
         const { shops, loading } = useData();
-        // FIX: Added mappedShop to the initial form state
-        const initialFormState = { name: '', location: '', mappedShop: '', manageStock: true };
+        // FIX: Added mappedShop, latitude, and longitude to the initial form state
+        const initialFormState = { name: '', location: '', mappedShop: '', latitude: '', longitude: '', manageStock: true };
         const [formData, setFormData] = useState(initialFormState);
         const [editId, setEditId] = useState(null);
         const [modal, setModal] = useState({ type: null, data: null });
         const [searchTerm, setSearchTerm] = useState(''); // Added search state
         const [showShopModal, setShowShopModal] = useState(false); // NEW: State for Shop Modal
+        const [isGettingGps, setIsGettingGps] = useState(false); // NEW: GPS loading state
+        const [gpsStatus, setGpsStatus] = useState({ type: '', text: '' }); // NEW: Inline GPS feedback
         
         const filteredShops = useMemo(() => {
             if (!searchTerm) return shops;
@@ -12252,10 +13046,41 @@
             const { name, value, type, checked } = e.target;
             setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
         };
+
+        const handleGetGps = () => {
+            if (!navigator.geolocation) {
+                setGpsStatus({ type: 'error', text: 'Geolocation is not supported by your browser.' });
+                return;
+            }
+            setIsGettingGps(true);
+            setGpsStatus({ type: 'info', text: 'Acquiring satellite / network GPS fix...' });
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const lat = position.coords.latitude.toFixed(6);
+                    const lng = position.coords.longitude.toFixed(6);
+                    setFormData(prev => ({
+                        ...prev,
+                        latitude: lat,
+                        longitude: lng
+                    }));
+                    setIsGettingGps(false);
+                    setGpsStatus({ type: 'success', text: `GPS captured (${lat}, ${lng})` });
+                },
+                (error) => {
+                    setIsGettingGps(false);
+                    let msg = 'Unable to retrieve your location.';
+                    if (error.code === 1) msg = 'Location permission denied. Please allow location access in browser settings.';
+                    else if (error.code === 2) msg = 'Location unavailable. Please check device GPS.';
+                    else if (error.code === 3) msg = 'GPS request timed out. Please try again.';
+                    setGpsStatus({ type: 'error', text: msg });
+                },
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            );
+        };
     
-        const resetForm = () => { setFormData(initialFormState); setEditId(null); setShowShopModal(false); };
-        const handleEdit = (shop) => { setEditId(shop.id); setFormData({ ...initialFormState, ...shop }); setShowShopModal(true); };
-        const handleAddNew = () => { setFormData(initialFormState); setEditId(null); setShowShopModal(true); };
+        const resetForm = () => { setFormData(initialFormState); setEditId(null); setShowShopModal(false); setIsGettingGps(false); setGpsStatus({ type: '', text: '' }); };
+        const handleEdit = (shop) => { setEditId(shop.id); setFormData({ ...initialFormState, ...shop }); setGpsStatus({ type: '', text: '' }); setShowShopModal(true); };
+        const handleAddNew = () => { setFormData(initialFormState); setEditId(null); setGpsStatus({ type: '', text: '' }); setShowShopModal(true); };
     
         const handleDelete = async (id) => {
             try {
@@ -12309,6 +13134,82 @@
                                         </label>
                                         <input type="text" name="location" placeholder="e.g. City Center" value={formData.location} onChange={handleInputChange} className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md focus:ring-2 focus:ring-blue-500 outline-none transition" />
                                     </div>
+
+                                    {/* NEW: Latitude, Longitude & Get GPS */}
+                                    <div className="md:col-span-2 bg-slate-900/50 p-4 rounded-lg border border-slate-700 space-y-3">
+                                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                            <label className="text-sm font-medium text-slate-300 flex items-center">
+                                                <i className="fas fa-compass text-cyan-400 mr-2"></i>GPS Coordinates (Lat / Long)
+                                            </label>
+                                            <div className="flex items-center gap-2">
+                                                {formData.latitude && formData.longitude && (
+                                                    <a
+                                                        href={`https://www.google.com/maps?q=${formData.latitude},${formData.longitude}`}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="text-xs bg-slate-800 hover:bg-slate-700 text-cyan-400 px-3 py-1.5 rounded-lg border border-slate-600 transition flex items-center gap-1.5"
+                                                        title="Preview on Google Maps"
+                                                    >
+                                                        <i className="fas fa-external-link-alt"></i> View Map
+                                                    </a>
+                                                )}
+                                                <button
+                                                    type="button"
+                                                    onClick={handleGetGps}
+                                                    disabled={isGettingGps}
+                                                    className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-700 text-white text-xs font-bold py-1.5 px-3 rounded-lg transition flex items-center gap-1.5 shadow-md shadow-cyan-900/20"
+                                                >
+                                                    {isGettingGps ? (
+                                                        <div className="loader w-3.5 h-3.5 border-2"></div>
+                                                    ) : (
+                                                        <i className="fas fa-location-crosshairs"></i>
+                                                    )}
+                                                    <span>{isGettingGps ? 'Getting GPS...' : 'Get GPS'}</span>
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-xs text-slate-400 mb-1">Latitude</label>
+                                                <input
+                                                    type="number"
+                                                    step="any"
+                                                    name="latitude"
+                                                    placeholder="e.g. 11.556374"
+                                                    value={formData.latitude || ''}
+                                                    onChange={handleInputChange}
+                                                    className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md focus:ring-2 focus:ring-cyan-500 outline-none transition font-mono text-sm"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-slate-400 mb-1">Longitude</label>
+                                                <input
+                                                    type="number"
+                                                    step="any"
+                                                    name="longitude"
+                                                    placeholder="e.g. 104.928210"
+                                                    value={formData.longitude || ''}
+                                                    onChange={handleInputChange}
+                                                    className="w-full bg-slate-700 text-slate-100 px-3 py-2 border border-slate-600 rounded-md focus:ring-2 focus:ring-cyan-500 outline-none transition font-mono text-sm"
+                                                />
+                                            </div>
+                                        </div>
+
+                                        {gpsStatus.text && (
+                                            <div className={`text-xs flex items-center gap-1.5 ${
+                                                gpsStatus.type === 'error' ? 'text-red-400' :
+                                                gpsStatus.type === 'success' ? 'text-emerald-400' : 'text-cyan-300'
+                                            }`}>
+                                                <i className={`fas ${
+                                                    gpsStatus.type === 'error' ? 'fa-exclamation-circle' :
+                                                    gpsStatus.type === 'success' ? 'fa-check-circle' : 'fa-satellite-dish'
+                                                }`}></i>
+                                                <span>{gpsStatus.text}</span>
+                                            </div>
+                                        )}
+                                    </div>
+
                                     <div className="md:col-span-2 flex items-center bg-slate-800/50 p-4 rounded-lg border border-slate-700">
                                         <input type="checkbox" name="manageStock" id="manageStock" checked={formData.manageStock} onChange={handleInputChange} className="h-5 w-5 text-blue-500 bg-slate-600 border-slate-500 rounded mr-3 cursor-pointer" />
                                         <label htmlFor="manageStock" className="text-sm font-medium text-slate-300 cursor-pointer flex items-center">
@@ -12357,6 +13258,7 @@
                                     {/* FIX: Added Header for Mapped Shop */}
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Mapped Shop</th>
                                     <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Location</th>
+                                    <th className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase">Lat / Long (GPS)</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Manages Stock</th>
                                     <th className="px-4 py-3 text-center text-xs font-semibold text-slate-400 uppercase">Actions</th>
                                 </tr>
@@ -12368,6 +13270,22 @@
                                         {/* FIX: Display Mapped Shop value */}
                                         <td className="px-4 py-3 text-sm text-slate-300 font-medium">{shop.mappedShop || '-'}</td>
                                         <td className="px-4 py-3 text-sm text-slate-400">{shop.location || '-'}</td>
+                                        <td className="px-4 py-3 text-sm text-slate-400 font-mono">
+                                            {shop.latitude && shop.longitude ? (
+                                                <a
+                                                    href={`https://www.google.com/maps?q=${shop.latitude},${shop.longitude}`}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    className="text-cyan-400 hover:text-cyan-300 hover:underline inline-flex items-center gap-1.5"
+                                                    title="Open in Google Maps"
+                                                >
+                                                    <i className="fas fa-location-dot"></i>
+                                                    <span>{shop.latitude}, {shop.longitude}</span>
+                                                </a>
+                                            ) : (
+                                                <span className="text-slate-600">-</span>
+                                            )}
+                                        </td>
                                         <td className="px-4 py-3 text-sm text-center">{shop.manageStock ? <i className="fas fa-check-circle text-green-500"></i> : <i className="fas fa-times-circle text-slate-500"></i>}</td>
                                         <td className="px-4 py-3 text-center space-x-4">
                                             <button onClick={() => handleEdit(shop)} className="text-blue-400 hover:text-blue-300"><i className="fas fa-edit"></i></button>
@@ -12645,7 +13563,7 @@
         const [isSidebarOpen, setSidebarOpen] = useState(false);
         const [activePage, setActivePage] = useState(null);
         const [pageData, setPageData] = useState(null);
-        const { backgroundFetchInitiated, backgroundLoadComplete, systemConfig } = useData(); // Get config
+        const { backgroundFetchInitiated, backgroundLoadComplete, systemConfig, activateHeavyCollections } = useData(); // Get config & lazy-loader
 
         // --- NEW: Update Document Title on Dashboard Load ---
         useEffect(() => {
@@ -12653,6 +13571,13 @@
                 document.title = systemConfig.appName;
             }
         }, [systemConfig]);
+
+        // --- QUOTA OPTIMIZATION: Only load POs, Transfers, and Users collections when navigating to Inventory or Settings ---
+        useEffect(() => {
+            if (activePage === 'inventory' || activePage === 'settings' || activePage === 'po-audit') {
+                activateHeavyCollections();
+            }
+        }, [activePage, activateHeavyCollections]);
 
         useEffect(() => {
             const permissions = userProfile?.permissions || [];
