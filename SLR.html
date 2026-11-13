@@ -1786,6 +1786,93 @@
                 };
             };
 
+            // PHASE 1-3 FIX: Centralized Loyalty Engine
+            window.SolarisLoyaltyEngine = {
+                async awardOrderLoyalty(orderId, orderData, pointsToRedeem, pointsConfig, knownCustomerData = null) {
+                    if (!orderId || !orderData || !orderData.customerPhone || orderData.customerPhone === 'N/A' || !pointsConfig?.pointsEnabled) return false;
+                    if (orderData.loyaltyPointsAwarded) return true;
+
+                    try {
+                        const { collection, query, where, getDocs, doc, setDoc, runTransaction } = window.FirebaseApp;
+                        const database = safeDB();
+                        const formattedPhone = formatPhoneNumber(orderData.customerPhone);
+                        const phoneVariants = Array.from(new Set([orderData.customerPhone, formattedPhone, String(orderData.customerPhone).replace(/\D/g, '')].filter(Boolean)));
+
+                        const isPaid = orderData.paymentStatus === 'Paid';
+                        const earnAmount = isPaid ? Number(orderData.totalAmount || 0) : 0;
+                        
+                        if (earnAmount <= 0 && (!pointsToRedeem || pointsToRedeem <= 0)) return false;
+
+                        let customerDocRef = null;
+                        
+                        if (knownCustomerData && knownCustomerData.id) {
+                            customerDocRef = doc(database, 'customers', knownCustomerData.id);
+                        } else {
+                            const q = phoneVariants.length > 1
+                                ? query(collection(database, 'customers'), where('phone', 'in', phoneVariants))
+                                : query(collection(database, 'customers'), where('phone', '==', formattedPhone));
+                            
+                            const snap = await getDocs(q);
+                            if (!snap.empty) {
+                                const sortedDocs = [...snap.docs].sort((a, b) => {
+                                    const score = (d) => (d.data().customerType && d.data().customerType !== 'Normal') ? 1 : 0;
+                                    return score(b) - score(a);
+                                });
+                                customerDocRef = sortedDocs[0].ref;
+                            }
+                        }
+
+                        if (!customerDocRef) {
+                            const cleanShopName = String(orderData.shopName || 'SLR').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+                            const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
+                            const randomSeq = String(Date.now()).slice(-6);
+                            
+                            customerDocRef = doc(collection(database, 'customers'));
+                            await setDoc(customerDocRef, {
+                                customerId: `${shopPrefix}-${randomSeq}`,
+                                phone: formattedPhone,
+                                name: orderData.customerName || 'Walk-in',
+                                sex: orderData.customerSex || 'M',
+                                status: 'Active',
+                                customerType: 'Normal',
+                                chargeStatus: 'Normal',
+                                registeredAtShop: orderData.shopId,
+                                createdAt: Date.now(),
+                                lastVisit: Date.now(),
+                                loyaltyData: { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 }
+                            });
+                        }
+
+                        await runTransaction(database, async (transaction) => {
+                            const freshSnap = await transaction.get(customerDocRef);
+                            if (!freshSnap.exists()) return;
+                            
+                            const freshData = freshSnap.data();
+                            const currentLoyalty = freshData.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
+                            
+                            const newLoyalty = calculateLoyaltyForOrder(earnAmount, pointsToRedeem, currentLoyalty, pointsConfig);
+                            
+                            const updates = { 
+                                loyaltyData: newLoyalty,
+                                lastVisit: Date.now()
+                            };
+                            
+                            if (freshData.hasWelcomeDiscount && orderData.appliedWelcomeDiscount) {
+                                updates.hasWelcomeDiscount = false; 
+                            }
+
+                            transaction.update(customerDocRef, updates);
+                            transaction.update(doc(database, 'orders', orderId), { loyaltyPointsAwarded: true });
+                        });
+
+                        return true;
+                    } catch (err) {
+                        console.warn("awardOrderLoyalty failed:", err);
+                        return false;
+                    }
+                }
+            };
+
             const deductInventory = async (cart, products, orderShopId, orderQueueNo) => {
                 const { doc, increment, collection, writeBatch } = window.FirebaseApp;
                 const stockUpdates = {}; 
@@ -4275,8 +4362,11 @@
 
                     if (window.SolarisPayWayVerifier) {
                         window.SolarisPayWayVerifier.inMemoryAbaPayments.set(trxId, entry);
-                        window.SolarisPayWayVerifier.saveLocalAbaCache();
+                        // 0ms Ultra-Fast TCP Push Mode: Notify UI immediately before blocking on synchronous localStorage or Firestore I/O
                         window.SolarisPayWayVerifier.notifySubscribers(entry);
+                        setTimeout(() => {
+                            if (window.SolarisPayWayVerifier) window.SolarisPayWayVerifier.saveLocalAbaCache();
+                        }, 0);
                     }
 
                     // If Firestore quota was recently exceeded, skip cloud write and rely on in-memory + localStorage cache
@@ -12233,17 +12323,18 @@
                                 );
                             }
 
-                            if (customerRef && realProfile) {
-                                let customerUpdates = { lastVisit: Date.now() };
-                                if (globalPoints?.pointsEnabled && pointsToRedeem > 0) {
-                                    const currentLoyalty = realProfile.loyaltyData || { activePoints: 0, freeClaims: 0, pointBatches: [], totalSpent: 0, totalRedeemed: 0, refilledDeducted: 0 };
-                                    customerUpdates.loyaltyData = calculateLoyaltyForOrder(0, pointsToRedeem, currentLoyalty, globalPoints);
-                                }
-                                if (snapHasWelcomeDiscount) {
-                                    customerUpdates.hasWelcomeDiscount = false;
-                                }
+                            // PHASE 1 FIX: Use centralized engine to ensure KHQR Auto-Pays earn points and missing profiles are created
+                            if (globalPoints?.pointsEnabled && snapCustomerPhone && snapCustomerPhone !== 'N/A') {
+                                orderData.shopName = targetShop.name;
+                                orderData.appliedWelcomeDiscount = snapHasWelcomeDiscount;
                                 secondaryPromises.push(
-                                    updateDoc(customerRef, customerUpdates).catch(() => {})
+                                    window.SolarisLoyaltyEngine.awardOrderLoyalty(
+                                        preAllocatedOrderRef.id,
+                                        orderData,
+                                        pointsToRedeem,
+                                        globalPoints,
+                                        snapCustomerProfile
+                                    )
                                 );
                             }
 
@@ -20576,7 +20667,7 @@
                                                             <span className={`w-2.5 h-2.5 rounded-full ${mtprotoStatus.isConnected ? 'bg-emerald-500 animate-ping' : 'bg-amber-400'}`}></span>
                                                             <span className="text-[11px] text-stone-700 font-bold">
                                                                 {mtprotoStatus.isConnected
-                                                                    ? `Live Browser MTProto Connected as ${mtprotoStatus.connectedUser?.firstName || 'User'}!`
+                                                                    ? `Connected to Telegram MTProto (Ultra-Fast TCP Push Mode) as ${mtprotoStatus.connectedUser?.firstName || 'User'}!`
                                                                     : 'Connect Browser MTProto or Node Listener to read @PayWayByABA_bot'}
                                                             </span>
                                                         </div>
@@ -34374,6 +34465,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                 const [selectedCustomer, setSelectedCustomer] = useState(null);
                 
                 const [globalPoints, setGlobalPoints] = useState({ pointsEnabled: false, spendAmount: 4000, pointsEarned: 1 });
+                const [branchPoints, setBranchPoints] = useState(null);
+                const effectivePointsConfig = branchPoints || globalPoints;
                 
                 // NEW: States for PIN Management
                 const [realCustomers, setRealCustomers] = useState([]);
@@ -34465,194 +34558,29 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     return { startTime, endTime };
                 };
 
-                // Fetch historical orders for loyalty
-                useEffect(() => {
-                    if (loyaltyDateFilter === 'all') return;
-                    const fetchHistory = async () => {
-                        setIsFetchingLoyaltyHistory(true);
-                        const { getDocs, query, where, collection } = window.FirebaseApp;
-                        const { startTime, endTime } = getLoyaltyTimeRange();
-                        try {
-                            const q = query(
-                                collection(db, 'orders'),
-                                where('createdAt', '>=', startTime),
-                                where('createdAt', '<', endTime)
-                            );
-                            const snap = await getDocs(q);
-                            setHistoricalLoyaltyOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-                        } catch(err) {
-                            console.error("Failed to fetch historical loyalty orders", err);
-                        } finally {
-                            setIsFetchingLoyaltyHistory(false);
-                        }
-                    };
-                    fetchHistory();
-                }, [loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth]);
-
-                const handlePinResetSubmit = async (e) => {
-                    e.preventDefault();
-                    if (!pinResetData || !pinResetData.id) return;
-                    
-                    const cleanPin = pinResetData.newPin.replace(/\D/g, '');
-                    if (cleanPin.length !== 4) {
-                        setPinResetData(prev => ({ ...prev, error: 'PIN must be exactly 4 digits.' }));
-                        return;
-                    }
-
-                    try {
-                        const { doc, updateDoc } = window.FirebaseApp;
-                        await updateDoc(doc(db, 'customers', pinResetData.id), {
-                            pin: cleanPin,
-                            updatedAt: Date.now()
-                        });
-                        
-                        setPinResetData(null);
-                        setCustomerError('PIN successfully reset!');
-                        setTimeout(() => setCustomerError(''), 3000);
-                    } catch (err) {
-                        setPinResetData(prev => ({ ...prev, error: 'Failed to reset PIN: ' + err.message }));
-                    }
-                };
-
-                const handleEditCustomerSubmit = async (e) => {
-                    e.preventDefault();
-                    if (isSavingCustomer) return;
-                    
-                    if (!editCustomerData?.name || !editCustomerData?.phone) {
-                        setCustomerError("Name and Phone Number are required.");
-                        setTimeout(() => setCustomerError(''), 3000);
-                        return;
-                    }
-
-                    const cleanPhone = String(editCustomerData.phone).replace(/\D/g, '');
-                    if (cleanPhone.length < 8) {
-                        setCustomerError("Please enter a valid phone number.");
-                        setTimeout(() => setCustomerError(''), 3000);
-                        return;
-                    }
-
-                    let finalPin = editCustomerData.pin ? String(editCustomerData.pin).trim() : null;
-                    if (finalPin) {
-                        finalPin = finalPin.replace(/\D/g, '');
-                        if (finalPin.length !== 4) {
-                            setCustomerError("Security PIN must be exactly 4 digits.");
-                            setTimeout(() => setCustomerError(''), 3000);
-                            return;
-                        }
-                    } else {
-                        finalPin = null;
-                    }
-
-                    const formattedPhone = formatPhoneNumber(editCustomerData.phone);
-                    const regShopId = editCustomerData.registeredAtShop || (filterShop !== 'All' ? filterShop : (shops[0]?.id || 'UNKNOWN'));
-
-                    // Compute deterministic Customer ID in memory if still blank (Zero extra Firestore reads!)
-                    let finalCustomerId = editCustomerData.customerId ? String(editCustomerData.customerId).trim() : '';
-                    if (!finalCustomerId) {
-                        const targetShop = shops.find(s => s.id === regShopId) || { name: 'UNK' };
-                        const cleanShopName = targetShop.name.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                        const shopPrefix = cleanShopName.length >= 3 ? cleanShopName.slice(-3) : cleanShopName.padStart(3, 'X');
-                        let maxSeq = 0;
-                        realCustomers.forEach(c => {
-                            if (c.customerId && c.customerId.startsWith(`${shopPrefix}-`)) {
-                                const seq = parseInt(c.customerId.split('-')[1], 10);
-                                if (!isNaN(seq) && seq < 100000000 && seq > maxSeq) maxSeq = seq;
-                            }
-                        });
-                        finalCustomerId = `${shopPrefix}-${String(maxSeq + 1).padStart(6, '0')}`;
-                    }
-
-                    // Check for duplicate phone number in memory (0 Firestore reads!)
-                    const duplicateInMemory = realCustomers.find(c =>
-                        c.id !== editCustomerData.id &&
-                        String(c.phone || '').replace(/\D/g, '') === cleanPhone
-                    );
-                    if (duplicateInMemory && !editCustomerData.id) {
-                        setCustomerError("A customer with this phone number already exists.");
-                        setTimeout(() => setCustomerError(''), 3000);
-                        return;
-                    }
-
-                    setIsSavingCustomer(true);
-                    try {
-                        const { doc, collection, setDoc, updateDoc, writeBatch } = window.FirebaseApp;
-
-                        const payload = {
-                            customerId: finalCustomerId,
-                            name: editCustomerData.name.trim(),
-                            phone: formattedPhone,
-                            sex: editCustomerData.sex || 'M',
-                            pin: finalPin,
-                            customerType: editCustomerData.customerType || 'Normal',
-                            status: editCustomerData.status || 'Active',
-                            chargeStatus: editCustomerData.chargeStatus || 'Normal',
-                            chargeStatusScope: editCustomerData.chargeStatusScope || 'All',
-                            chargeStatusShopIds: editCustomerData.chargeStatusScope === 'Specific' ? (editCustomerData.chargeStatusShopIds || []) : [],
-                            registeredAtShop: regShopId,
-                            hasWelcomeDiscount: !!editCustomerData.hasWelcomeDiscount,
-                            updatedAt: Date.now()
-                        };
-
-                        // Optimistic local state update so UI reflects changes immediately even under tight quotas
-                        if (editCustomerData.id) {
-                            setRealCustomers(prev => prev.map(c => c.id === editCustomerData.id ? { ...c, ...payload } : c));
-                            await updateDoc(doc(db, 'customers', editCustomerData.id), payload);
-
-                            // Only update orders in memory if the phone number was actually changed
-                            if (editCustomerData.originalPhone && editCustomerData.originalPhone !== formattedPhone) {
-                                const matchingOrders = (editCustomerData.orders || orders.filter(o => o.customerPhone === editCustomerData.originalPhone)).slice(0, 50);
-                                if (matchingOrders.length > 0) {
-                                    const batch = writeBatch(db);
-                                    matchingOrders.forEach(o => {
-                                        if (o.id) {
-                                            batch.update(doc(db, 'orders', o.id), {
-                                                customerPhone: formattedPhone,
-                                                customerName: payload.name
-                                            });
-                                        }
-                                    });
-                                    await batch.commit().catch(err => console.warn("Order phone sync skipped:", err));
-                                }
-                            }
-                        } else if (duplicateInMemory && duplicateInMemory.id) {
-                            // Legacy order-only customer already had a profile doc under this phone -> merge into existing doc (1 write!)
-                            setRealCustomers(prev => prev.map(c => c.id === duplicateInMemory.id ? { ...c, ...payload } : c));
-                            await setDoc(doc(db, 'customers', duplicateInMemory.id), payload, { merge: true });
-                        } else {
-                            // Create new customer document with a single write (no heavy transaction!)
-                            const newRef = doc(collection(db, 'customers'));
-                            const newDocData = {
-                                ...payload,
-                                createdAt: editCustomerData.createdAt || Date.now(),
-                                lastVisit: editCustomerData.lastVisit || Date.now()
-                            };
-                            setRealCustomers(prev => [{ id: newRef.id, ...newDocData }, ...prev]);
-                            await setDoc(newRef, newDocData);
-                        }
-
-                        setEditCustomerModalOpen(false);
-                        setEditCustomerData(null);
-                    } catch (err) {
-                        const isQuota = err?.code === 'resource-exhausted' || /quota|exhausted/i.test(err?.message || '');
-                        setCustomerError(
-                            isQuota
-                                ? "Firestore daily free write quota reached, or rate-limited. Changes applied locally in memory—please try saving again in a moment."
-                                : ("Error saving customer: " + err.message)
-                        );
-                        setTimeout(() => setCustomerError(''), 5000);
-                    } finally {
-                        setIsSavingCustomer(false);
-                    }
-                };
-
                 // Fetch Global Points Config
                 useEffect(() => {
                     const { doc, onSnapshot } = window.FirebaseApp;
-                    const unsub = onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
+                    const unsubs = [];
+                    
+                    unsubs.push(onSnapshot(doc(db, 'loyalty_settings', 'global_points'), snap => {
                         if (snap.exists()) setGlobalPoints(snap.data());
-                    }, e => console.warn("Failed to load global points in Customers View", e));
-                    return () => unsub();
-                }, []);
+                    }, e => console.warn("Failed to load global points in Customers View", e)));
+                    
+                    if (filterShop !== 'All') {
+                        unsubs.push(onSnapshot(doc(db, 'loyalty_settings', filterShop), snap => {
+                            if (snap.exists() && snap.data().pointsConfig && snap.data().pointsConfig.pointsEnabled !== undefined) {
+                                setBranchPoints(snap.data().pointsConfig);
+                            } else {
+                                setBranchPoints(null);
+                            }
+                        }, e => console.warn("Failed to load branch points in Customers View", e)));
+                    } else {
+                        setBranchPoints(null);
+                    }
+                    
+                    return () => unsubs.forEach(fn => fn());
+                }, [filterShop]);
 
                 // NEW: Fetch Secure Customer Database to sync PINs
                 useEffect(() => {
@@ -34670,7 +34598,8 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     // Pre-fill map with registered customers to access secure PIN data
                     realCustomers.forEach(c => {
                         if (!c.phone) return;
-                        map.set(c.phone, {
+                        const normPhone = c.phone.replace(/\D/g, '');
+                        map.set(normPhone, {
                             id: c.id,
                             customerId: c.customerId || null,
                             phone: c.phone,
@@ -34698,9 +34627,10 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
 
                     orders.forEach(o => {
                         if (!o.customerPhone || o.customerPhone === 'N/A') return; // Skip walk-ins without a phone
+                        const normPhone = o.customerPhone.replace(/\D/g, '');
                         
-                        if (!map.has(o.customerPhone)) {
-                            map.set(o.customerPhone, {
+                        if (!map.has(normPhone)) {
+                            map.set(normPhone, {
                                 id: null, // Legacy order without a secure profile
                                 customerId: null,
                                 phone: o.customerPhone,
@@ -34726,7 +34656,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             });
                         }
                         
-                        const c = map.get(o.customerPhone);
+                        const c = map.get(normPhone);
                         
                         // FIX: Self-Healing mechanism. If a profile exists but lacks a registration branch, adopt the active order's branch.
                         if (!c.registeredAtShop) {
@@ -34820,14 +34750,22 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                             // 2. Heavy Math Calculation (Optimized with DB Data)
                             let loyaltyMath = null;
                             const lifetimeSpent = c.totalSpent || 0;
-                            const lifetimeEarnedPts = Math.floor(lifetimeSpent / (globalPoints.spendAmount || 4000)) * (globalPoints.pointsEarned || 1);
+                            const lifetimeEarnedPts = Math.floor(lifetimeSpent / (effectivePointsConfig.spendAmount || 4000)) * (effectivePointsConfig.pointsEarned || 1);
 
                             if (c.dbLoyaltyData) {
                                 // PHASE 1 FIX: Replaced massive inline calculation with centralized engine!
-                                loyaltyMath = computeLiveLoyalty(c.dbLoyaltyData, globalPoints, c.refilledPoints);
+                                loyaltyMath = computeLiveLoyalty(c.dbLoyaltyData, effectivePointsConfig, c.refilledPoints);
+                                
+                                // HYBRID RECONCILIATION FIX: Fallback to real-time math if DB says 0 but user has lifetime spend
+                                if (loyaltyMath.activePoints === 0 && lifetimeSpent >= (effectivePointsConfig.spendAmount || 4000)) {
+                                    const realTimeMath = calculateCustomerLoyalty(c.orders, c.phone, effectivePointsConfig, c.refilledPoints || 0);
+                                    if (realTimeMath.activePoints > 0) {
+                                        loyaltyMath = realTimeMath;
+                                    }
+                                }
                             } else {
                                 // Fallback to calculation if no DB data exists
-                                loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, globalPoints, c.refilledPoints || 0);
+                                loyaltyMath = calculateCustomerLoyalty(c.orders, c.phone, effectivePointsConfig, c.refilledPoints || 0);
                             }
 
                             acc.push({
@@ -34844,7 +34782,7 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                     }, 50); // Small 50ms delay lets React paint the loading spinner first
 
                     return () => clearTimeout(timer);
-                }, [customersData, filterShop, loyaltySearchQuery, loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth, globalPoints, activeTab]);
+                }, [customersData, filterShop, loyaltySearchQuery, loyaltyDateFilter, loyaltyCustomDate, loyaltyCustomMonth, effectivePointsConfig, activeTab]);
 
                 // Loyalty Sub-Reports Logic
                 const sourceLoyaltyOrders = loyaltyDateFilter === 'all' ? orders : historicalLoyaltyOrders;
@@ -35945,8 +35883,14 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                                             if (cust) {
                                                 // PHASE 1 FIX: Use centralized logic
                                                 const loyalty = cust.dbLoyaltyData 
-                                                    ? computeLiveLoyalty(cust.dbLoyaltyData, globalPoints, cust.refilledPoints || 0)
-                                                    : calculateCustomerLoyalty(cust.orders, cust.phone, globalPoints, cust.refilledPoints || 0);
+                                                    ? computeLiveLoyalty(cust.dbLoyaltyData, effectivePointsConfig, cust.refilledPoints || 0)
+                                                    : calculateCustomerLoyalty(cust.orders, cust.phone, effectivePointsConfig, cust.refilledPoints || 0);
+                                                    
+                                                // HYBRID RECONCILIATION FIX
+                                                if (loyalty.activePoints === 0 && cust.totalSpent >= (effectivePointsConfig.spendAmount || 4000) && cust.dbLoyaltyData) {
+                                                    const rawLoyalty = calculateCustomerLoyalty(cust.orders, cust.phone, effectivePointsConfig, cust.refilledPoints || 0);
+                                                    if (rawLoyalty.activePoints > 0) loyalty.activePoints = rawLoyalty.activePoints;
+                                                }
                                                     
                                                 setRefillData({...refillData, id: cust.id, name: cust.name, phone: cust.phone, currentPts: loyalty.activePoints});
                                             }
