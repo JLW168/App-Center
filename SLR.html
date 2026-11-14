@@ -3751,6 +3751,32 @@
                     return result;
                 },
 
+                // Normalizes any single or comma/space/semicolon-separated list of Telegram Chat IDs into stripped numeric IDs
+                // e.g. "-1004452789426, -505836809" -> ["4452789426", "505836809"]
+                parseNormalizedChatIdList(rawChatIdsInput) {
+                    if (!rawChatIdsInput) return [];
+                    const rawStr = Array.isArray(rawChatIdsInput) ? rawChatIdsInput.join(',') : String(rawChatIdsInput);
+                    return Array.from(new Set(
+                        rawStr
+                            .split(/[\s,|;]+/)
+                            .map(id => String(id || '').trim().replace(/^-100/, '').replace(/^-/, '').trim())
+                            .filter(Boolean)
+                    ));
+                },
+
+                // Checks if a single incoming message Chat ID matches a shop's configured Chat ID (or comma-separated list of Chat IDs)
+                doesChatIdMatchFilter(msgChatIdInput, filterChatIdsInput) {
+                    const filterList = this.parseNormalizedChatIdList(filterChatIdsInput);
+                    if (filterList.length === 0) return true; // No filter configured -> allow all
+                    const msgList = this.parseNormalizedChatIdList(msgChatIdInput);
+                    if (msgList.length === 0) return true; // Diagnostic/manual broadcast without numeric chat ID
+                    // Only enforce strict numeric rejection if both sides contain numeric Telegram Chat IDs
+                    const hasNumericFilter = filterList.some(id => /^\d+$/.test(id));
+                    const hasNumericMsg = msgList.some(id => /^\d+$/.test(id));
+                    if (!hasNumericFilter || !hasNumericMsg) return true;
+                    return msgList.some(mId => filterList.includes(mId));
+                },
+
                 // Formats a single EMVCo TLV entry (Tag + 2-digit Length + Value)
                 formatTLV(tag, value) {
                     const valStr = String(value ?? '');
@@ -4110,7 +4136,7 @@
                 // PHASE 1.2: Filters & Auto-Sums ABA PayWay transactions strictly within a Shift's time window [openedAt -> closedAt/Now]
                 getShiftAbaTransactions(allAbaMessages = [], shift = null, shop = null, customWindow = null, orders = []) {
                     const exchangeRate = Math.max(100, Number(shop?.khqrConfig?.exchangeRate) || 4000);
-                    const shopChatId = String(shop?.khqrConfig?.paywayChatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                    const shopChatIdsList = this.parseNormalizedChatIdList(shop?.khqrConfig?.paywayChatId || '');
                     const shopMerchant = String(shop?.khqrConfig?.accountName || shop?.brandingName || shop?.name || '').trim().toUpperCase();
 
                     // Determine Start & End millisecond boundaries from Shift or Custom Window
@@ -4193,20 +4219,21 @@
                         const p = entry.parsedAba;
                         const linkedOrder = orderByTrxId.get(trxId) || (entry.claimedByOrderId ? (orders || []).find(o => o.id === entry.claimedByOrderId) : null);
 
-                        // 1. Branch / Group Isolation Check
+                        // 1. Branch / Multi-Group Isolation Check (Supports comma-separated PAYWAY_CHAT_ID lists per branch)
                         if (shop) {
                             if (linkedOrder && linkedOrder.shopId && linkedOrder.shopId !== shop.id) return;
 
-                            const msgChatId = String(entry.chatId || p.chatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
-                            if (shopChatId && msgChatId && /^\d+$/.test(shopChatId) && /^\d+$/.test(msgChatId)) {
-                                if (!shopChatId.includes(msgChatId) && !msgChatId.includes(shopChatId)) {
-                                    return;
-                                }
-                            } else if (!shopChatId && shopMerchant && p.merchantName) {
-                                const normMsgMerchant = String(p.merchantName).toUpperCase().replace(/[^A-Z0-9]/g, '');
-                                const normShopMerchant = shopMerchant.replace(/[^A-Z0-9]/g, '');
-                                if (normMsgMerchant && normShopMerchant && !normMsgMerchant.includes(normShopMerchant) && !normShopMerchant.includes(normMsgMerchant)) {
+                            const rawMsgChatId = String(entry.chatId || p.chatId || '').trim();
+                            if (shopChatIdsList.length > 0 && rawMsgChatId) {
+                                if (!this.doesChatIdMatchFilter(rawMsgChatId, shopChatIdsList)) {
                                     if (!linkedOrder) return;
+                                }
+                            } else if (shopChatIdsList.length === 0 && shopMerchant && p.merchantName) {
+                                const merchantAliases = shopMerchant.split(',').map(s => s.replace(/[^A-Z0-9]/g, '')).filter(Boolean);
+                                const normMsgMerchant = String(p.merchantName).toUpperCase().replace(/[^A-Z0-9]/g, '');
+                                if (normMsgMerchant && merchantAliases.length > 0) {
+                                    const anyAliasMatch = merchantAliases.some(alias => normMsgMerchant.includes(alias) || alias.includes(normMsgMerchant));
+                                    if (!anyAliasMatch && !linkedOrder) return;
                                 }
                             }
                         }
@@ -4476,7 +4503,7 @@
                         const database = safeDB();
 
                         const cleanFilterId = String(filterChatId || '').trim();
-                        const strippedFilterId = cleanFilterId.replace(/^-100/, '').replace(/^-/, '');
+                        const filterChatIdsList = this.parseNormalizedChatIdList(cleanFilterId);
 
                         const mergedByTrxId = new Map();
                         let discoveredChats = [];
@@ -4653,20 +4680,19 @@
 
                         const allMessages = Array.from(mergedByTrxId.values()).sort((a, b) => b.date - a.date);
 
-                        // CRITICAL FIX: Never silently discard valid ABA PayWay payments just because paywayChatId had a different prefix or wasn't set!
-                        // Prioritize exact chatId matches first, then include all valid unclaimed ABA PayWay transactions.
+                        // Multi-Group Aware Filter: Supports single Chat ID OR comma-separated list of Chat IDs
+                        // (e.g. "-1003938546235,-1003861176164,-1004452789426,-505836809,-5122424040,-5207801009,-5433742888,-5440582979")
                         const filteredMessages = allMessages.filter(entry => {
-                            if (!cleanFilterId || !entry.chatId) return true;
-                            const strippedDocChatId = String(entry.chatId).replace(/^-100/, '').replace(/^-/, '');
-                            if (entry.chatId === cleanFilterId || strippedDocChatId === strippedFilterId) return true;
-                            // Even if chatId differs, if it's a valid ABA PayWay message received recently, keep it so it's never silently lost!
-                            return entry.parsedAba?.isValid === true;
+                            if (filterChatIdsList.length === 0 || !entry.chatId) return true;
+                            if (this.doesChatIdMatchFilter(entry.chatId, filterChatIdsList)) return true;
+                            return false;
                         });
 
                         return {
                             ok: true,
                             sourceMode: window.SolarisBrowserMTProto?.isConnected ? 'BROWSER_MTPROTO_LIVE' : 'FIRESTORE_AND_BOT',
-                            messages: filteredMessages,
+                            messages: filteredMessages.length > 0 ? filteredMessages : allMessages,
+                            strictlyFilteredMessages: filteredMessages,
                             allAbaMessages: allMessages,
                             discoveredChats,
                             unfilteredAbaCount: allMessages.length,
@@ -4985,11 +5011,11 @@
                     }
                 },
 
-                // Scans recent group messages (e.g. "SLR KHQR Test") for any recent ABA PayWay notifications
+                // Scans recent group messages (e.g. "SLR KHQR Test" and all configured PayWay groups) for any recent ABA PayWay notifications
                 async scanRecentDialogsForAbaMessages() {
                     if (!this.client || !this.isConnected) return { found: 0, dialogs: [] };
                     try {
-                        const dialogs = await this.client.getDialogs({ limit: 15 });
+                        const dialogs = await this.client.getDialogs({ limit: 60 });
                         let foundCount = 0;
                         const dialogSummaries = [];
 
@@ -4998,7 +5024,7 @@
                             const title = d.title || d.name || 'Chat';
                             dialogSummaries.push({ chatId, title, isGroup: d.isGroup || d.isChannel });
 
-                            if (d.isGroup || d.isChannel || title.toLowerCase().includes('khqr') || title.toLowerCase().includes('payway')) {
+                            if (d.isGroup || d.isChannel || title.toLowerCase().includes('khqr') || title.toLowerCase().includes('payway') || title.toLowerCase().includes('aba')) {
                                 const msgs = await this.client.getMessages(d.entity, { limit: 15 });
                                 for (const m of msgs) {
                                     const txt = m?.message || m?.text || '';
@@ -5305,7 +5331,7 @@
                 },
 
                 // Checks if a parsed ABA PayWay message matches a specific pending KHQR order
-                // Dynamically validates Amount, Chronological Recency Gate (< 5 min & after QR generation), Optional APV Ref, and Chat ID
+                // Dynamically validates Amount, Chronological Recency Gate (< 5 min & after QR generation), Optional APV Ref, and Multi-Group Chat IDs
                 doesMessageMatchOrder(parsedAba, order, shop) {
                     if (!parsedAba || !parsedAba.isValid || !order) return false;
                     if (order.paymentStatus === 'Paid' || order.status === 'Cancelled') return false;
@@ -5313,13 +5339,11 @@
                     const isKhqrOrder = order.paymentMethod === 'KHQR (ABA)' || order.khqrExpectedKhr > 0;
                     if (!isKhqrOrder) return false;
 
-                    // 1. Optional Chat ID Isolation (If both the incoming payment and the shop have a specific Chat ID configured, ensure they belong to the same group)
-                    const shopChatId = String(shop?.khqrConfig?.paywayChatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
-                    const msgChatId = String(parsedAba.chatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
-                    const hasMultipleChatIds = shopChatId.includes(',') || msgChatId.includes(',');
-                    if (shopChatId && msgChatId && !hasMultipleChatIds && shopChatId !== msgChatId) {
-                        // Only enforce strict chatId rejection if msgChatId is an actual numeric Telegram ID (not a manual/diagnostic broadcast)
-                        if (/^\d+$/.test(shopChatId) && /^\d+$/.test(msgChatId)) {
+                    // 1. Multi-Group Chat ID Isolation (Supports single Chat ID or comma-separated list of Chat IDs configured on the branch)
+                    const shopChatIdConfig = String(shop?.khqrConfig?.paywayChatId || '').trim();
+                    const msgChatId = String(parsedAba.chatId || '').trim();
+                    if (shopChatIdConfig && msgChatId) {
+                        if (!window.SolarisKHQREngine.doesChatIdMatchFilter(msgChatId, shopChatIdConfig)) {
                             return false;
                         }
                     }
@@ -26392,16 +26416,16 @@ GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json`}</pre>
                         const database = safeDB();
 
                         const targetShop = posShopId === 'All' ? null : activeLedgerShopObj;
-                        const shopChatId = String(targetShop?.khqrConfig?.paywayChatId || '').replace(/^-100/, '').replace(/^-/, '').trim();
+                        const shopChatIdsList = window.SolarisKHQREngine.parseNormalizedChatIdList(targetShop?.khqrConfig?.paywayChatId || '');
                         const shopMerchant = String(targetShop?.khqrConfig?.accountName || targetShop?.brandingName || targetShop?.name || '').trim().toUpperCase();
 
                         const matchesShopFilter = (chatIdVal, merchantNameVal) => {
                             if (!targetShop) return true;
-                            const msgChatId = String(chatIdVal || '').replace(/^-100/, '').replace(/^-/, '').trim();
-                            if (shopChatId && msgChatId && /^\d+$/.test(shopChatId) && /^\d+$/.test(msgChatId)) {
-                                return shopChatId.includes(msgChatId) || msgChatId.includes(shopChatId);
+                            const msgChatId = String(chatIdVal || '').trim();
+                            if (shopChatIdsList.length > 0 && msgChatId) {
+                                return window.SolarisKHQREngine.doesChatIdMatchFilter(msgChatId, shopChatIdsList);
                             }
-                            if (!shopChatId && shopMerchant && merchantNameVal) {
+                            if (shopChatIdsList.length === 0 && shopMerchant && merchantNameVal) {
                                 const normMsgMerchant = String(merchantNameVal).toUpperCase().replace(/[^A-Z0-9]/g, '');
                                 const normShopMerchant = shopMerchant.replace(/[^A-Z0-9]/g, '');
                                 if (normMsgMerchant && normShopMerchant) {
